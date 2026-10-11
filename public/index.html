@@ -36,8 +36,9 @@ h1{margin:2px 0 0;font-size:24px;font-weight:600;letter-spacing:-.01em}
 #map{display:block;width:100%;min-width:820px;height:auto}
 .legend svg{display:inline-block;width:12px;height:12px}
 .side{background:var(--panel);border:1px solid var(--border);border-radius:10px;min-width:0;display:flex;flex-direction:column;max-height:880px}
-.tabs{display:flex;border-bottom:1px solid var(--border)}
-.tabs button{flex:1;background:none;border:0;border-bottom:2px solid transparent;color:var(--muted);font:500 12.5px var(--font);padding:12px 6px;cursor:pointer}
+.tabs{display:flex;border-bottom:1px solid var(--border);overflow-x:auto;scrollbar-width:none;-webkit-overflow-scrolling:touch}
+.tabs::-webkit-scrollbar{display:none}
+.tabs button{flex:1 0 auto;white-space:nowrap;background:none;border:0;border-bottom:2px solid transparent;color:var(--muted);font:500 12.5px var(--font);padding:12px 6px;cursor:pointer}
 .tabs button[aria-selected="true"]{color:var(--text);border-bottom-color:var(--accent)}
 .tabs button:focus-visible,.btn:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .pane{overflow:auto;padding:10px 12px;display:grid;gap:8px;align-content:start}
@@ -69,6 +70,13 @@ h1{margin:2px 0 0;font-size:24px;font-weight:600;letter-spacing:-.01em}
 .legend{display:flex;gap:14px;flex-wrap:wrap;font-size:11.5px;color:var(--muted);padding:10px 14px;border-top:1px solid var(--border)}
 .legend span{display:inline-flex;align-items:center;gap:6px}
 @keyframes pulse{0%{opacity:.9;r:9}100%{opacity:0;r:22}}
+.badge{font-family:var(--mono);font-size:10px;padding:1px 7px;border:1px solid var(--border);border-radius:999px;color:var(--muted);white-space:nowrap}
+.badge.warn{color:var(--warn);border-color:#4a3d29}.badge.bad{color:var(--bad);border-color:#4a2c2c}.badge.good{color:var(--good);border-color:#2b3d31}
+.days{display:grid;gap:2px;font-size:12px;font-variant-numeric:tabular-nums}
+.days div{display:grid;grid-template-columns:52px 1fr 1fr 44px 58px;gap:6px}
+.days .h{color:var(--faint);font-family:var(--mono);font-size:10px}
+.brief h3,.brief h4{margin:12px 0 4px;font-size:13px;color:var(--accent)}.brief ul{margin:0;padding-left:16px}.brief li{margin:2px 0;font-size:12.5px}
+.brief p{margin:4px 0;font-size:12.5px}.brief .note{border:1px solid #4a3d29;color:var(--warn);border-radius:6px;padding:6px 8px;font-size:12px}
 .ping{fill:none;stroke:var(--accent);stroke-width:1.5;animation:pulse 1.6s ease-out infinite}
 @media (prefers-reduced-motion:reduce){.ping{animation:none;opacity:.6}}
 </style>
@@ -112,6 +120,8 @@ h1{margin:2px 0 0;font-size:24px;font-weight:600;letter-spacing:-.01em}
         <button role="tab" aria-selected="true" data-tab="activity" id="tab-activity">Activity</button>
         <button role="tab" aria-selected="false" data-tab="approvals" id="tab-approvals">Approvals</button>
         <button role="tab" aria-selected="false" data-tab="supplier" id="tab-supplier">Supplier</button>
+        <button role="tab" aria-selected="false" data-tab="brief" id="tab-brief">Brief</button>
+        <button role="tab" aria-selected="false" data-tab="pnl" id="tab-pnl">P&amp;L</button>
         <button role="tab" aria-selected="false" data-tab="money" id="tab-money">Money</button>
         <button role="tab" aria-selected="false" data-tab="shipping" id="tab-shipping">Shipping</button>
         <button role="tab" aria-selected="false" data-tab="feeds" id="tab-feeds">Feeds</button>
@@ -302,6 +312,10 @@ h1{margin:2px 0 0;font-size:24px;font-weight:600;letter-spacing:-.01em}
         if(m&&navigator.clipboard) navigator.clipboard.writeText(m.body).then(function(){b.textContent="Copied"},function(){b.textContent="Copy failed"});
       }) });
       p.querySelectorAll("button[data-sent]").forEach(function(b){ b.addEventListener("click",function(){ markSent(b.dataset.sent,b) }) });
+    } else if(tab==="pnl"){
+      p.innerHTML=renderPnl(state.pnl||{stores:[],group:{}});
+    } else if(tab==="brief"){
+      p.innerHTML=renderBrief(state.brief||{});
     } else if(tab==="money"){
       p.innerHTML=renderMoney(state.money||{stores:[]});
     } else if(tab==="shipping"){
@@ -419,6 +433,95 @@ h1{margin:2px 0 0;font-size:24px;font-weight:600;letter-spacing:-.01em}
       rh+='</div>';
       return h+ah+ph+rh;
     }).join("")+((m.jobs||[]).length?'<div class="sub">Last runs</div><div class="row">'+m.jobs.map(function(j){ return kv(j.job,esc(ago(j.last_run_at))+(j.last_result&&j.last_result!=="ok"?' <span class="bad-t">'+esc(j.last_result)+'</span>':"")); }).join("")+'</div>':"");
+  }
+
+  /* ---------------- P&L ---------------- */
+  function pctTxt(n){ return n==null?"—":(Math.round(n*1000)/10)+"%"; }
+  function profitTxt(r){
+    if(r.profit!=null) return '<span'+(r.profit<0?' class="bad-t"':'')+'>'+esc(amt(r.profit))+'</span>';
+    var miss=(r.notes&&r.notes.missing)||r.missing||[];
+    return '<span class="pend">— '+esc(miss.join(", ")||"inputs")+' not wired'+(r.profit_partial!=null?' · '+esc(amt(r.profit_partial))+' before those':'')+'</span>';
+  }
+  function cogsTxt(r){
+    if(r.cogs==null) return "—";
+    var b=r.cogs_basis||{}, assumed=b.rate_assumed&&b.orders_by_rate>0||r.cogs_assumed;
+    var share=r.cogs_estimated_share;
+    return esc(amt(r.cogs))+' <span class="meta">· '+(share==null?"":esc(pctTxt(share))+' estimate')+(b.rate!=null&&b.orders_by_rate?' · rate '+esc(pctTxt(b.rate)):'')+'</span>'+(assumed?' <span class="badge warn">ASSUMED 33%</span>':'');
+  }
+  function statusBadge(r,today){
+    if(today) return '<span class="badge warn">PARTIAL · day not over</span>';
+    if(r.complete) return r.status==="restated"?'<span class="badge">restated</span>':'<span class="badge good">complete</span>';
+    var st=(r.notes&&r.notes.stale_inputs)||r.stale||[];
+    return '<span class="badge warn">not complete'+(st.length?' · '+esc(st.join(", ")):'')+'</span>';
+  }
+  function freshBadges(f){
+    if(!f) return "";
+    return '<span class="meta">'+["orders","ads","payouts","refunds"].map(function(k){ var s=(f[k]||{}).state||"not_wired"; if(s==="none")return "";
+      return '<span><span class="dot '+esc(s)+'"></span>'+esc(k)+': '+esc(FEED_LBL[s]||s)+'</span>'; }).join("")+'</span>';
+  }
+  function pnlBlock(title,r,o){
+    o=o||{};
+    if(!r) return '<div class="row"><b>'+esc(title)+'</b><span style="color:var(--muted);font-size:12.5px">No P&amp;L row yet.</span></div>';
+    var h='<div class="row'+(o.today?'':(!r.complete?' alarm':''))+'"><span style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap"><b>'+esc(title)+'</b>'+statusBadge(r,o.today)+'</span>';
+    h+=kv("Revenue",esc(amt(r.revenue))+(r.orders!=null?' <span class="meta">· '+esc(r.orders)+' orders</span>':''));
+    h+=kv("Refunds (processed)",esc(amt(r.refunds))+(r.refunds_pending?' <span class="pend">· '+esc(amt(r.refunds_pending))+' PENDING</span>':''));
+    h+=kv("COGS",cogsTxt(r));
+    h+=kv("Ads",esc(amt(r.ads)));
+    h+=kv("Guy fee",esc(amt(r.guy_fee)));
+    h+=kv("Shopify fees",r.fees==null?'<span class="meta">not wired</span>':esc(amt(r.fees)));
+    h+=kv("Profit",profitTxt(r));
+    h+=kv("Margin",esc(pctTxt(r.margin)));
+    h+=kv("ROAS vs break-even",(r.roas==null?"—":esc(r.roas.toFixed(2)))+' / '+(r.breakeven_roas==null?"—":esc(r.breakeven_roas.toFixed(2)))+(r.roas!=null&&r.breakeven_roas!=null?(r.roas>=r.breakeven_roas?' <span class="meta">above</span>':' <span class="bad-t">below</span>'):''));
+    if(o.fresh) h+=freshBadges(r.freshness);
+    return h+'</div>';
+  }
+  function daysTable(rows){
+    if(!rows||!rows.length) return '<span class="meta">No closed days recorded yet.</span>';
+    return '<div class="days"><div class="h"><span>day</span><span>revenue</span><span>profit</span><span>est.</span><span></span></div>'+rows.map(function(r){
+      return '<div><span>'+esc(r.day.slice(5))+'</span><span>'+esc(amt(r.revenue))+'</span><span>'+(r.profit==null?'<span class="pend">—</span>':'<span'+(r.profit<0?' class="bad-t"':'')+'>'+esc(amt(r.profit))+'</span>')+'</span><span>'+esc(r.cogs_estimated_share==null?"—":pctTxt(r.cogs_estimated_share))+'</span><span>'+(r.complete?'<span class="meta">ok</span>':'<span class="pend">open</span>')+'</span></div>';
+    }).join("")+'</div>';
+  }
+  function renderPnl(pl){
+    if(!pl.stores||!pl.stores.length) return '<div class="empty">No live stores.</div>';
+    var g=pl.group||{};
+    var h='<div class="row"><span style="font-size:12.5px;color:var(--muted)">COGS is an <b>estimate</b> until KFB bills are wired. Today is partial and never final. A dash means the input isn\'t wired (never zero).</span></div>';
+    h+='<div class="sub">Group</div>'+pnlBlock("Yesterday",g.yesterday)+pnlBlock("Month to date",g.mtd&&g.mtd.days?g.mtd:null)+pnlBlock("Today so far",g.today,{today:true});
+    pl.stores.forEach(function(s){
+      h+='<div class="sub">'+esc(s.name)+'</div>';
+      h+=pnlBlock("Yesterday"+(s.yesterday?" · "+s.yesterday.day:""),s.yesterday,{fresh:true});
+      h+=pnlBlock("Today so far · "+s.today_day,s.today,{today:true});
+      h+='<div class="row"><b>Last 7 days</b>'+daysTable(s.last7)+(s.last7_sum&&s.last7_sum.revenue!=null?kv("7-day revenue / profit",esc(amt(s.last7_sum.revenue))+' / '+(s.last7_sum.profit==null?'<span class="pend">—</span>':esc(amt(s.last7_sum.profit)))):'')+'</div>';
+      var m=s.mtd||{};
+      h+=pnlBlock("Month to date · "+(m.label||""),m.days?m:null);
+      if(m.missing_days&&m.missing_days.length) h+='<div class="row alarm"><span class="pend">MTD is missing '+esc(m.missing_days.length)+' day(s): '+esc(m.missing_days.slice(0,6).join(", "))+'</span></div>';
+    });
+    return h;
+  }
+  /* ---------------- brief ---------------- */
+  /* Same safe subset as the server: escape everything first, then ## / - / ** / _ / > only. */
+  function mdHtml(md){
+    var out=[], list=false;
+    function inline(t){ return esc(t).replace(/\*\*([^*]+)\*\*/g,"<b>$1</b>").replace(/(^|\s)_([^_]+)_(?=\s|$|[.,;:)])/g,"$1<i>$2</i>"); }
+    String(md||"").split("\n").forEach(function(line){
+      var t=line.trim(), bullet=/^[-*•]\s+/.test(t);
+      if(!bullet&&list){ out.push("</ul>"); list=false; }
+      if(!t) return;
+      if(bullet){ if(!list){out.push("<ul>");list=true;} out.push("<li>"+inline(t.replace(/^[-*•]\s+/,""))+"</li>"); return; }
+      var hm=/^(#{1,3})\s+(.*)$/.exec(t);
+      if(hm){ var n=hm[1].length+2; out.push("<h"+n+">"+inline(hm[2])+"</h"+n+">"); return; }
+      if(t.charAt(0)===">"){ out.push('<div class="note">'+inline(t.replace(/^>\s*/,""))+"</div>"); return; }
+      out.push("<p>"+inline(t)+"</p>");
+    });
+    if(list) out.push("</ul>");
+    return out.join("");
+  }
+  function renderBrief(b){
+    var mode=b.mode==="live"?"live (sent to your phone at 8:00)":"shadow (Mission Control only, not sent to your phone)";
+    var l=b.latest;
+    if(!l) return '<div class="sub">Morning brief · '+esc(mode)+'</div><div class="empty">No brief yet. The brain writes it once a day after 8:00 am Eastern.</div>';
+    var meta='<span class="meta"><span>'+esc(l.day)+'</span><span>'+esc(l.composer==="ai"?"Claude "+(l.model||""):"plain (no AI)")+'</span>'+(l.composer==="ai"?'<span>$'+esc(Number(l.cost_usd||0).toFixed(4))+'</span>':'')+'<span>'+esc(ago(l.created_at))+'</span>'+
+      (l.phone?'<span>'+(l.phone.sent?"sent to phone":'<span class="bad-t">phone: '+esc(l.phone.reason||"not sent")+'</span>')+'</span>':'')+'</span>';
+    return '<div class="sub">Morning brief · '+esc(mode)+'</div><div class="row">'+meta+(l.ai_error?'<span class="pend" style="font-size:12px">AI unavailable: '+esc(l.ai_error)+'</span>':'')+'<div class="brief">'+mdHtml(l.body_md)+'</div></div>';
   }
 
   var setupBusy=false;

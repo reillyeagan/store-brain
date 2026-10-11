@@ -24,7 +24,9 @@ const a = (id, dept, name, kind, level, status = "planned") => ({ id, dept, name
 export const AGENTS = Object.freeze([
   // Manager (around the Core)
   a("core.router", "core", "Router", "code", "L2"),
-  a("core.briefer", "core", "Briefer", "ai", "L2"),
+  // Morning brief at 8:00 ET: numbers by code, words by Claude, plain fallback. Shadow until
+  // Reilly sets BRIEF_PHONE_LIVE = "1".
+  a("core.briefer", "core", "Briefer", "ai", "L2", "built"),
   a("core.approvals", "core", "Approvals Desk", "code", "L1", "built"),
   a("core.decisions", "core", "Decision Keeper", "code", "L2"),
   a("core.librarian", "core", "Librarian", "ai", "L2"),
@@ -65,7 +67,8 @@ export const AGENTS = Object.freeze([
   a("pnl.pullers", "pnl", "Data Pullers", "code", "L2"),
   a("pnl.cogs", "pnl", "COGS Matcher", "code", "L2"),
   a("pnl.refunds", "pnl", "Refund Reconciler", "code", "L2"),
-  a("pnl.ledger", "pnl", "Ledger Keeper", "code", "L2"),
+  // Daily P&L rows in the ledger (pnl_days). Sheets writing comes later, after the shadow gate.
+  a("pnl.ledger", "pnl", "Ledger Keeper", "code", "L2", "built"),
   a("pnl.analyst", "pnl", "Analyst", "ai", "L2"),
   a("pnl.money_map", "pnl", "Money Map", "code", "L2"),
   a("pnl.calendar", "pnl", "Tax, Admin & Triggers", "code", "L1"),
@@ -117,6 +120,7 @@ export const SYSTEMS = Object.freeze([
   { id: "sys.whatsapp", name: "WhatsApp" },
   { id: "sys.phone", name: "Your phone" },
   { id: "sys.17track", name: "17TRACK" },
+  { id: "sys.claude", name: "Claude API" },
 ]);
 
 const KNOWN = new Set([...AGENTS.map((x) => x.id), ...SERVICES.map((x) => x.id), ...SYSTEMS.map((x) => x.id)]);

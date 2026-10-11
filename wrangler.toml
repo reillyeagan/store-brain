@@ -42,6 +42,11 @@ GOOGLE_ACCOUNT = "reillyworking26@gmail.com"
 # 2026-07-22, sunset Aug 2027). When the brain reports "version ... is not supported",
 # bump this to a current version from Google's sunset-dates page and redeploy.
 GOOGLE_ADS_API_VERSION = "v25"
+# Claude model for the 8:00 morning brief (Claude API model id). claude-sonnet-5-5 was the
+# newest Sonnet on 2026-10-11 ($2 / $10 per million tokens). Change it here and redeploy.
+# BRIEF_PHONE_LIVE is NOT set here: the brief stays shadow (Mission Control only) until
+# Reilly sets BRIEF_PHONE_LIVE = "1" in the Cloudflare dashboard.
+BRIEF_MODEL = "claude-sonnet-5-5"
 # Shopify app Client IDs are identifiers, not passwords, so they live here where a
 # deploy can never wipe them. The matching Client SECRETS stay Cloudflare secrets.
 SB_HC_CLIENT_ID = "91f62305f583acc7ac4dcaf6641590c1"

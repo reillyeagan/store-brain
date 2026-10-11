@@ -13,6 +13,7 @@
  *   GET  /approve/:id                    phone approval page (signed link from a notification)
  *   GET  /kfb/:id                        KFB copy-paste message page (signed link from a notification)
  *   POST /api/kfb/:id/sent               Reilly sent the KFB message (key OR a signed "sent" link)
+ *   GET  /brief/:id                      morning brief page (signed 48-hour link from the 8:00 notification)
  *   POST /api/admin/google/start         one-time Google consent URL (key required)
  *   GET  /oauth/google/callback          Google sends Reilly back here after consent
  *   GET  /api/admin/connections          which secrets exist (names only) + Google status (key required)
@@ -21,8 +22,9 @@
  * Crons
  *   every 15 min  reconciliation pull → money feeds (Ads spend hourly, payouts every 6 h, refunds
  *                 hourly; throttled in job_runs) → tracking (collect hourly, 17TRACK polls as due, checks)
+ *                 → P&L recompute (last 3 days, hourly) → morning brief (once per day after 08:00 ET)
  *                 → KFB composer (once per day after 18:45 ET) → Freshness Sentinel
- *   daily 05:00Z  day-close marker (P&L close logic arrives in Phase 2)
+ *   daily 05:00Z  P&L day close (01:00 EDT / 00:00 EST: "yesterday" is always the day that just ended)
  *
  * Secrets (Reilly adds these in Cloudflare; never in this repo):
  *   MC_KEY                 key for Mission Control + API
@@ -39,6 +41,8 @@
  *   GOOGLE_ADS_API_VERSION Google Ads API version, e.g. "v25" (wrangler.toml)
  *   SUPPLIER_MESSAGES_LIVE "1" = KFB messages go to the phone; anything else = shadow (Reilly flips it)
  *   PUBLIC_BASE_URL        this worker's https address, for links in phone notifications sent by crons
+ *   BRIEF_MODEL            Claude model id for the morning brief (wrangler.toml)
+ *   BRIEF_PHONE_LIVE       "1" = the 8:00 brief also goes to the phone; anything else = shadow (Reilly flips it)
  *   SB_<STORE>_CLIENT_ID / SB_<STORE>_CLIENT_SECRET   per-store Shopify app credentials
  */
 import { STORES, LIVE_STORE_IDS } from "./config/stores.js";
@@ -59,6 +63,8 @@ import {
   runKfbComposer, handleKfbPage, handleKfbSent, listKfbMessages, expressOrdersToday, supplierMode,
 } from "./lib/kfbMessage.js";
 import { runTracking, handleTrackingPush, shippingState } from "./lib/tracking.js";
+import { runPnlCron, runDayClose, pnlState } from "./lib/pnl.js";
+import { runBrief, latestBrief, handleBriefPage, briefMode } from "./lib/brief.js";
 
 export const VERSION = "0.1.0-foundation";
 
@@ -105,6 +111,7 @@ async function handleState(env) {
     shippingState(env),
   ]);
   const money = await moneyState(env.DB, feeds);
+  const [pnl, brief] = await Promise.all([pnlState(env.DB), latestBrief(env.DB)]);
   return json({
     version: VERSION,
     now: new Date().toISOString(),
@@ -123,6 +130,8 @@ async function handleState(env) {
     supplier: { mode: supplierMode(env), kfbMessages, expressToday },
     money: { ...money, jobs: (jobs && jobs.results) || [] },
     shipping,
+    pnl,
+    brief: { mode: briefMode(env), latest: brief },
   });
 }
 
@@ -205,6 +214,10 @@ export default {
       if (kp && request.method === "GET") {
         return await handleKfbPage(request, env, parseInt(kp[1], 10));
       }
+      const bp = path.match(/^\/brief\/(\d+)$/);
+      if (bp && request.method === "GET") {
+        return await handleBriefPage(request, env, parseInt(bp[1], 10));
+      }
       const ks = path.match(/^\/api\/kfb\/(\d+)\/sent$/);
       if (ks && request.method === "POST") {
         return await handleKfbSent(request, env, parseInt(ks[1], 10), hasKey(request, env));
@@ -233,10 +246,15 @@ export default {
     ctx.waitUntil(
       (async () => {
         if (event.cron === "0 5 * * *") {
-          await logEvent(env.DB, {
-            actor: "pnl.ledger", kind: "day.close",
-            summary: "Day close reached. P&L close logic arrives in Phase 2 (shadow mode first).",
-          });
+          try {
+            await ensureFeeds(env.DB);
+            await runDayClose(env);
+          } catch (err) {
+            await logEvent(env.DB, {
+              actor: "pnl.ledger", kind: "error.day_close",
+              summary: `P&L day close failed; the hourly recompute will catch up (${String(err && err.message).slice(0, 200)})`,
+            }).catch(() => {});
+          }
           return;
         }
         await ensureFeeds(env.DB);
@@ -257,6 +275,24 @@ export default {
           await logEvent(env.DB, {
             actor: "pnl.pullers", kind: "error.money_jobs",
             summary: `Money feeds failed to start; they will try again in 15 minutes (${String(err && err.message).slice(0, 200)})`,
+          }).catch(() => {});
+        }
+        // P&L: last 3 days, at most hourly (after the money feeds, so it uses their latest rows).
+        try {
+          await runPnlCron(env);
+        } catch (err) {
+          await logEvent(env.DB, {
+            actor: "pnl.ledger", kind: "error.pnl",
+            summary: `P&L recompute failed; it will try again next hour (${String(err && err.message).slice(0, 200)})`,
+          }).catch(() => {});
+        }
+        // Morning brief: once per Eastern day after 08:00. Its own try, like every step.
+        try {
+          await runBrief(env);
+        } catch (err) {
+          await logEvent(env.DB, {
+            actor: "core.briefer", kind: "error.brief",
+            summary: `Morning brief failed; it will try again in 15 minutes (${String(err && err.message).slice(0, 200)})`,
           }).catch(() => {});
         }
         // Before the composer, so tonight's KFB message sees the latest parcel statuses.

@@ -8,6 +8,16 @@
  *   (the Eagano dash once nearly cross-wired a store through a loose prefix match).
  * - `live: false` means no P&L rows, no workers, no alerts for that store yet.
  */
+/**
+ * Guy's media-buying fee, applied per store as rate x that day's ad spend, from his
+ * start date on (days before it carry no fee).
+ * Source: docs/specs/pnl-finance.md, Data Pullers: "Guy fee: 10% of spend from his start
+ * date, per store (config)". Start date 2026-09-07 as given in the P&L build brief
+ * (2026-10-11); confirm it against Guy's first invoice before the P&L leaves shadow.
+ * Per store on purpose: if one store's terms ever differ, change only that store.
+ */
+const GUY_FEE = Object.freeze({ rate: 0.10, start: "2026-09-07" });
+
 export const STORES = Object.freeze({
   hc: {
     id: "hc",
@@ -21,6 +31,9 @@ export const STORES = Object.freeze({
     live: true,
     timezone: "America/New_York",
     secrets: { clientId: "SB_HC_CLIENT_ID", clientSecret: "SB_HC_CLIENT_SECRET" },
+    // Guy (media buyer) fee: see GUY_FEE below.
+    guyFeeRate: GUY_FEE.rate,
+    guyStart: GUY_FEE.start,
   },
   aub: {
     id: "aub",
@@ -31,6 +44,9 @@ export const STORES = Object.freeze({
     live: true,
     timezone: "America/New_York",
     secrets: { clientId: "SB_AUB_CLIENT_ID", clientSecret: "SB_AUB_CLIENT_SECRET" },
+    // Guy (media buyer) fee: see GUY_FEE below.
+    guyFeeRate: GUY_FEE.rate,
+    guyStart: GUY_FEE.start,
   },
   mar: {
     id: "mar",
@@ -41,6 +57,9 @@ export const STORES = Object.freeze({
     live: true,
     timezone: "America/New_York",
     secrets: { clientId: "SB_MAR_CLIENT_ID", clientSecret: "SB_MAR_CLIENT_SECRET" },
+    // Guy (media buyer) fee: see GUY_FEE below.
+    guyFeeRate: GUY_FEE.rate,
+    guyStart: GUY_FEE.start,
   },
   cc: {
     id: "cc",
