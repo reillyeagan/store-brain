@@ -115,7 +115,11 @@ Every price change and every draft is ONE approval per batch, showing old → ne
 
 **Learning:** each product's verdict (true to size / runs small by N) is stored; size complaints and exchanges from email update it. Products Reilly already sized up by hand in the KFB chat seed the library (e.g. the shawl-collar cardigan "+2 sizes", the 3XL-max blazer).
 
-**Open:** the fit rule (how much room counts as "fits") and the US reference charts — see questions.
+**Fit rule (Reilly, 2026-10-11):** "idk if the sizing between US and chinese sizes seems accurate then its fine, but if the customer orders a M and the chinese M looks more like a S, we might want to send out a chinese L"
+- So the rule is **size equivalence**, not a fixed amount of room: work out which US size each Chinese size actually corresponds to (using US garment reference charts for that gender + garment type), then ship the Chinese size that matches the US size ordered. Accurate → ship as ordered.
+- Chest is the deciding measurement (it drives every complaint so far); length/sleeve are recorded and shown, not decisive. *(Default; Reilly can change.)*
+
+**Complaint log (Reilly, 2026-10-11):** "also keep track of email info from customers who have complained about sizing for certain products and make note of that." Every sizing complaint in email (too small / too big, order, product, size ordered, size that would have fit) is logged against the product. A product with complaints is treated as running small even if its chart looks fine, and the shift is learned from what customers say fit.
 1. **How do products reach KFB for quoting?** Does KFB pull everything from the store automatically, or do you submit products? Can you set priority?
    - **Answered 2026-10-11 (Reilly):** "KFB automatically pulls orders through there app, I have to manually pull products, so whenever i activate like 50 new products I just go into KFB and click "get products" and they go into the quotation section"
    - **Follow-up 2026-10-11 (Reilly):** "ill do the product publishing myself, and will do the get product thing in KFB. the store brain should never need to worry about it."
