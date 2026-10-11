@@ -76,9 +76,14 @@ Legend: **CODE** = program, no AI · **AI** = Claude for judgement/language · L
 ## Questions for Reilly
 1. **How do products reach KFB for quoting?** Does KFB pull everything from the store automatically, or do you submit products? Can you set priority?
    - **Answered 2026-10-11 (Reilly):** "KFB automatically pulls orders through there app, I have to manually pull products, so whenever i activate like 50 new products I just go into KFB and click "get products" and they go into the quotation section"
-   - Means: orders need no forwarding. Products reach KFB only when Reilly clicks **Get products** after activating a batch. Agent job: notice newly activated products that haven't been pulled into KFB yet and remind Reilly in the morning brief (agents stay view-only on KFB).
+   - **Follow-up 2026-10-11 (Reilly):** "ill do the product publishing myself, and will do the get product thing in KFB. the store brain should never need to worry about it."
+   - Means: orders need no forwarding. Publishing products and clicking **Get products** are Reilly's alone; the brain does not track or remind about them.
 2. **Status 25 "confirm quotation":** what do you check before confirming? Should the agent prepare a confirm/decline recommendation with the margin?
+   - **Answered 2026-10-11 (Reilly):** "when quotes come back, I just auto approve all them and then adjust the live store prices accordingly with what the quoted price is, and whatever products got denied i draft them on the live store."
+   - Means: no confirm/decline recommendation needed. The follow-on work is (a) reprice live products from the quote, (b) draft denied products. Open: the pricing rule, and whether the brain should prepare these as one approval.
 3. **Orders:** do all Shopify orders auto-forward to KFB (like #1174)? Do you pay bills every morning, or less often?
+   - **Answered 2026-10-11 (Reilly):** orders auto-forward via KFB's app (see Q1). "i try to pay KFB bills every morning if i can, most of the time i do"
+   - Means: the morning sweep reports unpaid bills (count, total, oldest) so a skipped day is visible. Paying stays Reilly's.
 4. **"Similar ones":** your rule: when is similar OK, and when must the listing change or be drafted?
 5. **WhatsApp:** what do you usually message KFB about, and how fast do they reply?
 6. **Returns:** do returned items go to your Charlotte address or back to KFB? For exchanges, does KFB ship the new size from China?
