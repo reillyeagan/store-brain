@@ -73,6 +73,23 @@ Legend: **CODE** = program, no AI · **AI** = Claude for judgement/language · L
 - Never bypass a CAPTCHA; Reilly logs in.
 - Data files hold only observations; inferences are labelled.
 
+## Pricing rules (from the vault + quoting sheets, 2026-10-11; confirm with Reilly)
+
+Every price change and every draft is ONE approval per batch, showing old → new for each product. Backup to R2 first, Store Guard, verify every variant against Shopify after.
+
+| Store | COGS band | Rule shape | Floor | Ceiling | Source |
+|---|---|---|---|---|---|
+| H&C | 29–33% | Directional: above 33% → raise to the cheapest `.95` at ≤33%; below 29% → cut to the dearest `.95` at ≥29%; in band → leave | — | $69.95 default; Reilly waives per product (13 waived 10-06, 2 more 10-08) | 09-06 split, 10-06 / 10-08 runs |
+| Auberlane | 25–29% | Single target (as Marlowe, no ceiling) | $44.95 | none recorded | 09-06 split, 09-07 review |
+| Marlowe | 25–29% | `target = min(max(up95(cost/0.29), 49.95), 144.95)` | $49.95 | $144.95 | 09-23 |
+
+- Prices end in `.95`. Cost = latest KFB quote (EUR billed → USD at the actual card rate).
+- Standing holds: H&C outerwear held at $114.95 under band (Reilly 09-01). A held product is never re-proposed unless its cost changes.
+- When the ceiling stops a product reaching band, the proposal says so and offers the waiver; it never waives on its own.
+- Denied products (and "needs a different supplier") → proposed for **draft**, same approval.
+
+**Compare-at tiers:** 20% none · 20% ~10% · 20% ~20% · 20% ~30% · 20% ~40% of active products, kept even after every batch. Compare-at is a clean `.95` (or `.50`); the badge must print the exact tier. H&C's `snippets/price.liquid` floors to a whole percent then rounds to the nearest 10, so ±5 points prints clean. Read each store's own badge snippet before computing — never assume. New products are assigned to whichever tier is short (seeded, reproducible). When a price changes, its compare-at is recomputed to keep the same tier.
+
 ## Questions for Reilly
 1. **How do products reach KFB for quoting?** Does KFB pull everything from the store automatically, or do you submit products? Can you set priority?
    - **Answered 2026-10-11 (Reilly):** "KFB automatically pulls orders through there app, I have to manually pull products, so whenever i activate like 50 new products I just go into KFB and click "get products" and they go into the quotation section"
@@ -80,7 +97,10 @@ Legend: **CODE** = program, no AI · **AI** = Claude for judgement/language · L
    - Means: orders need no forwarding. Publishing products and clicking **Get products** are Reilly's alone; the brain does not track or remind about them.
 2. **Status 25 "confirm quotation":** what do you check before confirming? Should the agent prepare a confirm/decline recommendation with the margin?
    - **Answered 2026-10-11 (Reilly):** "when quotes come back, I just auto approve all them and then adjust the live store prices accordingly with what the quoted price is, and whatever products got denied i draft them on the live store."
-   - Means: no confirm/decline recommendation needed. The follow-on work is (a) reprice live products from the quote, (b) draft denied products. Open: the pricing rule, and whether the brain should prepare these as one approval.
+   - Means: no confirm/decline recommendation needed. The follow-on work is (a) reprice live products from the quote, (b) draft denied products.
+   - **Pricing rule, Reilly 2026-10-11:** "look at the product quoting sheets we have … we try and keep the COGs in a certain percentage band, with min and max prices as well. additionally, we have to be sure to keep the compare at prices consistent, so 20% of products should have no compare at, 20% should have a rough 10% compare at (doesnt need to be an exact 10% sale we prioritize clean numbers like 43.95, but the badge still displays clean 10%, 20%, etc), 20% at 20% compare at, and so on."
+   - **Approval, Reilly 2026-10-11:** "yes i need to approve every price rewrite, as well as draft products, etc"
+   - The rulebook is in **Pricing rules** below (pending Reilly's confirmation of the summary).
 3. **Orders:** do all Shopify orders auto-forward to KFB (like #1174)? Do you pay bills every morning, or less often?
    - **Answered 2026-10-11 (Reilly):** orders auto-forward via KFB's app (see Q1). "i try to pay KFB bills every morning if i can, most of the time i do"
    - Means: the morning sweep reports unpaid bills (count, total, oldest) so a skipped day is visible. Paying stays Reilly's.
