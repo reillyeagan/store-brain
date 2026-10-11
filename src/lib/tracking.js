@@ -18,6 +18,14 @@
  * only if its order is from the last 30 days, and a rejection is never retried
  * automatically. A re-registration attempt (e.g. after a crash between the API call and
  * our write) is answered "already registered" by 17TRACK, which spends nothing.
+ * The first collection finds a month of parcels at once, so registration is guarded:
+ *   - newest first (the ones still on the road matter most);
+ *   - never a parcel Shopify already reports DELIVERED, never one shipped 21+ days ago;
+ *   - at most TRACKING_REGISTER_CAP registrations in total (default 60) until Reilly
+ *     raises that variable in Cloudflare;
+ *   - the last QUOTA_RESERVE registrations are kept for parcels shipped in the last
+ *     few days, so the backlog can never use up what new orders need.
+ * A parcel that isn't tracked still gets day-15 / day-20 flags from its order date.
  */
 import { LIVE_STORE_IDS, STORES } from "../config/stores.js";
 import { shopifyGraphQL } from "./storeGuard.js";
@@ -56,6 +64,18 @@ export const DAY15 = 15;
 export const DAY20 = 20;
 /** Mission Control warns when fewer registrations than this are left. */
 export const QUOTA_LOW = 20;
+/** The backlog never spends the last this-many registrations; they're kept for new parcels. */
+export const QUOTA_RESERVE = 20;
+/** "New parcel" for the reserve: shipped within this many days. */
+export const NEW_PARCEL_DAYS = 3;
+/** A parcel shipped this long ago isn't registered: it's arrived or it's a day-20 case already. */
+export const MAX_REGISTER_AGE_DAYS = 21;
+/** Total registrations allowed until Reilly sets TRACKING_REGISTER_CAP higher in Cloudflare. */
+export const DEFAULT_REGISTER_CAP = 60;
+/** Refused (bad-signature) pushes are counted and summarised in the log at most this often. */
+export const PUSH_REJECT_LOG_EVERY_MS = HOUR;
+/** Shopify's own word that a fulfillment arrived (FulfillmentDisplayStatus, Admin API 2026-07). */
+export const SHOPIFY_DELIVERED = new Set(["DELIVERED", "PICKED_UP"]);
 /** Shopify query: 25 orders × (1 + 3 fulfillments × (1 + 2 tracking)) ≈ 250 points, far under 1,000. */
 export const ORDERS_PER_PAGE = 25;
 export const MAX_PAGES = 8;
@@ -66,7 +86,7 @@ export const FULFILLMENTS_QUERY = `query RecentFulfillments($q: String!, $after:
     nodes {
       id name createdAt
       fulfillments(first: 3) {
-        id createdAt status
+        id createdAt status displayStatus deliveredAt
         trackingInfo(first: 2) { number company url }
       }
     }
@@ -145,6 +165,7 @@ export function shipmentsFromOrderNode(n) {
         order_id: n.id, order_name: n.name || null, order_created_at: n.createdAt || null,
         fulfillment_id: f.id || null, tracking_number: number,
         carrier_hint: t.company || null, tracking_url: t.url || null, shipped_at: f.createdAt || null,
+        shopify_status: f.displayStatus || null, shopify_delivered_at: f.deliveredAt || null,
       });
     }
   }
@@ -157,16 +178,17 @@ async function upsertShipment(db, storeId, s, at) {
   if (had) {
     await db.prepare(
       `UPDATE shipments SET order_name = COALESCE(?, order_name), carrier_hint = COALESCE(?, carrier_hint),
-              tracking_url = COALESCE(?, tracking_url), updated_at = ? WHERE tracking_number = ?`
-    ).bind(s.order_name, s.carrier_hint, s.tracking_url, at, s.tracking_number).run();
+              tracking_url = COALESCE(?, tracking_url), shopify_status = COALESCE(?, shopify_status),
+              shopify_delivered_at = COALESCE(shopify_delivered_at, ?), updated_at = ? WHERE tracking_number = ?`
+    ).bind(s.order_name, s.carrier_hint, s.tracking_url, s.shopify_status || null, s.shopify_delivered_at || null, at, s.tracking_number).run();
     return "seen";
   }
   await db.prepare(
     `INSERT INTO shipments (store, order_id, order_name, order_created_at, fulfillment_id, tracking_number,
-                            carrier_hint, tracking_url, shipped_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(tracking_number) DO NOTHING`
+                            carrier_hint, tracking_url, shipped_at, shopify_status, shopify_delivered_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(tracking_number) DO NOTHING`
   ).bind(storeId, s.order_id, s.order_name, s.order_created_at, s.fulfillment_id, s.tracking_number,
-    s.carrier_hint, s.tracking_url, s.shipped_at, at).run();
+    s.carrier_hint, s.tracking_url, s.shipped_at, s.shopify_status || null, s.shopify_delivered_at || null, at).run();
   return "new";
 }
 
@@ -241,6 +263,61 @@ async function saveQuota(db, quota, at) {
   }
 }
 
+/** SQL: Shopify already says this parcel arrived. */
+const SHOPIFY_DELIVERED_SQL =
+  `(shopify_delivered_at IS NOT NULL OR UPPER(COALESCE(shopify_status, '')) IN (${[...SHOPIFY_DELIVERED].map((s) => `'${s}'`).join(", ")}))`;
+
+export const isShopifyDelivered = (p) =>
+  !!(p && (p.shopify_delivered_at || SHOPIFY_DELIVERED.has(String(p.shopify_status || "").toUpperCase())));
+
+/** The total-registrations cap: TRACKING_REGISTER_CAP if Reilly set a number, else 60. */
+export function registerCap(env) {
+  const raw = env && env.TRACKING_REGISTER_CAP;
+  const n = raw == null || raw === "" ? NaN : Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : DEFAULT_REGISTER_CAP;
+}
+
+/**
+ * Which waiting parcels to register now: newest first, and only parcels shipped in the
+ * last NEW_PARCEL_DAYS may use the reserve. Pure, so the rule is easy to test.
+ * @returns {{ pick: object[], held: number, reason: string|null }}
+ */
+export function planRegistrations(eligible, { remain, cap, used, nowMs }) {
+  const left = remain == null ? 0 : Math.max(0, remain);
+  const capLeft = Math.max(0, cap - used);
+  const total = Math.min(left, capLeft, MAX_REGISTER_PER_RUN);
+  const backlogBudget = Math.min(total, Math.max(0, left - QUOTA_RESERVE));
+  const newSince = nowIso(nowMs - NEW_PARCEL_DAYS * DAY);
+  const pick = [];
+  let backlog = 0, reserveStop = false;
+  for (const r of eligible) {
+    if (pick.length >= total) break;
+    const isNew = String(r.shipped_at || r.order_created_at || "") >= newSince;
+    if (!isNew) {
+      if (backlog >= backlogBudget) { reserveStop = true; break; }
+      backlog++;
+    }
+    pick.push(r);
+  }
+  const held = eligible.length - pick.length;
+  let reason = null;
+  if (held) {
+    // Which limit stopped us. Only the per-run limit is not worth reporting: the rest go next hour.
+    if (remain == null) reason = "quota_unknown";
+    else if (reserveStop) reason = "reserve_kept";
+    else if (total === left) reason = "quota_used_up";
+    else if (total === capLeft) reason = "cap_reached";
+  }
+  return { pick, held, reason, cap, capLeft, total };
+}
+
+const HOLD_TEXT = {
+  quota_unknown: () => "17TRACK quota is unknown, so nothing is registered",
+  quota_used_up: () => "17TRACK quota is used up",
+  cap_reached: (p) => `the brain's cap of ${p.cap} registrations is reached (Reilly can raise TRACKING_REGISTER_CAP in Cloudflare)`,
+  reserve_kept: () => `the last ${QUOTA_RESERVE} registrations are kept for parcels shipped in the last ${NEW_PARCEL_DAYS} days`,
+};
+
 export async function registerNew(env, { nowMs = Date.now(), fetchImpl = fetch, sleep = sleepDefault } = {}) {
   const db = env.DB;
   const at = nowIso(nowMs);
@@ -250,28 +327,40 @@ export async function registerNew(env, { nowMs = Date.now(), fetchImpl = fetch, 
   await saveQuota(db, quota, at);
 
   if (!LIVE_STORE_IDS.length) return { quota, registered: 0 };
-  // Unknown quota = don't spend (rule 4: null is not a number).
-  const budget = quota.remain == null ? 0 : Math.max(0, Math.min(quota.remain, MAX_REGISTER_PER_RUN));
+  const cap = registerCap(env);
+  // Everything we've ever registered counts toward the cap, whichever store.
+  const usedRow = await db.prepare(`SELECT COUNT(*) AS n FROM shipments WHERE registered_at IS NOT NULL`).first();
+  const used = usedRow ? usedRow.n : 0;
   const { results } = await db.prepare(
-    `SELECT tracking_number, store, order_name FROM shipments
+    `SELECT tracking_number, store, order_name, shipped_at, order_created_at FROM shipments
       WHERE registered_at IS NULL AND register_error IS NULL
         AND store IN (${liveMarks()}) AND order_created_at >= ?
-      ORDER BY shipped_at, tracking_number LIMIT ?`
-  ).bind(...LIVE_STORE_IDS, nowIso(nowMs - LOOKBACK_DAYS * DAY), Math.max(budget, 0)).all();
-  const waiting = await db.prepare(
-    `SELECT COUNT(*) AS n FROM shipments WHERE registered_at IS NULL AND register_error IS NULL
-        AND store IN (${liveMarks()}) AND order_created_at >= ?`
-  ).bind(...LIVE_STORE_IDS, nowIso(nowMs - LOOKBACK_DAYS * DAY)).first();
-  const rows = budget > 0 ? (results || []) : [];
+        AND COALESCE(shipped_at, order_created_at) >= ?
+        AND NOT ${SHOPIFY_DELIVERED_SQL}
+      ORDER BY COALESCE(shipped_at, order_created_at) DESC, tracking_number`
+  ).bind(...LIVE_STORE_IDS, nowIso(nowMs - LOOKBACK_DAYS * DAY), nowIso(nowMs - MAX_REGISTER_AGE_DAYS * DAY)).all();
+  const eligible = results || [];
+  // Unknown quota = don't spend (rule 4: null is not a number).
+  const plan = planRegistrations(eligible, { remain: quota.remain, cap, used, nowMs });
+  const rows = plan.pick;
+
+  // Say why parcels are waiting, once per change of reason, not every hour.
+  const prev = await stageRow(db, "register");
+  const prevReason = prev && prev.detail ? prev.detail.reason : null;
+  if (plan.reason && plan.reason !== prevReason) {
+    const quotaReason = plan.reason === "quota_used_up" || plan.reason === "quota_unknown";
+    await logEvent(db, {
+      actor: ACTOR, kind: quotaReason ? "tracking.quota_exhausted" : "tracking.register_held", target: SYS,
+      summary: `17TRACK: ${plan.held} parcel${plan.held === 1 ? "" : "s"} not tracked for now: ${HOLD_TEXT[plan.reason](plan)}. They still get day-15 / day-20 checks from the order date.`,
+      data: { quota, cap, used, held: plan.held, reason: plan.reason }, at,
+    });
+  }
+  const saveStage = (registeredNow) => stageOk(db, "register", at, {
+    reason: plan.reason, held: plan.held, cap, used: used + registeredNow, eligible: eligible.length, checked_at: at,
+  });
   if (!rows.length) {
-    if (budget === 0 && waiting && waiting.n > 0) {
-      await logEvent(db, {
-        actor: ACTOR, kind: "tracking.quota_exhausted", target: SYS,
-        summary: `17TRACK quota is ${quota.remain == null ? "unknown" : "used up"}: ${waiting.n} parcel${waiting.n === 1 ? "" : "s"} can't be tracked until it's topped up`,
-        data: { quota, waiting: waiting.n }, at,
-      });
-    }
-    return { quota, registered: 0 };
+    await saveStage(0);
+    return { quota, registered: 0, held: plan.held, reason: plan.reason };
   }
 
   let registered = 0, rejected = 0, already = 0;
@@ -304,18 +393,20 @@ export async function registerNew(env, { nowMs = Date.now(), fetchImpl = fetch, 
       }
     }
   }
+  await saveStage(registered + already);
   // Read the quota back from 17TRACK rather than doing arithmetic on our side (rule 3).
   const after = await getQuota(env, opts);
   await saveQuota(db, after, at);
   await logEvent(db, {
     actor: ACTOR, kind: "tracking.registered", target: SYS,
-    summary: `17TRACK: registered ${registered} new parcel${registered === 1 ? "" : "s"}` +
+    summary: `17TRACK: registered ${registered} new parcel${registered === 1 ? "" : "s"} (newest first)` +
       (already ? `, ${already} already registered` : "") +
       (rejected ? `, ${rejected} rejected (see Shipping tab)` : "") +
+      (plan.held ? `, ${plan.held} waiting` : "") +
       `; ${after.remain == null ? "unknown" : after.remain} registrations left`,
-    data: { registered, already, rejected, quotaBefore: quota.remain, quotaAfter: after.remain }, at,
+    data: { registered, already, rejected, held: plan.held, reason: plan.reason, cap, quotaBefore: quota.remain, quotaAfter: after.remain }, at,
   });
-  return { quota: after, registered, already, rejected };
+  return { quota: after, registered, already, rejected, held: plan.held, reason: plan.reason };
 }
 
 /* ---------------- 3. poll + proof of delivery ---------------- */
@@ -447,6 +538,52 @@ async function raiseFlag(db, f, at) {
   return !!(res.meta && res.meta.changes === 1);
 }
 
+/** Delivered, by 17TRACK or by Shopify's own fulfillment status. */
+export const isDelivered = (p) => !!(p.delivered_at || p.state === "delivered" || isShopifyDelivered(p));
+
+/** Why a parcel isn't tracked by 17TRACK, in words for the flag. */
+export function untrackedReason(p, nowMs = Date.now()) {
+  if (p.register_error) return "17TRACK rejected the number";
+  const shipped = Date.parse(p.shipped_at || p.order_created_at || "");
+  if (Number.isFinite(shipped) && shipped < nowMs - MAX_REGISTER_AGE_DAYS * DAY) return "too old to register";
+  return "not registered: quota or cap";
+}
+
+/**
+ * Keep the order-level 'stuck_pickup' flag (what Mission Control and the brief show) in
+ * step with its per-parcel rows: open with every stuck parcel listed while any parcel is
+ * stuck, resolved once none is. A parcel stuck after an earlier one cleared re-opens it.
+ */
+async function syncOrderPickupFlag(db, store, orderId, orderName, at, freshSince) {
+  const { results: all } = await db.prepare(
+    `SELECT tracking_number, detail, resolved_at FROM parcel_pickup_flags WHERE store = ? AND order_id = ? ORDER BY raised_at, tracking_number`
+  ).bind(store, orderId).all();
+  const open = (all || []).filter((r) => !r.resolved_at);
+  if (open.length) {
+    await db.prepare(
+      `INSERT INTO shipment_flags (store, order_id, order_name, kind, tracking_number, detail, raised_at)
+       VALUES (?, ?, ?, 'stuck_pickup', ?, ?, ?)
+       ON CONFLICT(store, order_id, kind) DO UPDATE SET
+         detail = excluded.detail, tracking_number = excluded.tracking_number,
+         raised_at = CASE WHEN shipment_flags.resolved_at IS NOT NULL THEN excluded.raised_at ELSE shipment_flags.raised_at END,
+         resolved_at = NULL`
+    ).bind(store, orderId, orderName, open[0].tracking_number, open.map((r) => r.detail).join("; "), at).run();
+    return;
+  }
+  if ((all || []).length) {
+    await db.prepare(`UPDATE shipment_flags SET resolved_at = ? WHERE store = ? AND order_id = ? AND kind = 'stuck_pickup' AND resolved_at IS NULL`)
+      .bind(at, store, orderId).run();
+    return;
+  }
+  // A flag from before per-parcel rows existed: clears when its own parcel has a fresh scan.
+  await db.prepare(
+    `UPDATE shipment_flags SET resolved_at = ?
+      WHERE store = ? AND order_id = ? AND kind = 'stuck_pickup' AND resolved_at IS NULL
+        AND EXISTS (SELECT 1 FROM shipments s WHERE s.tracking_number = shipment_flags.tracking_number
+                     AND s.state IS NOT NULL AND s.state != 'awaiting_pickup' AND s.polled_at >= ?)`
+  ).bind(at, store, orderId, freshSince).run();
+}
+
 export async function runChecks(env, { nowMs = Date.now() } = {}) {
   const db = env.DB;
   if (!LIVE_STORE_IDS.length) return { raised: [] };
@@ -457,6 +594,7 @@ export async function runChecks(env, { nowMs = Date.now() } = {}) {
     `SELECT * FROM shipments WHERE store IN (${liveMarks()}) AND order_created_at >= ?`
   ).bind(...LIVE_STORE_IDS, nowIso(nowMs - 60 * DAY)).all();
   const rows = results || [];
+  const pickupOrders = new Map(); // orders whose per-parcel pickup rows may have changed
 
   // Per parcel: stuck pickup, failed delivery, waiting at a pickup point.
   for (const s of rows) {
@@ -467,14 +605,25 @@ export async function runChecks(env, { nowMs = Date.now() } = {}) {
         s.order_created_at >= nowIso(nowMs - LOOKBACK_DAYS * DAY)) {
       const days = Math.floor((nowMs - Date.parse(s.shipped_at)) / DAY);
       const detail = `${s.tracking_number}: shipped ${shortDate(s.shipped_at)}, no carrier scan after ${days} days (${s.last_status})`;
-      if (await raiseFlag(db, { ...s, kind: "stuck_pickup", detail }, at)) {
+      // Once per PARCEL: a second parcel of the same order stuck later is still raised.
+      const ins = await db.prepare(
+        `INSERT INTO parcel_pickup_flags (tracking_number, store, order_id, order_name, detail, raised_at)
+         VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(tracking_number) DO NOTHING`
+      ).bind(s.tracking_number, s.store, s.order_id, s.order_name, detail, at).run();
+      if (ins.meta && ins.meta.changes === 1) {
         raised.push("stuck_pickup");
+        pickupOrders.set(`${s.store}|${s.order_id}`, s);
         await logEvent(db, {
           actor: ACTOR, kind: "tracking.stuck_pickup", store: s.store, target: "sup.relay",
           summary: `${label} (${s.tracking_number}) shipped ${shortDate(s.shipped_at)} but the carrier hasn't picked it up; it goes in the next KFB message`,
           data: { tracking: s.tracking_number, shipped_at: s.shipped_at, status: s.last_status }, at,
         });
       }
+    } else if (s.state && s.state !== "awaiting_pickup") {
+      // Scanned now: clears THIS parcel only; the order stays flagged while another is stuck.
+      const u = await db.prepare(`UPDATE parcel_pickup_flags SET resolved_at = ? WHERE tracking_number = ? AND resolved_at IS NULL`)
+        .bind(at, s.tracking_number).run();
+      if (u.meta && u.meta.changes) pickupOrders.set(`${s.store}|${s.order_id}`, s);
     }
     if (s.state === "failed_attempt" || s.state === "pickup_ready") {
       const kind = s.state === "failed_attempt" ? "failed_delivery" : "pickup_ready";
@@ -491,8 +640,14 @@ export async function runChecks(env, { nowMs = Date.now() } = {}) {
       }
     }
   }
+  // Orders with an open stuck-pickup flag are re-synced too (covers flags from before 0008).
+  const { results: openPickup } = await db.prepare(
+    `SELECT store, order_id, order_name FROM shipment_flags WHERE kind = 'stuck_pickup' AND resolved_at IS NULL`
+  ).all();
+  for (const f of openPickup || []) if (!pickupOrders.has(`${f.store}|${f.order_id}`)) pickupOrders.set(`${f.store}|${f.order_id}`, f);
+  for (const o of pickupOrders.values()) await syncOrderPickupFlag(db, o.store, o.order_id, o.order_name, at, freshSince);
 
-  // Per order: day 15 and day 20, only when every parcel's status is fresh and none says delivered.
+  // Per order: day 15 and day 20.
   const orders = new Map();
   for (const s of rows) {
     const k = `${s.store}|${s.order_id}`;
@@ -502,27 +657,34 @@ export async function runChecks(env, { nowMs = Date.now() } = {}) {
   for (const parcels of orders.values()) {
     const o = parcels[0];
     if (!o.order_created_at) continue;
-    const allDelivered = parcels.every((p) => p.delivered_at);
-    if (allDelivered) {
+    const open = parcels.filter((p) => !isDelivered(p));
+    if (!open.length) {
       await db.prepare(`UPDATE shipment_flags SET resolved_at = ? WHERE store = ? AND order_id = ? AND resolved_at IS NULL`)
+        .bind(at, o.store, o.order_id).run();
+      await db.prepare(`UPDATE parcel_pickup_flags SET resolved_at = ? WHERE store = ? AND order_id = ? AND resolved_at IS NULL`)
         .bind(at, o.store, o.order_id).run();
       continue;
     }
-    // A stuck-pickup flag clears once the carrier has scanned the parcel.
-    for (const p of parcels) {
-      if (p.state && p.state !== "awaiting_pickup" && p.polled_at && p.polled_at >= freshSince) {
-        await db.prepare(`UPDATE shipment_flags SET resolved_at = ? WHERE store = ? AND order_id = ? AND kind = 'stuck_pickup' AND tracking_number = ? AND resolved_at IS NULL`)
-          .bind(at, o.store, o.order_id, p.tracking_number).run();
+    // Evidence, parcel by parcel. Delivered parcels never block the order (they're not
+    // re-polled). A registered parcel counts only with a fresh status (rules 4 and 6). A
+    // parcel 17TRACK isn't tracking (quota, age, rejected) counts from the order date
+    // alone, so it can never go silent.
+    const late = [];
+    for (const p of open) {
+      if (p.registered_at) {
+        if (p.polled_at && p.polled_at >= freshSince && p.state) late.push(`${p.tracking_number}: ${STATE_LABELS[p.state] || p.state}`);
+      } else {
+        late.push(`${p.tracking_number}: not tracked by 17TRACK (${untrackedReason(p, nowMs)})`);
       }
     }
-    const known = parcels.every((p) => p.polled_at && p.polled_at >= freshSince && p.state);
-    if (!known) continue;
+    if (!late.length) continue;
+    const delivered = parcels.length - open.length;
+    const where = late.join("; ") + (delivered ? `; ${delivered} other parcel${delivered === 1 ? "" : "s"} delivered` : "");
     const days = easternDaysSince(o.order_created_at, nowMs);
-    const label = `${storeName(o.store)} ${o.order_name}`;
-    const where = parcels.map((p) => `${p.tracking_number}: ${STATE_LABELS[p.state] || p.state}`).join("; ");
+    const label = `${storeName(o.store)} ${o.order_name || o.order_id}`;
     if (days >= DAY15) {
       const detail = `Day ${days} since the order (${shortDate(o.order_created_at)}), not delivered. ${where}`;
-      if (await raiseFlag(db, { ...o, kind: "day15", detail }, at)) {
+      if (await raiseFlag(db, { ...o, tracking_number: null, kind: "day15", detail }, at)) {
         raised.push("day15");
         await logEvent(db, {
           actor: LATE_ACTOR, kind: "tracking.day15", store: o.store, target: "cs.reply_writer",
@@ -533,22 +695,27 @@ export async function runChecks(env, { nowMs = Date.now() } = {}) {
     }
     if (days >= DAY20) {
       const detail = `Day ${days} since the order (${shortDate(o.order_created_at)}), not delivered. ${where}`;
-      if (await raiseFlag(db, { ...o, kind: "day20", detail }, at)) {
-        try {
-          const approvalId = await createApproval(db, {
-            dept: "ful", requestedBy: LATE_ACTOR, store: o.store,
-            title: `${label} not delivered ${days} days after the order (${where}). Reship or refund?`,
-            options: [{ id: "reship", label: "Reship" }, { id: "refund", label: "Refund" }],
-          });
-          await db.prepare(`UPDATE shipment_flags SET approval_id = ? WHERE store = ? AND order_id = ? AND kind = 'day20'`)
-            .bind(approvalId, o.store, o.order_id).run();
-          raised.push("day20");
-        } catch (err) {
-          // No approval = no flag, so the next run tries again (and still only once).
-          await db.prepare(`DELETE FROM shipment_flags WHERE store = ? AND order_id = ? AND kind = 'day20' AND approval_id IS NULL`)
-            .bind(o.store, o.order_id).run();
-          throw err;
-        }
+      await raiseFlag(db, { ...o, tracking_number: null, kind: "day20", detail }, at);
+      const flag = await db.prepare(`SELECT approval_id, resolved_at FROM shipment_flags WHERE store = ? AND order_id = ? AND kind = 'day20'`)
+        .bind(o.store, o.order_id).first();
+      if (flag && flag.approval_id == null && !flag.resolved_at) {
+        // Idempotent: the flag is never deleted, and an approval already made for this
+        // order (say the run crashed after createApproval wrote it) is re-linked, not
+        // asked again. The title starts with "<store> <order> not delivered ", which is
+        // the order's key; any status counts, so Reilly is never asked twice.
+        const prefix = `${label} not delivered `;
+        const existing = await db.prepare(
+          `SELECT id FROM approvals WHERE dept = 'ful' AND requested_by = ? AND store = ?
+              AND substr(title, 1, length(?)) = ? ORDER BY id DESC LIMIT 1`
+        ).bind(LATE_ACTOR, o.store, prefix, prefix).first();
+        const approvalId = existing ? existing.id : await createApproval(db, {
+          dept: "ful", requestedBy: LATE_ACTOR, store: o.store,
+          title: `${prefix}${days} days after the order (${where}). Reship or refund?`,
+          options: [{ id: "reship", label: "Reship" }, { id: "refund", label: "Refund" }],
+        });
+        await db.prepare(`UPDATE shipment_flags SET approval_id = ? WHERE store = ? AND order_id = ? AND kind = 'day20' AND approval_id IS NULL`)
+          .bind(approvalId, o.store, o.order_id).run();
+        raised.push(existing ? "day20_relinked" : "day20");
       }
     }
   }
@@ -598,6 +765,31 @@ export async function runTracking(env, { nowMs = Date.now(), fetchImpl = fetch, 
 const MAX_PUSH_BYTES = 512 * 1024;
 
 /**
+ * A refused push is counted, not logged one by one: anyone can POST junk at the URL, and
+ * an event per request would flood the Event Log. The first refusal is logged at once;
+ * after that, at most one summary event per hour, carrying the count since the last one.
+ */
+export async function noteRejectedPush(db, nowMs = Date.now()) {
+  const at = nowIso(nowMs);
+  const STAGE = "push_rejected";
+  await db.prepare(`INSERT INTO tracking_runs (stage) VALUES (?) ON CONFLICT(stage) DO NOTHING`).bind(STAGE).run();
+  await db.prepare(`UPDATE tracking_runs SET count = count + 1 WHERE stage = ?`).bind(STAGE).run();
+  const claimed = await claimStage(db, STAGE, nowMs, PUSH_REJECT_LOG_EVERY_MS);
+  if (!claimed) return { logged: false };
+  const row = await db.prepare(`SELECT count FROM tracking_runs WHERE stage = ?`).bind(STAGE).first();
+  const n = row ? row.count : 1;
+  // Subtract what we report (not "= 0") so refusals counted meanwhile aren't lost.
+  await db.prepare(`UPDATE tracking_runs SET count = count - ?, last_ok_at = ? WHERE stage = ?`).bind(n, at, STAGE).run();
+  await logEvent(db, {
+    actor: ACTOR, kind: "tracking.push_rejected", target: SYS,
+    summary: `Refused ${n} tracking push${n === 1 ? "" : "es"} whose signature didn't verify (not from 17TRACK with our key). ` +
+      `Further refusals are counted and summarised at most once an hour.`,
+    data: { refused: n }, at,
+  });
+  return { logged: true, refused: n };
+}
+
+/**
  * POST /webhooks/17track. Accepted only when the `sign` header verifies against our key.
  * Even then the body's status is not trusted: known numbers are queued for a re-read from
  * the API on the next 15-minute run; unknown numbers are ignored.
@@ -609,10 +801,7 @@ export async function handleTrackingPush(request, env, nowMs = Date.now()) {
   if (raw.length > MAX_PUSH_BYTES) return json({ ok: false, error: "too large" }, 413);
   const at = nowIso(nowMs);
   if (!(await verifyPush(raw, request.headers.get("sign"), env.TRACKING_API_KEY))) {
-    await logEvent(env.DB, {
-      actor: ACTOR, kind: "tracking.push_rejected", target: SYS,
-      summary: "Refused a tracking push: its signature didn't verify, so it didn't come from 17TRACK with our key", at,
-    });
+    await noteRejectedPush(env.DB, nowMs).catch(() => {});
     return json({ ok: false, error: "bad signature" }, 401);
   }
   let body = null;
@@ -644,13 +833,21 @@ export async function handleTrackingPush(request, env, nowMs = Date.now()) {
 
 export async function shippingState(env, nowMs = Date.now()) {
   const db = env.DB;
-  const empty = { wired: !!env.TRACKING_API_KEY, counts: {}, total: 0, unregistered: 0, registerErrors: [], flags: [], quota: null, quotaLow: false, lastSync: null, lastCollect: null };
+  const empty = { wired: !!env.TRACKING_API_KEY, counts: {}, total: 0, unregistered: 0, notTracked: { quota: 0, age: 0, shopifyDelivered: 0, rejected: 0 }, registerErrors: [], flags: [], quota: null, quotaLow: false, lastSync: null, lastCollect: null };
   if (!LIVE_STORE_IDS.length) return empty;
   const since = nowIso(nowMs - 60 * DAY);
+  // Parcels 17TRACK isn't tracking are counted by why: Shopify says delivered, too old,
+  // rejected, or waiting on quota/cap (decided from the last register run's reason).
   const { results: counts } = await db.prepare(
-    `SELECT COALESCE(state, CASE WHEN registered_at IS NULL THEN 'not_registered' ELSE 'not_checked' END) AS state, COUNT(*) AS n
+    `SELECT CASE
+              WHEN state IS NOT NULL THEN state
+              WHEN registered_at IS NOT NULL THEN 'not_checked'
+              WHEN register_error IS NOT NULL THEN 'not_tracked_rejected'
+              WHEN ${SHOPIFY_DELIVERED_SQL} THEN 'not_tracked_delivered'
+              WHEN order_created_at < ? OR COALESCE(shipped_at, order_created_at) < ? THEN 'not_tracked_age'
+              ELSE 'not_registered' END AS state, COUNT(*) AS n
        FROM shipments WHERE store IN (${liveMarks()}) AND order_created_at >= ? GROUP BY 1`
-  ).bind(...LIVE_STORE_IDS, since).all();
+  ).bind(nowIso(nowMs - LOOKBACK_DAYS * DAY), nowIso(nowMs - MAX_REGISTER_AGE_DAYS * DAY), ...LIVE_STORE_IDS, since).all();
   const { results: errs } = await db.prepare(
     `SELECT store, order_name, tracking_number, register_error FROM shipments
       WHERE register_error IS NOT NULL AND store IN (${liveMarks()}) AND order_created_at >= ? ORDER BY shipped_at DESC LIMIT 20`
@@ -667,16 +864,32 @@ export async function shippingState(env, nowMs = Date.now()) {
   const quotaRow = await stageRow(db, "quota");
   const pollRow = await stageRow(db, "poll");
   const collectRow = await stageRow(db, "collect");
+  const registerRow = await stageRow(db, "register");
+  const pushRow = await stageRow(db, "push_rejected");
   const quota = quotaRow && quotaRow.detail ? quotaRow.detail : null;
+  const hold = registerRow && registerRow.detail ? registerRow.detail : null;
   const c = {};
   let total = 0;
   for (const r of counts || []) { c[r.state] = r.n; total += r.n; }
+  // Held back by quota, the cap or the reserve: say so instead of "will register next hour".
+  if (hold && hold.reason && c.not_registered) { c.not_tracked_quota = c.not_registered; delete c.not_registered; }
   return {
     wired: !!env.TRACKING_API_KEY,
     counts: c,
-    labels: { ...STATE_LABELS, not_registered: "Not registered yet", not_checked: "Registered, not checked yet" },
+    labels: {
+      ...STATE_LABELS, not_registered: "Not registered yet", not_checked: "Registered, not checked yet",
+      not_tracked_quota: "Not tracked (quota/cap)", not_tracked_age: "Not tracked (21+ days old)",
+      not_tracked_delivered: "Not tracked (Shopify says delivered)", not_tracked_rejected: "Not tracked (17TRACK rejected)",
+    },
     total,
-    unregistered: c.not_registered || 0,
+    unregistered: (c.not_registered || 0) + (c.not_tracked_quota || 0),
+    notTracked: {
+      quota: c.not_tracked_quota || 0, age: c.not_tracked_age || 0,
+      shopifyDelivered: c.not_tracked_delivered || 0, rejected: c.not_tracked_rejected || 0,
+    },
+    registerCap: registerCap(env),
+    registerHold: hold && hold.reason ? { reason: hold.reason, held: hold.held, cap: hold.cap, used: hold.used } : null,
+    pushesRefused: pushRow ? { sinceLastReport: pushRow.count || 0, lastReported: pushRow.last_ok_at || null } : null,
     registerErrors: (errs || []).map((r) => ({ ...r, store_name: storeName(r.store) })),
     flags: (flags || []).map((f) => ({ ...f, store_name: storeName(f.store), label: FLAG_LABELS[f.kind] || f.kind })),
     quota,

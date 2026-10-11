@@ -19,6 +19,8 @@
  *
  * Every order asked about is recorded in `kfb_message_items` with a UNIQUE
  * (store, order, kind), so an order is never asked for twice, even across days.
+ * Pickup asks are per PARCEL: their kind is `pickup:<tracking number>`, so a second
+ * parcel of the same order that gets stuck later is still asked about, once.
  */
 import { STORES, STORE_IDS, LIVE_STORE_IDS } from "../config/stores.js";
 import { logEvent } from "./eventlog.js";
@@ -89,17 +91,20 @@ export function composePickupBody(items) {
 }
 
 /** The whole message: one section per kind, express first (it's time-critical). */
+export const isPickupKind = (kind) => kind === "pickup" || String(kind || "").startsWith("pickup:");
+
 export function composeKfbBody(items) {
   const parts = [
     composeExpressBody(items.filter((i) => i.kind === "express")),
-    composePickupBody(items.filter((i) => i.kind === "pickup")),
+    composePickupBody(items.filter((i) => isPickupKind(i.kind))),
   ].filter(Boolean);
   return parts.length ? parts.join("\n\n") : null;
 }
 
 /**
  * Parcels with tracking that no carrier has picked up 3+ days after KFB shipped them,
- * judged on a FRESH 17TRACK status only, and never asked about before (per order).
+ * judged on a FRESH 17TRACK status only, and never asked about before (per parcel).
+ * One line per parcel, each naming the store and the order.
  */
 async function pickupCandidates(db, nowMs) {
   if (!LIVE_STORE_IDS.length) return [];
@@ -113,31 +118,28 @@ async function pickupCandidates(db, nowMs) {
         AND s.shipped_at <= ?
         AND s.order_created_at >= ?
         AND NOT EXISTS (SELECT 1 FROM kfb_message_items i
-                         WHERE i.store = s.store AND i.order_id = s.order_id AND i.kind = 'pickup')
+                         WHERE i.store = s.store AND i.order_id = s.order_id
+                           AND (i.kind = 'pickup:' || s.tracking_number
+                                -- older per-order lines (kind 'pickup') listed their numbers in detail
+                                OR (i.kind = 'pickup' AND instr(COALESCE(i.detail, ''), s.tracking_number) > 0)))
       ORDER BY s.shipped_at, s.tracking_number`
   ).bind(...LIVE_STORE_IDS, nowIso(nowMs - STATUS_FRESH_MS), nowIso(nowMs - PICKUP_STUCK_DAYS * 86400000),
     nowIso(nowMs - TRACKING_LOOKBACK_DAYS * 86400000)).all();
-  // One line per order (the UNIQUE rule is per order and kind); several parcels share it.
-  const byOrder = new Map();
-  for (const r of results || []) {
-    const k = `${r.store}|${r.order_id}`;
-    if (byOrder.has(k)) { byOrder.get(k).tracking += `, ${r.tracking_number}`; continue; }
-    byOrder.set(k, {
-      store: r.store, order_id: r.order_id, order_name: r.order_name || r.order_id, kind: "pickup",
-      tracking: r.tracking_number, shipped_at: r.shipped_at,
-    });
-  }
-  return [...byOrder.values()].map((i) => ({ ...i, detail: `${i.tracking}; shipped ${String(i.shipped_at || "").slice(0, 10)}` }));
+  return (results || []).map((r) => ({
+    store: r.store, order_id: r.order_id, order_name: r.order_name || r.order_id, kind: `pickup:${r.tracking_number}`,
+    tracking: r.tracking_number, shipped_at: r.shipped_at,
+    detail: `${r.tracking_number}; shipped ${String(r.shipped_at || "").slice(0, 10)}`,
+  }));
 }
 
 /** Plain-English list for the event summary, per kind. */
 function describeItems(items) {
   const parts = [];
   const ex = items.filter((i) => i.kind === "express");
-  const pk = items.filter((i) => i.kind === "pickup");
+  const pk = items.filter((i) => isPickupKind(i.kind));
   const names = (xs) => xs.map((i) => `${STORES[i.store].name} ${i.order_name}`).join(", ");
   if (ex.length) parts.push(`express shipping for ${ex.length} order${ex.length === 1 ? "" : "s"}: ${names(ex)}`);
-  if (pk.length) parts.push(`carrier pickup check for ${pk.length} order${pk.length === 1 ? "" : "s"}: ${names(pk)}`);
+  if (pk.length) parts.push(`carrier pickup check for ${pk.length} parcel${pk.length === 1 ? "" : "s"}: ${pk.map((i) => `${STORES[i.store].name} ${i.order_name} (${i.tracking})`).join(", ")}`);
   return parts.join("; ");
 }
 
