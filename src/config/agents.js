@@ -53,7 +53,9 @@ export const AGENTS = Object.freeze([
   a("sup.denial_sync", "sup", "Denial Sync", "code", "L0"),
   a("sup.preflight", "sup", "Supply Pre-flight", "code", "L0"),
   a("sup.similar_qc", "sup", "\"Similar ones\" QC", "ai", "L0"),
-  a("sup.relay", "sup", "Relay", "ai", "L0"),
+  // Relay writes the KFB copy-paste messages. v1 (express asks) is plain code, shadow by default;
+  // later asks from email (sizes, addresses) will use AI, hence kind "ai".
+  a("sup.relay", "sup", "Relay", "ai", "L0", "built"),
   a("sup.digest", "sup", "Supplier Digest", "ai", "L2"),
   a("sup.size_charts", "sup", "Size-Chart Checker", "ai", "L0"),
   a("sup.scout", "sup", "Sourcing Scout", "ai", "L0"),

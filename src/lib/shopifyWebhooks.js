@@ -11,11 +11,23 @@ import { verifyWebhookHmac } from "./storeGuard.js";
 import { logEvent } from "./eventlog.js";
 import { markFeedOk } from "./freshness.js";
 import { localDay, nowIso } from "./time.js";
+import { shippingFromWebhook, linesFromWebhook, replaceOrderLines } from "./orderLines.js";
 
 const num = (v) => {
   const n = parseFloat(v);
   return Number.isFinite(n) ? n : null;
 };
+
+/**
+ * Shopify REST webhooks give times with the shop's offset ("2026-10-10T22:30:00-04:00");
+ * GraphQL gives UTC ("2026-10-11T02:30:00Z"). The out-of-order guard compares these as
+ * text, so both are stored as UTC ISO or the comparison is meaningless across paths.
+ */
+export function utcIso(v) {
+  if (!v) return null;
+  const ms = Date.parse(v);
+  return Number.isNaN(ms) ? null : new Date(ms).toISOString();
+}
 
 export function parseOrder(o) {
   return {
@@ -27,7 +39,9 @@ export function parseOrder(o) {
     discounts: num(o.current_total_discounts ?? o.total_discounts),
     total: num(o.current_total_price ?? o.total_price),
     financial_status: o.financial_status || null,
-    payload_updated_at: o.updated_at || o.created_at || null,
+    payload_updated_at: utcIso(o.updated_at || o.created_at),
+    ...shippingFromWebhook(o), // shipping_title, shipping_code, express
+    lines: linesFromWebhook(o), // null = payload had no line list; leave stored lines alone
   };
 }
 
@@ -56,34 +70,49 @@ export function parseRefund(r) {
 /**
  * Insert or update one order. Shared by webhooks and the reconciliation pull.
  * Webhooks can arrive out of order: an older payload never overwrites a newer one.
- * @returns {Promise<{isNew: boolean, moneyChanged: boolean, before: object|null, after: object|null}>}
+ * @returns {Promise<{isNew: boolean, written: boolean, moneyChanged: boolean, before: object|null, after: object|null}>}
  *   isNew: the order was not in the ledger before.
+ *   written: the ledger row was actually inserted/updated (false = an older payload, skipped).
  *   moneyChanged: an existing order's total or payment status actually changed in the ledger.
  *   Shopify sends orders/updated for every tag, note or fulfilment step; only money changes
  *   are worth a line in the Activity feed.
+ * If `o.lines` is an array, the order's line items are replaced too, but only when the row
+ * was written: the same out-of-order guard protects lines and money alike.
  */
 export async function upsertOrder(db, store, o, raw, tz, at) {
   const readMoney = () =>
     db.prepare(`SELECT total, financial_status FROM orders WHERE store = ? AND order_id = ?`).bind(store.id, o.order_id).first();
   const before = await readMoney();
-  await db.prepare(
-      `INSERT INTO orders (store, order_id, name, created_at, local_day, currency, subtotal, discounts, total, financial_status, raw, payload_updated_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  const res = await db.prepare(
+      `INSERT INTO orders (store, order_id, name, created_at, local_day, currency, subtotal, discounts, total, financial_status, raw, payload_updated_at, updated_at,
+         shipping_title, shipping_code, express)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(store, order_id) DO UPDATE SET
          name = excluded.name, currency = excluded.currency, subtotal = excluded.subtotal,
          discounts = excluded.discounts, total = excluded.total,
          financial_status = excluded.financial_status, raw = excluded.raw,
-         payload_updated_at = excluded.payload_updated_at, updated_at = excluded.updated_at
-       WHERE orders.payload_updated_at IS NULL OR excluded.payload_updated_at >= orders.payload_updated_at`
+         payload_updated_at = excluded.payload_updated_at, updated_at = excluded.updated_at,
+         shipping_title = excluded.shipping_title, shipping_code = excluded.shipping_code, express = excluded.express
+       WHERE orders.payload_updated_at IS NULL
+          OR julianday(excluded.payload_updated_at) >= julianday(orders.payload_updated_at)`
     )
     .bind(store.id, o.order_id, o.name, o.created_at, localDay(o.created_at, tz), o.currency,
-      o.subtotal, o.discounts, o.total, o.financial_status, raw, o.payload_updated_at, at)
+      o.subtotal, o.discounts, o.total, o.financial_status, raw, o.payload_updated_at, at,
+      o.shipping_title ?? null, o.shipping_code ?? null, o.express ? 1 : 0)
     .run();
+  // The guard compares parsed times (julianday), not text: older rows hold "…00Z" or
+  // "…-04:00" strings while new ones are "…00.000Z", and text comparison would wrongly
+  // skip same-moment payloads (so existing orders would never get shipping/lines).
+  // changes = 0 means the WHERE guard skipped an older payload.
+  const written = !!(res.meta && res.meta.changes > 0);
+  if (written && Array.isArray(o.lines)) {
+    await replaceOrderLines(db, store.id, o.order_id, o.lines, o.payload_updated_at, at);
+  }
   // Compare against what the ledger now holds, not the payload: an older payload is skipped.
   const after = await readMoney();
   const moneyChanged = !!before && !!after &&
     (before.total !== after.total || (before.financial_status || null) !== (after.financial_status || null));
-  return { isNew: !before, moneyChanged, before: before || null, after: after || null };
+  return { isNew: !before, written, moneyChanged, before: before || null, after: after || null };
 }
 
 const money = (v) => (v == null ? "amount unknown" : "$" + Number(v).toFixed(2));

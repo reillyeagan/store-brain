@@ -8,9 +8,9 @@
  */
 import { getApproval, signDecision, verifyDecisionSig } from "./approvals.js";
 
-const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+export const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 
-const HEADERS = {
+export const HEADERS = {
   "content-type": "text/html; charset=utf-8",
   "cache-control": "no-store",
   "referrer-policy": "no-referrer", // the URL carries signatures; don't hand it to anyone
@@ -18,7 +18,8 @@ const HEADERS = {
   "content-security-policy": "default-src 'none'; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; script-src 'unsafe-inline'; connect-src 'self'",
 };
 
-function page(title, inner, status = 200) {
+/** Shared shell for the small signed phone pages (approvals, KFB messages). */
+export function page(title, inner, status = 200, extraCss = "") {
   const html = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${esc(title)}</title>
@@ -34,7 +35,7 @@ button{width:100%;margin-top:10px;padding:11px;border-radius:8px;border:1px soli
 button.no{color:var(--bad)}button:disabled{opacity:.4}
 .done{padding:14px;border-radius:10px;background:var(--panel);border:1px solid var(--border)}
 .good{color:var(--good)}.bad{color:var(--bad)}.warn{color:var(--warn)}
-</style></head><body><main>${inner}</main></body></html>`;
+${extraCss}</style></head><body><main>${inner}</main></body></html>`;
   return new Response(html, { status, headers: HEADERS });
 }
 

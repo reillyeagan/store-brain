@@ -10,10 +10,12 @@
  *   POST /api/admin/webhooks             connect order/refund notifications (key required)
  *   POST /api/admin/test-notification    send a test message to Reilly's phone (key required)
  *   GET  /approve/:id                    phone approval page (signed link from a notification)
+ *   GET  /kfb/:id                        KFB copy-paste message page (signed link from a notification)
+ *   POST /api/kfb/:id/sent               Reilly sent the KFB message (key OR a signed "sent" link)
  *   GET  /                               Mission Control page (static, no data until a key is given)
  *
  * Crons
- *   every 15 min  Freshness Sentinel
+ *   every 15 min  reconciliation pull → KFB composer (acts once per day after 18:45 ET) → Freshness Sentinel
  *   daily 05:00Z  day-close marker (P&L close logic arrives in Phase 2)
  *
  * Secrets (Reilly adds these in Cloudflare; never in this repo):
@@ -21,6 +23,10 @@
  *   APPROVAL_SIGNING_KEY   signs phone Approve/Reject links
  *   PUSHOVER_APP_TOKEN     Pushover application token (phone notifications)
  *   PUSHOVER_USER_KEY      Reilly's Pushover user key
+ *
+ * Variables (not secret):
+ *   SUPPLIER_MESSAGES_LIVE "1" = KFB messages go to the phone; anything else = shadow (Reilly flips it)
+ *   PUBLIC_BASE_URL        this worker's https address, for links in phone notifications sent by crons
  *   SB_<STORE>_CLIENT_ID / SB_<STORE>_CLIENT_SECRET   per-store Shopify app credentials
  */
 import { STORES, LIVE_STORE_IDS } from "./config/stores.js";
@@ -34,6 +40,9 @@ import { handleShopifyWebhook } from "./lib/shopifyWebhooks.js";
 import { localDay } from "./lib/time.js";
 import { checkStores, registerWebhooks } from "./lib/setup.js";
 import { reconcileOrders } from "./lib/reconcile.js";
+import {
+  runKfbComposer, handleKfbPage, handleKfbSent, listKfbMessages, expressOrdersToday, supplierMode,
+} from "./lib/kfbMessage.js";
 
 export const VERSION = "0.1.0-foundation";
 
@@ -69,11 +78,13 @@ async function handleState(env) {
   await ensureFeeds(env.DB);
   const tz = env.TIMEZONE || "America/New_York";
   const todayStart = startOfLocalDayIso(tz);
-  const [events, feeds, approvals, aiCostToday] = await Promise.all([
+  const [events, feeds, approvals, aiCostToday, kfbMessages, expressToday] = await Promise.all([
     recentEvents(env.DB, { limit: 300 }),
     evaluateFeeds(env.DB),
     listPending(env.DB),
     costSince(env.DB, todayStart),
+    listKfbMessages(env.DB, 10),
+    expressOrdersToday(env.DB),
   ]);
   return json({
     version: VERSION,
@@ -90,6 +101,7 @@ async function handleState(env) {
     approvals,
     aiCostToday,
     todayStart,
+    supplier: { mode: supplierMode(env), kfbMessages, expressToday },
   });
 }
 
@@ -152,6 +164,14 @@ export default {
       if (ap && request.method === "GET") {
         return await handleApprovalPage(request, env, parseInt(ap[1], 10));
       }
+      const kp = path.match(/^\/kfb\/(\d+)$/);
+      if (kp && request.method === "GET") {
+        return await handleKfbPage(request, env, parseInt(kp[1], 10));
+      }
+      const ks = path.match(/^\/api\/kfb\/(\d+)\/sent$/);
+      if (ks && request.method === "POST") {
+        return await handleKfbSent(request, env, parseInt(ks[1], 10), hasKey(request, env));
+      }
       const m = path.match(/^\/api\/approvals\/(\d+)\/decide$/);
       if (m && request.method === "POST") {
         return await handleDecide(request, env, parseInt(m[1], 10));
@@ -184,6 +204,16 @@ export default {
         }
         await ensureFeeds(env.DB);
         await reconcileOrders(env); // backstop behind webhooks; keeps the orders feed honest
+        // After the pull, so the newest orders are in. Its own try: a composer fault must
+        // never stop the Freshness Sentinel.
+        try {
+          await runKfbComposer(env);
+        } catch (err) {
+          await logEvent(env.DB, {
+            actor: "sup.relay", kind: "error.kfb_composer", target: "sys.kfb",
+            summary: `KFB message composer failed; it will try again in 15 minutes (${String(err && err.message).slice(0, 200)})`,
+          }).catch(() => {});
+        }
         await runSentinel(env.DB);
       })()
     );

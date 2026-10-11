@@ -44,6 +44,8 @@ h1{margin:2px 0 0;font-size:24px;font-weight:600;letter-spacing:-.01em}
 .row{border:1px solid var(--soft);border-radius:8px;padding:9px 10px;display:grid;gap:3px;background:var(--panel2)}
 .row .meta{font-family:var(--mono);font-size:10.5px;color:var(--faint);display:flex;gap:8px;flex-wrap:wrap}
 .row.alarm{border-color:#4a2c2c}
+.msg{white-space:pre-wrap;font-size:12.5px;background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:8px;margin:2px 0}
+.sub{font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin-top:4px}
 .btns{display:flex;gap:6px;flex-wrap:wrap;margin-top:4px}
 .btn{background:var(--soft);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font:500 12px var(--font);cursor:pointer}
 .btn.primary{border-color:var(--accent-dim);color:var(--accent)}
@@ -104,6 +106,7 @@ h1{margin:2px 0 0;font-size:24px;font-weight:600;letter-spacing:-.01em}
       <div class="tabs" role="tablist">
         <button role="tab" aria-selected="true" data-tab="activity" id="tab-activity">Activity</button>
         <button role="tab" aria-selected="false" data-tab="approvals" id="tab-approvals">Approvals</button>
+        <button role="tab" aria-selected="false" data-tab="supplier" id="tab-supplier">Supplier</button>
         <button role="tab" aria-selected="false" data-tab="feeds" id="tab-feeds">Feeds</button>
         <button role="tab" aria-selected="false" data-tab="setup" id="tab-setup">Setup</button>
       </div>
@@ -272,6 +275,24 @@ h1{margin:2px 0 0;font-size:24px;font-weight:600;letter-spacing:-.01em}
           '<button class="btn reject" data-ap="'+a.id+'" data-choice="reject">Reject</button></div></div>';
       }).join("");
       p.querySelectorAll("button[data-ap]").forEach(function(b){ b.addEventListener("click",function(){ decideApproval(b.dataset.ap,b.dataset.choice,b) }) });
+    } else if(tab==="supplier"){
+      var sup=state.supplier||{kfbMessages:[],expressToday:[],mode:"shadow"};
+      var html='<div class="sub">Express orders today</div>';
+      html+=sup.expressToday.length?sup.expressToday.map(function(o){
+        return '<div class="row"><span>'+esc(o.store_name)+' '+esc(o.name)+'</span><span class="meta"><span>'+esc(o.shipping_title||"express")+'</span><span>'+(o.asked_in?"asked KFB (message "+esc(o.asked_in)+")":"not asked yet")+'</span><span>'+esc(ago(o.created_at))+'</span></span></div>';
+      }).join(""):'<div class="empty">No express orders today.</div>';
+      html+='<div class="sub">KFB messages · '+(sup.mode==="live"?"live (sent to your phone)":"shadow (drafts only, not sent to your phone)")+'</div>';
+      html+=sup.kfbMessages.length?sup.kfbMessages.map(function(m){
+        var st=m.status==="sent"?"sent "+ago(m.sent_at):m.status;
+        return '<div class="row" id="kfb-'+m.id+'"><div class="msg">'+esc(m.body)+'</div><span class="meta"><span>'+esc(m.local_day)+'</span><span>'+esc(m.mode)+'</span><span>'+esc(st)+'</span><span>'+esc(m.item_count)+' order'+(m.item_count===1?"":"s")+'</span></span>'+
+          '<div class="btns"><button class="btn" data-copy="'+m.id+'">Copy</button>'+(m.status!=="sent"?'<button class="btn primary" data-sent="'+m.id+'">Mark sent</button>':"")+'</div></div>';
+      }).join(""):'<div class="empty">No KFB messages yet. The brain checks once a day after 6:45 pm Eastern.</div>';
+      p.innerHTML=html;
+      p.querySelectorAll("button[data-copy]").forEach(function(b){ b.addEventListener("click",function(){
+        var m=sup.kfbMessages.find(function(x){return String(x.id)===b.dataset.copy});
+        if(m&&navigator.clipboard) navigator.clipboard.writeText(m.body).then(function(){b.textContent="Copied"},function(){b.textContent="Copy failed"});
+      }) });
+      p.querySelectorAll("button[data-sent]").forEach(function(b){ b.addEventListener("click",function(){ markSent(b.dataset.sent,b) }) });
     } else if(tab==="setup"){
       p.innerHTML='<div class="row"><b>1 · Check the store connections</b><span style="color:var(--muted);font-size:12.5px">Logs in to each store with its own app, confirms it is the right shop, and lists the access Shopify granted. Read-only.</span><div class="btns"><button class="btn primary" id="btnCheck">Check stores</button></div><div id="outCheck"></div></div>'+
         '<div class="row"><b>2 · Connect order + refund notifications</b><span style="color:var(--muted);font-size:12.5px">Tells each store to notify the brain the moment an order or refund happens. Checked against Shopify afterwards.</span><div class="btns"><button class="btn primary" id="btnHooks">Connect notifications</button></div><div id="outHooks"></div></div>'+
@@ -298,6 +319,15 @@ h1{margin:2px 0 0;font-size:24px;font-weight:600;letter-spacing:-.01em}
       out.innerHTML=b.ok?b.results.map(function(x){return '<div>'+line(x)+'</div>'}).join(""):'<span style="color:var(--bad)">'+esc(b.error||("HTTP "+r.status))+'</span>';
     }catch(e){ out.innerHTML='<span style="color:var(--bad)">Couldn\'t reach the brain.</span>'; }
     btn.disabled=false; setTimeout(function(){setupBusy=false},20000);
+  }
+  async function markSent(id,btn){
+    var row=btn.closest(".row"); btn.disabled=true;
+    try{
+      var r=await fetch("/api/kfb/"+id+"/sent",{method:"POST",headers:{"x-store-brain-key":key}});
+      var b=await r.json();
+      row.insertAdjacentHTML("beforeend",'<span class="meta" style="color:'+(b.ok?"var(--good)":"var(--bad)")+'">'+(b.ok?"Recorded as sent":"Not recorded: "+esc(b.error))+'</span>');
+    }catch(e){ btn.disabled=false; row.insertAdjacentHTML("beforeend",'<span class="meta" style="color:var(--bad)">Couldn\'t reach the brain. Nothing was recorded.</span>'); }
+    setTimeout(load,800);
   }
   async function decideApproval(id,choice,btn){
     var row=btn.closest(".row"); row.querySelectorAll("button").forEach(function(x){x.disabled=true});

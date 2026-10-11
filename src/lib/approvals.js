@@ -96,7 +96,8 @@ export async function markExecuted(db, id, { ok, result }) {
 
 /* ---------- signed phone links ---------- */
 
-async function hmacHex(secret, message) {
+/** HMAC-SHA256 as hex. Shared with the KFB message links (kfbMessage.js). */
+export async function hmacHex(secret, message) {
   const key = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   const sig = await crypto.subtle.sign("HMAC", key, enc.encode(message));
   return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
@@ -117,8 +118,14 @@ export async function verifyDecisionSig(secret, approval, choice, sig, expMs, no
   const exp = Number(expMs);
   if (!Number.isFinite(exp) || exp < nowMs) return false;
   const expected = await signDecision(secret, approval, choice, exp);
-  if (expected.length !== String(sig).length) return false;
+  return sameText(expected, sig);
+}
+
+/** Constant-time text comparison, so a signature can't be guessed one character at a time. */
+export function sameText(a, b) {
+  const x = String(a ?? ""), y = String(b ?? "");
+  if (x.length !== y.length) return false;
   let diff = 0;
-  for (let i = 0; i < expected.length; i++) diff |= expected.charCodeAt(i) ^ String(sig).charCodeAt(i);
+  for (let i = 0; i < x.length; i++) diff |= x.charCodeAt(i) ^ y.charCodeAt(i);
   return diff === 0;
 }

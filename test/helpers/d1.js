@@ -3,7 +3,7 @@
  * Implements the subset the Store Brain uses: prepare().bind().run()/all()/first().
  */
 import { DatabaseSync } from "node:sqlite";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -11,7 +11,11 @@ const here = dirname(fileURLToPath(import.meta.url));
 
 export function makeD1() {
   const db = new DatabaseSync(":memory:");
-  db.exec(readFileSync(join(here, "../../migrations/0001_ledger.sql"), "utf8"));
+  // Apply every migration in order, exactly as `wrangler d1 migrations apply` would.
+  const dir = join(here, "../../migrations");
+  for (const f of readdirSync(dir).filter((n) => n.endsWith(".sql")).sort()) {
+    db.exec(readFileSync(join(dir, f), "utf8"));
+  }
   const prepare = (sql) => {
     let params = [];
     const stmt = {

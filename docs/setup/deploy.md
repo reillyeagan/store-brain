@@ -75,6 +75,8 @@ Cloudflare dashboard → **Workers & Pages → store-brain → Settings → Vari
 npx wrangler deploy
 ```
 
+> **Before deploying the order-detail / KFB message update:** apply migration 0002 first with `npx wrangler d1 migrations apply store-brain-ledger --remote`, or the new code will hit missing columns and tables.
+
 Claude will provide `DEPLOY STORE BRAIN.bat`, so this becomes a double-click. Then open `https://store-brain.<your-subdomain>.workers.dev/health`. It should say `"ok": true`.
 
 ## 5. Phone notifications (Reilly · 2 min)
