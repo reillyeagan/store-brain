@@ -102,7 +102,20 @@ Every price change and every draft is ONE approval per batch, showing old → ne
 - **DECIDED 2026-10-11 (Reilly): copy-paste, no WhatsApp API.** "honestly we could just use copy-paste messages instead, the brain gives me a notifaction with the supplier message ready to copy paste then i go and send it myeslf". The brain writes the KFB message, Pushover notifies Reilly with a link to a signed page showing the message and a **Copy** button; Reilly pastes it into the existing KFB group. No business number, no Meta setup. Brain cannot read KFB's replies (bills, "similar" notices) through this route.
 - (Superseded) **WhatsApp channel:** Meta's Groups API needs an Official Business Account, max 8 participants, invite-link only, and documents only groups the business creates. Joining KFB's existing group is not documented as possible. Path: ask KFB to talk to the business number directly (1:1) or join a new group it creates.
 
-## Questions for Reilly (all 7 answered 2026-10-11)
+## Size Checker — every order (Reilly, 2026-10-11)
+
+> "it also should do the size chart checker thing for every single order. every time we get an order it should check either KFG for the supplier link to find the size chart or the database that gets built with size charts that have already been checked over time, and compares it to US sizing. we are hunting for products that run small, so we can send out sizes that will fit to avoid all the returns for small sized products"
+
+**Flow, per order line with a size:**
+1. Look up the product in the **size-chart library** (D1 `size_charts`: product + factory link → size → garment measurements in cm, source image, who checked it, when).
+2. Not in the library → during the morning KFB session, open the product's supplier (factory) link, read the size chart image (AI, vision; Chinese/cm), store it as **unverified**.
+3. Compare the ordered size's garment measurements with the **US standard** for that gender + garment type.
+4. Runs small → recommend the size that fits (never above the factory's largest size; if nothing fits, flag for a customer message instead).
+5. Recommendations go into the morning KFB message ("#1234 ordered L → please ship XL") and are logged per order, so returns can later confirm or correct the rule.
+
+**Learning:** each product's verdict (true to size / runs small by N) is stored; size complaints and exchanges from email update it. Products Reilly already sized up by hand in the KFB chat seed the library (e.g. the shawl-collar cardigan "+2 sizes", the 3XL-max blazer).
+
+**Open:** the fit rule (how much room counts as "fits") and the US reference charts — see questions.
 1. **How do products reach KFB for quoting?** Does KFB pull everything from the store automatically, or do you submit products? Can you set priority?
    - **Answered 2026-10-11 (Reilly):** "KFB automatically pulls orders through there app, I have to manually pull products, so whenever i activate like 50 new products I just go into KFB and click "get products" and they go into the quotation section"
    - **Follow-up 2026-10-11 (Reilly):** "ill do the product publishing myself, and will do the get product thing in KFB. the store brain should never need to worry about it."
