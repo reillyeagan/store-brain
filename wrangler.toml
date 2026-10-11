@@ -6,6 +6,8 @@
 name = "store-brain"
 main = "src/index.js"
 compatibility_date = "2026-09-01"
+# Keep variables added in the Cloudflare dashboard when deploying.
+keep_vars = true
 
 # Background checks. Every 15 minutes: freshness sentinel + reconciliation pulls.
 # 05:00 UTC daily (~midnight-1am Eastern): day close. Exact close logic lives in code.
