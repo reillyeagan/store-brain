@@ -92,6 +92,15 @@ Every price change and every draft is ONE approval per batch, showing old → ne
 
 **Compare-at tiers:** 20% none · 20% ~10% · 20% ~20% · 20% ~30% · 20% ~40% of active products, kept even after every batch. Compare-at is a clean `.95` (or `.50`); the badge must print the exact tier. H&C's `snippets/price.liquid` floors to a whole percent then rounds to the nearest 10, so ±5 points prints clean. Read each store's own badge snippet before computing — never assume. New products are assigned to whichever tier is short (seeded, reproducible). When a price changes, its compare-at is recomputed to keep the same tier.
 
+## Goal: fully automated supplier conversations (Reilly, 2026-10-11)
+
+> "please see if we can add the business number to this chat. my goal is to have supplier conversations completely automated. you check my orders for which ones were express shipping, so the brain can automatically tell KFB which orders to add express shipping to. the brain should use info from my email like size complaints, exchanges, color chagnes, address changes, etc and should tell KFB that as well, evyerthing in this can be automated by the brain"
+
+- **Express shipping:** read the shipping method the customer paid for on each Shopify order; express orders are sent to KFB automatically before that day's bill.
+- **From email (CS → Supplier tickets):** size changes, exchanges/replacements, colour changes, address changes, cancellations → one message to KFB per order, tied to the order in the ledger.
+- **Ramp (rule 11):** shadow (drafts only, compared with what Reilly sends) → approve each → automatic once a clean streak is reached; Reilly approves go-live.
+- **WhatsApp channel:** Meta's Groups API needs an Official Business Account, max 8 participants, invite-link only, and documents only groups the business creates. Joining KFB's existing group is not documented as possible. Path: ask KFB to talk to the business number directly (1:1) or join a new group it creates.
+
 ## Questions for Reilly
 1. **How do products reach KFB for quoting?** Does KFB pull everything from the store automatically, or do you submit products? Can you set priority?
    - **Answered 2026-10-11 (Reilly):** "KFB automatically pulls orders through there app, I have to manually pull products, so whenever i activate like 50 new products I just go into KFB and click "get products" and they go into the quotation section"
@@ -111,4 +120,5 @@ Every price change and every draft is ONE approval per batch, showing old → ne
    - Means: a "similar" quote is treated exactly like an exact match: priced by the rules, never drafted for being similar.
 5. **WhatsApp:** what do you usually message KFB about, and how fast do they reply?
 6. **Returns:** do returned items go to your Charlotte address or back to KFB? For exchanges, does KFB ship the new size from China?
+   - **Answered 2026-10-11 (Reilly):** "i never return things to KFB." Returns come to Reilly; replacements/exchanges are new shipments from KFB.
 7. **New sourcing:** can you send KFB a link to a new factory/product and get it quoted? Is that how a category fix would work?
