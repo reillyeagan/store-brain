@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Mission Control · Store Brain</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
+<style>
+/* Eagano dash language: near-black, steel accent, Inter, no colour noise. */
+:root{
+  color-scheme:dark;
+  --bg:#0b0b0d; --panel:#131316; --panel2:#17171b; --border:#26262b; --soft:#1d1d21;
+  --text:#e8e8ea; --muted:#8a8a93; --faint:#54545c;
+  --accent:#c7d2db; --accent-dim:#5e6b76; --good:#6bbf8a; --warn:#c9a36b; --bad:#c97b7b;
+  --font:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+html,body{margin:0;background:var(--bg);color:var(--text);font-family:var(--font);font-size:14px;line-height:1.45}
+body{padding:calc(16px + env(safe-area-inset-top,0px)) 16px calc(24px + env(safe-area-inset-bottom,0px))}
+.wrap{max-width:1560px;margin:0 auto;display:grid;gap:14px}
+header{display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:10px}
+.eyebrow{font-family:var(--mono);font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
+h1{margin:2px 0 0;font-size:24px;font-weight:600;letter-spacing:-.01em}
+.pill{font-family:var(--mono);font-size:11px;padding:3px 9px;border:1px solid var(--border);border-radius:999px;color:var(--muted);white-space:nowrap}
+.pill.good{color:var(--good);border-color:#2b3d31}.pill.warn{color:var(--warn);border-color:#4a3d29}.pill.bad{color:var(--bad);border-color:#4a2c2c}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.tile{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px 14px;display:grid;gap:4px}
+.tile .pill{white-space:normal}
+.tile b{font-size:22px;font-weight:600;font-variant-numeric:tabular-nums}
+.main{display:grid;grid-template-columns:minmax(0,1fr) 380px;gap:14px;align-items:start}
+@media (max-width:1000px){.main{grid-template-columns:minmax(0,1fr)}}
+.stage{background:var(--panel);border:1px solid var(--border);border-radius:10px;overflow-x:auto;min-width:0}
+#map{display:block;width:100%;min-width:820px;height:auto}
+.legend svg{display:inline-block;width:12px;height:12px}
+.side{background:var(--panel);border:1px solid var(--border);border-radius:10px;min-width:0;display:flex;flex-direction:column;max-height:880px}
+.tabs{display:flex;border-bottom:1px solid var(--border)}
+.tabs button{flex:1;background:none;border:0;border-bottom:2px solid transparent;color:var(--muted);font:500 12.5px var(--font);padding:12px 6px;cursor:pointer}
+.tabs button[aria-selected="true"]{color:var(--text);border-bottom-color:var(--accent)}
+.tabs button:focus-visible,.btn:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.pane{overflow:auto;padding:10px 12px;display:grid;gap:8px;align-content:start}
+.row{border:1px solid var(--soft);border-radius:8px;padding:9px 10px;display:grid;gap:3px;background:var(--panel2)}
+.row .meta{font-family:var(--mono);font-size:10.5px;color:var(--faint);display:flex;gap:8px;flex-wrap:wrap}
+.row.alarm{border-color:#4a2c2c}
+.btns{display:flex;gap:6px;flex-wrap:wrap;margin-top:4px}
+.btn{background:var(--soft);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font:500 12px var(--font);cursor:pointer}
+.btn.primary{border-color:var(--accent-dim);color:var(--accent)}
+.btn.reject{color:var(--bad)}
+.empty{color:var(--muted);text-align:center;padding:26px 10px;font-size:13px}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;vertical-align:1px;background:var(--faint)}
+.dot.fresh{background:var(--good)}.dot.stale,.dot.failing{background:var(--bad)}.dot.not_wired{background:var(--faint)}
+.lbl{fill:var(--text);font:400 10.5px var(--font)}
+.lbl.m{fill:var(--muted)}
+.dlbl{fill:var(--text);font:600 11.5px var(--font);letter-spacing:.14em}
+.edge{stroke:#2c2c32;stroke-width:1}
+.edge.hot{stroke:var(--accent);stroke-width:1.8}
+.gate{position:fixed;inset:0;background:var(--bg);display:grid;place-items:center;padding:16px}
+.gate form{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:22px;display:grid;gap:12px;width:min(420px,100%)}
+.gate input{background:var(--panel2);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:10px 12px;font:14px var(--mono)}
+.legend{display:flex;gap:14px;flex-wrap:wrap;font-size:11.5px;color:var(--muted);padding:10px 14px;border-top:1px solid var(--border)}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+@keyframes pulse{0%{opacity:.9;r:9}100%{opacity:0;r:22}}
+.ping{fill:none;stroke:var(--accent);stroke-width:1.5;animation:pulse 1.6s ease-out infinite}
+@media (prefers-reduced-motion:reduce){.ping{animation:none;opacity:.6}}
+</style>
+</head>
+<body>
+<div class="gate" id="gate" hidden>
+  <form id="gateForm">
+    <div class="eyebrow">Store Brain</div>
+    <h1>Mission Control</h1>
+    <label for="keyIn" style="color:var(--muted);font-size:13px">Enter your Mission Control key. It stays in this browser tab only.</label>
+    <input id="keyIn" type="password" autocomplete="off" required>
+    <button class="btn primary" type="submit">Open</button>
+  </form>
+</div>
+
+<div class="wrap" id="app" hidden>
+  <header>
+    <div>
+      <div class="eyebrow">Store Brain · separate from Eagano</div>
+      <h1>Mission Control</h1>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <span class="pill" id="updated">—</span>
+      <span class="pill" id="version">—</span>
+    </div>
+  </header>
+  <div class="tiles" id="tiles"></div>
+  <div class="main">
+    <div class="stage">
+      <svg id="map" viewBox="0 0 1200 900" role="img" aria-label="Live map of the Store Brain"></svg>
+      <div class="legend">
+        <span><svg width="12" height="12"><circle cx="6" cy="6" r="4.5" fill="none" stroke="#54545c"/></svg>Planned</span>
+        <span><svg width="12" height="12"><circle cx="6" cy="6" r="4.5" fill="none" stroke="#c7d2db" stroke-width="1.5"/></svg>Built</span>
+        <span><svg width="12" height="12"><circle cx="6" cy="6" r="4.5" fill="#c9a36b"/></svg>Shadow</span>
+        <span><svg width="12" height="12"><circle cx="6" cy="6" r="4.5" fill="#c7d2db"/></svg>Live</span>
+        <span><svg width="12" height="12"><circle cx="6" cy="6" r="5" fill="none" stroke="#c7d2db"/></svg>Pulsing = acted in the last 2 min</span>
+      </div>
+    </div>
+    <aside class="side">
+      <div class="tabs" role="tablist">
+        <button role="tab" aria-selected="true" data-tab="activity" id="tab-activity">Activity</button>
+        <button role="tab" aria-selected="false" data-tab="approvals" id="tab-approvals">Approvals</button>
+        <button role="tab" aria-selected="false" data-tab="feeds" id="tab-feeds">Feeds</button>
+      </div>
+      <div class="pane" id="pane"></div>
+    </aside>
+  </div>
+</div>
+
+<script>
+(function(){
+  "use strict";
+  var KEY_STORE="sb_mc_key";
+  var key=null, state=null, tab="activity", timer=null;
+  var $=function(s){return document.querySelector(s)};
+  var esc=function(s){return String(s==null?"":s).replace(/[&<>"]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]})};
+
+  function getKey(){
+    var u=new URL(location.href), k=u.searchParams.get("key");
+    if(k){ try{sessionStorage.setItem(KEY_STORE,k)}catch(e){} u.searchParams.delete("key"); history.replaceState(null,"",u.pathname+u.hash); return k; }
+    try{ return sessionStorage.getItem(KEY_STORE) }catch(e){ return null }
+  }
+  function showGate(msg){
+    $("#app").hidden=true; $("#gate").hidden=false;
+    if(msg){ $("#keyIn").setCustomValidity(msg); $("#keyIn").reportValidity(); }
+  }
+  $("#gateForm").addEventListener("submit",function(e){
+    e.preventDefault(); key=$("#keyIn").value.trim(); $("#keyIn").setCustomValidity("");
+    try{sessionStorage.setItem(KEY_STORE,key)}catch(err){}
+    load();
+  });
+
+  async function load(){
+    if(!key){ showGate(); return; }
+    try{
+      var r=await fetch("/api/state",{headers:{"x-store-brain-key":key},cache:"no-store"});
+      if(r.status===401){ try{sessionStorage.removeItem(KEY_STORE)}catch(e){} key=null; showGate("That key didn't work."); return; }
+      if(!r.ok) throw new Error("HTTP "+r.status);
+      state=await r.json();
+      $("#gate").hidden=true; $("#app").hidden=false;
+      render();
+    }catch(err){
+      $("#updated").textContent="Can't reach the brain: "+err.message;
+      $("#updated").className="pill bad";
+    }
+    clearTimeout(timer); timer=setTimeout(load,15000);
+  }
+
+  /* ---------------- map ---------------- */
+  var NS="http://www.w3.org/2000/svg";
+  function el(t,a,p){var e=document.createElementNS(NS,t);for(var k in a)e.setAttribute(k,a[k]);(p||svg).appendChild(e);return e}
+  var svg=$("#map"), pos={};
+  var C={x:500,y:450};
+  function anc(c){return c>.25?"start":c<-.25?"end":"middle"}
+
+  function layout(){
+    pos={};
+    pos["core"]={x:C.x,y:C.y,r:36};
+    var mgr=state.agents.filter(function(a){return a.dept==="core"});
+    mgr.forEach(function(a,i){var t=-Math.PI/2+i*2*Math.PI/mgr.length;pos[a.id]={x:C.x+Math.cos(t)*88,y:C.y+Math.sin(t)*88,r:6,ang:t}});
+    var depts=state.departments.filter(function(d){return d.id!=="core"});
+    var step=2*Math.PI/depts.length;
+    state.services.forEach(function(s,i){var t=-Math.PI/2+(i+.5)*(2*Math.PI/state.services.length);pos[s.id]={x:C.x+Math.cos(t)*160,y:C.y+Math.sin(t)*160,r:5,ang:t,sq:true}});
+    depts.forEach(function(d,i){
+      var t=-Math.PI/2+i*step, x=C.x+Math.cos(t)*285, y=C.y+Math.sin(t)*285;
+      pos[d.id]={x:x,y:y,r:22,ang:t};
+      var subs=state.agents.filter(function(a){return a.dept===d.id}), n=subs.length, spread=Math.min(Math.PI*.95,n*.37);
+      subs.forEach(function(a,j){var b=t-spread/2+(n===1?spread/2:j*spread/(n-1));pos[a.id]={x:x+Math.cos(b)*84,y:y+Math.sin(b)*84,r:6,ang:b,j:j}});
+    });
+    state.systems.forEach(function(s,i){pos[s.id]={x:1100,y:150+i*80,r:0,sys:true}});
+  }
+
+  function render(){
+    var now=Date.now();
+    $("#updated").textContent="Updated "+new Date(state.now).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"});
+    $("#updated").className="pill";
+    $("#version").textContent="v"+state.version;
+
+    // tiles
+    var feeds=state.feeds, fresh=feeds.filter(function(f){return f.state==="fresh"}).length;
+    var bad=feeds.filter(function(f){return f.state==="stale"||f.state==="failing"}).length;
+    var unwired=feeds.filter(function(f){return f.state==="not_wired"}).length;
+    var dayStart=new Date(); dayStart.setHours(0,0,0,0);
+    var today=state.events.filter(function(e){return Date.parse(e.at)>=dayStart.getTime()}).length;
+    var live=state.agents.filter(function(a){return a.status==="live"}).length;
+    $("#tiles").innerHTML=
+      tile("Stores live",state.stores.filter(function(s){return s.live}).length+" / "+state.stores.length,"")+
+      tile("Feeds fresh",fresh+" / "+feeds.length, bad?bad+" stale or failing":unwired?unwired+" not wired yet":"all fresh", bad?"bad":"")+
+      tile("Waiting on you",state.approvals.length,"approvals","")+
+      tile("Actions today",today,"events","")+
+      tile("Agents live",live+" / "+state.agents.length,"rest built or planned","")+
+      tile("AI cost today","$"+Number(state.aiCostToday||0).toFixed(2),"","");
+
+    // map
+    while(svg.firstChild) svg.removeChild(svg.firstChild);
+    layout();
+    var gE=el("g",{}), gN=el("g",{});
+    el("circle",{cx:C.x,cy:C.y,r:160,fill:"none",stroke:"#5e6b76","stroke-opacity":.5,"stroke-dasharray":"2 6"},gE);
+    var recent=state.events.filter(function(e){return now-Date.parse(e.at)<120000});
+    var active={}, hotLinks=[];
+    recent.forEach(function(e){active[e.actor]=1; if(e.target) {active[e.target]=1; hotLinks.push([e.actor,e.target]);}});
+    function line(a,b,hot){ if(!pos[a]||!pos[b])return; el("line",{x1:pos[a].x,y1:pos[a].y,x2:pos[b].x,y2:pos[b].y,class:"edge"+(hot?" hot":"")},gE); }
+    state.agents.forEach(function(a){ line(a.dept==="core"?"core":a.dept,a.id,false) });
+    state.departments.forEach(function(d){ if(d.id!=="core") line("core",d.id,false) });
+    hotLinks.forEach(function(l){ line(l[0],l[1],true) });
+
+    // core
+    el("circle",{cx:C.x,cy:C.y,r:36,fill:"#e8e8ea"},gN);
+    var ct=el("text",{x:C.x,y:C.y+4,"text-anchor":"middle",class:"dlbl"},gN); ct.textContent="CORE"; ct.style.fill="#0b0b0d";
+    // departments
+    state.departments.forEach(function(d){ if(d.id==="core")return; var p=pos[d.id];
+      el("circle",{cx:p.x,cy:p.y,r:22,fill:"#17171b",stroke:"#5e6b76"},gN);
+      var ca=Math.cos(p.ang),sa=Math.sin(p.ang);
+      var t=el("text",{x:p.x-ca*32,y:p.y-sa*32+(Math.abs(ca)<.3?(sa>0?-4:14):4),"text-anchor":Math.abs(ca)<.3?"middle":(ca<0?"start":"end"),class:"dlbl"},gN); t.textContent=d.short.toUpperCase();
+    });
+    // agents
+    state.agents.forEach(function(a){ var p=pos[a.id];
+      var st=a.status, fill=st==="live"?"#c7d2db":st==="shadow"?"#c9a36b":"#0b0b0d", stroke=st==="planned"?"#54545c":"#c7d2db";
+      if(active[a.id]) el("circle",{cx:p.x,cy:p.y,r:9,class:"ping"},gN);
+      var c=el("circle",{cx:p.x,cy:p.y,r:6,fill:fill,stroke:stroke,"stroke-width":st==="built"?1.6:1},gN);
+      var tt=el("title",{},c); tt.textContent=a.name+" · "+(a.kind==="ai"?"AI":"code")+" · "+a.level+" · "+st;
+      var c2=Math.cos(p.ang), s2=Math.sin(p.ang), vert=Math.abs(c2)<.45 && a.dept!=="core";
+      var lx=p.x+c2*11, ly=p.y+s2*11+4+(vert&&p.j%2?13*Math.sign(s2):0);
+      var t=el("text",{x:lx,y:ly,"text-anchor":vert?(c2>=0?"start":"end"):anc(c2),class:"lbl"+(st==="planned"?" m":"")},gN); t.textContent=a.name;
+    });
+    // services
+    state.services.forEach(function(s){ var p=pos[s.id];
+      if(active[s.id]) el("circle",{cx:p.x,cy:p.y,r:9,class:"ping"},gN);
+      el("rect",{x:p.x-5,y:p.y-5,width:10,height:10,rx:2,fill:"#0b0b0d",stroke:s.status==="planned"?"#54545c":"#c7d2db","stroke-width":1.4},gN);
+      var t=el("text",{x:p.x+Math.cos(p.ang)*13,y:p.y+Math.sin(p.ang)*13+4,"text-anchor":anc(Math.cos(p.ang)),class:"lbl m","font-family":"ui-monospace,Menlo,monospace","font-size":"9.5"},gN); t.textContent=s.name;
+    });
+    // systems
+    var h=el("text",{x:1100,y:118,"text-anchor":"middle",class:"lbl m"},gN); h.textContent="SYSTEMS";
+    state.systems.forEach(function(s){ var p=pos[s.id];
+      el("rect",{x:p.x-70,y:p.y-15,width:140,height:30,rx:6,fill:"#131316",stroke:active[s.id]?"#c7d2db":"#26262b"},gN);
+      var t=el("text",{x:p.x,y:p.y+4,"text-anchor":"middle",class:"lbl"},gN); t.textContent=s.name;
+    });
+
+    renderPane();
+  }
+  function tile(label,value,sub,cls){
+    return '<div class="tile"><span class="eyebrow">'+esc(label)+'</span><b>'+esc(value)+'</b>'+(sub?'<span class="pill '+(cls||"")+'" style="justify-self:start">'+esc(sub)+'</span>':"")+'</div>';
+  }
+
+  /* ---------------- side panel ---------------- */
+  document.querySelectorAll(".tabs button").forEach(function(b){
+    b.addEventListener("click",function(){ tab=b.dataset.tab; document.querySelectorAll(".tabs button").forEach(function(x){x.setAttribute("aria-selected",x===b?"true":"false")}); renderPane(); });
+  });
+  function agentName(id){ var a=state.agents.find(function(x){return x.id===id}) || state.services.find(function(x){return x.id===id}) || state.systems.find(function(x){return x.id===id}); return a?a.name:id; }
+  function ago(iso){ var m=Math.round((Date.now()-Date.parse(iso))/60000); if(m<1)return "just now"; if(m<60)return m+" min ago"; var h=Math.round(m/60); return h<48?h+" h ago":Math.round(h/24)+" d ago"; }
+
+  function renderPane(){
+    var p=$("#pane");
+    if(tab==="activity"){
+      if(!state.events.length){ p.innerHTML='<div class="empty">No activity yet. Events appear here the moment any agent acts.</div>'; return; }
+      p.innerHTML=state.events.slice(0,120).map(function(e){
+        var alarm=/alarm|error|failed|mismatch/i.test(e.kind);
+        return '<div class="row'+(alarm?" alarm":"")+'"><span>'+esc(e.summary)+'</span><span class="meta"><span>'+esc(agentName(e.actor))+'</span>'+(e.target?'<span>→ '+esc(agentName(e.target))+'</span>':"")+(e.store?'<span>'+esc(e.store.toUpperCase())+'</span>':"")+'<span>'+esc(ago(e.at))+'</span></span></div>';
+      }).join("");
+    } else if(tab==="approvals"){
+      if(!state.approvals.length){ p.innerHTML='<div class="empty">Nothing is waiting on you.</div>'; return; }
+      p.innerHTML=state.approvals.map(function(a){
+        return '<div class="row" id="approval-'+a.id+'"><b>'+esc(a.title)+'</b><span class="meta"><span>'+esc(agentName(a.requested_by))+'</span>'+(a.store?'<span>'+esc(a.store.toUpperCase())+'</span>':"")+'<span>'+esc(ago(a.created_at))+'</span></span>'+
+          a.options.map(function(o){return o.detail?'<span style="color:var(--muted);font-size:12.5px">'+esc(o.label)+': '+esc(o.detail)+'</span>':""}).join("")+
+          '<div class="btns">'+a.options.map(function(o){return '<button class="btn primary" data-ap="'+a.id+'" data-choice="'+esc(o.id)+'">'+esc(o.label)+'</button>'}).join("")+
+          '<button class="btn reject" data-ap="'+a.id+'" data-choice="reject">Reject</button></div></div>';
+      }).join("");
+      p.querySelectorAll("button[data-ap]").forEach(function(b){ b.addEventListener("click",function(){ decideApproval(b.dataset.ap,b.dataset.choice,b) }) });
+    } else {
+      p.innerHTML=state.feeds.map(function(f){
+        var label={fresh:"Fresh",stale:"Stale",failing:"Failing",not_wired:"Not wired yet"}[f.state]||f.state;
+        return '<div class="row'+(f.state==="stale"||f.state==="failing"?" alarm":"")+'"><span><span class="dot '+esc(f.state)+'"></span>'+esc(f.label)+'</span><span class="meta"><span>'+esc(label)+'</span>'+(f.last_ok_at?'<span>last delivered '+esc(ago(f.last_ok_at))+'</span>':"")+'<span>limit '+esc(f.max_age_min)+' min</span>'+(f.last_error?'<span>'+esc(f.last_error)+'</span>':"")+'</span></div>';
+      }).join("");
+    }
+  }
+  async function decideApproval(id,choice,btn){
+    var row=btn.closest(".row"); row.querySelectorAll("button").forEach(function(x){x.disabled=true});
+    try{
+      var r=await fetch("/api/approvals/"+id+"/decide",{method:"POST",headers:{"x-store-brain-key":key,"content-type":"application/json"},body:JSON.stringify({choice:choice})});
+      var b=await r.json();
+      row.insertAdjacentHTML("beforeend",'<span class="meta" style="color:'+(b.ok?"var(--good)":"var(--bad)")+'">'+(b.ok?(b.status==="approved"?"Approved":"Rejected"):"Not recorded: "+esc(b.error))+'</span>');
+    }catch(e){ row.insertAdjacentHTML("beforeend",'<span class="meta" style="color:var(--bad)">Couldn\'t reach the brain. Nothing was recorded.</span>'); }
+    setTimeout(load,800);
+  }
+
+  key=getKey(); load();
+})();
+</script>
+</body>
+</html>

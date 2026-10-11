@@ -1,0 +1,36 @@
+# Store Brain — Cloudflare Worker config.
+# No secrets live in this file. Secrets are added by Reilly in the Cloudflare
+# dashboard (Workers & Pages → store-brain → Settings → Variables and Secrets)
+# or with `wrangler secret put NAME`. See docs/setup/deploy.md.
+
+name = "store-brain"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+
+# Background checks. Every 15 minutes: freshness sentinel + reconciliation pulls.
+# 05:00 UTC daily (~midnight-1am Eastern): day close. Exact close logic lives in code.
+[triggers]
+crons = ["*/15 * * * *", "0 5 * * *"]
+
+# The ledger. Create it once with: wrangler d1 create store-brain-ledger
+# then paste the database_id it prints below.
+[[d1_databases]]
+binding = "DB"
+database_name = "store-brain-ledger"
+database_id = "REPLACE_WITH_ID_FROM_wrangler_d1_create"
+migrations_dir = "migrations"
+
+# Backup Vault. Create once with: wrangler r2 bucket create store-brain-backups
+[[r2_buckets]]
+binding = "BACKUPS"
+bucket_name = "store-brain-backups"
+
+[assets]
+directory = "public"
+binding = "ASSETS"
+
+[vars]
+TIMEZONE = "America/New_York"
+# Phone notifications go to this ntfy topic. The topic name itself is set as a
+# secret (NTFY_TOPIC) so nobody can guess it and subscribe.
+NTFY_SERVER = "https://ntfy.sh"

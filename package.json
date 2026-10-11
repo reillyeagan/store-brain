@@ -1,0 +1,16 @@
+{
+  "name": "store-brain",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "24/7 operations brain for Reilly's Shopify stores. Separate from the Eagano personal brain.",
+  "scripts": {
+    "test": "node --test --no-warnings test/*.test.js",
+    "check": "node --check src/index.js && npm test",
+    "deploy": "wrangler deploy",
+    "db:migrate": "wrangler d1 migrations apply store-brain-ledger --remote"
+  },
+  "devDependencies": {
+    "wrangler": "^4.149.0"
+  }
+}

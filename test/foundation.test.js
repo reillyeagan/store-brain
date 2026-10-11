@@ -1,0 +1,401 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { createHmac } from "node:crypto";
+import { makeD1, makeR2 } from "./helpers/d1.js";
+
+import { STORES, LIVE_STORE_IDS, getStore, storeByDomain } from "../src/config/stores.js";
+import { AGENTS, SERVICES } from "../src/config/agents.js";
+import { logEvent, recentEvents, redact, costSince } from "../src/lib/eventlog.js";
+import { feedState, runSentinel, markFeedOk, markFeedFailed, evaluateFeeds } from "../src/lib/freshness.js";
+import { verifiedWrite } from "../src/lib/writeVerifier.js";
+import { backup, readBackup } from "../src/lib/backupVault.js";
+import {
+  createApproval, decide, listPending, markExecuted, signDecision, verifyDecisionSig, notifyPhone,
+} from "../src/lib/approvals.js";
+import {
+  storeCredentials, getAccessToken, assertShop, guardedWrite, verifyWebhookHmac, StoreGuardError,
+  _resetTokenCacheForTests,
+} from "../src/lib/storeGuard.js";
+import { parseOrder, parseRefund, handleShopifyWebhook } from "../src/lib/shopifyWebhooks.js";
+import { localDay } from "../src/lib/time.js";
+import worker from "../src/index.js";
+
+/* ---------------- config ---------------- */
+
+test("stores: exactly H&C, Auberlane and Marlowe are live", () => {
+  assert.deepEqual([...LIVE_STORE_IDS].sort(), ["aub", "hc", "mar"]);
+  assert.equal(STORES.cc.live, false);
+  assert.equal(STORES.tund.live, false);
+});
+
+test("stores: secret prefixes are unique per store", () => {
+  const names = Object.values(STORES).flatMap((s) => [s.secrets.clientId, s.secrets.clientSecret]);
+  assert.equal(new Set(names).size, names.length);
+});
+
+test("stores: lookup never defaults to a store", () => {
+  assert.equal(getStore(undefined), null);
+  assert.equal(getStore("toString"), null);
+  assert.equal(storeByDomain("JMZJX1-IT.myshopify.com").id, "hc");
+  assert.equal(storeByDomain("evil.myshopify.com"), null);
+});
+
+test("agents: 52 agents, unique ids, 7 services", () => {
+  assert.equal(AGENTS.length, 52);
+  assert.equal(new Set(AGENTS.map((a) => a.id)).size, 52);
+  assert.equal(SERVICES.length, 7);
+});
+
+/* ---------------- time ---------------- */
+
+test("localDay uses the store timezone, not UTC", () => {
+  // 02:30 UTC on Oct 11 is still Oct 10 in New York (EDT, UTC-4)
+  assert.equal(localDay("2026-10-11T02:30:00Z", "America/New_York"), "2026-10-10");
+  assert.equal(localDay("2026-10-11T04:30:00Z", "America/New_York"), "2026-10-11");
+});
+
+/* ---------------- event log ---------------- */
+
+test("event log: stores events newest-first and redacts secrets", async () => {
+  const db = makeD1();
+  await logEvent(db, { actor: "svc.store_guard", kind: "a", summary: "one", data: { token: "abc", ok: 1 } });
+  await logEvent(db, { actor: "pnl.pullers", kind: "b", summary: "two", costUsd: 0.25 });
+  const ev = await recentEvents(db);
+  assert.equal(ev.length, 2);
+  assert.equal(ev[0].summary, "two");
+  assert.equal(ev[1].data.token, "[redacted]");
+  assert.equal(ev[1].data.ok, 1);
+  assert.equal(await costSince(db, "2000-01-01T00:00:00Z"), 0.25);
+});
+
+test("event log: unknown actors are logged but flagged", async () => {
+  const db = makeD1();
+  await logEvent(db, { actor: "mystery.worker", kind: "x", summary: "hi" });
+  const [e] = await recentEvents(db);
+  assert.equal(e.data._unknownActor, true);
+});
+
+test("event log: requires actor, kind, summary", async () => {
+  await assert.rejects(logEvent(makeD1(), { actor: "a", kind: "b" }));
+});
+
+test("redact handles nested objects and arrays", () => {
+  const r = redact({ a: [{ api_key: "x", n: 1 }], nested: { Authorization: "y" } });
+  assert.equal(r.a[0].api_key, "[redacted]");
+  assert.equal(r.a[0].n, 1);
+  assert.equal(r.nested.Authorization, "[redacted]");
+});
+
+/* ---------------- freshness ---------------- */
+
+test("freshness: states", () => {
+  const now = Date.parse("2026-10-10T12:00:00Z");
+  assert.equal(feedState({ wired: 0 }, now), "not_wired");
+  assert.equal(feedState({ wired: 1, last_ok_at: "2026-10-10T11:45:00Z", max_age_min: 30 }, now), "fresh");
+  assert.equal(feedState({ wired: 1, last_ok_at: "2026-10-10T11:00:00Z", max_age_min: 30 }, now), "stale");
+  assert.equal(
+    feedState({ wired: 1, last_ok_at: "2026-10-10T11:50:00Z", last_try_at: "2026-10-10T11:55:00Z", last_error: "boom", max_age_min: 30 }, now),
+    "failing"
+  );
+});
+
+test("freshness: sentinel alarms once on change, not every run", async () => {
+  const db = makeD1();
+  const t0 = Date.parse("2026-10-10T12:00:00Z");
+  await runSentinel(db, t0); // creates feeds as not_wired (quiet state events)
+  await markFeedOk(db, "shopify.orders.hc", "2026-10-10T12:00:00Z");
+  await runSentinel(db, t0 + 5 * 60000); // hc orders becomes fresh
+  await runSentinel(db, t0 + 60 * 60000); // 60 min later: stale (limit 30)
+  await runSentinel(db, t0 + 75 * 60000); // still stale — no new alarm
+  const alarms = (await recentEvents(db)).filter((e) => e.kind === "feed.alarm" && e.data.feed === "shopify.orders.hc");
+  assert.equal(alarms.length, 1);
+  assert.equal(alarms[0].data.to, "stale");
+});
+
+test("freshness: a failure after success reads as failing", async () => {
+  const db = makeD1();
+  await runSentinel(db, Date.parse("2026-10-10T12:00:00Z"));
+  await markFeedOk(db, "ads.spend.aub", "2026-10-10T12:00:00Z");
+  await markFeedFailed(db, "ads.spend.aub", "HTTP 500", "2026-10-10T12:10:00Z");
+  const f = (await evaluateFeeds(db, Date.parse("2026-10-10T12:11:00Z"))).find((x) => x.id === "ads.spend.aub");
+  assert.equal(f.current, "failing");
+});
+
+/* ---------------- write verifier ---------------- */
+
+test("write verifier: succeeds only when the read-back shows the change", async () => {
+  let stored = 0;
+  const ok = await verifiedWrite({
+    write: async () => { stored = 5; return 200; }, read: async () => stored, expect: (v) => v === 5, sleep: async () => {},
+  });
+  assert.equal(ok.ok, true);
+
+  const fake200 = await verifiedWrite({
+    write: async () => 200, read: async () => 0, expect: (v) => v === 5, attempts: 3, sleep: async () => {},
+  });
+  assert.equal(fake200.ok, false); // a "200" that changed nothing is a failure
+  assert.equal(fake200.attempts, 3);
+});
+
+test("write verifier: retries a lagging system", async () => {
+  let reads = 0;
+  const r = await verifiedWrite({
+    write: async () => {}, read: async () => ++reads, expect: (v) => v >= 2, sleep: async () => {},
+  });
+  assert.equal(r.ok, true);
+  assert.equal(r.attempts, 2);
+});
+
+/* ---------------- backup vault ---------------- */
+
+test("backup vault: writes, confirms and reads back", async () => {
+  const r2 = makeR2();
+  const res = await backup(r2, { store: "hc", label: "prices before reprice", data: [{ id: 1, price: 49.95 }] });
+  assert.equal(res.ok, true);
+  assert.match(res.key, /^backups\/hc\//);
+  const back = await readBackup(r2, res.key);
+  assert.equal(back.data[0].price, 49.95);
+});
+
+test("backup vault: refuses to run without a bucket", async () => {
+  await assert.rejects(backup(null, { store: "hc", label: "x", data: 1 }), /Refusing/);
+});
+
+/* ---------------- approvals ---------------- */
+
+test("approvals: pending → approved, second tap does nothing", async () => {
+  const db = makeD1();
+  const id = await createApproval(db, {
+    dept: "cs", requestedBy: "cs.reply_writer", title: "Send reply to order #1231",
+    options: [{ id: "send", label: "Send as drafted" }],
+  });
+  assert.equal((await listPending(db)).length, 1);
+  const first = await decide(db, id, { choice: "send", note: "looks good" });
+  assert.equal(first.ok, true);
+  assert.equal(first.status, "approved");
+  const second = await decide(db, id, { choice: "reject" });
+  assert.equal(second.ok, false);
+  assert.equal(second.error, "already_approved");
+  assert.equal((await listPending(db)).length, 0);
+  const exec = await markExecuted(db, id, { ok: true, result: { verified: true } });
+  assert.equal(exec.status, "executed");
+});
+
+test("approvals: invalid choices and option rules", async () => {
+  const db = makeD1();
+  await assert.rejects(createApproval(db, { dept: "cs", requestedBy: "x", title: "t", options: [] }));
+  await assert.rejects(createApproval(db, { dept: "cs", requestedBy: "x", title: "t", options: [{ id: "reject", label: "no" }] }));
+  const id = await createApproval(db, { dept: "cs", requestedBy: "x", title: "t", options: [{ id: "a", label: "A" }] });
+  assert.equal((await decide(db, id, { choice: "zzz" })).error, "invalid_choice");
+  assert.equal((await decide(db, 999, { choice: "a" })).error, "not_found");
+});
+
+test("approvals: signed phone links can't be reused for another option or approval", async () => {
+  const sig = await signDecision("k", 7, "send");
+  assert.equal(await verifyDecisionSig("k", 7, "send", sig), true);
+  assert.equal(await verifyDecisionSig("k", 7, "reject", sig), false);
+  assert.equal(await verifyDecisionSig("k", 8, "send", sig), false);
+  assert.equal(await verifyDecisionSig("other", 7, "send", sig), false);
+});
+
+test("approvals: phone notify is a no-op until the phone is set up", async () => {
+  const r = await notifyPhone({}, { id: 1, title: "t", options: [{ id: "a", label: "A" }] }, { baseUrl: "https://x" });
+  assert.equal(r.sent, false);
+});
+
+test("approvals: phone notify sends buttons when configured", async () => {
+  let sent;
+  const r = await notifyPhone(
+    { NTFY_TOPIC: "topic", APPROVAL_SIGNING_KEY: "k", NTFY_SERVER: "https://ntfy.example" },
+    { id: 3, title: "Draft 4 denied products", options: [{ id: "draft", label: "Draft all 4" }] },
+    { baseUrl: "https://brain.example", fetchImpl: async (url, init) => { sent = { url, init }; return { ok: true, status: 200 }; } }
+  );
+  assert.equal(r.sent, true);
+  assert.equal(sent.url, "https://ntfy.example/topic");
+  assert.match(sent.init.headers.Actions, /decide\?choice=draft&sig=/);
+  assert.match(sent.init.headers.Actions, /choice=reject/);
+});
+
+/* ---------------- store guard ---------------- */
+
+const ENV = {
+  SB_HC_CLIENT_ID: "id-hc", SB_HC_CLIENT_SECRET: "secret-hc",
+  SB_AUB_CLIENT_ID: "id-aub", SB_AUB_CLIENT_SECRET: "secret-aub",
+};
+
+function fakeShopify(reportedDomainFor) {
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    calls.push(url);
+    if (url.endsWith("/admin/oauth/access_token")) {
+      return { ok: true, status: 200, json: async () => ({ access_token: "tok-" + new URL(url).host, expires_in: 86399 }) };
+    }
+    const host = new URL(url).host;
+    return { ok: true, status: 200, json: async () => ({ data: { shop: { myshopifyDomain: reportedDomainFor(host), name: "x" } } }) };
+  };
+  return { fetchImpl, calls };
+}
+
+test("store guard: refuses unknown, not-live and unwired stores", () => {
+  assert.throws(() => storeCredentials(ENV, "nope"), (e) => e.code === "UNKNOWN_STORE");
+  assert.throws(() => storeCredentials(ENV, "tund"), (e) => e.code === "STORE_NOT_LIVE");
+  assert.throws(() => storeCredentials(ENV, "mar"), (e) => e.code === "NOT_WIRED");
+});
+
+test("store guard: writes run only when Shopify confirms the right shop", async () => {
+  _resetTokenCacheForTests();
+  const ok = fakeShopify((host) => host);
+  let wrote = false;
+  await guardedWrite(ENV, "hc", async () => { wrote = true; }, { fetchImpl: ok.fetchImpl });
+  assert.equal(wrote, true);
+});
+
+test("store guard: a token for the wrong shop is a hard stop", async () => {
+  _resetTokenCacheForTests();
+  const bad = fakeShopify(() => "3as2ya-dw.myshopify.com"); // everything claims to be Auberlane
+  let wrote = false;
+  await assert.rejects(
+    guardedWrite(ENV, "hc", async () => { wrote = true; }, { fetchImpl: bad.fetchImpl }),
+    (e) => e instanceof StoreGuardError && e.code === "STORE_MISMATCH"
+  );
+  assert.equal(wrote, false);
+});
+
+test("store guard: tokens are cached per store", async () => {
+  _resetTokenCacheForTests();
+  const f = fakeShopify((h) => h);
+  await getAccessToken(ENV, "hc", { fetchImpl: f.fetchImpl });
+  await getAccessToken(ENV, "hc", { fetchImpl: f.fetchImpl });
+  await getAccessToken(ENV, "aub", { fetchImpl: f.fetchImpl });
+  assert.equal(f.calls.filter((u) => u.includes("access_token")).length, 2);
+});
+
+test("store guard: webhook HMAC check", async () => {
+  const body = '{"id":1}';
+  const good = createHmac("sha256", "s3cret").update(body).digest("base64");
+  assert.equal(await verifyWebhookHmac(body, good, "s3cret"), true);
+  assert.equal(await verifyWebhookHmac(body, good, "wrong"), false);
+  assert.equal(await verifyWebhookHmac('{"id":2}', good, "s3cret"), false);
+  assert.equal(await verifyWebhookHmac(body, "", "s3cret"), false);
+});
+
+/* ---------------- webhooks ---------------- */
+
+const ORDER = {
+  id: 1231, admin_graphql_api_id: "gid://shopify/Order/1231", name: "#1231",
+  created_at: "2026-10-11T02:30:00Z", currency: "USD",
+  current_subtotal_price: "129.90", current_total_discounts: "12.99", current_total_price: "116.91",
+  financial_status: "paid",
+};
+
+test("webhooks: order parsing", () => {
+  const o = parseOrder(ORDER);
+  assert.equal(o.total, 116.91);
+  assert.equal(o.order_id, "gid://shopify/Order/1231");
+});
+
+test("webhooks: refund amount comes from refund transactions, PENDING kept", () => {
+  const r = parseRefund({
+    id: 9, order_id: 1231, processed_at: "2026-10-10T15:00:00Z",
+    transactions: [{ kind: "refund", amount: "48.95", status: "pending" }, { kind: "sale", amount: "999", status: "success" }],
+  });
+  assert.equal(r.amount, 48.95);
+  assert.equal(r.status, "PENDING");
+});
+
+function webhookRequest(topic, domain, payload, secret) {
+  const body = JSON.stringify(payload);
+  const hmac = createHmac("sha256", secret).update(body).digest("base64");
+  return new Request("https://brain.example/webhooks/shopify", {
+    method: "POST", body,
+    headers: { "x-shopify-topic": topic, "x-shopify-shop-domain": domain, "x-shopify-hmac-sha256": hmac },
+  });
+}
+
+test("webhooks: a signed Auberlane order lands in the ledger, on the store's local day, and marks the feed fresh", async () => {
+  const DB = makeD1();
+  const env = { DB, TIMEZONE: "America/New_York", SB_AUB_CLIENT_SECRET: "aub-secret" };
+  const res = await handleShopifyWebhook(webhookRequest("orders/create", "3as2ya-dw.myshopify.com", ORDER, "aub-secret"), env);
+  assert.equal(res.status, 200);
+  const row = await DB.prepare("SELECT * FROM orders").first();
+  assert.equal(row.store, "aub");
+  assert.equal(row.local_day, "2026-10-10");
+  const feed = await DB.prepare("SELECT * FROM feeds WHERE id = 'shopify.orders.aub'").first();
+  assert.equal(feed.wired, 1);
+  assert.ok(feed.last_ok_at);
+  const [ev] = await recentEvents(DB);
+  assert.equal(ev.kind, "order.created");
+  assert.match(ev.summary, /Auberlane #1231/);
+});
+
+test("webhooks: forged or cross-store signatures are rejected", async () => {
+  const DB = makeD1();
+  const env = { DB, SB_AUB_CLIENT_SECRET: "aub-secret", SB_HC_CLIENT_SECRET: "hc-secret" };
+  // signed with H&C's secret but claiming to be Auberlane
+  const res = await handleShopifyWebhook(webhookRequest("orders/create", "3as2ya-dw.myshopify.com", ORDER, "hc-secret"), env);
+  assert.equal(res.status, 401);
+  assert.equal(await DB.prepare("SELECT COUNT(*) AS n FROM orders").first().then((r) => r.n), 0);
+  const unknown = await handleShopifyWebhook(webhookRequest("orders/create", "x.myshopify.com", ORDER, "aub-secret"), env);
+  assert.equal(unknown.status, 404);
+});
+
+test("webhooks: the same order twice is one row (updates are upserts)", async () => {
+  const DB = makeD1();
+  const env = { DB, SB_HC_CLIENT_SECRET: "hc-secret" };
+  await handleShopifyWebhook(webhookRequest("orders/create", "jmzjx1-it.myshopify.com", ORDER, "hc-secret"), env);
+  await handleShopifyWebhook(webhookRequest("orders/updated", "jmzjx1-it.myshopify.com", { ...ORDER, current_total_price: "100.00" }, "hc-secret"), env);
+  const rows = (await DB.prepare("SELECT * FROM orders").all()).results;
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].total, 100);
+});
+
+/* ---------------- worker routes ---------------- */
+
+test("worker: /health is public; /api/state needs the key", async () => {
+  const DB = makeD1();
+  const env = { DB, MC_KEY: "k".repeat(32) };
+  const h = await worker.fetch(new Request("https://b.example/health"), env);
+  assert.equal(h.status, 200);
+  const denied = await worker.fetch(new Request("https://b.example/api/state"), env);
+  assert.equal(denied.status, 401);
+  const ok = await worker.fetch(new Request("https://b.example/api/state", { headers: { "x-store-brain-key": "k".repeat(32) } }), env);
+  assert.equal(ok.status, 200);
+  const body = await ok.json();
+  assert.equal(body.agents.length, 52);
+  assert.ok(body.feeds.length >= 10);
+  assert.ok(body.feeds.every((f) => f.state === "not_wired"));
+});
+
+test("worker: API stays locked when no key is configured", async () => {
+  const res = await worker.fetch(new Request("https://b.example/api/state?key="), { DB: makeD1() });
+  assert.equal(res.status, 401);
+});
+
+test("worker: decisions via key or a signed link only", async () => {
+  const DB = makeD1();
+  const env = { DB, MC_KEY: "x".repeat(32), APPROVAL_SIGNING_KEY: "sign" };
+  const id = await createApproval(DB, { dept: "sup", requestedBy: "sup.denial_sync", title: "Draft 2", options: [{ id: "draft", label: "Draft both" }] });
+  const forged = await worker.fetch(new Request(`https://b.example/api/approvals/${id}/decide?choice=draft&sig=abc`, { method: "POST" }), env);
+  assert.equal(forged.status, 401);
+  const sig = await signDecision("sign", id, "draft");
+  const good = await worker.fetch(new Request(`https://b.example/api/approvals/${id}/decide?choice=draft&sig=${sig}`, { method: "POST" }), env);
+  assert.equal(good.status, 200);
+  const again = await worker.fetch(new Request(`https://b.example/api/approvals/${id}/decide?choice=draft&sig=${sig}`, { method: "POST" }), env);
+  assert.equal(again.status, 409);
+});
+
+test("worker: cron runs the sentinel; day-close cron logs a marker", async () => {
+  const DB = makeD1();
+  const waits = [];
+  const ctx = { waitUntil: (p) => waits.push(p) };
+  await worker.scheduled({ cron: "*/15 * * * *" }, { DB }, ctx);
+  await worker.scheduled({ cron: "0 5 * * *" }, { DB }, ctx);
+  await Promise.all(waits);
+  const ev = await recentEvents(DB);
+  assert.ok(ev.some((e) => e.kind === "day.close"));
+  // First run: feeds exist and are "not wired" — recorded silently, no alarm spam.
+  const feeds = (await DB.prepare("SELECT * FROM feeds").all()).results;
+  assert.ok(feeds.length >= 10);
+  assert.ok(feeds.every((f) => f.state === "not_wired"));
+  assert.equal(ev.filter((e) => e.actor === "svc.freshness").length, 0);
+});
