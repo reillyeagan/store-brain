@@ -25,6 +25,9 @@ export function expectedFeeds() {
     feeds.push({ id: `ads.spend.${id}`, store: id, label: `${name} — Google Ads spend`, max_age_min: 90 });
   }
   feeds.push({ id: "kfb.morning_sweep", store: null, label: "KungFuBuy morning sweep", max_age_min: 26 * 60 });
+  // Marked OK only when 17TRACK itself answers (quota read hourly, tracking reads as due).
+  // Never marked at all without TRACKING_API_KEY, so it shows "not wired", not zero.
+  feeds.push({ id: "tracking.17track", store: null, label: "17TRACK parcel tracking", max_age_min: 8 * 60 });
   return feeds;
 }
 

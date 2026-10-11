@@ -107,6 +107,7 @@ h1{margin:2px 0 0;font-size:24px;font-weight:600;letter-spacing:-.01em}
         <button role="tab" aria-selected="true" data-tab="activity" id="tab-activity">Activity</button>
         <button role="tab" aria-selected="false" data-tab="approvals" id="tab-approvals">Approvals</button>
         <button role="tab" aria-selected="false" data-tab="supplier" id="tab-supplier">Supplier</button>
+        <button role="tab" aria-selected="false" data-tab="shipping" id="tab-shipping">Shipping</button>
         <button role="tab" aria-selected="false" data-tab="feeds" id="tab-feeds">Feeds</button>
         <button role="tab" aria-selected="false" data-tab="setup" id="tab-setup">Setup</button>
       </div>
@@ -196,6 +197,8 @@ h1{margin:2px 0 0;font-size:24px;font-weight:600;letter-spacing:-.01em}
       tile("Stores live",state.stores.filter(function(s){return s.live}).length+" / "+state.stores.length,"")+
       tile("Feeds fresh",fresh+" / "+feeds.length, bad?bad+" stale or failing":unwired?unwired+" not wired yet":"all fresh", bad?"bad":"")+
       tile("Waiting on you",state.approvals.length,"approvals","")+
+      (function(sh){ sh=sh||{flags:[]}; var q=sh.quota;
+        return tile("Parcels flagged",sh.flags.length, sh.quotaLow?"17TRACK quota low: "+q.remain+" left":!sh.wired?"17TRACK not wired":q&&q.remain!=null?q.remain+" registrations left":"", sh.quotaLow?"warn":""); })(state.shipping)+
       tile("Actions today",today,"events","")+
       tile("Agents live",live+" / "+state.agents.length,"rest built or planned","")+
       tile("AI cost today","$"+Number(state.aiCostToday||0).toFixed(2),"","");
@@ -293,6 +296,34 @@ h1{margin:2px 0 0;font-size:24px;font-weight:600;letter-spacing:-.01em}
         if(m&&navigator.clipboard) navigator.clipboard.writeText(m.body).then(function(){b.textContent="Copied"},function(){b.textContent="Copy failed"});
       }) });
       p.querySelectorAll("button[data-sent]").forEach(function(b){ b.addEventListener("click",function(){ markSent(b.dataset.sent,b) }) });
+    } else if(tab==="shipping"){
+      var sh=state.shipping||{wired:false,counts:{},labels:{},flags:[],registerErrors:[]};
+      var html2='';
+      if(!sh.wired) html2+='<div class="row alarm"><span>17TRACK is not wired: add TRACKING_API_KEY in Cloudflare (Setup bat 9). Tracking numbers are still collected from Shopify.</span></div>';
+      var q=sh.quota;
+      html2+='<div class="row'+(sh.quotaLow?" alarm":"")+'"><span>'+(q&&q.remain!=null?'<b>'+esc(q.remain)+'</b> tracking registrations left'+(q.total!=null?' of '+esc(q.total):''):'Quota not read yet')+'</span><span class="meta">'+
+        (sh.quotaLow?'<span style="color:var(--warn)">low: new parcels stop being tracked at 0</span>':'')+
+        '<span>last 17TRACK sync '+(sh.lastSync?esc(ago(sh.lastSync)):'never')+'</span><span>Shopify numbers read '+(sh.lastCollect?esc(ago(sh.lastCollect)):'never')+'</span></span></div>';
+      html2+='<div class="sub">Parcels · last 60 days</div>';
+      var order=["not_registered","not_checked","awaiting_pickup","in_transit","out_for_delivery","pickup_ready","failed_attempt","exception","expired","unknown","delivered"];
+      var keys=Object.keys(sh.counts||{}).sort(function(a,b){return order.indexOf(a)-order.indexOf(b)});
+      html2+=keys.length?'<div class="row">'+keys.map(function(k){
+        var warn=k==="failed_attempt"||k==="pickup_ready"||k==="exception";
+        return '<span style="display:flex;justify-content:space-between"><span'+(warn?' style="color:var(--warn)"':'')+'>'+esc((sh.labels&&sh.labels[k])||k)+'</span><b style="font-variant-numeric:tabular-nums">'+esc(sh.counts[k])+'</b></span>';
+      }).join("")+'</div>':'<div class="empty">No parcels yet. Tracking numbers appear after KFB ships an order.</div>';
+      html2+='<div class="sub">Needs attention</div>';
+      html2+=sh.flags.length?sh.flags.map(function(f){
+        var hot=f.kind==="day20"||f.kind==="failed_delivery"||f.kind==="pickup_ready";
+        return '<div class="row'+(hot?" alarm":"")+'"><b>'+esc(f.store_name)+' '+esc(f.order_name)+' · '+esc(f.label)+'</b><span style="color:var(--muted);font-size:12.5px">'+esc(f.detail)+'</span><span class="meta">'+
+          (f.tracking_number?'<span>'+esc(f.tracking_number)+'</span>':'')+(f.last_event_text?'<span>'+esc(String(f.last_event_text).slice(0,80))+'</span>':'')+
+          (f.approval_id?'<span>approval '+esc(f.approval_id)+(f.approval_status?' · '+esc(f.approval_status):'')+'</span>':'')+'<span>flagged '+esc(ago(f.raised_at))+'</span></span></div>';
+      }).join(""):'<div class="empty">Nothing stuck, failed or late.</div>';
+      if(sh.registerErrors&&sh.registerErrors.length){
+        html2+='<div class="sub">17TRACK couldn\'t take these numbers</div>'+sh.registerErrors.map(function(r){
+          return '<div class="row"><span>'+esc(r.store_name)+' '+esc(r.order_name)+' · '+esc(r.tracking_number)+'</span><span class="meta"><span>'+esc(r.register_error)+'</span></span></div>';
+        }).join("");
+      }
+      p.innerHTML=html2;
     } else if(tab==="setup"){
       p.innerHTML='<div class="row"><b>1 · Check the store connections</b><span style="color:var(--muted);font-size:12.5px">Logs in to each store with its own app, confirms it is the right shop, and lists the access Shopify granted. Read-only.</span><div class="btns"><button class="btn primary" id="btnCheck">Check stores</button></div><div id="outCheck"></div></div>'+
         '<div class="row"><b>2 · Connect order + refund notifications</b><span style="color:var(--muted);font-size:12.5px">Tells each store to notify the brain the moment an order or refund happens. Checked against Shopify afterwards.</span><div class="btns"><button class="btn primary" id="btnHooks">Connect notifications</button></div><div id="outHooks"></div></div>'+
