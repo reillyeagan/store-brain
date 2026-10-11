@@ -104,7 +104,12 @@ The old tracker estimated. The new one reads Shopify Payments directly with each
 6. **Ads** — spend pacing per store.
 7. **Today** — calendar items (tax, invoices, deadlines).
 
-## Open questions
-- **FX source:** which card pays KFB, and how can the brain see its charges? Options: (a) the card's per-transaction email alerts (Gmail agent reads them), (b) a monthly statement CSV export, (c) a bank-connection service. (a) is free and exact if the card sends alerts.
-- **Other balances (PayPal, bank, Amex):** there is no simple official API for personal bank/card balances. Options: transaction-alert emails, statement CSV imports, a paid bank-connection service, or a 10-second weekly "type your balances" box.
-- **Morning brief time.**
+## Settled 2026-10-10 (later)
+- **FX source:** Reilly pays KFB with his **Wells Fargo card** (billed in EUR). He will turn on WF purchase alerts by email; the brain reads each alert from Gmail and matches the USD actually charged to the KFB payment. That gives the exact rate per payment. Any separate WF foreign-transaction fee line is captured too, as a real cost.
+- **PayPal / bank balances:** Reilly enters them himself (balance box on Mission Control). Money Map shows each balance with the date it was entered, so stale ones are obvious.
+- **Subscription log:** Reilly will write a full subscription log (what, amount, billing day). It lives in the Core, and Money Map uses it to expect charges and flag surprises.
+- **Morning brief:** 8:00 AM Eastern.
+
+## Real-time orders (lesson from the Eagano dash, 2026-10-10)
+On the current Eagano dash, H&C updates within about a minute but Auberlane and Marlowe lag 5–10 min. Cause, found in the worker code: the page's own pull calls `/shopify/pull` **without a store parameter**, which defaults to H&C, so only H&C is refreshed on page open or refresh; the other stores wait for the 15-minute cron.
+**Store Brain design:** each store's app subscribes to Shopify **webhooks** (`orders/create`, `orders/updated`, `refunds/create`). An order lands in the ledger and on the P&L dashboard within seconds, for every store. The hourly/close pulls remain as the reconciliation backstop.
