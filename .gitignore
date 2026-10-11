@@ -5,3 +5,4 @@ node_modules/
 .DS_Store
 d1-create-output.txt
 deploy-output.txt
+r2-check-output.txt

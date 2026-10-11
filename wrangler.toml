@@ -17,7 +17,7 @@ crons = ["*/15 * * * *", "0 5 * * *"]
 [[d1_databases]]
 binding = "DB"
 database_name = "store-brain-ledger"
-database_id = "REPLACE_WITH_ID_FROM_wrangler_d1_create"
+database_id = "f12ed783-ba0b-445b-93c6-44cbbe268184"
 migrations_dir = "migrations"
 
 # Backup Vault. Create once with: wrangler r2 bucket create store-brain-backups
