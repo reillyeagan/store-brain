@@ -14,14 +14,24 @@ For each of **Holt & Crane, Auberlane, Marlowe Standard**:
 
 1. Go to **dev.shopify.com** (Shopify Dev Dashboard), in the **same organization as the store**. Client credentials only work when the app and the store are in the same org.
 2. **Apps → Create app.** Name it `Store Brain — Holt & Crane` (or the store's name).
-3. Set the scopes to exactly these five (Phase 1 is read-only):
+3. Set the scopes. All read-only; the brain can look but not change anything. Write access is added later, one department at a time, each with your OK:
    ```
    read_orders
+   read_all_orders
    read_products
+   read_inventory
    read_reports
    read_shopify_payments_payouts
    read_shopify_payments_accounts
+   read_shopify_payments_disputes
+   read_customers
+   read_fulfillments
+   read_merchant_managed_fulfillment_orders
+   read_returns
+   read_discounts
+   read_themes
    ```
+   If Shopify refuses `read_all_orders` (it sometimes needs a request), leave it out. Everything else still works; history then goes back 60 days.
 4. **Release a version**, then **install** it on that store.
 5. Open **Client credentials**. Leave this tab open for step 3 below. **Don't paste these anywhere except Cloudflare.**
 

@@ -77,13 +77,23 @@ export function storeByDomain(domain) {
 }
 
 /**
- * Shopify scopes requested in Phase 1: read-only. Write scopes are added per
- * department as each one goes live, never earlier.
+ * Shopify scopes granted to each store's app. All READ-ONLY: write scopes are added
+ * per department as each one goes live, never earlier. Read scopes are granted up
+ * front so later departments don't need another app version just to look.
  */
-export const SHOPIFY_SCOPES_PHASE1 = Object.freeze([
-  "read_orders",
-  "read_products",
-  "read_reports",
-  "read_shopify_payments_payouts",
-  "read_shopify_payments_accounts",
+export const SHOPIFY_SCOPES_READ = Object.freeze([
+  "read_orders",                              // orders, refunds (P&L, CS)
+  "read_all_orders",                          // history beyond 60 days (if Shopify allows it for this app)
+  "read_products",                            // catalog, prices, compare-at
+  "read_inventory",                           // tracked/continue settings
+  "read_reports",                             // ShopifyQL sessions/sales
+  "read_shopify_payments_payouts",            // exact payouts + balance transactions
+  "read_shopify_payments_accounts",           // balance
+  "read_shopify_payments_disputes",           // chargebacks (Risk)
+  "read_customers",                           // order history for CS replies
+  "read_fulfillments",                        // tracking (Fulfillment)
+  "read_merchant_managed_fulfillment_orders", // fulfillment status
+  "read_returns",                             // returns/exchanges
+  "read_discounts",                           // volume ladder (Margin Guard)
+  "read_themes",                              // what the storefront claims (Claims Auditor)
 ]);
