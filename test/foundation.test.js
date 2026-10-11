@@ -495,3 +495,43 @@ test("review: markExecuted only counts once", async () => {
   assert.equal((await markExecuted(db, id, { ok: true })).ok, true);
   assert.equal((await markExecuted(db, id, { ok: true })).ok, false);
 });
+
+/* ---------------- reconciliation ---------------- */
+import { reconcileOrders, orderFromNode } from "../src/lib/reconcile.js";
+
+function reconEnv(nodesByHost) {
+  _resetTokenCacheForTests();
+  const fetchImpl = async (url) => {
+    if (url.endsWith("/admin/oauth/access_token")) return { ok: true, status: 200, json: async () => ({ access_token: "t", expires_in: 86399 }) };
+    const host = new URL(url).host;
+    if (nodesByHost[host] === "fail") return { ok: false, status: 500, json: async () => ({}) };
+    return { ok: true, status: 200, json: async () => ({ data: { orders: { nodes: nodesByHost[host] || [] } } }) };
+  };
+  return { fetchImpl };
+}
+const node = (n, total) => ({ id: `gid://shopify/Order/${n}`, name: `#${n}`, createdAt: "2026-10-11T14:00:00Z", updatedAt: "2026-10-11T14:05:00Z",
+  currencyCode: "USD", displayFinancialStatus: "PAID", currentTotalPriceSet: { shopMoney: { amount: total } } });
+
+test("reconcile: first pull imports quietly; later misses are flagged; feed goes fresh", async () => {
+  const DB = makeD1();
+  const env = { DB, SB_HC_CLIENT_ID: "a", SB_HC_CLIENT_SECRET: "b", SB_AUB_CLIENT_ID: "c", SB_AUB_CLIENT_SECRET: "d", SB_MAR_CLIENT_ID: "e", SB_MAR_CLIENT_SECRET: "f" };
+  const first = reconEnv({ "jmzjx1-it.myshopify.com": [node(1, "50.00"), node(2, "60.00")] });
+  await reconcileOrders(env, first);
+  let ev = await recentEvents(DB);
+  assert.equal(ev.filter((e) => e.kind === "order.backfilled").length, 0);
+  assert.equal(ev.filter((e) => e.kind === "orders.imported").length, 1);
+  const second = reconEnv({ "jmzjx1-it.myshopify.com": [node(3, "70.00"), node(2, "60.00")], "806080-g8.myshopify.com": "fail" });
+  const r = await reconcileOrders(env, second);
+  ev = await recentEvents(DB);
+  assert.equal(ev.filter((e) => e.kind === "order.backfilled").length, 1);
+  const feeds = await evaluateFeeds(DB);
+  assert.equal(feeds.find((f) => f.id === "shopify.orders.hc").current, "fresh");
+  assert.equal(feeds.find((f) => f.id === "shopify.orders.mar").current, "failing");
+  assert.equal(r.find((x) => x.store === "mar").ok, false);
+});
+
+test("reconcile: GraphQL order maps to the webhook shape", () => {
+  const o = orderFromNode(node(9, "12.34"));
+  assert.equal(o.total, 12.34);
+  assert.equal(o.financial_status, "paid");
+});

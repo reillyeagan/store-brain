@@ -54,6 +54,29 @@ export function parseRefund(r) {
 }
 
 /**
+ * Insert or update one order. Shared by webhooks and the reconciliation pull.
+ * Webhooks can arrive out of order: an older payload never overwrites a newer one.
+ * @returns {Promise<boolean>} true if this order was not in the ledger before
+ */
+export async function upsertOrder(db, store, o, raw, tz, at) {
+  const existed = await db.prepare(`SELECT 1 AS x FROM orders WHERE store = ? AND order_id = ?`).bind(store.id, o.order_id).first();
+  await db.prepare(
+      `INSERT INTO orders (store, order_id, name, created_at, local_day, currency, subtotal, discounts, total, financial_status, raw, payload_updated_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(store, order_id) DO UPDATE SET
+         name = excluded.name, currency = excluded.currency, subtotal = excluded.subtotal,
+         discounts = excluded.discounts, total = excluded.total,
+         financial_status = excluded.financial_status, raw = excluded.raw,
+         payload_updated_at = excluded.payload_updated_at, updated_at = excluded.updated_at
+       WHERE orders.payload_updated_at IS NULL OR excluded.payload_updated_at >= orders.payload_updated_at`
+    )
+    .bind(store.id, o.order_id, o.name, o.created_at, localDay(o.created_at, tz), o.currency,
+      o.subtotal, o.discounts, o.total, o.financial_status, raw, o.payload_updated_at, at)
+    .run();
+  return !existed;
+}
+
+/**
  * @returns {Promise<Response>}
  */
 export async function handleShopifyWebhook(request, env) {
@@ -101,20 +124,7 @@ export async function handleShopifyWebhook(request, env) {
     if (!o.created_at || Number.isNaN(Date.parse(o.created_at))) {
       return new Response("bad payload: no created_at", { status: 400 });
     }
-    // Webhooks can arrive out of order: an older payload never overwrites a newer one.
-    await env.DB.prepare(
-      `INSERT INTO orders (store, order_id, name, created_at, local_day, currency, subtotal, discounts, total, financial_status, raw, payload_updated_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(store, order_id) DO UPDATE SET
-         name = excluded.name, currency = excluded.currency, subtotal = excluded.subtotal,
-         discounts = excluded.discounts, total = excluded.total,
-         financial_status = excluded.financial_status, raw = excluded.raw,
-         payload_updated_at = excluded.payload_updated_at, updated_at = excluded.updated_at
-       WHERE orders.payload_updated_at IS NULL OR excluded.payload_updated_at >= orders.payload_updated_at`
-    )
-      .bind(store.id, o.order_id, o.name, o.created_at, localDay(o.created_at, tz), o.currency,
-        o.subtotal, o.discounts, o.total, o.financial_status, raw, o.payload_updated_at, at)
-      .run();
+    await upsertOrder(env.DB, store, o, raw, tz, at);
     await markFeedOk(env.DB, `shopify.orders.${store.id}`, at);
     await logEvent(env.DB, {
       actor: "pnl.pullers", kind: topic === "orders/create" ? "order.created" : "order.updated",

@@ -28,6 +28,7 @@ import { listPending, decide, verifyDecisionSig, getApproval } from "./lib/appro
 import { handleShopifyWebhook } from "./lib/shopifyWebhooks.js";
 import { localDay } from "./lib/time.js";
 import { checkStores, registerWebhooks } from "./lib/setup.js";
+import { reconcileOrders } from "./lib/reconcile.js";
 
 export const VERSION = "0.1.0-foundation";
 
@@ -163,6 +164,8 @@ export default {
           });
           return;
         }
+        await ensureFeeds(env.DB);
+        await reconcileOrders(env); // backstop behind webhooks; keeps the orders feed honest
         await runSentinel(env.DB);
       })()
     );
