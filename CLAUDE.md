@@ -2,6 +2,8 @@
 
 This repo is the **Store Brain**: the 24/7 operations system for Reilly's Shopify stores. It is **separate from Eagano** (Reilly's personal AI brain in his Obsidian vault). Eagano's vault holds the history and the planning notes; this repo holds the system itself.
 
+**Eagano is the ultimate data hub for everything (Reilly, 2026-10-11).** The Store Brain is the source of truth for running the stores, but every new fact, decision and brief it produces must also reach the vault, and store changes Reilly makes through Eagano must reach the Core. See `docs/specs/core.md`.
+
 ## Stores
 | id | Store | Live | KFB shop code |
 |---|---|---|---|
