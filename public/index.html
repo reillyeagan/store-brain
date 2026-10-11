@@ -44,6 +44,11 @@ h1{margin:2px 0 0;font-size:24px;font-weight:600;letter-spacing:-.01em}
 .row{border:1px solid var(--soft);border-radius:8px;padding:9px 10px;display:grid;gap:3px;background:var(--panel2)}
 .row .meta{font-family:var(--mono);font-size:10.5px;color:var(--faint);display:flex;gap:8px;flex-wrap:wrap}
 .row.alarm{border-color:#4a2c2c}
+.kv{display:flex;justify-content:space-between;gap:10px;font-size:12.5px}
+.kv span:first-child{color:var(--muted)}
+.kv b{font-weight:500;font-variant-numeric:tabular-nums}
+.pend{color:var(--warn)}
+.bad-t{color:var(--bad)}
 .msg{white-space:pre-wrap;font-size:12.5px;background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:8px;margin:2px 0}
 .sub{font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin-top:4px}
 .btns{display:flex;gap:6px;flex-wrap:wrap;margin-top:4px}
@@ -107,6 +112,7 @@ h1{margin:2px 0 0;font-size:24px;font-weight:600;letter-spacing:-.01em}
         <button role="tab" aria-selected="true" data-tab="activity" id="tab-activity">Activity</button>
         <button role="tab" aria-selected="false" data-tab="approvals" id="tab-approvals">Approvals</button>
         <button role="tab" aria-selected="false" data-tab="supplier" id="tab-supplier">Supplier</button>
+        <button role="tab" aria-selected="false" data-tab="money" id="tab-money">Money</button>
         <button role="tab" aria-selected="false" data-tab="feeds" id="tab-feeds">Feeds</button>
         <button role="tab" aria-selected="false" data-tab="setup" id="tab-setup">Setup</button>
       </div>
@@ -293,6 +299,8 @@ h1{margin:2px 0 0;font-size:24px;font-weight:600;letter-spacing:-.01em}
         if(m&&navigator.clipboard) navigator.clipboard.writeText(m.body).then(function(){b.textContent="Copied"},function(){b.textContent="Copy failed"});
       }) });
       p.querySelectorAll("button[data-sent]").forEach(function(b){ b.addEventListener("click",function(){ markSent(b.dataset.sent,b) }) });
+    } else if(tab==="money"){
+      p.innerHTML=renderMoney(state.money||{stores:[]});
     } else if(tab==="setup"){
       p.innerHTML='<div class="row"><b>1 · Check the store connections</b><span style="color:var(--muted);font-size:12.5px">Logs in to each store with its own app, confirms it is the right shop, and lists the access Shopify granted. Read-only.</span><div class="btns"><button class="btn primary" id="btnCheck">Check stores</button></div><div id="outCheck"></div></div>'+
         '<div class="row"><b>2 · Connect order + refund notifications</b><span style="color:var(--muted);font-size:12.5px">Tells each store to notify the brain the moment an order or refund happens. Checked against Shopify afterwards.</span><div class="btns"><button class="btn primary" id="btnHooks">Connect notifications</button></div><div id="outHooks"></div></div>'+
@@ -336,6 +344,52 @@ h1{margin:2px 0 0;font-size:24px;font-weight:600;letter-spacing:-.01em}
       }).join("");
     }
   }
+  /* ---------------- money ---------------- */
+  var FEED_LBL={fresh:"Fresh",stale:"Stale",failing:"Failing",not_wired:"Not wired yet"};
+  function amt(n,cur){ return n==null?"—":Number(n).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})+(cur?" "+cur:""); }
+  function feedLine(name,f){
+    f=f||{state:"not_wired"};
+    return '<span class="meta"><span><span class="dot '+esc(f.state)+'"></span>'+esc(name)+': '+esc(FEED_LBL[f.state]||f.state)+'</span>'+(f.last_ok_at?'<span>last delivered '+esc(ago(f.last_ok_at))+'</span>':"")+(f.last_error&&f.state!=="fresh"?'<span class="bad-t">'+esc(f.last_error)+'</span>':"")+'</span>';
+  }
+  function kv(k,v,cls){ return '<div class="kv"><span>'+esc(k)+'</span><b'+(cls?' class="'+cls+'"':"")+'>'+v+'</b></div>'; }
+  function renderMoney(m){
+    if(!m.stores.length) return '<div class="empty">No live stores.</div>';
+    return m.stores.map(function(s){
+      var h='<div class="sub">'+esc(s.name)+'</div>';
+      // Ads spend
+      var a=s.ads, ah='<div class="row'+(s.adsFeed.state==="stale"||s.adsFeed.state==="failing"?" alarm":"")+'"><b>Google Ads spend</b>';
+      if(!a){ ah+='<span style="color:var(--muted);font-size:12.5px">No spend data yet (shown as absent, never as zero).</span>'; }
+      else{
+        ah+=kv("Yesterday"+(a.yesterday?" · "+a.yesterday.day:""),a.yesterday?esc(amt(a.yesterday.cost,a.currency))+' <span class="meta">· '+esc(a.yesterday.clicks)+' clicks · conv. '+esc(amt(a.yesterday.conv_value))+'</span>':"—")+
+            kv("Last 7 days"+(a.last7?" · "+a.last7.from.slice(5)+" to "+a.last7.to.slice(5):""),a.last7?esc(amt(a.last7.cost,a.currency))+' <span class="meta">· '+esc(a.last7.clicks)+' clicks · conv. '+esc(amt(a.last7.conv_value))+'</span>':"—")+
+            kv("Today so far (partial)",a.today?esc(amt(a.today.cost,a.currency)):"—")+
+            '<span class="meta"><span>account time '+esc(a.account_tz||"?")+'</span></span>';
+      }
+      ah+=feedLine("Ads feed",s.adsFeed)+'</div>';
+      // Shopify balance + payouts
+      var ph='<div class="row'+(s.payoutsFeed.state==="stale"||s.payoutsFeed.state==="failing"?" alarm":"")+'"><b>Shopify Payments</b>';
+      ph+=kv("Balance",s.balance?esc(amt(s.balance.amount,s.balance.currency))+' <span class="meta">· as of '+esc(ago(s.balance.as_of))+'</span>':"—");
+      ph+=s.payouts.length?s.payouts.map(function(p){
+        var chk=p.check_result==="mismatch"?'<span class="bad-t">doesn\'t add up</span>':p.check_result==="match"?'adds up':p.check_result==="unverified"?'not checked yet':'';
+        var st=p.status==="PAID"?"paid":p.status==="SCHEDULED"?'<span class="pend">scheduled</span>':'<span class="bad-t">'+esc(String(p.status||"").toLowerCase())+'</span>';
+        return kv(String(p.issued_at||"").slice(0,10),esc(amt(p.net,p.currency))+' <span class="meta">· '+st+(chk?' · '+chk:"")+'</span>');
+      }).join(""):'<span style="color:var(--muted);font-size:12.5px">No payouts recorded yet.</span>';
+      ph+=feedLine("Payouts feed",s.payoutsFeed)+'</div>';
+      // Refunds by processed day
+      var r=s.refunds, rh='<div class="row"><b>Refunds by processed day</b>';
+      rh+=r.byDay.length?r.byDay.map(function(d){
+        return kv(d.day,esc(d.n)+' · '+esc(amt(d.amount))+(d.pending_n?' <span class="pend">('+esc(d.pending_n)+' pending, '+esc(amt(d.pending_amount))+')</span>':""));
+      }).join(""):'<span style="color:var(--muted);font-size:12.5px">No refunds processed '+esc(r.from)+' to '+esc(r.to)+'.</span>';
+      if(r.pending.length){
+        rh+='<span class="pend" style="font-size:12.5px;margin-top:4px">PENDING — money not yet back with the customer:</span>'+r.pending.map(function(p){
+          return kv(p.local_day||"?",'<span class="pend">'+esc(amt(p.amount))+' · '+esc(p.status)+'</span>');
+        }).join("");
+      }
+      rh+='</div>';
+      return h+ah+ph+rh;
+    }).join("")+((m.jobs||[]).length?'<div class="sub">Last runs</div><div class="row">'+m.jobs.map(function(j){ return kv(j.job,esc(ago(j.last_run_at))+(j.last_result&&j.last_result!=="ok"?' <span class="bad-t">'+esc(j.last_result)+'</span>':"")); }).join("")+'</div>':"");
+  }
+
   var setupBusy=false;
   async function runSetup(path,btn,out,line){
     setupBusy=true; btn.disabled=true; out.innerHTML='<span class="meta">Working…</span>';

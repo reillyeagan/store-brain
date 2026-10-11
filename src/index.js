@@ -18,7 +18,8 @@
  *   GET  /                               Mission Control page (static, no data until a key is given)
  *
  * Crons
- *   every 15 min  reconciliation pull → KFB composer (acts once per day after 18:45 ET) → Freshness Sentinel
+ *   every 15 min  reconciliation pull → money feeds (Ads spend hourly, payouts every 6 h, refunds
+ *                 hourly; throttled in job_runs) → KFB composer (once per day after 18:45 ET) → Freshness Sentinel
  *   daily 05:00Z  day-close marker (P&L close logic arrives in Phase 2)
  *
  * Secrets (Reilly adds these in Cloudflare; never in this repo):
@@ -29,7 +30,10 @@
  *   ANTHROPIC_API_KEY      Claude API (thinking agents)
  *   GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET   Google OAuth client (Gmail, Ads, Merchant Center, Sheets)
  *
+ *   GOOGLE_ADS_DEVELOPER_TOKEN  optional; Google retired developer tokens on 2026-09-09, so leave it unset
+ *
  * Variables (not secret):
+ *   GOOGLE_ADS_API_VERSION Google Ads API version, e.g. "v25" (wrangler.toml)
  *   SUPPLIER_MESSAGES_LIVE "1" = KFB messages go to the phone; anything else = shadow (Reilly flips it)
  *   PUBLIC_BASE_URL        this worker's https address, for links in phone notifications sent by crons
  *   SB_<STORE>_CLIENT_ID / SB_<STORE>_CLIENT_SECRET   per-store Shopify app credentials
@@ -45,6 +49,8 @@ import { handleShopifyWebhook } from "./lib/shopifyWebhooks.js";
 import { localDay } from "./lib/time.js";
 import { checkStores, registerWebhooks } from "./lib/setup.js";
 import { reconcileOrders } from "./lib/reconcile.js";
+import { runMoneyJobs } from "./lib/moneyJobs.js";
+import { moneyState } from "./lib/moneyState.js";
 import { startGoogleConnect, handleGoogleCallback, googleStatus, mailboxStatus, secretPresence } from "./lib/google.js";
 import {
   runKfbComposer, handleKfbPage, handleKfbSent, listKfbMessages, expressOrdersToday, supplierMode,
@@ -84,14 +90,16 @@ async function handleState(env) {
   await ensureFeeds(env.DB);
   const tz = env.TIMEZONE || "America/New_York";
   const todayStart = startOfLocalDayIso(tz);
-  const [events, feeds, approvals, aiCostToday, kfbMessages, expressToday] = await Promise.all([
+  const [events, feeds, approvals, aiCostToday, kfbMessages, expressToday, jobs] = await Promise.all([
     recentEvents(env.DB, { limit: 300 }),
     evaluateFeeds(env.DB),
     listPending(env.DB),
     costSince(env.DB, todayStart),
     listKfbMessages(env.DB, 10),
     expressOrdersToday(env.DB),
+    env.DB.prepare(`SELECT job, last_run_at, last_result FROM job_runs WHERE job IN ('ads.spend','payouts','refunds')`).all(),
   ]);
+  const money = await moneyState(env.DB, feeds);
   return json({
     version: VERSION,
     now: new Date().toISOString(),
@@ -108,6 +116,7 @@ async function handleState(env) {
     aiCostToday,
     todayStart,
     supplier: { mode: supplierMode(env), kfbMessages, expressToday },
+    money: { ...money, jobs: (jobs && jobs.results) || [] },
   });
 }
 
@@ -222,7 +231,25 @@ export default {
           return;
         }
         await ensureFeeds(env.DB);
-        await reconcileOrders(env); // backstop behind webhooks; keeps the orders feed honest
+        // Each step in its own try: one fault must never stop the steps after it,
+        // above all the Freshness Sentinel, which is what notices that something broke.
+        try {
+          await reconcileOrders(env); // backstop behind webhooks; keeps the orders feed honest
+        } catch (err) {
+          await logEvent(env.DB, {
+            actor: "pnl.pullers", kind: "error.order_pull", target: "sys.shopify",
+            summary: `Order check failed; it will try again in 15 minutes (${String(err && err.message).slice(0, 200)})`,
+          }).catch(() => {});
+        }
+        // Money feeds: throttled (hourly / 6-hourly) and isolated from each other inside.
+        try {
+          await runMoneyJobs(env);
+        } catch (err) {
+          await logEvent(env.DB, {
+            actor: "pnl.pullers", kind: "error.money_jobs",
+            summary: `Money feeds failed to start; they will try again in 15 minutes (${String(err && err.message).slice(0, 200)})`,
+          }).catch(() => {});
+        }
         // After the pull, so the newest orders are in. Its own try: a composer fault must
         // never stop the Freshness Sentinel.
         try {

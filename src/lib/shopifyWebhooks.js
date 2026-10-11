@@ -53,18 +53,55 @@ export function parseOrder(o) {
  */
 export function parseRefund(r) {
   const txs = Array.isArray(r.transactions) ? r.transactions : [];
-  const refundTxs = txs.filter((t) => (t.kind || "").toLowerCase() === "refund");
+  return summarizeRefund({
+    refundId: r.admin_graphql_api_id || `gid://shopify/Refund/${r.id}`,
+    orderId: r.order_id ? `gid://shopify/Order/${r.order_id}` : null,
+    refundProcessedAt: r.processed_at || r.created_at || null,
+    transactions: txs.map((t) => ({
+      kind: t.kind, status: t.status, amount: t.amount, processedAt: t.processed_at || t.created_at || null,
+    })),
+  });
+}
+
+/**
+ * One rule for refunds, shared by webhooks (parseRefund) and the hourly pull (refunds.js):
+ *  - amount = refund transactions that moved or are moving money (SUCCESS + PENDING);
+ *  - status = the refund transactions' own status (PENDING refunds look "Paid" at order level);
+ *  - processed_at = when the money moved: the earliest PROCESSED time of those transactions
+ *    (rule 7: book refunds by the refund transaction's processed date). Only if the
+ *    transactions carry no time do we fall back to the refund's own processedAt.
+ * Times are stored as UTC so webhook and pull agree on the local day.
+ */
+export function summarizeRefund({ refundId, orderId, refundProcessedAt, transactions }) {
+  const refundTxs = (transactions || []).filter((t) => (t.kind || "").toLowerCase() === "refund");
   const counted = refundTxs.filter((t) => ["success", "pending"].includes(String(t.status || "").toLowerCase()));
   const amount = counted.reduce((s, t) => s + (num(t.amount) || 0), 0);
   const statuses = [...new Set(refundTxs.map((t) => String(t.status || "").toUpperCase()).filter(Boolean))];
+  const times = (counted.length ? counted : refundTxs).map((t) => utcIso(t.processedAt)).filter(Boolean).sort();
   return {
-    refund_id: r.admin_graphql_api_id || `gid://shopify/Refund/${r.id}`,
-    order_id: r.order_id ? `gid://shopify/Order/${r.order_id}` : null,
-    processed_at: r.processed_at || r.created_at || null,
+    refund_id: refundId,
+    order_id: orderId,
+    processed_at: times[0] || utcIso(refundProcessedAt) || null,
     amount: Math.round(amount * 100) / 100,
-    // PENDING refunds report as "Paid" at order level; we keep their own status.
     status: statuses.length === 1 ? statuses[0] : statuses.length ? statuses.join("|") : "UNKNOWN",
   };
+}
+
+/** Insert or update one refund event (shared by webhooks and the hourly pull). Returns the row before. */
+export async function upsertRefund(db, storeId, r, raw, tz, at) {
+  const before = await db.prepare(`SELECT amount, status, local_day FROM refunds WHERE store = ? AND refund_id = ?`).bind(storeId, r.refund_id).first();
+  await db.prepare(
+    `INSERT INTO refunds (store, refund_id, order_id, processed_at, local_day, amount, status, raw, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(store, refund_id) DO UPDATE SET
+       order_id = COALESCE(excluded.order_id, refunds.order_id),
+       processed_at = excluded.processed_at, local_day = excluded.local_day, amount = excluded.amount,
+       status = excluded.status, raw = excluded.raw, updated_at = excluded.updated_at`
+  )
+    .bind(storeId, r.refund_id, r.order_id, r.processed_at,
+      r.processed_at ? localDay(r.processed_at, tz) : null, r.amount, r.status, raw, at)
+    .run();
+  return before || null;
 }
 
 /**
@@ -196,16 +233,7 @@ export async function handleShopifyWebhook(request, env) {
 
   if (topic === "refunds/create") {
     const r = parseRefund(body);
-    await env.DB.prepare(
-      `INSERT INTO refunds (store, refund_id, order_id, processed_at, local_day, amount, status, raw, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(store, refund_id) DO UPDATE SET
-         processed_at = excluded.processed_at, local_day = excluded.local_day, amount = excluded.amount,
-         status = excluded.status, raw = excluded.raw, updated_at = excluded.updated_at`
-    )
-      .bind(store.id, r.refund_id, r.order_id, r.processed_at,
-        r.processed_at ? localDay(r.processed_at, tz) : null, r.amount, r.status, raw, at)
-      .run();
+    await upsertRefund(env.DB, store.id, r, raw, tz, at);
     await logEvent(env.DB, {
       actor: "pnl.refunds", kind: "refund.created", store: store.id, target: "sys.shopify",
       summary: `${store.name} refund $${r.amount.toFixed(2)} (${r.status})`,
