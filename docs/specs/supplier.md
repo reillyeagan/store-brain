@@ -107,6 +107,8 @@ Every price change and every draft is ONE approval per batch, showing old → ne
    - **Answered 2026-10-11 (Reilly):** orders auto-forward via KFB's app (see Q1). "i try to pay KFB bills every morning if i can, most of the time i do"
    - Means: the morning sweep reports unpaid bills (count, total, oldest) so a skipped day is visible. Paying stays Reilly's.
 4. **"Similar ones":** your rule: when is similar OK, and when must the listing change or be drafted?
+   - **Answered 2026-10-11 (Reilly):** "q4 always fine"
+   - Means: a "similar" quote is treated exactly like an exact match: priced by the rules, never drafted for being similar.
 5. **WhatsApp:** what do you usually message KFB about, and how fast do they reply?
 6. **Returns:** do returned items go to your Charlotte address or back to KFB? For exchanges, does KFB ship the new size from China?
 7. **New sourcing:** can you send KFB a link to a new factory/product and get it quoted? Is that how a category fix would work?
