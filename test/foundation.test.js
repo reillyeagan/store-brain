@@ -357,6 +357,34 @@ test("webhooks: the same order twice is one row (updates are upserts)", async ()
   assert.equal(rows[0].total, 100);
 });
 
+test("webhooks: tag-only updates are silent; money changes get one clear line", async () => {
+  const DB = makeD1();
+  const env = { DB, SB_HC_CLIENT_SECRET: "hc-secret" };
+  const send = (topic, body) => handleShopifyWebhook(webhookRequest(topic, "jmzjx1-it.myshopify.com", body, "hc-secret"), env);
+  await send("orders/create", ORDER);
+  await send("orders/updated", { ...ORDER, updated_at: "2026-10-11T03:00:00Z", tags: "kfb-sent" });
+  await send("orders/updated", { ...ORDER, updated_at: "2026-10-11T03:05:00Z", note: "fulfilled" });
+  let evs = (await recentEvents(DB)).filter((e) => e.kind.startsWith("order."));
+  assert.equal(evs.length, 1, "only the creation is logged");
+  assert.equal(evs[0].kind, "order.created");
+  await send("orders/updated", { ...ORDER, updated_at: "2026-10-11T04:00:00Z", financial_status: "refunded", current_total_price: "0.00" });
+  evs = (await recentEvents(DB)).filter((e) => e.kind === "order.updated");
+  assert.equal(evs.length, 1);
+  assert.match(evs[0].summary, /→ \$0\.00/);
+  assert.match(evs[0].summary, /→ refunded/);
+});
+
+test("phone: test notification posts a plain message to the topic", async () => {
+  const { sendTestNotification } = await import("../src/lib/approvals.js");
+  assert.deepEqual(await sendTestNotification({}), { sent: false, reason: "NTFY_TOPIC is not set in Cloudflare" });
+  let call;
+  const fetchImpl = async (url, init) => { call = { url, init }; return new Response("{}", { status: 200 }); };
+  const r = await sendTestNotification({ NTFY_TOPIC: "sb-topic", NTFY_SERVER: "https://ntfy.sh" }, { fetchImpl });
+  assert.equal(r.sent, true);
+  assert.equal(call.url, "https://ntfy.sh/sb-topic");
+  assert.equal(call.init.headers.Actions, undefined, "no action buttons on a test");
+});
+
 /* ---------------- worker routes ---------------- */
 
 test("worker: /health is public; /api/state needs the key", async () => {
@@ -528,6 +556,26 @@ test("reconcile: first pull imports quietly; later misses are flagged; feed goes
   assert.equal(feeds.find((f) => f.id === "shopify.orders.hc").current, "fresh");
   assert.equal(feeds.find((f) => f.id === "shopify.orders.mar").current, "failing");
   assert.equal(r.find((x) => x.store === "mar").ok, false);
+});
+
+test("reconcile: a money change found by the pull is logged (the late webhook will find nothing new)", async () => {
+  const DB = makeD1();
+  const env = { DB, SB_HC_CLIENT_ID: "a", SB_HC_CLIENT_SECRET: "b", SB_AUB_CLIENT_ID: "c", SB_AUB_CLIENT_SECRET: "d", SB_MAR_CLIENT_ID: "e", SB_MAR_CLIENT_SECRET: "f" };
+  await reconcileOrders(env, reconEnv({ "jmzjx1-it.myshopify.com": [node(5, "100.00")] }));
+  await reconcileOrders(env, reconEnv({ "jmzjx1-it.myshopify.com": [node(5, "100.00")] }));
+  assert.equal((await recentEvents(DB)).filter((e) => e.kind === "order.updated").length, 0, "no change, no line");
+  await reconcileOrders(env, reconEnv({ "jmzjx1-it.myshopify.com": [node(5, "0.00")] }));
+  const ups = (await recentEvents(DB)).filter((e) => e.kind === "order.updated");
+  assert.equal(ups.length, 1);
+  assert.match(ups[0].summary, /\$100\.00 → \$0\.00/);
+});
+
+test("phone: a network failure never leaks the topic", async () => {
+  const { sendTestNotification } = await import("../src/lib/approvals.js");
+  const fetchImpl = async (url) => { throw new Error(`Fetch API cannot load: ${url}`); };
+  const r = await sendTestNotification({ NTFY_TOPIC: "secret-topic-123", NTFY_SERVER: "ntfy.sh" }, { fetchImpl });
+  assert.equal(r.sent, false);
+  assert.ok(!JSON.stringify(r).includes("secret-topic-123"));
 });
 
 test("reconcile: GraphQL order maps to the webhook shape", () => {

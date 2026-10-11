@@ -8,6 +8,7 @@
  *   POST /webhooks/shopify               Shopify webhooks (HMAC-verified per store)
  *   POST /api/admin/check-stores         Store Guard check for every live store (key required)
  *   POST /api/admin/webhooks             connect order/refund notifications (key required)
+ *   POST /api/admin/test-notification    send a test message to Reilly's phone (key required)
  *   GET  /                               Mission Control page (static, no data until a key is given)
  *
  * Crons
@@ -24,7 +25,7 @@ import { STORES, LIVE_STORE_IDS } from "./config/stores.js";
 import { DEPARTMENTS, AGENTS, SERVICES, SYSTEMS } from "./config/agents.js";
 import { recentEvents, costSince, logEvent } from "./lib/eventlog.js";
 import { evaluateFeeds, runSentinel, ensureFeeds } from "./lib/freshness.js";
-import { listPending, decide, verifyDecisionSig, getApproval } from "./lib/approvals.js";
+import { listPending, decide, verifyDecisionSig, getApproval, sendTestNotification } from "./lib/approvals.js";
 import { handleShopifyWebhook } from "./lib/shopifyWebhooks.js";
 import { localDay } from "./lib/time.js";
 import { checkStores, registerWebhooks } from "./lib/setup.js";
@@ -133,6 +134,15 @@ export default {
       if (path === "/api/admin/webhooks" && request.method === "POST") {
         if (!hasKey(request, env)) return json({ ok: false, error: "unauthorized" }, 401);
         return json({ ok: true, results: await registerWebhooks(env, url.origin) });
+      }
+      if (path === "/api/admin/test-notification" && request.method === "POST") {
+        if (!hasKey(request, env)) return json({ ok: false, error: "unauthorized" }, 401);
+        const r = await sendTestNotification(env);
+        await logEvent(env.DB, {
+          actor: "core.approvals", kind: r.sent ? "phone.test_sent" : "phone.test_failed", target: "sys.phone",
+          summary: r.sent ? "Test notification sent to Reilly's phone" : `Test notification failed: ${r.reason}`,
+        });
+        return json({ ok: true, results: [r] });
       }
       const m = path.match(/^\/api\/approvals\/(\d+)\/decide$/);
       if (m && request.method === "POST") {

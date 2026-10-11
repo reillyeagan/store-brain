@@ -122,6 +122,33 @@ export async function verifyDecisionSig(secret, approval, choice, sig, expMs, no
 }
 
 /**
+ * POST to the private ntfy topic. Network errors are caught here and reported
+ * generically: their messages can contain the URL, and the URL contains the topic.
+ */
+async function postToTopic(env, init, fetchImpl) {
+  try {
+    const res = await fetchImpl(`${env.NTFY_SERVER || "https://ntfy.sh"}/${env.NTFY_TOPIC}`, { method: "POST", ...init });
+    return { ok: res.ok, status: res.status };
+  } catch {
+    return { ok: false, status: null };
+  }
+}
+
+/**
+ * Send a plain test message to Reilly's phone (Setup tab). No action buttons, no links.
+ * ntfy accepting it only proves the server took it; the real check is Reilly seeing it.
+ */
+export async function sendTestNotification(env, { fetchImpl = fetch } = {}) {
+  if (!env.NTFY_TOPIC) return { sent: false, reason: "NTFY_TOPIC is not set in Cloudflare" };
+  const res = await postToTopic(env, {
+    headers: { Title: "Store Brain: test notification", Tags: "bell" },
+    body: "If you can read this on your phone, approvals and alerts will reach you.",
+  }, fetchImpl);
+  if (res.ok) return { sent: true };
+  return { sent: false, reason: res.status ? `ntfy answered HTTP ${res.status}` : "couldn't reach the ntfy server (check NTFY_SERVER)" };
+}
+
+/**
  * Push an approval to Reilly's phone via ntfy, with Approve/Reject buttons.
  * Returns {sent:false} (not an error) when the phone isn't set up yet.
  */
@@ -138,10 +165,9 @@ export async function notifyPhone(env, approval, { baseUrl, fetchImpl = fetch } 
     `http, Reject, ${decideUrl("reject", rejectSig)}, method=POST, clear=true`,
     `view, Open, ${baseUrl}/#approval-${approval.id}`,
   ].join("; ");
-  const res = await fetchImpl(`${env.NTFY_SERVER || "https://ntfy.sh"}/${env.NTFY_TOPIC}`, {
-    method: "POST",
+  const res = await postToTopic(env, {
     headers: { Title: `Store Brain: ${approval.title}`.slice(0, 120), Tags: "white_check_mark", Actions: actions },
     body: approval.options.map((o) => `• ${o.label}${o.detail ? ` — ${o.detail}` : ""}`).join("\n"),
-  });
+  }, fetchImpl);
   return { sent: res.ok, status: res.status };
 }

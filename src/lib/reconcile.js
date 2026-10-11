@@ -10,7 +10,7 @@
  */
 import { LIVE_STORE_IDS, STORES } from "../config/stores.js";
 import { shopifyGraphQL } from "./storeGuard.js";
-import { upsertOrder } from "./shopifyWebhooks.js";
+import { upsertOrder, describeMoneyChange } from "./shopifyWebhooks.js";
 import { markFeedOk, markFeedFailed } from "./freshness.js";
 import { logEvent } from "./eventlog.js";
 import { nowIso } from "./time.js";
@@ -61,8 +61,17 @@ export async function reconcileOrders(env, opts = {}) {
       for (const node of data.orders.nodes) {
         const o = orderFromNode(node);
         if (!o.created_at) continue;
-        const isNew = await upsertOrder(env.DB, store, o, JSON.stringify(node), store.timezone || "America/New_York", at);
-        if (isNew) {
+        const res = await upsertOrder(env.DB, store, o, JSON.stringify(node), store.timezone || "America/New_York", at);
+        // Whoever writes a money change first logs it: if this pull beats the webhook,
+        // the webhook will find nothing new, so the line must come from here.
+        if (res.moneyChanged) {
+          await logEvent(env.DB, {
+            actor: "pnl.pullers", kind: "order.updated", store: id, target: "sys.shopify",
+            summary: `${store.name} ${o.name || "order"} changed: ${describeMoneyChange(res.before, res.after)} (found by the 15-minute check)`,
+            data: { orderId: o.order_id }, at,
+          });
+        }
+        if (res.isNew) {
           backfilled++;
           if (initial) continue;
           await logEvent(env.DB, {

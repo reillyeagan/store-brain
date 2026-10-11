@@ -56,10 +56,16 @@ export function parseRefund(r) {
 /**
  * Insert or update one order. Shared by webhooks and the reconciliation pull.
  * Webhooks can arrive out of order: an older payload never overwrites a newer one.
- * @returns {Promise<boolean>} true if this order was not in the ledger before
+ * @returns {Promise<{isNew: boolean, moneyChanged: boolean, before: object|null, after: object|null}>}
+ *   isNew: the order was not in the ledger before.
+ *   moneyChanged: an existing order's total or payment status actually changed in the ledger.
+ *   Shopify sends orders/updated for every tag, note or fulfilment step; only money changes
+ *   are worth a line in the Activity feed.
  */
 export async function upsertOrder(db, store, o, raw, tz, at) {
-  const existed = await db.prepare(`SELECT 1 AS x FROM orders WHERE store = ? AND order_id = ?`).bind(store.id, o.order_id).first();
+  const readMoney = () =>
+    db.prepare(`SELECT total, financial_status FROM orders WHERE store = ? AND order_id = ?`).bind(store.id, o.order_id).first();
+  const before = await readMoney();
   await db.prepare(
       `INSERT INTO orders (store, order_id, name, created_at, local_day, currency, subtotal, discounts, total, financial_status, raw, payload_updated_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -73,7 +79,23 @@ export async function upsertOrder(db, store, o, raw, tz, at) {
     .bind(store.id, o.order_id, o.name, o.created_at, localDay(o.created_at, tz), o.currency,
       o.subtotal, o.discounts, o.total, o.financial_status, raw, o.payload_updated_at, at)
     .run();
-  return !existed;
+  // Compare against what the ledger now holds, not the payload: an older payload is skipped.
+  const after = await readMoney();
+  const moneyChanged = !!before && !!after &&
+    (before.total !== after.total || (before.financial_status || null) !== (after.financial_status || null));
+  return { isNew: !before, moneyChanged, before: before || null, after: after || null };
+}
+
+const money = (v) => (v == null ? "amount unknown" : "$" + Number(v).toFixed(2));
+
+/** One readable line for a money change, e.g. "$100.00 → $0.00, paid → refunded". */
+export function describeMoneyChange(before, after) {
+  const parts = [];
+  if (before.total !== after.total) parts.push(`${money(before.total)} → ${money(after.total)}`);
+  if ((before.financial_status || null) !== (after.financial_status || null)) {
+    parts.push(`${before.financial_status || "unknown"} → ${after.financial_status || "unknown"}`);
+  }
+  return parts.join(", ");
 }
 
 /**
@@ -124,14 +146,22 @@ export async function handleShopifyWebhook(request, env) {
     if (!o.created_at || Number.isNaN(Date.parse(o.created_at))) {
       return new Response("bad payload: no created_at", { status: 400 });
     }
-    await upsertOrder(env.DB, store, o, raw, tz, at);
+    const res = await upsertOrder(env.DB, store, o, raw, tz, at);
     await markFeedOk(env.DB, `shopify.orders.${store.id}`, at);
-    await logEvent(env.DB, {
-      actor: "pnl.pullers", kind: topic === "orders/create" ? "order.created" : "order.updated",
-      store: store.id, target: "sys.shopify",
-      summary: `${store.name} ${o.name || "order"} — ${o.total == null ? "amount unknown" : "$" + o.total.toFixed(2)}${topic === "orders/updated" ? " (updated)" : ""}`,
-      data: { orderId: o.order_id, webhookId }, at,
-    });
+    const label = `${store.name} ${o.name || "order"}`;
+    if (res.isNew) {
+      // First time we see it, whichever topic arrived first.
+      await logEvent(env.DB, {
+        actor: "pnl.pullers", kind: "order.created", store: store.id, target: "sys.shopify",
+        summary: `${label} — ${money(o.total)}`, data: { orderId: o.order_id, webhookId }, at,
+      });
+    } else if (res.moneyChanged) {
+      await logEvent(env.DB, {
+        actor: "pnl.pullers", kind: "order.updated", store: store.id, target: "sys.shopify",
+        summary: `${label} changed: ${describeMoneyChange(res.before, res.after)}`, data: { orderId: o.order_id, webhookId }, at,
+      });
+    }
+    // Tag/note/fulfilment-only updates are stored silently.
     return new Response("ok");
   }
 
