@@ -11,6 +11,10 @@ echo.
 call npx --yes wrangler@4 deploy > deploy-output.txt 2>&1
 type deploy-output.txt
 echo.
+echo   Secret NAMES only (values are never shown):
+call npx --yes wrangler@4 secret list > secret-names.txt 2>&1
+type secret-names.txt
+echo.
 echo ==========================================================
 echo   DONE. Tell Claude "deployed".
 echo   The address it printed (ending in workers.dev) is your
