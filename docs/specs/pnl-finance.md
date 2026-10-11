@@ -1,4 +1,4 @@
-# Department spec — P&L & Finance (deep-dive draft v1, 2026-10-10)
+# Department spec — P&L & Finance (deep-dive draft v2, 2026-10-10)
 
 **Mission:** a true number every morning, per store and for the group, and a clear answer to "where did the money go?"
 **Why it's built first:** it's the most mature process today, and it's where past errors cost the most. Every one of those errors made profit look *better* than it was.
@@ -75,11 +75,36 @@ Shopify refunds ──────► Refund Reconciler ┘                    �
 ## Shadow gate (before it takes over the sheets)
 7 days running beside today's manual process. Must match to the cent, or every difference is explained and Reilly agrees. Then the Ledger Keeper goes live.
 
-## Decisions for Reilly
-1. **Stores with P&L rows:** H&C, Auberlane and Marlowe today. Colette & Claire and Tundrelle — start rows when they first take orders / spend?
-2. **Sheets:** keep the 4 workbooks as the record (and add C&C / TUND workbooks when live)?
-3. **The "correct" FX rate:** what currency does KFB bill in, and how do you pay it (card in USD, PayPal, Wise)? That decides where the true rate comes from.
-4. **Day close:** midnight Eastern, re-pulling the last 3 days each night — OK?
-5. **Morning brief time:** e.g. 7:30 AM?
-6. **Money Map balances:** which accounts (Shopify, PayPal, bank, Amex)? Options: a 10-second weekly "type your balances" box on Mission Control, or skip non-API balances.
-7. **Analyst depth:** daily short note + weekly + monthly — right amount?
+## Decisions (Reilly, 2026-10-10)
+1. **Stores:** H&C, Auberlane, Marlowe only. Colette & Claire and Tundrelle are not live; they get rows and workbooks when they go live.
+2. **Sheets:** keep the 4 workbooks as the record.
+3. **FX:** KFB bills in EUR and Reilly pays by card in EUR. **Use the exact card transaction amounts** (USD actually charged per KFB payment) as the rate. Source of those amounts: to be confirmed (see open questions).
+4. **Day close:** midnight Eastern; re-check the last 3 days every night.
+5. **Morning brief:** contents proposed below; time to be confirmed.
+6. **Balances must be exact.** Shopify via the Payments API (below); other accounts per open questions.
+7. **Analyst:** daily + weekly + monthly, broken down by P&L and margins per store/product/campaign, with room to improve.
+8. **NEW — live P&L dashboard:** separate from the Eagano dash, same aesthetic, intraday, exact numbers matching the sheets.
+
+## Exact Shopify payouts (fixing the old tracker)
+The old tracker estimated. The new one reads Shopify Payments directly with each store's own key (scope `read_shopify_payments_payouts`): **current balance, every payout (amount, status, date) and every balance transaction** (charge, refund, fee, adjustment, reserve). Rules: a payout must equal the sum of its balance transactions to the cent, otherwise flag. Pending vs paid are kept separate. Dedupe by payout id, never by amount (identical $67.62 payouts are normal).
+
+## Live P&L dashboard (Phase 2 deliverable)
+- Separate page from the Eagano dash; Eagano-dash aesthetic; phone + desktop.
+- Today (partial, clearly marked, refreshed hourly) · yesterday (closed) · month-to-date · per store + group.
+- Revenue, COGS (actual vs estimated share shown), ads, services, fees, refunds, chargebacks, profit, **REAL profit**, ROAS vs refund-adjusted break-even, margins.
+- Freshness badge per feed; every number reads from the same ledger that writes the sheets, so the two can never disagree.
+- Replaces the old `hc-pnl` lender page.
+
+## Morning brief — proposed contents (short, one screen)
+1. **Needs you** — approvals waiting, decisions, KFB login ping.
+2. **FAILs / alerts** — stale feeds, PENDING refunds, deadlines (e.g. chargeback #1053, Oct 31).
+3. **Yesterday** — profit and REAL per store + group, ROAS vs break-even, month-to-date.
+4. **Supplier** — overnight quotes/denials, "similar ones", KFB bills to pay (you pay).
+5. **Customers** — open tickets, promises due today, late shipments.
+6. **Ads** — spend pacing per store.
+7. **Today** — calendar items (tax, invoices, deadlines).
+
+## Open questions
+- **FX source:** which card pays KFB, and how can the brain see its charges? Options: (a) the card's per-transaction email alerts (Gmail agent reads them), (b) a monthly statement CSV export, (c) a bank-connection service. (a) is free and exact if the card sends alerts.
+- **Other balances (PayPal, bank, Amex):** there is no simple official API for personal bank/card balances. Options: transaction-alert emails, statement CSV imports, a paid bank-connection service, or a 10-second weekly "type your balances" box.
+- **Morning brief time.**
