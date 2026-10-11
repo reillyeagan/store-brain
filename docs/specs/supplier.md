@@ -99,7 +99,8 @@ Every price change and every draft is ONE approval per batch, showing old → ne
 - **Express shipping:** read the shipping method the customer paid for on each Shopify order; express orders are sent to KFB automatically before that day's bill.
 - **From email (CS → Supplier tickets):** size changes, exchanges/replacements, colour changes, address changes, cancellations → one message to KFB per order, tied to the order in the ledger.
 - **Ramp (rule 11):** shadow (drafts only, compared with what Reilly sends) → approve each → automatic once a clean streak is reached; Reilly approves go-live.
-- **WhatsApp channel:** Meta's Groups API needs an Official Business Account, max 8 participants, invite-link only, and documents only groups the business creates. Joining KFB's existing group is not documented as possible. Path: ask KFB to talk to the business number directly (1:1) or join a new group it creates.
+- **DECIDED 2026-10-11 (Reilly): copy-paste, no WhatsApp API.** "honestly we could just use copy-paste messages instead, the brain gives me a notifaction with the supplier message ready to copy paste then i go and send it myeslf". The brain writes the KFB message, Pushover notifies Reilly with a link to a signed page showing the message and a **Copy** button; Reilly pastes it into the existing KFB group. No business number, no Meta setup. Brain cannot read KFB's replies (bills, "similar" notices) through this route.
+- (Superseded) **WhatsApp channel:** Meta's Groups API needs an Official Business Account, max 8 participants, invite-link only, and documents only groups the business creates. Joining KFB's existing group is not documented as possible. Path: ask KFB to talk to the business number directly (1:1) or join a new group it creates.
 
 ## Questions for Reilly
 1. **How do products reach KFB for quoting?** Does KFB pull everything from the store automatically, or do you submit products? Can you set priority?
