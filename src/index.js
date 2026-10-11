@@ -6,6 +6,7 @@
  *   GET  /api/state                      Mission Control data (key required)
  *   POST /api/approvals/:id/decide       Reilly's decision (key OR a signed phone link)
  *   POST /webhooks/shopify               Shopify webhooks (HMAC-verified per store)
+ *   POST /webhooks/17track               17TRACK pushes (`sign` header verified; known numbers re-read from the API)
  *   POST /api/admin/check-stores         Store Guard check for every live store (key required)
  *   POST /api/admin/webhooks             connect order/refund notifications (key required)
  *   POST /api/admin/test-notification    send a test message to Reilly's phone (key required)
@@ -19,7 +20,8 @@
  *
  * Crons
  *   every 15 min  reconciliation pull → money feeds (Ads spend hourly, payouts every 6 h, refunds
- *                 hourly; throttled in job_runs) → KFB composer (once per day after 18:45 ET) → Freshness Sentinel
+ *                 hourly; throttled in job_runs) → tracking (collect hourly, 17TRACK polls as due, checks)
+ *                 → KFB composer (once per day after 18:45 ET) → Freshness Sentinel
  *   daily 05:00Z  day-close marker (P&L close logic arrives in Phase 2)
  *
  * Secrets (Reilly adds these in Cloudflare; never in this repo):
@@ -29,6 +31,7 @@
  *   PUSHOVER_USER_KEY      Reilly's Pushover user key
  *   ANTHROPIC_API_KEY      Claude API (thinking agents)
  *   GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET   Google OAuth client (Gmail, Ads, Merchant Center, Sheets)
+ *   TRACKING_API_KEY       17TRACK API security key (also verifies 17TRACK pushes)
  *
  *   GOOGLE_ADS_DEVELOPER_TOKEN  optional; Google retired developer tokens on 2026-09-09, so leave it unset
  *
@@ -55,6 +58,7 @@ import { startGoogleConnect, handleGoogleCallback, googleStatus, mailboxStatus, 
 import {
   runKfbComposer, handleKfbPage, handleKfbSent, listKfbMessages, expressOrdersToday, supplierMode,
 } from "./lib/kfbMessage.js";
+import { runTracking, handleTrackingPush, shippingState } from "./lib/tracking.js";
 
 export const VERSION = "0.1.0-foundation";
 
@@ -90,7 +94,7 @@ async function handleState(env) {
   await ensureFeeds(env.DB);
   const tz = env.TIMEZONE || "America/New_York";
   const todayStart = startOfLocalDayIso(tz);
-  const [events, feeds, approvals, aiCostToday, kfbMessages, expressToday, jobs] = await Promise.all([
+  const [events, feeds, approvals, aiCostToday, kfbMessages, expressToday, jobs, shipping] = await Promise.all([
     recentEvents(env.DB, { limit: 300 }),
     evaluateFeeds(env.DB),
     listPending(env.DB),
@@ -98,6 +102,7 @@ async function handleState(env) {
     listKfbMessages(env.DB, 10),
     expressOrdersToday(env.DB),
     env.DB.prepare(`SELECT job, last_run_at, last_result FROM job_runs WHERE job IN ('ads.spend','payouts','refunds')`).all(),
+    shippingState(env),
   ]);
   const money = await moneyState(env.DB, feeds);
   return json({
@@ -117,6 +122,7 @@ async function handleState(env) {
     todayStart,
     supplier: { mode: supplierMode(env), kfbMessages, expressToday },
     money: { ...money, jobs: (jobs && jobs.results) || [] },
+    shipping,
   });
 }
 
@@ -153,6 +159,9 @@ export default {
       }
       if (path === "/webhooks/shopify" && request.method === "POST") {
         return await handleShopifyWebhook(request, env);
+      }
+      if (path === "/webhooks/17track" && request.method === "POST") {
+        return await handleTrackingPush(request, env);
       }
       if (path === "/api/state" && request.method === "GET") {
         if (!hasKey(request, env)) return json({ ok: false, error: "unauthorized" }, 401);
@@ -248,6 +257,16 @@ export default {
           await logEvent(env.DB, {
             actor: "pnl.pullers", kind: "error.money_jobs",
             summary: `Money feeds failed to start; they will try again in 15 minutes (${String(err && err.message).slice(0, 200)})`,
+          }).catch(() => {});
+        }
+        // Before the composer, so tonight's KFB message sees the latest parcel statuses.
+        // runTracking isolates its own stages; this outer try is the last line of defence.
+        try {
+          await runTracking(env);
+        } catch (err) {
+          await logEvent(env.DB, {
+            actor: "ful.tracking", kind: "error.tracking", target: "sys.17track",
+            summary: `Tracking run failed; it will try again in 15 minutes (${String(err && err.message).slice(0, 200)})`,
           }).catch(() => {});
         }
         // After the pull, so the newest orders are in. Its own try: a composer fault must

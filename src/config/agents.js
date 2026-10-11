@@ -78,8 +78,12 @@ export const AGENTS = Object.freeze([
 
   // Fulfillment
   a("ful.order_watch", "ful", "Order-to-Supplier Watcher", "code", "L1"),
-  a("ful.tracking", "ful", "Tracking Sync", "code", "L1"),
-  a("ful.late", "ful", "Late-Shipment Watcher", "ai", "L0"),
+  // Tracking Sync: Shopify tracking numbers → 17TRACK, stuck-pickup / failed-delivery flags,
+  // proof of delivery to R2. Shadow-safe (nothing reaches a customer).
+  a("ful.tracking", "ful", "Tracking Sync", "code", "L1", "built"),
+  // Day-15 / day-20 flags and the reship-or-refund approval are plain code today; the
+  // customer emails it will draft later need AI, hence kind "ai".
+  a("ful.late", "ful", "Late-Shipment Watcher", "ai", "L0", "built"),
   a("ful.exceptions", "ful", "Exception Fixer", "ai", "L0"),
 
   // Catalog
@@ -112,6 +116,7 @@ export const SYSTEMS = Object.freeze([
   { id: "sys.sheets", name: "P&L Sheets" },
   { id: "sys.whatsapp", name: "WhatsApp" },
   { id: "sys.phone", name: "Your phone" },
+  { id: "sys.17track", name: "17TRACK" },
 ]);
 
 const KNOWN = new Set([...AGENTS.map((x) => x.id), ...SERVICES.map((x) => x.id), ...SYSTEMS.map((x) => x.id)]);

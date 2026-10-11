@@ -5,7 +5,10 @@
  * KFB group, Reilly gets a phone notification with a link to a signed page showing the
  * message and a Copy button, and he pastes and sends it himself (rule 12).
  *
- * v1 asks for one thing: express shipping on the orders whose customers paid for it.
+ * It asks for two things (each a "kind" of line):
+ *   express  add express shipping to the orders whose customers paid for it
+ *   pickup   check a parcel KFB marked shipped 3+ days ago that no carrier has scanned yet
+ *            (status from 17TRACK, see tracking.js; only a fresh status counts)
  *
  * When: once per Eastern day, on the first 15-minute cron run at/after 18:45 New York
  * time. KFB's working day in China starts ~20:00 Eastern and processes the previous
@@ -24,6 +27,7 @@ import { sendPhone, phoneReady } from "./phone.js";
 import { hmacHex, sameText, LINK_TTL_MS } from "./approvals.js";
 import { page, esc } from "./approvalPage.js";
 import { localDay, nowIso } from "./time.js";
+import { PICKUP_STUCK_DAYS, LOOKBACK_DAYS as TRACKING_LOOKBACK_DAYS, STATUS_FRESH_MS, shortDate } from "./tracking.js";
 
 export const KFB_TZ = "America/New_York";
 /** 18:45 Eastern, in minutes after midnight. */
@@ -72,6 +76,69 @@ export function composeExpressBody(items) {
     String(a.order_name).localeCompare(String(b.order_name), "en", { numeric: true }));
   return "Please add express shipping to these orders:\n" +
     sorted.map((i) => `• ${STORES[i.store] ? STORES[i.store].name : i.store} ${i.order_name}`).join("\n");
+}
+
+/** One line per order whose parcel hasn't been picked up. Store name in every line. */
+export function composePickupBody(items) {
+  if (!items.length) return null;
+  const sorted = [...items].sort((a, b) => storeOrder(a.store) - storeOrder(b.store) ||
+    String(a.order_name).localeCompare(String(b.order_name), "en", { numeric: true }));
+  return sorted.map((i) =>
+    `Please check ${STORES[i.store] ? STORES[i.store].name : i.store} ${i.order_name} (${i.tracking}) — shipped ${shortDate(i.shipped_at)}, not picked up by the carrier yet.`
+  ).join("\n");
+}
+
+/** The whole message: one section per kind, express first (it's time-critical). */
+export function composeKfbBody(items) {
+  const parts = [
+    composeExpressBody(items.filter((i) => i.kind === "express")),
+    composePickupBody(items.filter((i) => i.kind === "pickup")),
+  ].filter(Boolean);
+  return parts.length ? parts.join("\n\n") : null;
+}
+
+/**
+ * Parcels with tracking that no carrier has picked up 3+ days after KFB shipped them,
+ * judged on a FRESH 17TRACK status only, and never asked about before (per order).
+ */
+async function pickupCandidates(db, nowMs) {
+  if (!LIVE_STORE_IDS.length) return [];
+  const marks = LIVE_STORE_IDS.map(() => "?").join(", ");
+  const { results } = await db.prepare(
+    `SELECT s.store, s.order_id, s.order_name, s.tracking_number, s.shipped_at
+       FROM shipments s
+      WHERE s.store IN (${marks})
+        AND s.state = 'awaiting_pickup'
+        AND s.polled_at >= ?
+        AND s.shipped_at <= ?
+        AND s.order_created_at >= ?
+        AND NOT EXISTS (SELECT 1 FROM kfb_message_items i
+                         WHERE i.store = s.store AND i.order_id = s.order_id AND i.kind = 'pickup')
+      ORDER BY s.shipped_at, s.tracking_number`
+  ).bind(...LIVE_STORE_IDS, nowIso(nowMs - STATUS_FRESH_MS), nowIso(nowMs - PICKUP_STUCK_DAYS * 86400000),
+    nowIso(nowMs - TRACKING_LOOKBACK_DAYS * 86400000)).all();
+  // One line per order (the UNIQUE rule is per order and kind); several parcels share it.
+  const byOrder = new Map();
+  for (const r of results || []) {
+    const k = `${r.store}|${r.order_id}`;
+    if (byOrder.has(k)) { byOrder.get(k).tracking += `, ${r.tracking_number}`; continue; }
+    byOrder.set(k, {
+      store: r.store, order_id: r.order_id, order_name: r.order_name || r.order_id, kind: "pickup",
+      tracking: r.tracking_number, shipped_at: r.shipped_at,
+    });
+  }
+  return [...byOrder.values()].map((i) => ({ ...i, detail: `${i.tracking}; shipped ${String(i.shipped_at || "").slice(0, 10)}` }));
+}
+
+/** Plain-English list for the event summary, per kind. */
+function describeItems(items) {
+  const parts = [];
+  const ex = items.filter((i) => i.kind === "express");
+  const pk = items.filter((i) => i.kind === "pickup");
+  const names = (xs) => xs.map((i) => `${STORES[i.store].name} ${i.order_name}`).join(", ");
+  if (ex.length) parts.push(`express shipping for ${ex.length} order${ex.length === 1 ? "" : "s"}: ${names(ex)}`);
+  if (pk.length) parts.push(`carrier pickup check for ${pk.length} order${pk.length === 1 ? "" : "s"}: ${names(pk)}`);
+  return parts.join("; ");
 }
 
 /** Express orders not yet asked about, newest few days only, live stores only. */
@@ -125,11 +192,21 @@ export async function runKfbComposer(env, { nowMs = Date.now(), fetchImpl = fetc
   let messageId = null;
   try {
     const rows = await expressCandidates(db, day);
+    // Pickup lines come from the tracking ledger. A fault there must not cost the express asks.
+    let pickups = [];
+    try {
+      pickups = await pickupCandidates(db, nowMs);
+    } catch (err) {
+      await logEvent(db, {
+        actor: ACTOR, kind: "error.kfb_pickup_lines", target: "sys.kfb",
+        summary: `KFB message: couldn't read stuck parcels, so no pickup lines today (${String(err && err.message).slice(0, 150)})`, at,
+      }).catch(() => {});
+    }
     const warnings = await staleOrderFeeds(db, nowMs);
-    if (!rows.length) {
+    if (!rows.length && !pickups.length) {
       await logEvent(db, {
         actor: ACTOR, kind: "kfb.nothing_to_ask", target: "sys.kfb",
-        summary: `KFB check ${day}: no new express orders, so no message today` +
+        summary: `KFB check ${day}: no new express orders or stuck parcels, so no message today` +
           (warnings.length ? ` (but ${warnings.join("; ")}: an order may be missing)` : ""),
         data: { day, warnings }, at,
       });
@@ -139,8 +216,8 @@ export async function runKfbComposer(env, { nowMs = Date.now(), fetchImpl = fetc
     const items = rows.map((r) => ({
       store: r.store, order_id: r.order_id, order_name: r.name || r.order_id, kind: "express",
       detail: r.shipping_title || r.shipping_code || null,
-    }));
-    const body = composeExpressBody(items);
+    })).concat(pickups);
+    const body = composeKfbBody(items);
     const mode = supplierMode(env);
     const ins = await db.prepare(
       `INSERT INTO kfb_messages (created_at, local_day, mode, body, items, status) VALUES (?, ?, ?, ?, ?, 'draft')`
@@ -155,7 +232,7 @@ export async function runKfbComposer(env, { nowMs = Date.now(), fetchImpl = fetc
     await db.prepare(`UPDATE kfb_runs SET message_id = ?, item_count = ? WHERE local_day = ?`)
       .bind(messageId, items.length, day).run();
 
-    const list = items.map((i) => `${STORES[i.store].name} ${i.order_name}`).join(", ");
+    const list = describeItems(items);
     const warnText = warnings.length ? ` Warning: ${warnings.join("; ")}, so an order may be missing.` : "";
     let phone = null;
     if (mode === "live") {
@@ -170,11 +247,11 @@ export async function runKfbComposer(env, { nowMs = Date.now(), fetchImpl = fetc
       kind: mode === "shadow" ? "kfb.message_drafted" : phone.sent ? "kfb.message_notified" : "kfb.notify_failed",
       target: mode === "live" ? "sys.phone" : "sys.kfb",
       summary: (mode === "shadow"
-        ? `KFB message drafted (shadow, not sent to phone): express shipping for ${items.length} order${items.length === 1 ? "" : "s"}: ${list}`
+        ? `KFB message drafted (shadow, not sent to phone): ${list}`
         : phone.sent
-          ? `KFB message ready on Reilly's phone: express shipping for ${items.length} order${items.length === 1 ? "" : "s"}: ${list}`
+          ? `KFB message ready on Reilly's phone: ${list}`
           : `KFB message drafted but the phone notification failed (${phone.reason}): ${list}`) + warnText,
-      data: { messageId, day, mode, orders: items.map((i) => ({ store: i.store, order: i.order_name })), warnings },
+      data: { messageId, day, mode, orders: items.map((i) => ({ store: i.store, order: i.order_name, kind: i.kind })), warnings },
       at,
     });
     return { ran: true, day, messageId, mode, body, items, phone, warnings };
