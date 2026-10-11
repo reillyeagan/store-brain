@@ -39,10 +39,8 @@ export function storeCredentials(env, storeId) {
   const clientId = env[store.secrets.clientId];
   const clientSecret = env[store.secrets.clientSecret];
   if (!clientId || !clientSecret) {
-    throw new StoreGuardError(
-      `${store.name} is not wired: secrets ${store.secrets.clientId} / ${store.secrets.clientSecret} are missing`,
-      "NOT_WIRED"
-    );
+    const missing = [!clientId && store.secrets.clientId, !clientSecret && store.secrets.clientSecret].filter(Boolean);
+    throw new StoreGuardError(`${store.name} is not wired: ${missing.join(" and ")} missing`, "NOT_WIRED");
   }
   return { store, clientId, clientSecret };
 }

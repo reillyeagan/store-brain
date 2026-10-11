@@ -33,6 +33,11 @@ binding = "ASSETS"
 
 [vars]
 TIMEZONE = "America/New_York"
+# Shopify app Client IDs are identifiers, not passwords, so they live here where a
+# deploy can never wipe them. The matching Client SECRETS stay Cloudflare secrets.
+SB_HC_CLIENT_ID = "91f62305f583acc7ac4dcaf6641590c1"
+SB_AUB_CLIENT_ID = "7664f4cf5ed9ec191539f10c9a09335f"
+SB_MAR_CLIENT_ID = "d2f3cee30759ff7d4d5f12058bce3373"
 # Phone notifications go to this ntfy topic. The topic name itself is set as a
 # secret (NTFY_TOPIC) so nobody can guess it and subscribe.
 NTFY_SERVER = "https://ntfy.sh"
