@@ -75,6 +75,8 @@ Legend: **CODE** = program, no AI · **AI** = Claude for judgement/language · L
 
 ## Questions for Reilly
 1. **How do products reach KFB for quoting?** Does KFB pull everything from the store automatically, or do you submit products? Can you set priority?
+   - **Answered 2026-10-11 (Reilly):** "KFB automatically pulls orders through there app, I have to manually pull products, so whenever i activate like 50 new products I just go into KFB and click "get products" and they go into the quotation section"
+   - Means: orders need no forwarding. Products reach KFB only when Reilly clicks **Get products** after activating a batch. Agent job: notice newly activated products that haven't been pulled into KFB yet and remind Reilly in the morning brief (agents stay view-only on KFB).
 2. **Status 25 "confirm quotation":** what do you check before confirming? Should the agent prepare a confirm/decline recommendation with the margin?
 3. **Orders:** do all Shopify orders auto-forward to KFB (like #1174)? Do you pay bills every morning, or less often?
 4. **"Similar ones":** your rule: when is similar OK, and when must the listing change or be drafted?
