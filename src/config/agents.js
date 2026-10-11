@@ -84,11 +84,9 @@ export const AGENTS = Object.freeze([
   a("cat.pricing", "cat", "Pricing", "code", "L0"),
   a("cat.margin_guard", "cat", "Margin Guard", "code", "L0"),
   a("cat.status", "cat", "Product Status", "code", "L1"),
-  a("cat.prepublish", "cat", "Pre-Publish Gate", "code", "L0"),
-  a("cat.feed_health", "cat", "Feed Health", "code", "L0"),
-  a("cat.content", "cat", "Content & Size Notes", "ai", "L0"),
-  a("cat.imports", "cat", "Import Builder", "code", "L0"),
-  a("cat.themes", "cat", "Theme Release Desk", "code", "L0"),
+  a("cat.prepublish", "cat", "New-Product Check", "code", "L2"),
+  a("cat.feed_health", "cat", "Merchant Center Health", "code", "L0"),
+  // Dropped 2026-10-11 (Reilly): content & size notes, import builder, theme desk.
 ]);
 
 /** Shared safety services — plain code every agent runs through. */

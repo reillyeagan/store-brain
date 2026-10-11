@@ -42,9 +42,9 @@ test("stores: lookup never defaults to a store", () => {
   assert.equal(storeByDomain("evil.myshopify.com"), null);
 });
 
-test("agents: 52 agents, unique ids, 7 services", () => {
-  assert.equal(AGENTS.length, 52);
-  assert.equal(new Set(AGENTS.map((a) => a.id)).size, 52);
+test("agents: 49 agents (3 catalog agents dropped 2026-10-11), unique ids, 7 services", () => {
+  assert.equal(AGENTS.length, 49);
+  assert.equal(new Set(AGENTS.map((a) => a.id)).size, 49);
   assert.equal(SERVICES.length, 7);
 });
 
@@ -400,7 +400,7 @@ test("worker: /health is public; /api/state needs the key", async () => {
   const ok = await worker.fetch(new Request("https://b.example/api/state", { headers: { "x-store-brain-key": "k".repeat(32) } }), env);
   assert.equal(ok.status, 200);
   const body = await ok.json();
-  assert.equal(body.agents.length, 52);
+  assert.equal(body.agents.length, 49);
   assert.ok(body.feeds.length >= 10);
   assert.ok(body.feeds.every((f) => f.state === "not_wired"));
 });
