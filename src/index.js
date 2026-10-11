@@ -20,7 +20,7 @@
  *   GET  /                               Mission Control page (static, no data until a key is given)
  *
  * Crons
- *   every 15 min  reconciliation pull → money feeds (Ads spend hourly, payouts every 6 h, refunds
+ *   every 15 min  reconciliation pull → orders backfill (history for the P&L) → money feeds (Ads spend hourly, payouts every 6 h, refunds
  *                 hourly; throttled in job_runs) → tracking (collect hourly, 17TRACK polls as due, checks)
  *                 → P&L recompute (last 3 days, hourly) → morning brief (once per day after 08:00 ET)
  *                 → KFB composer (once per day after 18:45 ET) → Freshness Sentinel
@@ -56,6 +56,7 @@ import { handleShopifyWebhook } from "./lib/shopifyWebhooks.js";
 import { localDay } from "./lib/time.js";
 import { checkStores, registerWebhooks } from "./lib/setup.js";
 import { reconcileOrders } from "./lib/reconcile.js";
+import { runOrderBackfill } from "./lib/orderBackfill.js";
 import { runMoneyJobs } from "./lib/moneyJobs.js";
 import { moneyState } from "./lib/moneyState.js";
 import { startGoogleConnect, handleGoogleCallback, googleStatus, mailboxStatus, secretPresence } from "./lib/google.js";
@@ -266,6 +267,16 @@ export default {
           await logEvent(env.DB, {
             actor: "pnl.pullers", kind: "error.order_pull", target: "sys.shopify",
             summary: `Order check failed; it will try again in 15 minutes (${String(err && err.message).slice(0, 200)})`,
+          }).catch(() => {});
+        }
+        // Order history for the P&L: first a one-time pass since the 1st of last month
+        // (a few pages per run, resumable), then hourly re-reads of recently updated orders.
+        try {
+          await runOrderBackfill(env);
+        } catch (err) {
+          await logEvent(env.DB, {
+            actor: "pnl.pullers", kind: "error.orders_backfill", target: "sys.shopify",
+            summary: `Order history check failed to start; it will try again in 15 minutes (${String(err && err.message).slice(0, 200)})`,
           }).catch(() => {});
         }
         // Money feeds: throttled (hourly / 6-hourly) and isolated from each other inside.

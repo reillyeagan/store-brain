@@ -102,7 +102,19 @@ export const FLAG_LABELS = Object.freeze({
   pickup_ready: "Waiting at pickup point — customer email needed",
   day15: "Day-15 heads-up email due",
   day20: "Escalate: reship or refund",
+  day20_verify: "Day 20+, not tracked: verify manually",
 });
+
+/**
+ * Day-20 approvals (fix after review, 2026-10-11): an approval asks Reilly to spend money
+ * (reship or refund), so it needs real evidence. Only a parcel 17TRACK is tracking with a
+ * fresh status counts. Untracked parcels (quota, age, rejected) and orders older than
+ * DAY20_MAX_AGE_DAYS get a "verify manually" flag on the Shipping tab instead. At most
+ * DAY20_APPROVALS_PER_RUN new approvals per run, so a backlog can't flood Reilly's phone;
+ * the rest wait (their flag stays open without an approval) and are asked on later runs.
+ */
+export const DAY20_MAX_AGE_DAYS = 45;
+export const DAY20_APPROVALS_PER_RUN = 5;
 
 const storeName = (id) => (STORES[id] ? STORES[id].name : id);
 const sleepDefault = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -648,6 +660,8 @@ export async function runChecks(env, { nowMs = Date.now() } = {}) {
   for (const o of pickupOrders.values()) await syncOrderPickupFlag(db, o.store, o.order_id, o.order_name, at, freshSince);
 
   // Per order: day 15 and day 20.
+  let newApprovals = 0;
+  const held = [];
   const orders = new Map();
   for (const s of rows) {
     const k = `${s.store}|${s.order_id}`;
@@ -668,11 +682,15 @@ export async function runChecks(env, { nowMs = Date.now() } = {}) {
     // Evidence, parcel by parcel. Delivered parcels never block the order (they're not
     // re-polled). A registered parcel counts only with a fresh status (rules 4 and 6). A
     // parcel 17TRACK isn't tracking (quota, age, rejected) counts from the order date
-    // alone, so it can never go silent.
+    // alone, so it can never go silent, but it is never enough for a day-20 approval.
     const late = [];
+    let trackedLate = 0;
     for (const p of open) {
       if (p.registered_at) {
-        if (p.polled_at && p.polled_at >= freshSince && p.state) late.push(`${p.tracking_number}: ${STATE_LABELS[p.state] || p.state}`);
+        if (p.polled_at && p.polled_at >= freshSince && p.state) {
+          late.push(`${p.tracking_number}: ${STATE_LABELS[p.state] || p.state}`);
+          trackedLate++;
+        }
       } else {
         late.push(`${p.tracking_number}: not tracked by 17TRACK (${untrackedReason(p, nowMs)})`);
       }
@@ -695,6 +713,14 @@ export async function runChecks(env, { nowMs = Date.now() } = {}) {
     }
     if (days >= DAY20) {
       const detail = `Day ${days} since the order (${shortDate(o.order_created_at)}), not delivered. ${where}`;
+      if (!trackedLate || days > DAY20_MAX_AGE_DAYS) {
+        // No fresh 17TRACK evidence, or too old to act on automatically: a flag only.
+        const why = !trackedLate ? "no parcel is tracked by 17TRACK with a fresh status" : `older than ${DAY20_MAX_AGE_DAYS} days`;
+        if (await raiseFlag(db, { ...o, tracking_number: null, kind: "day20_verify", detail: `${detail}. Verify manually (${why}); no reship/refund approval raised.` }, at)) {
+          raised.push("day20_verify");
+        }
+        continue;
+      }
       await raiseFlag(db, { ...o, tracking_number: null, kind: "day20", detail }, at);
       const flag = await db.prepare(`SELECT approval_id, resolved_at FROM shipment_flags WHERE store = ? AND order_id = ? AND kind = 'day20'`)
         .bind(o.store, o.order_id).first();
@@ -708,18 +734,27 @@ export async function runChecks(env, { nowMs = Date.now() } = {}) {
           `SELECT id FROM approvals WHERE dept = 'ful' AND requested_by = ? AND store = ?
               AND substr(title, 1, length(?)) = ? ORDER BY id DESC LIMIT 1`
         ).bind(LATE_ACTOR, o.store, prefix, prefix).first();
+        if (!existing && newApprovals >= DAY20_APPROVALS_PER_RUN) { held.push(o.order_name || o.order_id); continue; }
         const approvalId = existing ? existing.id : await createApproval(db, {
           dept: "ful", requestedBy: LATE_ACTOR, store: o.store,
           title: `${prefix}${days} days after the order (${where}). Reship or refund?`,
           options: [{ id: "reship", label: "Reship" }, { id: "refund", label: "Refund" }],
         });
+        if (!existing) newApprovals++;
         await db.prepare(`UPDATE shipment_flags SET approval_id = ? WHERE store = ? AND order_id = ? AND kind = 'day20' AND approval_id IS NULL`)
           .bind(approvalId, o.store, o.order_id).run();
         raised.push(existing ? "day20_relinked" : "day20");
       }
     }
   }
-  return { raised };
+  if (held.length) {
+    await logEvent(db, {
+      actor: LATE_ACTOR, kind: "tracking.day20_held", target: "core.approvals",
+      summary: `Day-20 reship/refund approvals: ${DAY20_APPROVALS_PER_RUN} asked this run, ${held.length} more held back for the next runs (${held.slice(0, 10).join(", ")}${held.length > 10 ? ", ..." : ""})`,
+      data: { held: held.length, cap: DAY20_APPROVALS_PER_RUN, orders: held }, at,
+    });
+  }
+  return { raised, held: held.length };
 }
 
 /* ---------------- the cron entry ---------------- */
@@ -858,7 +893,7 @@ export async function shippingState(env, nowMs = Date.now()) {
        LEFT JOIN shipments s ON s.tracking_number = f.tracking_number
        LEFT JOIN approvals a ON a.id = f.approval_id
       WHERE f.resolved_at IS NULL AND f.store IN (${liveMarks()})
-      ORDER BY CASE f.kind WHEN 'day20' THEN 0 WHEN 'failed_delivery' THEN 1 WHEN 'pickup_ready' THEN 2 WHEN 'stuck_pickup' THEN 3 ELSE 4 END, f.raised_at DESC
+      ORDER BY CASE f.kind WHEN 'day20' THEN 0 WHEN 'day20_verify' THEN 0 WHEN 'failed_delivery' THEN 1 WHEN 'pickup_ready' THEN 2 WHEN 'stuck_pickup' THEN 3 ELSE 4 END, f.raised_at DESC
       LIMIT 100`
   ).bind(...LIVE_STORE_IDS).all();
   const quotaRow = await stageRow(db, "quota");

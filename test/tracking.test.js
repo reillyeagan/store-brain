@@ -600,11 +600,43 @@ test("fix 2: multi-parcel orders reach day 15 / day 20 — delivered parcels don
   await runChecks(env, { nowMs: now });
   const flags = (await DB.prepare(`SELECT order_name, kind, detail FROM shipment_flags ORDER BY order_name, kind`).all()).results;
   assert.deepEqual(flags.map((f) => `${f.order_name}:${f.kind}`),
-    ["#2001:day15", "#2001:day20", "#2002:day15", "#2002:day20", "#2003:day15", "#2003:day20"]);
+    ["#2001:day15", "#2001:day20", "#2002:day15", "#2002:day20_verify", "#2003:day15", "#2003:day20_verify"]);
   const b = flags.find((f) => f.order_name === "#2002" && f.kind === "day15");
   assert.match(b.detail, /UL200200002YP: not tracked by 17TRACK \(not registered: quota or cap\); 1 other parcel delivered/);
   assert.match(flags.find((f) => f.order_name === "#2003").detail, /not tracked by 17TRACK \(17TRACK rejected the number\)/);
-  assert.equal((await listPending(DB)).length, 3);
+  assert.equal((await listPending(DB)).length, 1, "only #2001 has fresh 17TRACK evidence; the others are verify-manually flags");
+  assert.match(flags.find((f) => f.kind === "day20_verify").detail, /Verify manually \(no parcel is tracked by 17TRACK with a fresh status\)/);
+});
+
+test("day-20 approvals: never for orders older than 45 days, at most 5 new per run, the rest held and logged", async () => {
+  const DB = makeD1();
+  const env = { DB };
+  const now = Date.parse("2026-10-10T14:00:00Z");
+  const fresh = iso(now - 3600000);
+  // 8 tracked, fresh, late orders at day 20-27.
+  for (let i = 0; i < 8; i++) {
+    const order = iso(now - (20 + i) * DAY);
+    await seed(DB, { order: 4000 + i, tracking_number: `UL40000000${i}YP`, order_created_at: order, registered_at: order, state: "in_transit", last_status: "InTransit", polled_at: fresh });
+  }
+  // A tracked, late order 50 days old: flag only.
+  const old = iso(now - 50 * DAY);
+  await seed(DB, { order: 4100, tracking_number: "UL410000000YP", order_created_at: old, registered_at: old, state: "in_transit", last_status: "InTransit", polled_at: fresh });
+
+  const r1 = await runChecks(env, { nowMs: now });
+  assert.equal(r1.held, 3);
+  assert.equal((await listPending(DB)).length, 5);
+  const heldEv = (await DB.prepare(`SELECT * FROM events WHERE kind = 'tracking.day20_held'`).all()).results;
+  assert.equal(heldEv.length, 1);
+  assert.equal(JSON.parse(heldEv[0].data).held, 3);
+  const oldFlags = (await DB.prepare(`SELECT kind, approval_id FROM shipment_flags WHERE order_name = '#4100' ORDER BY kind`).all()).results;
+  assert.deepEqual(oldFlags.map((f) => f.kind), ["day15", "day20_verify"]);
+  assert.equal(oldFlags[1].approval_id, null);
+
+  // Next run asks the 3 held ones (and still nothing for the 50-day order).
+  const r2 = await runChecks(env, { nowMs: now + 15 * 60000 });
+  assert.equal(r2.held, 0);
+  assert.equal((await listPending(DB)).length, 8);
+  assert.ok(!(await listPending(DB)).some((a) => /#4100/.test(a.title)));
 });
 
 test("fix 3: a day-20 approval half-written by a crashed run is re-linked, never duplicated", async () => {

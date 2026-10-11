@@ -22,14 +22,26 @@ import { markFeedOk, markFeedFailed } from "./freshness.js";
 import { logEvent } from "./eventlog.js";
 import { nowIso } from "./time.js";
 
-const RECENT_ORDERS = `{
-  orders(first: 25, sortKey: UPDATED_AT, reverse: true) {
-    nodes {
-      id name createdAt updatedAt currencyCode displayFinancialStatus
+/**
+ * The order fields every pull reads (shared with the orders backfill).
+ *  - `test`: Shopify test orders are excluded from P&L revenue.
+ *  - `totalPriceSet`: the ORIGINAL order total ("before returns"), which is the P&L
+ *    revenue basis; refunds are booked separately on their processed day (rule 7).
+ *  - `currentTotalPriceSet`: the current total (after refunds/edits), kept as `orders.total`.
+ * Requested cost per order: the Order 1 + 4 MoneyBags x 2 (bag + shopMoney) + shippingLine 1
+ * = 10 points; 25 orders ≈ 252 points, 50 orders ≈ 502 (Shopify's limit is 1,000).
+ */
+export const ORDER_FIELDS = `
+      id name createdAt updatedAt test currencyCode displayFinancialStatus
       currentSubtotalPriceSet { shopMoney { amount } }
       currentTotalDiscountsSet { shopMoney { amount } }
       currentTotalPriceSet { shopMoney { amount } }
-      shippingLine { title code }
+      totalPriceSet { shopMoney { amount } }
+      shippingLine { title code }`;
+
+const RECENT_ORDERS = `{
+  orders(first: 25, sortKey: UPDATED_AT, reverse: true) {
+    nodes { ${ORDER_FIELDS}
     }
   }
 }`;
@@ -72,6 +84,8 @@ export function orderFromNode(n) {
     subtotal: amt(n.currentSubtotalPriceSet),
     discounts: amt(n.currentTotalDiscountsSet),
     total: amt(n.currentTotalPriceSet),
+    original_total: amt(n.totalPriceSet), // revenue basis; the P&L reads it from `raw`
+    test: n.test === true,
     financial_status: n.displayFinancialStatus ? String(n.displayFinancialStatus).toLowerCase() : null,
     payload_updated_at: utcIso(n.updatedAt || n.createdAt),
     ...shippingFromNode(n), // shipping_title, shipping_code, express
@@ -84,7 +98,7 @@ export function orderFromNode(n) {
  * Fetch and store line items for the orders whose stored lines are behind.
  * Only orders this pull actually wrote are considered (the out-of-order guard).
  */
-async function syncLines(env, id, writtenIds, at, opts) {
+export async function syncLines(env, id, writtenIds, at, opts) {
   if (!writtenIds.length) return 0;
   const behind = [];
   for (const orderId of writtenIds) {
