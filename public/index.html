@@ -105,6 +105,7 @@ h1{margin:2px 0 0;font-size:24px;font-weight:600;letter-spacing:-.01em}
         <button role="tab" aria-selected="true" data-tab="activity" id="tab-activity">Activity</button>
         <button role="tab" aria-selected="false" data-tab="approvals" id="tab-approvals">Approvals</button>
         <button role="tab" aria-selected="false" data-tab="feeds" id="tab-feeds">Feeds</button>
+        <button role="tab" aria-selected="false" data-tab="setup" id="tab-setup">Setup</button>
       </div>
       <div class="pane" id="pane"></div>
     </aside>
@@ -143,7 +144,7 @@ h1{margin:2px 0 0;font-size:24px;font-weight:600;letter-spacing:-.01em}
       if(!r.ok) throw new Error("HTTP "+r.status);
       state=await r.json();
       $("#gate").hidden=true; $("#app").hidden=false;
-      render();
+      if(!(tab==="setup"&&setupBusy)) render();
     }catch(err){
       $("#updated").textContent="Can't reach the brain: "+err.message;
       $("#updated").className="pill bad";
@@ -271,12 +272,29 @@ h1{margin:2px 0 0;font-size:24px;font-weight:600;letter-spacing:-.01em}
           '<button class="btn reject" data-ap="'+a.id+'" data-choice="reject">Reject</button></div></div>';
       }).join("");
       p.querySelectorAll("button[data-ap]").forEach(function(b){ b.addEventListener("click",function(){ decideApproval(b.dataset.ap,b.dataset.choice,b) }) });
+    } else if(tab==="setup"){
+      p.innerHTML='<div class="row"><b>1 · Check the store connections</b><span style="color:var(--muted);font-size:12.5px">Logs in to each store with its own app, confirms it is the right shop, and lists the access Shopify granted. Read-only.</span><div class="btns"><button class="btn primary" id="btnCheck">Check stores</button></div><div id="outCheck"></div></div>'+
+        '<div class="row"><b>2 · Connect order + refund notifications</b><span style="color:var(--muted);font-size:12.5px">Tells each store to notify the brain the moment an order or refund happens. Checked against Shopify afterwards.</span><div class="btns"><button class="btn primary" id="btnHooks">Connect notifications</button></div><div id="outHooks"></div></div>';
+      $("#btnCheck").addEventListener("click",function(){ runSetup("/api/admin/check-stores",$("#btnCheck"),$("#outCheck"),function(r){
+        return r.ok?'<span style="color:var(--good)">✓ '+esc(r.name)+'</span> <span class="meta">'+esc(r.domain)+(r.missing&&r.missing.length?' · missing: '+esc(r.missing.join(", ")):' · all access granted')+'</span>':'<span style="color:var(--bad)">✗ '+esc(r.name)+': '+esc(r.error)+'</span>'; }) });
+      $("#btnHooks").addEventListener("click",function(){ runSetup("/api/admin/webhooks",$("#btnHooks"),$("#outHooks"),function(r){
+        return r.verified?'<span style="color:var(--good)">✓ '+esc(r.name)+'</span> <span class="meta">connected and verified</span>':'<span style="color:var(--bad)">✗ '+esc(r.name)+': '+esc((r.errors||[]).join(" | ")||"not verified")+'</span>'; }) });
     } else {
       p.innerHTML=state.feeds.map(function(f){
         var label={fresh:"Fresh",stale:"Stale",failing:"Failing",not_wired:"Not wired yet"}[f.state]||f.state;
         return '<div class="row'+(f.state==="stale"||f.state==="failing"?" alarm":"")+'"><span><span class="dot '+esc(f.state)+'"></span>'+esc(f.label)+'</span><span class="meta"><span>'+esc(label)+'</span>'+(f.last_ok_at?'<span>last delivered '+esc(ago(f.last_ok_at))+'</span>':"")+'<span>limit '+esc(f.max_age_min)+' min</span>'+(f.last_error?'<span>'+esc(f.last_error)+'</span>':"")+'</span></div>';
       }).join("");
     }
+  }
+  var setupBusy=false;
+  async function runSetup(path,btn,out,line){
+    setupBusy=true; btn.disabled=true; out.innerHTML='<span class="meta">Working…</span>';
+    try{
+      var r=await fetch(path,{method:"POST",headers:{"x-store-brain-key":key}});
+      var b=await r.json();
+      out.innerHTML=b.ok?b.results.map(function(x){return '<div>'+line(x)+'</div>'}).join(""):'<span style="color:var(--bad)">'+esc(b.error||("HTTP "+r.status))+'</span>';
+    }catch(e){ out.innerHTML='<span style="color:var(--bad)">Couldn\'t reach the brain.</span>'; }
+    btn.disabled=false; setTimeout(function(){setupBusy=false},20000);
   }
   async function decideApproval(id,choice,btn){
     var row=btn.closest(".row"); row.querySelectorAll("button").forEach(function(x){x.disabled=true});

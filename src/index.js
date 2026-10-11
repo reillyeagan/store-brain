@@ -6,6 +6,8 @@
  *   GET  /api/state                      Mission Control data (key required)
  *   POST /api/approvals/:id/decide       Reilly's decision (key OR a signed phone link)
  *   POST /webhooks/shopify               Shopify webhooks (HMAC-verified per store)
+ *   POST /api/admin/check-stores         Store Guard check for every live store (key required)
+ *   POST /api/admin/webhooks             connect order/refund notifications (key required)
  *   GET  /                               Mission Control page (static, no data until a key is given)
  *
  * Crons
@@ -25,6 +27,7 @@ import { evaluateFeeds, runSentinel, ensureFeeds } from "./lib/freshness.js";
 import { listPending, decide, verifyDecisionSig, getApproval } from "./lib/approvals.js";
 import { handleShopifyWebhook } from "./lib/shopifyWebhooks.js";
 import { localDay } from "./lib/time.js";
+import { checkStores, registerWebhooks } from "./lib/setup.js";
 
 export const VERSION = "0.1.0-foundation";
 
@@ -121,6 +124,14 @@ export default {
       if (path === "/api/state" && request.method === "GET") {
         if (!hasKey(request, env)) return json({ ok: false, error: "unauthorized" }, 401);
         return await handleState(env);
+      }
+      if (path === "/api/admin/check-stores" && request.method === "POST") {
+        if (!hasKey(request, env)) return json({ ok: false, error: "unauthorized" }, 401);
+        return json({ ok: true, results: await checkStores(env) });
+      }
+      if (path === "/api/admin/webhooks" && request.method === "POST") {
+        if (!hasKey(request, env)) return json({ ok: false, error: "unauthorized" }, 401);
+        return json({ ok: true, results: await registerWebhooks(env, url.origin) });
       }
       const m = path.match(/^\/api\/approvals\/(\d+)\/decide$/);
       if (m && request.method === "POST") {
