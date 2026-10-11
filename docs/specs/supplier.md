@@ -75,13 +75,13 @@ Legend: **CODE** = program, no AI · **AI** = Claude for judgement/language · L
 
 ## Pricing rules (from the vault + quoting sheets, 2026-10-11)
 
-> **Reilly 2026-10-11 on H&C's old $69.95 ceiling:** "We have products well over 69.96 on H&C btw" → **"max price 144.95 all 3 stores"**. The $69.95 H&C ceiling is retired.
+> **Reilly 2026-10-11 on H&C's old $69.95 ceiling:** "We have products well over 69.96 on H&C btw" → **"max price 144.95 all 3 stores"**. The $69.95 H&C ceiling is retired. Then: **"min price 44.95 on H&C going forwards"**.
 
 Every price change and every draft is ONE approval per batch, showing old → new for each product. Backup to R2 first, Store Guard, verify every variant against Shopify after.
 
 | Store | COGS band | Rule shape | Floor | Ceiling | Source |
 |---|---|---|---|---|---|
-| H&C | 29–33% | Directional: above 33% → raise to the cheapest `.95` at ≤33%; below 29% → cut to the dearest `.95` at ≥29%; in band → leave | — | $144.95 | 09-06 split, 10-06 / 10-08 runs; ceiling 2026-10-11 |
+| H&C | 29–33% | Directional: above 33% → raise to the cheapest `.95` at ≤33%; below 29% → cut to the dearest `.95` at ≥29%; in band → leave | $44.95 | $144.95 | 09-06 split, 10-06 / 10-08 runs; ceiling 2026-10-11 |
 | Auberlane | 25–29% | Single target (as Marlowe) | $44.95 | $144.95 | 09-06 split, 09-07 review; ceiling 2026-10-11 |
 | Marlowe | 25–29% | `target = min(max(up95(cost/0.29), 49.95), 144.95)` | $49.95 | $144.95 | 09-23 |
 
