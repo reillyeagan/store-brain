@@ -35,6 +35,8 @@ binding = "ASSETS"
 TIMEZONE = "America/New_York"
 # Where the brain lives, for links in phone notifications sent from crons.
 PUBLIC_BASE_URL = "https://store-brain.reillyworking26.workers.dev"
+# The only Google account allowed to connect (Gmail, Ads, Merchant Center, Sheets).
+GOOGLE_ACCOUNT = "reillyworking26@gmail.com"
 # Shopify app Client IDs are identifiers, not passwords, so they live here where a
 # deploy can never wipe them. The matching Client SECRETS stay Cloudflare secrets.
 SB_HC_CLIENT_ID = "91f62305f583acc7ac4dcaf6641590c1"

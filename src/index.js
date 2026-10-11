@@ -12,6 +12,9 @@
  *   GET  /approve/:id                    phone approval page (signed link from a notification)
  *   GET  /kfb/:id                        KFB copy-paste message page (signed link from a notification)
  *   POST /api/kfb/:id/sent               Reilly sent the KFB message (key OR a signed "sent" link)
+ *   POST /api/admin/google/start         one-time Google consent URL (key required)
+ *   GET  /oauth/google/callback          Google sends Reilly back here after consent
+ *   GET  /api/admin/connections          which secrets exist (names only) + Google status (key required)
  *   GET  /                               Mission Control page (static, no data until a key is given)
  *
  * Crons
@@ -23,6 +26,8 @@
  *   APPROVAL_SIGNING_KEY   signs phone Approve/Reject links
  *   PUSHOVER_APP_TOKEN     Pushover application token (phone notifications)
  *   PUSHOVER_USER_KEY      Reilly's Pushover user key
+ *   ANTHROPIC_API_KEY      Claude API (thinking agents)
+ *   GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET   Google OAuth client (Gmail, Ads, Merchant Center, Sheets)
  *
  * Variables (not secret):
  *   SUPPLIER_MESSAGES_LIVE "1" = KFB messages go to the phone; anything else = shadow (Reilly flips it)
@@ -40,6 +45,7 @@ import { handleShopifyWebhook } from "./lib/shopifyWebhooks.js";
 import { localDay } from "./lib/time.js";
 import { checkStores, registerWebhooks } from "./lib/setup.js";
 import { reconcileOrders } from "./lib/reconcile.js";
+import { startGoogleConnect, handleGoogleCallback, googleStatus, secretPresence } from "./lib/google.js";
 import {
   runKfbComposer, handleKfbPage, handleKfbSent, listKfbMessages, expressOrdersToday, supplierMode,
 } from "./lib/kfbMessage.js";
@@ -159,6 +165,18 @@ export default {
           summary: r.sent ? "Test notification sent to Reilly's phone" : `Test notification failed: ${r.reason}`,
         });
         return json({ ok: true, results: [r] });
+      }
+      if (path === "/api/admin/google/start" && request.method === "POST") {
+        if (!hasKey(request, env)) return json({ ok: false, error: "unauthorized" }, 401);
+        const r = await startGoogleConnect(env);
+        return json(r, r.ok ? 200 : 400);
+      }
+      if (path === "/oauth/google/callback" && request.method === "GET") {
+        return await handleGoogleCallback(request, env);
+      }
+      if (path === "/api/admin/connections" && request.method === "GET") {
+        if (!hasKey(request, env)) return json({ ok: false, error: "unauthorized" }, 401);
+        return json({ ok: true, secrets: secretPresence(env), google: await googleStatus(env.DB) });
       }
       const ap = path.match(/^\/approve\/(\d+)$/);
       if (ap && request.method === "GET") {

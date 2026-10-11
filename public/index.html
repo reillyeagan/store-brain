@@ -296,7 +296,24 @@ h1{margin:2px 0 0;font-size:24px;font-weight:600;letter-spacing:-.01em}
     } else if(tab==="setup"){
       p.innerHTML='<div class="row"><b>1 · Check the store connections</b><span style="color:var(--muted);font-size:12.5px">Logs in to each store with its own app, confirms it is the right shop, and lists the access Shopify granted. Read-only.</span><div class="btns"><button class="btn primary" id="btnCheck">Check stores</button></div><div id="outCheck"></div></div>'+
         '<div class="row"><b>2 · Connect order + refund notifications</b><span style="color:var(--muted);font-size:12.5px">Tells each store to notify the brain the moment an order or refund happens. Checked against Shopify afterwards.</span><div class="btns"><button class="btn primary" id="btnHooks">Connect notifications</button></div><div id="outHooks"></div></div>'+
-        '<div class="row"><b>3 · Test your phone</b><span style="color:var(--muted);font-size:12.5px">Sends one plain message through Pushover. If it shows up on your phone, approvals and alerts will reach you.</span><div class="btns"><button class="btn primary" id="btnPhone">Send test notification</button></div><div id="outPhone"></div></div>';
+        '<div class="row"><b>3 · Test your phone</b><span style="color:var(--muted);font-size:12.5px">Sends one plain message through Pushover. If it shows up on your phone, approvals and alerts will reach you.</span><div class="btns"><button class="btn primary" id="btnPhone">Send test notification</button></div><div id="outPhone"></div></div>'+
+        '<div class="row"><b>4 · Connect Google</b><span style="color:var(--muted);font-size:12.5px">One sign-in with reillyworking26@gmail.com gives the brain Gmail, Google Ads (watch only), Merchant Center and Sheets. Google will call the app unverified: click Advanced, then Go to Store Brain, and tick every box.</span><div class="btns"><button class="btn primary" id="btnGoogle">Connect Google</button></div><div id="outGoogle"></div></div>'+
+        '<div class="row"><b>Connections</b><span style="color:var(--muted);font-size:12.5px">Which keys are in Cloudflare (names only, values are never shown).</span><div id="outConn"><span class="meta">Checking…</span></div></div>';
+      $("#btnGoogle").addEventListener("click",async function(){
+        var b=$("#btnGoogle"); b.disabled=true; $("#outGoogle").innerHTML='<span class="meta">Opening Google…</span>';
+        try{ var r=await fetch("/api/admin/google/start",{method:"POST",headers:{"x-store-brain-key":key}}); var j=await r.json();
+          if(j.ok&&j.url){ window.location.assign(j.url); return; }
+          $("#outGoogle").innerHTML='<span style="color:var(--bad)">✗ '+esc(j.error||("HTTP "+r.status))+'</span>';
+        }catch(e){ $("#outGoogle").innerHTML='<span style="color:var(--bad)">Couldn\'t reach the brain.</span>'; }
+        b.disabled=false;
+      });
+      (async function(){
+        try{ var r=await fetch("/api/admin/connections",{headers:{"x-store-brain-key":key}}); var j=await r.json(); if(!j.ok) throw 0;
+          var rows=Object.keys(j.secrets).map(function(n){ return '<div>'+(j.secrets[n]?'<span style="color:var(--good)">✓</span>':'<span style="color:var(--faint)">·</span>')+' <span class="meta">'+esc(n)+'</span></div>'; }).join("");
+          var g=j.google||{}; var gl=(g.connected===false&&g.account)?'<div><span style="color:var(--warn)">!</span> Google: saved but not verified — click Connect Google again</div>':g.connected?('<div><span style="color:var(--good)">✓</span> Google: '+esc(g.account)+' <span class="meta">'+esc((g.granted||[]).join(", "))+(g.missing&&g.missing.length?' · missing: '+esc(g.missing.join(", ")):'')+(g.verified_at?' · checked '+esc(ago(g.verified_at)):'')+'</span></div>'):'<div><span style="color:var(--faint)">·</span> Google: not connected</div>';
+          $("#outConn").innerHTML=gl+rows;
+        }catch(e){ $("#outConn").innerHTML='<span class="meta">Couldn\'t load connections.</span>'; }
+      })();
       $("#btnPhone").addEventListener("click",function(){ runSetup("/api/admin/test-notification",$("#btnPhone"),$("#outPhone"),function(r){
         return r.sent?'<span style="color:var(--good)">✓ Sent</span> <span class="meta">check your phone. If nothing arrives within a minute, the user key belongs to a different Pushover account.</span>':'<span style="color:var(--bad)">✗ '+esc(r.reason||"not sent")+'</span>'; }) });
       $("#btnCheck").addEventListener("click",function(){ runSetup("/api/admin/check-stores",$("#btnCheck"),$("#outCheck"),function(r){
