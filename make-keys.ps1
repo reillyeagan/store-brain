@@ -1,4 +1,4 @@
-# Store Brain - make the 3 private keys and add them to Cloudflare.
+# Store Brain - make the 2 private keys and add them to Cloudflare.
 # Runs only on this PC. The keys are shown on screen once, for you to save.
 # They are never written to a file that stays on disk, and Claude never sees them.
 
@@ -11,11 +11,10 @@ function New-RandomKey([int]$len) {
 
 $mcKey   = New-RandomKey 40
 $signKey = New-RandomKey 48
-$topic   = 'sb-' + (New-RandomKey 20)
 
 $tmp = Join-Path $env:TEMP ('sb-' + [guid]::NewGuid().ToString() + '.json')
 try {
-  $json = '{"MC_KEY":"' + $mcKey + '","APPROVAL_SIGNING_KEY":"' + $signKey + '","NTFY_TOPIC":"' + $topic + '"}'
+  $json = '{"MC_KEY":"' + $mcKey + '","APPROVAL_SIGNING_KEY":"' + $signKey + '"}'
   [System.IO.File]::WriteAllText($tmp, $json)
   Write-Host ''
   Write-Host '  Adding the keys to Cloudflare...'
@@ -31,14 +30,11 @@ if (-not $ok) {
   exit 1
 }
 Write-Host '  ==========================================================' -ForegroundColor Green
-Write-Host '   DONE. SAVE THESE TWO IN YOUR PASSWORD MANAGER NOW:' -ForegroundColor Green
+Write-Host '   DONE. SAVE THIS IN YOUR PASSWORD MANAGER NOW:' -ForegroundColor Green
 Write-Host '  ==========================================================' -ForegroundColor Green
 Write-Host ''
 Write-Host '   Mission Control key (MC_KEY):'
 Write-Host ('     ' + $mcKey) -ForegroundColor Yellow
-Write-Host ''
-Write-Host '   Phone channel (NTFY_TOPIC) - type this into the ntfy app:'
-Write-Host ('     ' + $topic) -ForegroundColor Yellow
 Write-Host ''
 Write-Host '   (The approval signing key was also added. You never need it.)'
 Write-Host '   Do not send these to Claude or paste them into any chat.'

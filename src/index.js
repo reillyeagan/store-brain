@@ -9,6 +9,7 @@
  *   POST /api/admin/check-stores         Store Guard check for every live store (key required)
  *   POST /api/admin/webhooks             connect order/refund notifications (key required)
  *   POST /api/admin/test-notification    send a test message to Reilly's phone (key required)
+ *   GET  /approve/:id                    phone approval page (signed link from a notification)
  *   GET  /                               Mission Control page (static, no data until a key is given)
  *
  * Crons
@@ -18,14 +19,17 @@
  * Secrets (Reilly adds these in Cloudflare; never in this repo):
  *   MC_KEY                 key for Mission Control + API
  *   APPROVAL_SIGNING_KEY   signs phone Approve/Reject links
- *   NTFY_TOPIC             private ntfy topic for phone notifications
+ *   PUSHOVER_APP_TOKEN     Pushover application token (phone notifications)
+ *   PUSHOVER_USER_KEY      Reilly's Pushover user key
  *   SB_<STORE>_CLIENT_ID / SB_<STORE>_CLIENT_SECRET   per-store Shopify app credentials
  */
 import { STORES, LIVE_STORE_IDS } from "./config/stores.js";
 import { DEPARTMENTS, AGENTS, SERVICES, SYSTEMS } from "./config/agents.js";
 import { recentEvents, costSince, logEvent } from "./lib/eventlog.js";
 import { evaluateFeeds, runSentinel, ensureFeeds } from "./lib/freshness.js";
-import { listPending, decide, verifyDecisionSig, getApproval, sendTestNotification } from "./lib/approvals.js";
+import { listPending, decide, verifyDecisionSig, getApproval } from "./lib/approvals.js";
+import { sendTestNotification } from "./lib/phone.js";
+import { handleApprovalPage } from "./lib/approvalPage.js";
 import { handleShopifyWebhook } from "./lib/shopifyWebhooks.js";
 import { localDay } from "./lib/time.js";
 import { checkStores, registerWebhooks } from "./lib/setup.js";
@@ -143,6 +147,10 @@ export default {
           summary: r.sent ? "Test notification sent to Reilly's phone" : `Test notification failed: ${r.reason}`,
         });
         return json({ ok: true, results: [r] });
+      }
+      const ap = path.match(/^\/approve\/(\d+)$/);
+      if (ap && request.method === "GET") {
+        return await handleApprovalPage(request, env, parseInt(ap[1], 10));
       }
       const m = path.match(/^\/api\/approvals\/(\d+)\/decide$/);
       if (m && request.method === "POST") {

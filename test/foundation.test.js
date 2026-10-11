@@ -10,8 +10,10 @@ import { feedState, runSentinel, markFeedOk, markFeedFailed, evaluateFeeds } fro
 import { verifiedWrite } from "../src/lib/writeVerifier.js";
 import { backup, readBackup } from "../src/lib/backupVault.js";
 import {
-  createApproval, decide, listPending, markExecuted, signDecision, verifyDecisionSig, notifyPhone,
+  createApproval, decide, listPending, markExecuted, signDecision, verifyDecisionSig, getApproval,
 } from "../src/lib/approvals.js";
+import { notifyPhone, sendTestNotification } from "../src/lib/phone.js";
+import { handleApprovalPage } from "../src/lib/approvalPage.js";
 import {
   storeCredentials, getAccessToken, assertShop, guardedWrite, verifyWebhookHmac, StoreGuardError,
   _resetTokenCacheForTests,
@@ -211,17 +213,19 @@ test("approvals: phone notify is a no-op until the phone is set up", async () =>
   assert.equal(r.sent, false);
 });
 
-test("approvals: phone notify sends buttons when configured", async () => {
-  let sent;
-  const r = await notifyPhone(
-    { NTFY_TOPIC: "topic", APPROVAL_SIGNING_KEY: "k", NTFY_SERVER: "https://ntfy.example" },
-    { id: 3, title: "Draft 4 denied products", options: [{ id: "draft", label: "Draft all 4" }] },
-    { baseUrl: "https://brain.example", fetchImpl: async (url, init) => { sent = { url, init }; return { ok: true, status: 200 }; } }
-  );
+const PO_ENV = { PUSHOVER_APP_TOKEN: "app-tok-xyz", PUSHOVER_USER_KEY: "user-key-abc", APPROVAL_SIGNING_KEY: "k" };
+const poOk = (log) => async (url, init) => { log.push({ url, init }); return new Response('{"status":1,"request":"r"}', { status: 200 }); };
+
+test("approvals: phone notify sends one signed page link through Pushover", async () => {
+  const log = [];
+  const r = await notifyPhone(PO_ENV,
+    { id: 3, created_at: "2026-10-11T00:00:00Z", title: "Draft 4 denied products", options: [{ id: "draft", label: "Draft all 4" }] },
+    { baseUrl: "https://brain.example", fetchImpl: poOk(log) });
   assert.equal(r.sent, true);
-  assert.equal(sent.url, "https://ntfy.example/topic");
-  assert.match(sent.init.headers.Actions, /decide\?choice=draft&exp=\d+&sig=/);
-  assert.match(sent.init.headers.Actions, /choice=reject/);
+  assert.equal(log[0].url, "https://api.pushover.net/1/messages.json");
+  const form = new URLSearchParams(log[0].init.body);
+  assert.match(form.get("url"), /^https:\/\/brain\.example\/approve\/3\?exp=\d+&sig=[0-9a-f]{64}$/);
+  assert.match(form.get("message"), /Draft all 4/);
 });
 
 /* ---------------- store guard ---------------- */
@@ -374,15 +378,14 @@ test("webhooks: tag-only updates are silent; money changes get one clear line", 
   assert.match(evs[0].summary, /→ refunded/);
 });
 
-test("phone: test notification posts a plain message to the topic", async () => {
-  const { sendTestNotification } = await import("../src/lib/approvals.js");
-  assert.deepEqual(await sendTestNotification({}), { sent: false, reason: "NTFY_TOPIC is not set in Cloudflare" });
-  let call;
-  const fetchImpl = async (url, init) => { call = { url, init }; return new Response("{}", { status: 200 }); };
-  const r = await sendTestNotification({ NTFY_TOPIC: "sb-topic", NTFY_SERVER: "https://ntfy.sh" }, { fetchImpl });
-  assert.equal(r.sent, true);
-  assert.equal(call.url, "https://ntfy.sh/sb-topic");
-  assert.equal(call.init.headers.Actions, undefined, "no action buttons on a test");
+test("phone: test notification goes through Pushover; Pushover's own receipt is checked", async () => {
+  assert.equal((await sendTestNotification({})).sent, false);
+  const log = [];
+  assert.equal((await sendTestNotification(PO_ENV, { fetchImpl: poOk(log) })).sent, true);
+  assert.equal(new URLSearchParams(log[0].init.body).get("url"), null, "no link on a test");
+  // HTTP 200 without status:1 is not a delivery.
+  const r = await sendTestNotification(PO_ENV, { fetchImpl: async () => new Response('{"status":0}', { status: 200 }) });
+  assert.equal(r.sent, false);
 });
 
 /* ---------------- worker routes ---------------- */
@@ -570,12 +573,38 @@ test("reconcile: a money change found by the pull is logged (the late webhook wi
   assert.match(ups[0].summary, /\$100\.00 → \$0\.00/);
 });
 
-test("phone: a network failure never leaks the topic", async () => {
-  const { sendTestNotification } = await import("../src/lib/approvals.js");
-  const fetchImpl = async (url) => { throw new Error(`Fetch API cannot load: ${url}`); };
-  const r = await sendTestNotification({ NTFY_TOPIC: "secret-topic-123", NTFY_SERVER: "ntfy.sh" }, { fetchImpl });
-  assert.equal(r.sent, false);
-  assert.ok(!JSON.stringify(r).includes("secret-topic-123"));
+test("phone: failures never echo the keys", async () => {
+  const fetchImpl = async (url, init) => { throw new Error(`failed: ${init.body}`); };
+  const r = await sendTestNotification(PO_ENV, { fetchImpl });
+  const bad = await sendTestNotification(PO_ENV, { fetchImpl: async () => new Response('{"status":0,"errors":["token app-tok-xyz is invalid"]}', { status: 400 }) });
+  for (const x of [r, bad]) {
+    assert.equal(x.sent, false);
+    assert.ok(!/app-tok-xyz|user-key-abc/.test(JSON.stringify(x)));
+  }
+});
+
+test("phone page: signed link shows choices; bad link refused; decided approvals say so", async () => {
+  const DB = makeD1();
+  const env = { DB, APPROVAL_SIGNING_KEY: "k" };
+  const id = await createApproval(DB, { dept: "cs", requestedBy: "cs.drafter", title: "Send <reply> to #1001", options: [{ id: "send", label: "Send it", detail: "as drafted" }] });
+  const ap = await getApproval(DB, id);
+  const exp = Date.now() + 60000;
+  const sig = await signDecision("k", ap, "view", exp);
+  const ok = await handleApprovalPage(new Request(`https://b.example/approve/${id}?exp=${exp}&sig=${sig}`), env, id);
+  assert.equal(ok.status, 200);
+  const html = await ok.text();
+  assert.match(html, /Send &lt;reply&gt; to #1001/, "title is escaped");
+  assert.match(html, /choice=send&amp;exp=/);
+  assert.match(html, /choice=reject&amp;exp=/);
+  const forged = await handleApprovalPage(new Request(`https://b.example/approve/${id}?exp=${exp}&sig=${"0".repeat(64)}`), env, id);
+  assert.equal(forged.status, 403);
+  // the "view" signature can't be used to decide
+  const misuse = await decide(DB, id, { choice: "view" });
+  assert.equal(misuse.ok, false);
+  await decide(DB, id, { choice: "send" });
+  const after = await (await handleApprovalPage(new Request(`https://b.example/approve/${id}?exp=${exp}&sig=${sig}`), env, id)).text();
+  assert.match(after, /Already decided: <b>Send it<\/b>/);
+  await assert.rejects(createApproval(DB, { dept: "x", requestedBy: "y", title: "t", options: [{ id: "view", label: "V" }] }));
 });
 
 test("reconcile: GraphQL order maps to the webhook shape", () => {

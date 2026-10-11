@@ -5,9 +5,10 @@
  * with exact numbers. A decision is recorded once; it cannot be changed after the
  * fact, and an approval can only move pending → approved/rejected → executed/failed.
  *
- * Phone buttons: each notification carries signed Approve/Reject links. The
- * signature (HMAC of approval id + choice) means a link can't be forged or reused
- * for a different approval or option.
+ * Phone: each notification links to a signed page (/approve/:id, see phone.js) that
+ * carries a signed link per choice. The signature (HMAC of approval id + creation
+ * time + choice + expiry) means a link can't be forged or reused for another
+ * approval or option.
  */
 import { nowIso } from "./time.js";
 import { logEvent } from "./eventlog.js";
@@ -21,7 +22,8 @@ export async function createApproval(db, { dept, requestedBy, title, options, st
   }
   for (const o of options) {
     if (!o || !o.id || !o.label) throw new Error("createApproval: every option needs id and label");
-    if (o.id === "reject") throw new Error('createApproval: "reject" is reserved');
+    // "reject" is the universal no; "view" signs the phone page link. Neither may be an option.
+    if (o.id === "reject" || o.id === "view") throw new Error(`createApproval: "${o.id}" is reserved`);
   }
   const at = nowIso();
   const res = await db
@@ -119,55 +121,4 @@ export async function verifyDecisionSig(secret, approval, choice, sig, expMs, no
   let diff = 0;
   for (let i = 0; i < expected.length; i++) diff |= expected.charCodeAt(i) ^ String(sig).charCodeAt(i);
   return diff === 0;
-}
-
-/**
- * POST to the private ntfy topic. Network errors are caught here and reported
- * generically: their messages can contain the URL, and the URL contains the topic.
- */
-async function postToTopic(env, init, fetchImpl) {
-  try {
-    const res = await fetchImpl(`${env.NTFY_SERVER || "https://ntfy.sh"}/${env.NTFY_TOPIC}`, { method: "POST", ...init });
-    return { ok: res.ok, status: res.status };
-  } catch {
-    return { ok: false, status: null };
-  }
-}
-
-/**
- * Send a plain test message to Reilly's phone (Setup tab). No action buttons, no links.
- * ntfy accepting it only proves the server took it; the real check is Reilly seeing it.
- */
-export async function sendTestNotification(env, { fetchImpl = fetch } = {}) {
-  if (!env.NTFY_TOPIC) return { sent: false, reason: "NTFY_TOPIC is not set in Cloudflare" };
-  const res = await postToTopic(env, {
-    headers: { Title: "Store Brain: test notification", Tags: "bell" },
-    body: "If you can read this on your phone, approvals and alerts will reach you.",
-  }, fetchImpl);
-  if (res.ok) return { sent: true };
-  return { sent: false, reason: res.status ? `ntfy answered HTTP ${res.status}` : "couldn't reach the ntfy server (check NTFY_SERVER)" };
-}
-
-/**
- * Push an approval to Reilly's phone via ntfy, with Approve/Reject buttons.
- * Returns {sent:false} (not an error) when the phone isn't set up yet.
- */
-export async function notifyPhone(env, approval, { baseUrl, fetchImpl = fetch } = {}) {
-  if (!env.NTFY_TOPIC || !env.APPROVAL_SIGNING_KEY || !baseUrl) return { sent: false, reason: "phone not set up" };
-  const first = approval.options[0];
-  const exp = Date.now() + LINK_TTL_MS;
-  const approveSig = await signDecision(env.APPROVAL_SIGNING_KEY, approval, first.id, exp);
-  const rejectSig = await signDecision(env.APPROVAL_SIGNING_KEY, approval, "reject", exp);
-  const decideUrl = (choice, sig) =>
-    `${baseUrl}/api/approvals/${approval.id}/decide?choice=${encodeURIComponent(choice)}&exp=${exp}&sig=${sig}`;
-  const actions = [
-    `http, ${first.label.replace(/[,;]/g, " ").slice(0, 40)}, ${decideUrl(first.id, approveSig)}, method=POST, clear=true`,
-    `http, Reject, ${decideUrl("reject", rejectSig)}, method=POST, clear=true`,
-    `view, Open, ${baseUrl}/#approval-${approval.id}`,
-  ].join("; ");
-  const res = await postToTopic(env, {
-    headers: { Title: `Store Brain: ${approval.title}`.slice(0, 120), Tags: "white_check_mark", Actions: actions },
-    body: approval.options.map((o) => `• ${o.label}${o.detail ? ` — ${o.detail}` : ""}`).join("\n"),
-  }, fetchImpl);
-  return { sent: res.ok, status: res.status };
 }

@@ -64,8 +64,8 @@ Cloudflare dashboard → **Workers & Pages → store-brain → Settings → Vari
 | `SB_AUB_CLIENT_ID` / `SB_AUB_CLIENT_SECRET` | Auberlane app |
 | `SB_MAR_CLIENT_ID` / `SB_MAR_CLIENT_SECRET` | Marlowe Standard app |
 | `MC_KEY` | Your Mission Control key. Make up a long random password (32+ characters) and keep it in your password manager. |
-| `APPROVAL_SIGNING_KEY` | Another long random password. Signs the Approve/Reject buttons on your phone. |
-| `NTFY_TOPIC` | A long random name for your private phone channel (step 5). |
+| `APPROVAL_SIGNING_KEY` | Another long random password. Signs the approval links sent to your phone. |
+| `PUSHOVER_USER_KEY` / `PUSHOVER_APP_TOKEN` | Your Pushover keys (step 5), added with `5 ADD PUSHOVER KEYS.bat`. |
 
 > If a secret is ever pasted into a chat, rotate it (make a new one) right away.
 
@@ -79,8 +79,15 @@ Claude will provide `DEPLOY STORE BRAIN.bat`, so this becomes a double-click. Th
 
 ## 5. Phone notifications (Reilly · 2 min)
 
-1. Install **ntfy** on your phone (App Store / Play Store; free).
-2. Subscribe to the topic name you chose for `NTFY_TOPIC`.
+ntfy.sh refused every connection from Cloudflare (HTTP 522), so the phone channel is **Pushover** (decided 2026-10-11).
+
+1. Install **Pushover** on your phone and create an account (30-day free trial, then $5 one-time).
+2. On pushover.net, log in: your **User Key** is top right.
+3. Under **Your Applications**, create one named "Store Brain" and copy its **API Token**.
+4. Double-click `5 ADD PUSHOVER KEYS.bat` and paste both (hidden as you paste).
+5. Mission Control → Setup → **Send test notification**.
+
+Approvals arrive as a notification with an **Open to decide** link: a small signed page with one button per choice.
 
 ## 6. Shopify webhooks (Claude prepares, Reilly approves)
 
