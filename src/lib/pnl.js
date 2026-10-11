@@ -48,6 +48,12 @@ export const BREAKEVEN_REFUND_RATE = 0.119;
 export const BREAKEVEN_FEE_RATE = 0.0334;
 /** Used ONLY when the Core has no measured COGS rate for a store. Flagged "assumed" everywhere. */
 export const FALLBACK_COGS_RATE = 0.33;
+/**
+ * EUR→USD used ONLY to turn the Core's measured "EUR per $1 of revenue" blanket rates into a
+ * USD share until the card-alert FX feed is wired. 1.17 = the rate on the quoting sheets.
+ * Always flagged as an estimate; replaced by the actual card rate (decision 2026-10-10).
+ */
+export const EUR_USD_ESTIMATE = 1.17;
 /** How many days (today included) the hourly job recomputes. */
 export const RECOMPUTE_DAYS = 3;
 export const RECOMPUTE_EVERY_MIN = 60;
@@ -113,6 +119,16 @@ export async function cogsRate(db, storeId) {
       ORDER BY CASE WHEN store IS NULL THEN 1 ELSE 0 END, observed_at DESC, id DESC`
   ).bind(storeId).all();
   for (const f of results || []) {
+    // The vault's measured blanket rates are text like "0.2849 EUR per $1 of revenue":
+    // convert with the estimate FX (flagged) rather than silently falling back to 33%.
+    const eur = /([0-9]*\.[0-9]+)\s*EUR\s+per\s+\$1/i.exec(String(f.value));
+    if (eur) {
+      const rate = Number(eur[1]) * EUR_USD_ESTIMATE;
+      if (rate > 0 && rate < 1) {
+        return { rate, assumed: false, source: `core:${f.key} (${eur[1]} EUR per $1 × ${EUR_USD_ESTIMATE} est. FX)`, factId: f.id,
+          observed_at: f.observed_at, stale: !!(f.stale_after && f.stale_after < nowIso()) };
+      }
+    }
     const rate = parseRate(f.value);
     if (rate == null) continue;
     return { rate, assumed: false, source: `core:${f.key}`, factId: f.id, observed_at: f.observed_at,

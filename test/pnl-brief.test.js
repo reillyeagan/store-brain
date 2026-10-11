@@ -453,3 +453,16 @@ test("worker: /api/state carries the P&L and the latest brief", async () => {
   assert.equal(j.brief.mode, "shadow");
   assert.equal(FALLBACK_COGS_RATE, 0.33);
 });
+
+test("cogs: the Core's measured 'EUR per $1' blanket rate is used (×1.17 est. FX), not the 33% fallback", async () => {
+  const { makeD1 } = await import("./helpers/d1.js");
+  const { cogsRate } = await import("../src/lib/pnl.js");
+  const DB = makeD1();
+  await DB.prepare(`INSERT INTO core_facts (store, area, key, value, kind, source, observed_at) VALUES ('hc','pnl','cogs.blanket_rate','H&C blanket COGS estimate rate: 0.2849 EUR per $1 of revenue (176 orders).','observation','vault','2026-10-06')`).run();
+  const r = await cogsRate(DB, "hc");
+  assert.equal(r.assumed, false);
+  assert.ok(Math.abs(r.rate - 0.2849 * 1.17) < 1e-9);
+  assert.match(r.source, /est\. FX/);
+  const m = await cogsRate(DB, "mar");
+  assert.equal(m.assumed, true);
+});
