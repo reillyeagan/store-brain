@@ -80,10 +80,11 @@ export async function markExecuted(db, id, { ok, result }) {
   const ap = await getApproval(db, id);
   if (!ap || ap.status !== "approved") return { ok: false, error: "not_approved" };
   const status = ok ? "executed" : "failed";
-  await db
+  const res = await db
     .prepare(`UPDATE approvals SET status = ?, executed_at = ?, result = ? WHERE id = ? AND status = 'approved'`)
     .bind(status, nowIso(), JSON.stringify(result ?? null), id)
     .run();
+  if (!res.meta || res.meta.changes !== 1) return { ok: false, error: "race_lost" };
   await logEvent(db, {
     actor: "core.approvals", kind: `approval.${status}`, store: ap.store, target: ap.requested_by,
     summary: `${ok ? "Done and verified" : "FAILED"}: ${ap.title}`, data: { approvalId: id, result },
@@ -99,11 +100,21 @@ async function hmacHex(secret, message) {
   return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-export const signDecision = (secret, id, choice) => hmacHex(secret, `approval:${id}:${choice}`);
+/** Phone links expire after 7 days. */
+export const LINK_TTL_MS = 7 * 24 * 3600 * 1000;
 
-export async function verifyDecisionSig(secret, id, choice, sig) {
-  if (!secret || !sig) return false;
-  const expected = await signDecision(secret, id, choice);
+/**
+ * The signature binds the approval id AND its creation time (so a recreated ledger
+ * can't reuse an old link), the option, and an expiry.
+ */
+export const signDecision = (secret, approval, choice, expMs) =>
+  hmacHex(secret, `approval:${approval.id}:${approval.created_at}:${choice}:${expMs}`);
+
+export async function verifyDecisionSig(secret, approval, choice, sig, expMs, nowMs = Date.now()) {
+  if (!secret || !sig || !approval) return false;
+  const exp = Number(expMs);
+  if (!Number.isFinite(exp) || exp < nowMs) return false;
+  const expected = await signDecision(secret, approval, choice, exp);
   if (expected.length !== String(sig).length) return false;
   let diff = 0;
   for (let i = 0; i < expected.length; i++) diff |= expected.charCodeAt(i) ^ String(sig).charCodeAt(i);
@@ -117,10 +128,11 @@ export async function verifyDecisionSig(secret, id, choice, sig) {
 export async function notifyPhone(env, approval, { baseUrl, fetchImpl = fetch } = {}) {
   if (!env.NTFY_TOPIC || !env.APPROVAL_SIGNING_KEY || !baseUrl) return { sent: false, reason: "phone not set up" };
   const first = approval.options[0];
-  const approveSig = await signDecision(env.APPROVAL_SIGNING_KEY, approval.id, first.id);
-  const rejectSig = await signDecision(env.APPROVAL_SIGNING_KEY, approval.id, "reject");
+  const exp = Date.now() + LINK_TTL_MS;
+  const approveSig = await signDecision(env.APPROVAL_SIGNING_KEY, approval, first.id, exp);
+  const rejectSig = await signDecision(env.APPROVAL_SIGNING_KEY, approval, "reject", exp);
   const decideUrl = (choice, sig) =>
-    `${baseUrl}/api/approvals/${approval.id}/decide?choice=${encodeURIComponent(choice)}&sig=${sig}`;
+    `${baseUrl}/api/approvals/${approval.id}/decide?choice=${encodeURIComponent(choice)}&exp=${exp}&sig=${sig}`;
   const actions = [
     `http, ${first.label.replace(/[,;]/g, " ").slice(0, 40)}, ${decideUrl(first.id, approveSig)}, method=POST, clear=true`,
     `http, Reject, ${decideUrl("reject", rejectSig)}, method=POST, clear=true`,

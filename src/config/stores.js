@@ -16,6 +16,7 @@ export const STORES = Object.freeze({
     kfbShopCode: "jmzjx1-it",
     adsCustomerId: "710-814-3649",
     live: true,
+    timezone: "America/New_York",
     secrets: { clientId: "SB_HC_CLIENT_ID", clientSecret: "SB_HC_CLIENT_SECRET" },
   },
   aub: {
@@ -25,6 +26,7 @@ export const STORES = Object.freeze({
     kfbShopCode: "3as2ya-dw",
     adsCustomerId: "148-187-2496",
     live: true,
+    timezone: "America/New_York",
     secrets: { clientId: "SB_AUB_CLIENT_ID", clientSecret: "SB_AUB_CLIENT_SECRET" },
   },
   mar: {
@@ -34,6 +36,7 @@ export const STORES = Object.freeze({
     kfbShopCode: "806080-g8",
     adsCustomerId: "774-220-2674",
     live: true,
+    timezone: "America/New_York",
     secrets: { clientId: "SB_MAR_CLIENT_ID", clientSecret: "SB_MAR_CLIENT_SECRET" },
   },
   cc: {
@@ -43,6 +46,7 @@ export const STORES = Object.freeze({
     kfbShopCode: null,
     adsCustomerId: null,
     live: false,
+    timezone: "America/New_York",
     secrets: { clientId: "SB_CC_CLIENT_ID", clientSecret: "SB_CC_CLIENT_SECRET" },
   },
   tund: {
@@ -52,6 +56,7 @@ export const STORES = Object.freeze({
     kfbShopCode: "mek6yu-91",
     adsCustomerId: null,
     live: false,
+    timezone: "America/New_York",
     secrets: { clientId: "SB_TUND_CLIENT_ID", clientSecret: "SB_TUND_CLIENT_SECRET" },
   },
 });

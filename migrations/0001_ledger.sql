@@ -108,10 +108,19 @@ CREATE TABLE IF NOT EXISTS orders (
   total       REAL,
   financial_status TEXT,
   raw         TEXT,                          -- JSON
+  payload_updated_at TEXT,                   -- Shopify's own updated_at; older webhooks never overwrite newer data
   updated_at  TEXT    NOT NULL,
   PRIMARY KEY (store, order_id)
 );
 CREATE INDEX IF NOT EXISTS idx_orders_day ON orders(store, local_day);
+
+-- Every webhook id we've processed, so a replayed or re-delivered webhook is ignored.
+CREATE TABLE IF NOT EXISTS webhooks_seen (
+  webhook_id  TEXT    PRIMARY KEY,
+  store       TEXT    NOT NULL,
+  topic       TEXT    NOT NULL,
+  at          TEXT    NOT NULL
+);
 
 -- Refund events (not aggregates). Includes PENDING.
 CREATE TABLE IF NOT EXISTS refunds (

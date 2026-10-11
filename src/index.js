@@ -22,7 +22,7 @@ import { STORES, LIVE_STORE_IDS } from "./config/stores.js";
 import { DEPARTMENTS, AGENTS, SERVICES, SYSTEMS } from "./config/agents.js";
 import { recentEvents, costSince, logEvent } from "./lib/eventlog.js";
 import { evaluateFeeds, runSentinel, ensureFeeds } from "./lib/freshness.js";
-import { listPending, decide, verifyDecisionSig } from "./lib/approvals.js";
+import { listPending, decide, verifyDecisionSig, getApproval } from "./lib/approvals.js";
 import { handleShopifyWebhook } from "./lib/shopifyWebhooks.js";
 import { localDay } from "./lib/time.js";
 
@@ -36,8 +36,8 @@ const json = (body, status = 200) =>
 
 function hasKey(request, env) {
   if (!env.MC_KEY) return false; // no key configured = API locked, never open
-  const url = new URL(request.url);
-  const given = request.headers.get("x-store-brain-key") || url.searchParams.get("key") || "";
+  // Header only: keys in URLs end up in logs and browser history.
+  const given = request.headers.get("x-store-brain-key") || "";
   if (given.length !== env.MC_KEY.length) return false;
   let diff = 0;
   for (let i = 0; i < given.length; i++) diff |= given.charCodeAt(i) ^ env.MC_KEY.charCodeAt(i);
@@ -80,6 +80,7 @@ async function handleState(env) {
     })),
     approvals,
     aiCostToday,
+    todayStart,
   });
 }
 
@@ -95,7 +96,11 @@ async function handleDecide(request, env, id) {
   if (!choice) return json({ ok: false, error: "choice required" }, 400);
 
   const viaKey = hasKey(request, env);
-  const viaSig = !viaKey && (await verifyDecisionSig(env.APPROVAL_SIGNING_KEY, id, choice, url.searchParams.get("sig")));
+  let viaSig = false;
+  if (!viaKey) {
+    const approval = await getApproval(env.DB, id);
+    viaSig = await verifyDecisionSig(env.APPROVAL_SIGNING_KEY, approval, choice, url.searchParams.get("sig"), url.searchParams.get("exp"));
+  }
   if (!viaKey && !viaSig) return json({ ok: false, error: "unauthorized" }, 401);
 
   const res = await decide(env.DB, id, { choice, note });

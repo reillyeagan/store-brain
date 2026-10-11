@@ -6,7 +6,7 @@
  * Every webhook is HMAC-verified with that store's own app secret before anything
  * is stored. The 15-minute reconciliation pulls remain the backstop.
  */
-import { storeByDomain } from "../config/stores.js";
+import { storeByDomain, STORES, STORE_IDS } from "../config/stores.js";
 import { verifyWebhookHmac } from "./storeGuard.js";
 import { logEvent } from "./eventlog.js";
 import { markFeedOk } from "./freshness.js";
@@ -27,14 +27,21 @@ export function parseOrder(o) {
     discounts: num(o.current_total_discounts ?? o.total_discounts),
     total: num(o.current_total_price ?? o.total_price),
     financial_status: o.financial_status || null,
+    payload_updated_at: o.updated_at || o.created_at || null,
   };
 }
 
-/** Refund amount = sum of its refund transactions (not an order-level aggregate). */
+/**
+ * Refund amount = sum of its refund transactions that moved (or are moving) money:
+ * SUCCESS and PENDING. FAILURE/ERROR transactions are kept in the status, never in the amount.
+ * Note: PENDING refunds only change status later; the reconciliation pull (Phase 2)
+ * re-reads refund transactions and updates `refunds.status`.
+ */
 export function parseRefund(r) {
   const txs = Array.isArray(r.transactions) ? r.transactions : [];
   const refundTxs = txs.filter((t) => (t.kind || "").toLowerCase() === "refund");
-  const amount = refundTxs.reduce((s, t) => s + (num(t.amount) || 0), 0);
+  const counted = refundTxs.filter((t) => ["success", "pending"].includes(String(t.status || "").toLowerCase()));
+  const amount = counted.reduce((s, t) => s + (num(t.amount) || 0), 0);
   const statuses = [...new Set(refundTxs.map((t) => String(t.status || "").toUpperCase()).filter(Boolean))];
   return {
     refund_id: r.admin_graphql_api_id || `gid://shopify/Refund/${r.id}`,
@@ -59,9 +66,17 @@ export async function handleShopifyWebhook(request, env) {
   const store = storeByDomain(domain);
   if (!store) return new Response("unknown shop", { status: 404 });
   const secret = env[store.secrets.clientSecret];
+  // The signature covers the body, not the shop-domain header. That's only safe if every
+  // store has its OWN app secret, so a shared secret is refused outright.
+  const shared = STORE_IDS.some((id) => id !== store.id && env[STORES[id].secrets.clientSecret] === secret);
+  if (secret && shared) {
+    return new Response("misconfigured: stores must not share an app secret", { status: 500 });
+  }
   if (!secret || !(await verifyWebhookHmac(raw, hmac, secret))) {
     return new Response("unauthorized", { status: 401 });
   }
+  // Stores that aren't live get no rows. Acknowledge so Shopify doesn't retry.
+  if (!store.live) return new Response("ignored: store not live");
 
   let body;
   try {
@@ -70,27 +85,41 @@ export async function handleShopifyWebhook(request, env) {
     return new Response("bad json", { status: 400 });
   }
 
-  const tz = env.TIMEZONE || "America/New_York";
+  const tz = store.timezone || env.TIMEZONE || "America/New_York";
   const at = nowIso();
+
+  // A webhook delivered twice (Shopify retries, or a replay) is processed once.
+  if (webhookId) {
+    const seen = await env.DB.prepare(
+      `INSERT INTO webhooks_seen (webhook_id, store, topic, at) VALUES (?, ?, ?, ?) ON CONFLICT(webhook_id) DO NOTHING`
+    ).bind(webhookId, store.id, topic, at).run();
+    if (seen.meta && seen.meta.changes === 0) return new Response("duplicate");
+  }
 
   if (topic === "orders/create" || topic === "orders/updated") {
     const o = parseOrder(body);
+    if (!o.created_at || Number.isNaN(Date.parse(o.created_at))) {
+      return new Response("bad payload: no created_at", { status: 400 });
+    }
+    // Webhooks can arrive out of order: an older payload never overwrites a newer one.
     await env.DB.prepare(
-      `INSERT INTO orders (store, order_id, name, created_at, local_day, currency, subtotal, discounts, total, financial_status, raw, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO orders (store, order_id, name, created_at, local_day, currency, subtotal, discounts, total, financial_status, raw, payload_updated_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(store, order_id) DO UPDATE SET
          name = excluded.name, currency = excluded.currency, subtotal = excluded.subtotal,
          discounts = excluded.discounts, total = excluded.total,
-         financial_status = excluded.financial_status, raw = excluded.raw, updated_at = excluded.updated_at`
+         financial_status = excluded.financial_status, raw = excluded.raw,
+         payload_updated_at = excluded.payload_updated_at, updated_at = excluded.updated_at
+       WHERE orders.payload_updated_at IS NULL OR excluded.payload_updated_at >= orders.payload_updated_at`
     )
       .bind(store.id, o.order_id, o.name, o.created_at, localDay(o.created_at, tz), o.currency,
-        o.subtotal, o.discounts, o.total, o.financial_status, raw, at)
+        o.subtotal, o.discounts, o.total, o.financial_status, raw, o.payload_updated_at, at)
       .run();
     await markFeedOk(env.DB, `shopify.orders.${store.id}`, at);
     await logEvent(env.DB, {
       actor: "pnl.pullers", kind: topic === "orders/create" ? "order.created" : "order.updated",
       store: store.id, target: "sys.shopify",
-      summary: `${store.name} ${o.name || "order"} — $${(o.total ?? 0).toFixed(2)}${topic === "orders/updated" ? " (updated)" : ""}`,
+      summary: `${store.name} ${o.name || "order"} — ${o.total == null ? "amount unknown" : "$" + o.total.toFixed(2)}${topic === "orders/updated" ? " (updated)" : ""}`,
       data: { orderId: o.order_id, webhookId }, at,
     });
     return new Response("ok");

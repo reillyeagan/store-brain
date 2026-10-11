@@ -190,12 +190,20 @@ test("approvals: invalid choices and option rules", async () => {
   assert.equal((await decide(db, 999, { choice: "a" })).error, "not_found");
 });
 
-test("approvals: signed phone links can't be reused for another option or approval", async () => {
-  const sig = await signDecision("k", 7, "send");
-  assert.equal(await verifyDecisionSig("k", 7, "send", sig), true);
-  assert.equal(await verifyDecisionSig("k", 7, "reject", sig), false);
-  assert.equal(await verifyDecisionSig("k", 8, "send", sig), false);
-  assert.equal(await verifyDecisionSig("other", 7, "send", sig), false);
+test("approvals: signed phone links are bound to one approval, option, creation time and expiry", async () => {
+  const ap = { id: 7, created_at: "2026-10-10T12:00:00.000Z" };
+  const exp = Date.parse("2026-10-17T12:00:00Z");
+  const now = Date.parse("2026-10-11T12:00:00Z");
+  const sig = await signDecision("k", ap, "send", exp);
+  assert.equal(await verifyDecisionSig("k", ap, "send", sig, exp, now), true);
+  assert.equal(await verifyDecisionSig("k", ap, "reject", sig, exp, now), false);
+  assert.equal(await verifyDecisionSig("k", { ...ap, id: 8 }, "send", sig, exp, now), false);
+  // same id but a recreated ledger (different creation time) can't reuse the link
+  assert.equal(await verifyDecisionSig("k", { ...ap, created_at: "2026-11-01T00:00:00.000Z" }, "send", sig, exp, now), false);
+  assert.equal(await verifyDecisionSig("other", ap, "send", sig, exp, now), false);
+  // expired, or expiry tampered with
+  assert.equal(await verifyDecisionSig("k", ap, "send", sig, exp, exp + 1), false);
+  assert.equal(await verifyDecisionSig("k", ap, "send", sig, exp + 86400000, now), false);
 });
 
 test("approvals: phone notify is a no-op until the phone is set up", async () => {
@@ -212,7 +220,7 @@ test("approvals: phone notify sends buttons when configured", async () => {
   );
   assert.equal(r.sent, true);
   assert.equal(sent.url, "https://ntfy.example/topic");
-  assert.match(sent.init.headers.Actions, /decide\?choice=draft&sig=/);
+  assert.match(sent.init.headers.Actions, /decide\?choice=draft&exp=\d+&sig=/);
   assert.match(sent.init.headers.Actions, /choice=reject/);
 });
 
@@ -366,6 +374,12 @@ test("worker: /health is public; /api/state needs the key", async () => {
   assert.ok(body.feeds.every((f) => f.state === "not_wired"));
 });
 
+test("worker: the key is accepted from the header only, never the URL", async () => {
+  const env = { DB: makeD1(), MC_KEY: "k".repeat(32) };
+  const res = await worker.fetch(new Request(`https://b.example/api/state?key=${"k".repeat(32)}`), env);
+  assert.equal(res.status, 401);
+});
+
 test("worker: API stays locked when no key is configured", async () => {
   const res = await worker.fetch(new Request("https://b.example/api/state?key="), { DB: makeD1() });
   assert.equal(res.status, 401);
@@ -375,12 +389,17 @@ test("worker: decisions via key or a signed link only", async () => {
   const DB = makeD1();
   const env = { DB, MC_KEY: "x".repeat(32), APPROVAL_SIGNING_KEY: "sign" };
   const id = await createApproval(DB, { dept: "sup", requestedBy: "sup.denial_sync", title: "Draft 2", options: [{ id: "draft", label: "Draft both" }] });
-  const forged = await worker.fetch(new Request(`https://b.example/api/approvals/${id}/decide?choice=draft&sig=abc`, { method: "POST" }), env);
+  const exp = Date.now() + 3600000;
+  const forged = await worker.fetch(new Request(`https://b.example/api/approvals/${id}/decide?choice=draft&exp=${exp}&sig=abc`, { method: "POST" }), env);
   assert.equal(forged.status, 401);
-  const sig = await signDecision("sign", id, "draft");
-  const good = await worker.fetch(new Request(`https://b.example/api/approvals/${id}/decide?choice=draft&sig=${sig}`, { method: "POST" }), env);
+  // the key in a URL is no longer accepted (header only)
+  const urlKey = await worker.fetch(new Request(`https://b.example/api/approvals/${id}/decide?choice=draft&key=${"x".repeat(32)}`, { method: "POST" }), env);
+  assert.equal(urlKey.status, 401);
+  const ap = await DB.prepare("SELECT * FROM approvals WHERE id = ?").bind(id).first();
+  const sig = await signDecision("sign", ap, "draft", exp);
+  const good = await worker.fetch(new Request(`https://b.example/api/approvals/${id}/decide?choice=draft&exp=${exp}&sig=${sig}`, { method: "POST" }), env);
   assert.equal(good.status, 200);
-  const again = await worker.fetch(new Request(`https://b.example/api/approvals/${id}/decide?choice=draft&sig=${sig}`, { method: "POST" }), env);
+  const again = await worker.fetch(new Request(`https://b.example/api/approvals/${id}/decide?choice=draft&exp=${exp}&sig=${sig}`, { method: "POST" }), env);
   assert.equal(again.status, 409);
 });
 
@@ -398,4 +417,81 @@ test("worker: cron runs the sentinel; day-close cron logs a marker", async () =>
   assert.ok(feeds.length >= 10);
   assert.ok(feeds.every((f) => f.state === "not_wired"));
   assert.equal(ev.filter((e) => e.actor === "svc.freshness").length, 0);
+});
+
+/* ---------------- review fixes ---------------- */
+
+function webhookWithId(topic, domain, payload, secret, id) {
+  const r = webhookRequest(topic, domain, payload, secret);
+  const h = new Headers(r.headers); h.set("x-shopify-webhook-id", id);
+  return new Request(r.url, { method: "POST", headers: h, body: JSON.stringify(payload) });
+}
+
+test("review: webhooks for a store that isn't live are acknowledged but store nothing", async () => {
+  const DB = makeD1();
+  const env = { DB, SB_TUND_CLIENT_SECRET: "tund-secret" };
+  const res = await handleShopifyWebhook(webhookRequest("orders/create", "mek6yu-91.myshopify.com", ORDER, "tund-secret"), env);
+  assert.equal(res.status, 200);
+  assert.equal((await DB.prepare("SELECT COUNT(*) AS n FROM orders").first()).n, 0);
+});
+
+test("review: failed refund transactions are not counted as money refunded", () => {
+  const r = parseRefund({ id: 1, order_id: 2, transactions: [
+    { kind: "refund", amount: "50", status: "failure" }, { kind: "refund", amount: "50", status: "success" } ] });
+  assert.equal(r.amount, 50);
+  assert.equal(r.status, "FAILURE|SUCCESS");
+});
+
+test("review: an older orders/updated never overwrites newer data", async () => {
+  const DB = makeD1();
+  const env = { DB, SB_HC_CLIENT_SECRET: "hc-secret" };
+  const newer = { ...ORDER, updated_at: "2026-10-11T03:00:00Z", financial_status: "refunded", current_total_price: "0.00" };
+  const older = { ...ORDER, updated_at: "2026-10-11T02:40:00Z", financial_status: "paid" };
+  await handleShopifyWebhook(webhookRequest("orders/updated", "jmzjx1-it.myshopify.com", newer, "hc-secret"), env);
+  await handleShopifyWebhook(webhookRequest("orders/updated", "jmzjx1-it.myshopify.com", older, "hc-secret"), env);
+  const row = await DB.prepare("SELECT * FROM orders").first();
+  assert.equal(row.financial_status, "refunded");
+});
+
+test("review: a re-delivered webhook (same id) is processed once", async () => {
+  const DB = makeD1();
+  const env = { DB, SB_HC_CLIENT_SECRET: "hc-secret" };
+  const a = await handleShopifyWebhook(webhookWithId("orders/create", "jmzjx1-it.myshopify.com", ORDER, "hc-secret", "wh-1"), env);
+  const b = await handleShopifyWebhook(webhookWithId("orders/create", "jmzjx1-it.myshopify.com", ORDER, "hc-secret", "wh-1"), env);
+  assert.equal(await a.text(), "ok");
+  assert.equal(await b.text(), "duplicate");
+  assert.equal((await recentEvents(DB)).filter((e) => e.kind === "order.created").length, 1);
+});
+
+test("review: two stores sharing one app secret is refused", async () => {
+  const DB = makeD1();
+  const env = { DB, SB_HC_CLIENT_SECRET: "same", SB_AUB_CLIENT_SECRET: "same" };
+  const res = await handleShopifyWebhook(webhookRequest("orders/create", "3as2ya-dw.myshopify.com", ORDER, "same"), env);
+  assert.equal(res.status, 500);
+  assert.equal((await DB.prepare("SELECT COUNT(*) AS n FROM orders").first()).n, 0);
+});
+
+test("review: a malformed order is rejected with 400, not retried forever", async () => {
+  const DB = makeD1();
+  const env = { DB, SB_HC_CLIENT_SECRET: "hc-secret" };
+  const { created_at, ...noDate } = ORDER;
+  const res = await handleShopifyWebhook(webhookRequest("orders/create", "jmzjx1-it.myshopify.com", noDate, "hc-secret"), env);
+  assert.equal(res.status, 400);
+});
+
+test("review: an unknown order total is shown as unknown, not $0.00", async () => {
+  const DB = makeD1();
+  const env = { DB, SB_HC_CLIENT_SECRET: "hc-secret" };
+  const { current_total_price, ...noTotal } = ORDER;
+  await handleShopifyWebhook(webhookRequest("orders/create", "jmzjx1-it.myshopify.com", noTotal, "hc-secret"), env);
+  const [ev] = await recentEvents(DB);
+  assert.match(ev.summary, /amount unknown/);
+});
+
+test("review: markExecuted only counts once", async () => {
+  const db = makeD1();
+  const id = await createApproval(db, { dept: "cs", requestedBy: "x", title: "t", options: [{ id: "a", label: "A" }] });
+  await decide(db, id, { choice: "a" });
+  assert.equal((await markExecuted(db, id, { ok: true })).ok, true);
+  assert.equal((await markExecuted(db, id, { ok: true })).ok, false);
 });

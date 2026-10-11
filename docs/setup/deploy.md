@@ -8,7 +8,7 @@ Nothing here touches a live store. Phase 1 is read-only.
 
 ## 1. Shopify: one app per live store (Reilly · ~5 min per store)
 
-Same method as the Eagano dash's Marlowe app (see the vault note "WIRING A NEW STORE — Shopify app + token"), but **new apps**, so the Store Brain never shares credentials with the Eagano dash.
+**Each store must have its own app** (the brain refuses two stores sharing one app secret, because a shared secret would let one store's webhook be accepted as another's). Same method as the Eagano dash's Marlowe app (see the vault note "WIRING A NEW STORE — Shopify app + token"), but **new apps**, so the Store Brain never shares credentials with the Eagano dash.
 
 For each of **Holt & Crane, Auberlane, Marlowe Standard**:
 
@@ -84,7 +84,7 @@ Every webhook is checked with that store's own app secret before anything is sav
 
 ## 7. Check it (together)
 
-Open Mission Control at `https://store-brain.<your-subdomain>.workers.dev/` and enter your `MC_KEY`.
+Open Mission Control at `https://store-brain.<your-subdomain>.workers.dev/` and enter your `MC_KEY`. (Bookmark `…/#key=YOUR_KEY` to skip the prompt; the part after `#` never leaves your browser.)
 - **Feeds** tab: each store's orders feed turns **Fresh** after its first order or pull.
 - **Activity** tab: every order appears within seconds, with the store's name.
 - Nothing writes to any store in Phase 1.

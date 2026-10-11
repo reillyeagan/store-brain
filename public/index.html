@@ -120,8 +120,9 @@ h1{margin:2px 0 0;font-size:24px;font-weight:600;letter-spacing:-.01em}
   var esc=function(s){return String(s==null?"":s).replace(/[&<>"]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]})};
 
   function getKey(){
-    var u=new URL(location.href), k=u.searchParams.get("key");
-    if(k){ try{sessionStorage.setItem(KEY_STORE,k)}catch(e){} u.searchParams.delete("key"); history.replaceState(null,"",u.pathname+u.hash); return k; }
+    /* #key=... in the address (never ?key=), so the key is never sent to the server in a URL */
+    var m=/(?:^|[#&])key=([^&]+)/.exec(location.hash), k=m?decodeURIComponent(m[1]):null;
+    if(k){ try{sessionStorage.setItem(KEY_STORE,k)}catch(e){} history.replaceState(null,"",location.pathname); return k; }
     try{ return sessionStorage.getItem(KEY_STORE) }catch(e){ return null }
   }
   function showGate(msg){
@@ -184,8 +185,8 @@ h1{margin:2px 0 0;font-size:24px;font-weight:600;letter-spacing:-.01em}
     var feeds=state.feeds, fresh=feeds.filter(function(f){return f.state==="fresh"}).length;
     var bad=feeds.filter(function(f){return f.state==="stale"||f.state==="failing"}).length;
     var unwired=feeds.filter(function(f){return f.state==="not_wired"}).length;
-    var dayStart=new Date(); dayStart.setHours(0,0,0,0);
-    var today=state.events.filter(function(e){return Date.parse(e.at)>=dayStart.getTime()}).length;
+    var dayStartMs=Date.parse(state.todayStart);
+    var today=state.events.filter(function(e){return Date.parse(e.at)>=dayStartMs}).length;
     var live=state.agents.filter(function(a){return a.status==="live"}).length;
     $("#tiles").innerHTML=
       tile("Stores live",state.stores.filter(function(s){return s.live}).length+" / "+state.stores.length,"")+
