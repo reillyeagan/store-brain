@@ -5,6 +5,8 @@
 ## Inbox
 All three stores' mail (info@holtandcrane.com, info@auberlane.com, info@marlowestandard.com, Shopify contact forms, voicemail transcripts) arrives in reillyworking26@gmail.com. Replies are signed as the store the customer bought from.
 
+**Store inboxes (Reilly, 2026-10-11):** info@holtandcrane.com "has its own gmail, we need to connect it. also, eventually all the stores will have their own gmails". Each store's CS Gmail is connected separately (Setup → Store inboxes; config `mailbox` in `src/config/stores.js`). CS reads and drafts replies **in the inbox the customer wrote to**. Until a store has its own inbox, its mail is read from reillyworking26@gmail.com.
+
 ## Decisions — Reilly, 2026-10-11 (verbatim)
 1. **Express shipping:** "express is fine its all been good and getting delivered on time". The playbook's "never promise express timing" rule is lifted; express can be quoted as the faster option (still never a guaranteed date).
 2. **Sending:** "lets start of with the emails being put in my drafts that i review and click send, then once im ready ill tell you to just start sending them." → Every reply is a **Gmail draft**. No automatic streak counter; auto-send only when Reilly says so, in his words, recorded in `decisions`.
