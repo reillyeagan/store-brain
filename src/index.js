@@ -45,7 +45,7 @@ import { handleShopifyWebhook } from "./lib/shopifyWebhooks.js";
 import { localDay } from "./lib/time.js";
 import { checkStores, registerWebhooks } from "./lib/setup.js";
 import { reconcileOrders } from "./lib/reconcile.js";
-import { startGoogleConnect, handleGoogleCallback, googleStatus, secretPresence } from "./lib/google.js";
+import { startGoogleConnect, handleGoogleCallback, googleStatus, mailboxStatus, secretPresence } from "./lib/google.js";
 import {
   runKfbComposer, handleKfbPage, handleKfbSent, listKfbMessages, expressOrdersToday, supplierMode,
 } from "./lib/kfbMessage.js";
@@ -168,7 +168,8 @@ export default {
       }
       if (path === "/api/admin/google/start" && request.method === "POST") {
         if (!hasKey(request, env)) return json({ ok: false, error: "unauthorized" }, 401);
-        const r = await startGoogleConnect(env);
+        const body = request.headers.get("content-type")?.includes("application/json") ? await request.json().catch(() => ({})) : {};
+        const r = await startGoogleConnect(env, { target: String(body.target || "main").slice(0, 20) });
         return json(r, r.ok ? 200 : 400);
       }
       if (path === "/oauth/google/callback" && request.method === "GET") {
@@ -176,7 +177,7 @@ export default {
       }
       if (path === "/api/admin/connections" && request.method === "GET") {
         if (!hasKey(request, env)) return json({ ok: false, error: "unauthorized" }, 401);
-        return json({ ok: true, secrets: secretPresence(env), google: await googleStatus(env.DB) });
+        return json({ ok: true, secrets: secretPresence(env), google: await googleStatus(env.DB), mailboxes: await mailboxStatus(env) });
       }
       const ap = path.match(/^\/approve\/(\d+)$/);
       if (ap && request.method === "GET") {

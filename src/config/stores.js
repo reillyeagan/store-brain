@@ -15,6 +15,9 @@ export const STORES = Object.freeze({
     domain: "jmzjx1-it.myshopify.com",
     kfbShopCode: "jmzjx1-it",
     adsCustomerId: "710-814-3649",
+    // The store's own customer-service Gmail, connected separately (Reilly, 2026-10-11:
+    // "it has its own gmail, we need to connect it. also, eventually all the stores will have their own gmails").
+    mailbox: "info@holtandcrane.com",
     live: true,
     timezone: "America/New_York",
     secrets: { clientId: "SB_HC_CLIENT_ID", clientSecret: "SB_HC_CLIENT_SECRET" },

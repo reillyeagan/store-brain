@@ -150,3 +150,34 @@ test("review fixes: a failing reconnect never overwrites a working token; status
   await DB.prepare(`UPDATE oauth_tokens SET verified_at = NULL`).run();
   assert.equal((await googleStatus(DB)).connected, false);
 });
+
+test("store inbox: H&C info@ connects to its own slot with Gmail-only scope; main account refused there", async () => {
+  _resetGoogleCacheForTests();
+  const { mailboxStatus } = await import("../src/lib/google.js");
+  const DB = makeD1(); const env = ENV(DB);
+  const r = await startGoogleConnect(env, { target: "hc" });
+  assert.equal(r.ok, true);
+  const u = new URL(r.url);
+  assert.equal(u.searchParams.get("login_hint"), "info@holtandcrane.com");
+  assert.ok(!u.searchParams.get("scope").includes("adwords"), "inbox asks for Gmail only");
+  // Signing in with the main account on the H&C slot is refused.
+  const wrong = await handleGoogleCallback(new Request(`https://b/oauth/google/callback?code=c&state=${u.searchParams.get("state")}`), env,
+    { fetchImpl: fakeGoogle({ email: "reillyworking26@gmail.com", scope: "openid email https://www.googleapis.com/auth/gmail.modify" }).fetchImpl });
+  assert.equal(wrong.status, 403);
+  const r2 = await startGoogleConnect(env, { target: "hc" });
+  const st2 = new URL(r2.url).searchParams.get("state");
+  const ok = await handleGoogleCallback(new Request(`https://b/oauth/google/callback?code=c&state=${st2}`), env,
+    { fetchImpl: fakeGoogle({ email: "info@holtandcrane.com", scope: "openid email https://www.googleapis.com/auth/gmail.modify" }).fetchImpl });
+  assert.equal(ok.status, 200);
+  assert.match(await ok.text(), /Holt &amp; Crane inbox connected/);
+  const row = await DB.prepare(`SELECT provider, account FROM oauth_tokens`).first();
+  assert.deepEqual({ ...row }, { provider: "google:hc", account: "info@holtandcrane.com" });
+  const boxes = await mailboxStatus(env);
+  assert.equal(boxes.find((b) => b.store === "hc").connected, true);
+  assert.deepEqual(boxes.find((b) => b.store === "hc").missing, []);
+  assert.equal(boxes.find((b) => b.store === "aub").mailbox, null);
+  // main slot untouched
+  assert.equal((await googleStatus(DB)).connected, false);
+  // unknown target refused
+  assert.equal((await startGoogleConnect(env, { target: "aub" })).ok, false);
+});
