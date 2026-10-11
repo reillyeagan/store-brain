@@ -102,7 +102,7 @@ Every price change and every draft is ONE approval per batch, showing old → ne
 - **DECIDED 2026-10-11 (Reilly): copy-paste, no WhatsApp API.** "honestly we could just use copy-paste messages instead, the brain gives me a notifaction with the supplier message ready to copy paste then i go and send it myeslf". The brain writes the KFB message, Pushover notifies Reilly with a link to a signed page showing the message and a **Copy** button; Reilly pastes it into the existing KFB group. No business number, no Meta setup. Brain cannot read KFB's replies (bills, "similar" notices) through this route.
 - (Superseded) **WhatsApp channel:** Meta's Groups API needs an Official Business Account, max 8 participants, invite-link only, and documents only groups the business creates. Joining KFB's existing group is not documented as possible. Path: ask KFB to talk to the business number directly (1:1) or join a new group it creates.
 
-## Questions for Reilly
+## Questions for Reilly (all 7 answered 2026-10-11)
 1. **How do products reach KFB for quoting?** Does KFB pull everything from the store automatically, or do you submit products? Can you set priority?
    - **Answered 2026-10-11 (Reilly):** "KFB automatically pulls orders through there app, I have to manually pull products, so whenever i activate like 50 new products I just go into KFB and click "get products" and they go into the quotation section"
    - **Follow-up 2026-10-11 (Reilly):** "ill do the product publishing myself, and will do the get product thing in KFB. the store brain should never need to worry about it."
@@ -123,3 +123,4 @@ Every price change and every draft is ONE approval per batch, showing old → ne
 6. **Returns:** do returned items go to your Charlotte address or back to KFB? For exchanges, does KFB ship the new size from China?
    - **Answered 2026-10-11 (Reilly):** "i never return things to KFB." Returns come to Reilly; replacements/exchanges are new shipments from KFB.
 7. **New sourcing:** can you send KFB a link to a new factory/product and get it quoted? Is that how a category fix would work?
+   - **Answered 2026-10-11 (Reilly):** "i havent tried this and havent needed to". Not in scope for v1; the brain only flags quality/margin problems.
