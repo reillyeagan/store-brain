@@ -117,7 +117,8 @@ Every price change and every draft is ONE approval per batch, showing old → ne
 
 **Fit rule (Reilly, 2026-10-11):** "idk if the sizing between US and chinese sizes seems accurate then its fine, but if the customer orders a M and the chinese M looks more like a S, we might want to send out a chinese L"
 - So the rule is **size equivalence**, not a fixed amount of room: work out which US size each Chinese size actually corresponds to (using US garment reference charts for that gender + garment type), then ship the Chinese size that matches the US size ordered. Accurate → ship as ordered.
-- Chest is the deciding measurement (it drives every complaint so far); length/sleeve are recorded and shown, not decisive. *(Default; Reilly can change.)*
+- **Measurements (Reilly, 2026-10-11): "check everything and make logical decisions".** Chest, length, shoulder and sleeve are all compared. A size is only "equivalent" if it matches the US size on the measurements that matter for that garment (e.g. chest + shoulder for a jacket, chest + length for a sweater). When measurements disagree (chest says M, length says S), the recommendation states the conflict and the reasoning.
+- **Store listings are never changed (Reilly, 2026-10-11): "dont fix the store".** The Size Checker only changes what is shipped.
 
 **Complaint log (Reilly, 2026-10-11):** "also keep track of email info from customers who have complained about sizing for certain products and make note of that." Every sizing complaint in email (too small / too big, order, product, size ordered, size that would have fit) is logged against the product. A product with complaints is treated as running small even if its chart looks fine, and the shift is learned from what customers say fit.
 1. **How do products reach KFB for quoting?** Does KFB pull everything from the store automatically, or do you submit products? Can you set priority?
