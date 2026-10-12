@@ -724,6 +724,8 @@ test("review fix: a loss written up as profit is flagged; ordinary decimals are 
   assert.deepEqual(unverifiedNumbers("The net loss was $52. A loss of about $52. In the red by $52.", data), []);
   assert.deepEqual(unverifiedNumbers("Margin was 12%", { m: { margin: -0.12 } }), ["12%"]);
   assert.deepEqual(unverifiedNumbers("Margin was -12%", { m: { margin: -0.12 } }), []);
+  assert.deepEqual(unverifiedNumbers("No losses today, net profit $52.", data), ["$52"]);
+  assert.deepEqual(unverifiedNumbers("Ad spend down, margin 12%.", { m: { margin: -0.12 } }), ["12%"]);
 });
 
 test("review fix: a failed first refunds read can't be mistaken for a full one", async () => {

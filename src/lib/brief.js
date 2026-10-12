@@ -396,7 +396,9 @@ function matchesFigure(figures, v, dec, { percent = false, scale = 1, sign = 0 }
 }
 
 // Loss wording within a few words before the amount ("the net loss was $52", "a loss of about $52").
-const LOSS_BEFORE = /\b(?:lost|loss(?:es)?|down|negative|deficit|minus|in the red)\b[^.$%\n]{0,24}$/i;
+const LOSS_BEFORE = /\b(?:lost|loss(?:es)?|deficit|in the red|down)\b(?:\s+(?:of|was|is|were|at|by|about|around|roughly|nearly|almost|approximately)){0,3}\s*[:=]?\s*$/i;
+// Only filler words may sit between the loss word and the amount: "No losses today, net
+// profit $52" must NOT turn "$52" into a loss (the profit claim is checked as positive).
 const LOSS_AFTER = /^\s*(?:loss|lost|in the red|negative)\b/i;
 
 /**
