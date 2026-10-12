@@ -606,6 +606,14 @@ test("fix 2: multi-parcel orders reach day 15 / day 20 — delivered parcels don
   assert.match(flags.find((f) => f.order_name === "#2003").detail, /not tracked by 17TRACK \(17TRACK rejected the number\)/);
   assert.equal((await listPending(DB)).length, 1, "only #2001 has fresh 17TRACK evidence; the others are verify-manually flags");
   assert.match(flags.find((f) => f.kind === "day20_verify").detail, /Verify manually \(no parcel is tracked by 17TRACK with a fresh status\)/);
+
+  // #2002's parcel gets registered and a fresh status: now an approval, and the verify flag is superseded.
+  await DB.prepare(`UPDATE shipments SET registered_at = ?, state = 'in_transit', last_status = 'InTransit', polled_at = ? WHERE tracking_number = 'UL200200002YP'`)
+    .bind(order, iso(now + 10 * 60000)).run();
+  await runChecks(env, { nowMs: now + 15 * 60000 });
+  assert.equal((await listPending(DB)).length, 2);
+  const v = await DB.prepare(`SELECT resolved_at FROM shipment_flags WHERE order_name = '#2002' AND kind = 'day20_verify'`).first();
+  assert.ok(v.resolved_at);
 });
 
 test("day-20 approvals: never for orders older than 45 days, at most 5 new per run, the rest held and logged", async () => {
@@ -628,6 +636,8 @@ test("day-20 approvals: never for orders older than 45 days, at most 5 new per r
   const heldEv = (await DB.prepare(`SELECT * FROM events WHERE kind = 'tracking.day20_held'`).all()).results;
   assert.equal(heldEv.length, 1);
   assert.equal(JSON.parse(heldEv[0].data).held, 3);
+  assert.equal(r1.asked, 5);
+  assert.match(heldEv[0].summary, /5 asked this run \(cap 5\), 3 more held back/);
   const oldFlags = (await DB.prepare(`SELECT kind, approval_id FROM shipment_flags WHERE order_name = '#4100' ORDER BY kind`).all()).results;
   assert.deepEqual(oldFlags.map((f) => f.kind), ["day15", "day20_verify"]);
   assert.equal(oldFlags[1].approval_id, null);

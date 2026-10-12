@@ -722,6 +722,9 @@ export async function runChecks(env, { nowMs = Date.now() } = {}) {
         continue;
       }
       await raiseFlag(db, { ...o, tracking_number: null, kind: "day20", detail }, at);
+      // Fresh 17TRACK evidence now: an earlier "verify manually" flag is superseded.
+      await db.prepare(`UPDATE shipment_flags SET resolved_at = ? WHERE store = ? AND order_id = ? AND kind = 'day20_verify' AND resolved_at IS NULL`)
+        .bind(at, o.store, o.order_id).run();
       const flag = await db.prepare(`SELECT approval_id, resolved_at FROM shipment_flags WHERE store = ? AND order_id = ? AND kind = 'day20'`)
         .bind(o.store, o.order_id).first();
       if (flag && flag.approval_id == null && !flag.resolved_at) {
@@ -750,11 +753,11 @@ export async function runChecks(env, { nowMs = Date.now() } = {}) {
   if (held.length) {
     await logEvent(db, {
       actor: LATE_ACTOR, kind: "tracking.day20_held", target: "core.approvals",
-      summary: `Day-20 reship/refund approvals: ${DAY20_APPROVALS_PER_RUN} asked this run, ${held.length} more held back for the next runs (${held.slice(0, 10).join(", ")}${held.length > 10 ? ", ..." : ""})`,
-      data: { held: held.length, cap: DAY20_APPROVALS_PER_RUN, orders: held }, at,
+      summary: `Day-20 reship/refund approvals: ${newApprovals} asked this run (cap ${DAY20_APPROVALS_PER_RUN}), ${held.length} more held back for the next runs (${held.slice(0, 10).join(", ")}${held.length > 10 ? ", ..." : ""})`,
+      data: { held: held.length, asked: newApprovals, cap: DAY20_APPROVALS_PER_RUN, orders: held }, at,
     });
   }
-  return { raised, held: held.length };
+  return { raised, held: held.length, asked: newApprovals };
 }
 
 /* ---------------- the cron entry ---------------- */

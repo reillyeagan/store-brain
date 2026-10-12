@@ -3,10 +3,12 @@
  *
  * Code gathers every number (P&L, approvals, KFB, shipping, money, risk, media, feeds).
  * Claude only writes the words: it is given the computed numbers and nothing else, and told
- * never to invent one. After it answers, CODE checks every number in its text against the
- * data (rule 9: the author never audits its own work); any it can't find is listed at the
- * top of the brief. If the API key is missing or the call fails, a plain code-built brief
- * goes out instead and says so.
+ * never to invent one. After it answers, CODE checks its text (rule 9: the author never
+ * audits its own work): every $-amount, %-figure and ROAS must match one of the COMPUTED
+ * figures (money, counts, ratios; never ids or timestamps), and every order name and date
+ * must be in the reference list it was given. Anything else is listed at the top as
+ * "Unverified numbers" and the brief is stored with checked = 0. If the API key is missing
+ * or the call fails, a plain code-built brief goes out instead and says so.
  *
  * Voice (Reilly, 2026-10-11): "similar to the eagano brain, short and concise while getting
  * the info across and giving a lot of data and reasoning."
@@ -34,6 +36,7 @@ import { listKfbMessages, easternClock } from "./kfbMessage.js";
 import { sendPhone, phoneReady } from "./phone.js";
 import { page, esc } from "./approvalPage.js";
 import { recomputeDays, rowsBetween, sumRows, storeTz } from "./pnl.js";
+import { orderCoverage, coveredDays } from "./orderBackfill.js";
 import { minusDays } from "./adsSpend.js";
 import { localDay, nowIso } from "./time.js";
 
@@ -43,6 +46,8 @@ export const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
 export const ANTHROPIC_VERSION = "2023-06-01";
 export const BRIEF_MAX_TOKENS = 1500; // ~250 words of brief plus headroom; keeps the cost to cents
 export const BRIEF_LINK_TTL_MS = 48 * 3600 * 1000; // money on the page: shorter than the 7-day approval links
+/** A 'composing' row older than this is a run that died part-way: the next run may reclaim it. */
+export const BRIEF_RECLAIM_MIN = 30;
 const ACTOR = "core.briefer";
 
 /**
@@ -94,7 +99,8 @@ function pnlFacts(r) {
     margin: r.margin, roas: r.roas, breakeven_roas: r.breakeven_roas,
     roas_minus_breakeven: r.roas != null && r.breakeven_roas != null ? Math.round((r.roas - r.breakeven_roas) * 100) / 100 : null,
     complete: !!r.complete,
-    not_wired: (r.notes && r.notes.missing) || r.missing || [],
+    missing: (r.notes && r.notes.missing) || r.missing || [],
+    missing_why: (r.notes && r.notes.missing_why) || undefined,
     stale_inputs: (r.notes && r.notes.stale_inputs) || r.stale || [],
   };
 }
@@ -122,10 +128,11 @@ export async function gatherBriefData(env, { nowMs = Date.now() } = {}) {
     mtdRows.push(...mrows);
     const mtd = sumRows(mrows);
     const wk = sumRows(w);
+    const cd = coveredDays((await orderCoverage(db, id)).covered_from, from, y);
     stores.push({
       id, name: STORES[id].name,
       yesterday: yr ? pnlFacts(yr) : null,
-      month_to_date: { from, to: y, days_recorded: mrows.length, ...pnlFacts(mtd) },
+      month_to_date: { from, to: y, days_recorded: mrows.length, order_history_days_covered: cd.covered, days_in_period: cd.total, ...pnlFacts(mtd) },
       media_watch: {
         ads_yesterday: yr ? yr.ads : null, roas_yesterday: yr ? yr.roas : null, breakeven_yesterday: yr ? yr.breakeven_roas : null,
         verdict_yesterday: verdict(yr && yr.roas, yr && yr.breakeven_roas),
@@ -172,7 +179,7 @@ export async function gatherBriefData(env, { nowMs = Date.now() } = {}) {
       ORDER BY id DESC LIMIT 8`
   ).bind(nowIso(nowMs - 86400000)).all();
 
-  return {
+  const data = {
     brief_day: day,
     pnl_day: forDay,
     stores,
@@ -198,6 +205,10 @@ export async function gatherBriefData(env, { nowMs = Date.now() } = {}) {
     risk: (alarms || []).map((a) => ({ kind: a.kind, store: a.store, what: a.summary })),
     feeds_not_fresh: feeds.filter((f) => f.current !== "fresh").map((f) => ({ feed: f.label, state: f.current, last_ok_at: f.last_ok_at })),
   };
+  // The only order names and dates the brief may mention (checked afterwards).
+  const w = briefWhitelist(data);
+  data.references = { order_names: [...w.orderNames].sort(), dates: [...w.dates].sort() };
+  return data;
 }
 
 function verdict(roas, be) {
@@ -212,7 +223,7 @@ function moneyLine(name, f) {
   const est = f.cogs_source === "estimate" || f.cogs_source === "mixed";
   const cogs = f.cogs == null ? "not wired" : `${money(f.cogs)}${est ? ` (estimate${f.cogs_rate_assumed ? ", ASSUMED 33% rate" : ""})` : ""}`;
   const profit = f.profit != null ? money(f.profit)
-    : `unknown (${f.not_wired.join(", ") || "inputs missing"} not wired)${f.profit_excluding_unwired != null ? `; ${money(f.profit_excluding_unwired)} before those` : ""}`;
+    : `unknown (missing: ${f.missing.join(", ") || "inputs"})${f.profit_excluding_unwired != null ? `; ${money(f.profit_excluding_unwired)} without those` : ""}`;
   return `- **${name}:** revenue ${money(f.revenue)} (${f.orders == null ? "orders not wired" : `${f.orders} order${f.orders === 1 ? "" : "s"}`}) · refunds ${money(f.refunds)}` +
     `${f.refunds_pending ? ` (${money(f.refunds_pending)} PENDING)` : ""} · COGS ${cogs} · ads ${money(f.ads)} · Guy ${money(f.guy_fee)}` +
     ` · fees ${money(f.shopify_fees)} → **profit ${profit}** · ROAS ${x2(f.roas)} vs break-even ${x2(f.breakeven_roas)}` +
@@ -225,6 +236,12 @@ export function plainBrief(d) {
   for (const s of d.stores) L.push(moneyLine(s.name, s.yesterday));
   L.push(moneyLine("Group", d.group.yesterday));
   if (d.group.month_to_date) L.push(moneyLine(`Month to date`, d.group.month_to_date));
+  for (const s of d.stores) {
+    const m = s.month_to_date;
+    if (m.order_history_days_covered < m.days_in_period) {
+      L.push(`- **${s.name} month to date covers ${m.order_history_days_covered} of ${m.days_in_period} days** of order history (backfill still reading); profit unknown for the rest.`);
+    }
+  }
   L.push("");
   L.push("## Waiting on you");
   if (!d.waiting.approvals.length) L.push("- Nothing waiting.");
@@ -269,10 +286,11 @@ Hard rules:
 1. Use ONLY numbers that appear in DATA. Never invent, estimate, round into new figures, or extrapolate. Do not add up numbers yourself; the totals you need are in DATA (group, month_to_date, roas_minus_breakeven).
 2. null means "not wired / unknown". Say "not wired", never treat it as zero.
 3. Wherever cogs_source is "estimate", call COGS (and profit, margin, break-even) an estimate. If cogs_rate_assumed is true, say the 33% COGS rate is ASSUMED.
-4. A day with complete=false or stale_inputs is not final; say which inputs.
+4. A day with complete=false or stale_inputs is not final; say which inputs. If a store's month_to_date has order_history_days_covered below days_in_period, say "month-to-date covers X of Y days" with those two numbers.
 5. Good news gets MORE scrutiny, not less: when a number looks good, say what could make it wrong (estimated COGS, stale feed, partial day, PENDING refunds).
 6. Media is watch only: describe ROAS against break-even and the reason; never recommend changing bids, budgets or campaigns.
 7. Give the reasoning behind each judgement in a few words.
+8. Mention an order number (#1234) or a date only if it is listed in DATA.references; write dates as YYYY-MM-DD.
 
 Format: plain markdown subset only: "## " headings, "- " bullets, **bold**. No tables, no links, no HTML.
 Sections in this order: Yesterday's money (per store + group, then month to date) · Waiting on you · Orders · Risk (omit if empty) · Media · Feeds.
@@ -284,8 +302,13 @@ export function buildPrompt(data) {
 
 export class BriefAiError extends Error {}
 
-/** One Messages API call. Returns { text, usage, model, stop_reason }. Throws BriefAiError (never with the key in it). */
-export async function callClaude(env, prompt, { fetchImpl = fetch } = {}) {
+/**
+ * One Messages API call. Returns { text, usage, model, stop_reason }. Throws BriefAiError
+ * (never with the key in it). `onUsage(model, usage, stop_reason)` is awaited as soon as a
+ * response reports token usage, BEFORE the content is checked: an empty or malformed answer
+ * is still paid for, and its cost must reach the ledger.
+ */
+export async function callClaude(env, prompt, { fetchImpl = fetch, onUsage = null } = {}) {
   const model = String(env.BRIEF_MODEL || DEFAULT_BRIEF_MODEL).trim();
   const base = {
     model, max_tokens: BRIEF_MAX_TOKENS, system: prompt.system,
@@ -310,61 +333,144 @@ export async function callClaude(env, prompt, { fetchImpl = fetch } = {}) {
   let { res, j } = await send(tuned);
   const errMsg = (x) => (x && x.error && x.error.message) || "";
   if (res.status === 400 && /thinking|output_config|effort/i.test(errMsg(j))) ({ res, j } = await send(base));
+  if (j && j.usage && onUsage) await onUsage(j.model || model, j.usage, j.stop_reason || null);
   if (!res.ok || !j) {
     throw new BriefAiError(scrubKey(`Claude API HTTP ${res.status}${errMsg(j) ? `: ${errMsg(j)}` : ""}`, env));
   }
-  const text = (Array.isArray(j.content) ? j.content : []).filter((b) => b && b.type === "text").map((b) => b.text).join("\n").trim();
+  const text = (Array.isArray(j.content) ? j.content : []).filter((b) => b && b.type === "text" && typeof b.text === "string").map((b) => b.text).join("\n").trim();
   if (!text) throw new BriefAiError(`Claude API returned no text (stop_reason ${j.stop_reason || "?"})`);
   return { text, usage: j.usage || {}, model: j.model || model, stop_reason: j.stop_reason || null };
 }
 
 /* ---------------- 3. code checks the AI's numbers (rule 9) ---------------- */
 
-function collectNumbers(v, out = []) {
-  if (v == null) return out;
-  if (typeof v === "number") { if (Number.isFinite(v)) out.push(v); return out; }
-  if (typeof v === "string") {
-    for (const m of v.replace(/,/g, "").matchAll(/-?\d+(?:\.\d+)?/g)) out.push(Number(m[0]));
-    return out;
-  }
-  if (Array.isArray(v)) { for (const x of v) collectNumbers(x, out); return out; }
-  if (typeof v === "object") for (const x of Object.values(v)) collectNumbers(x, out);
-  return out;
+/** Keys whose numbers are identifiers, not figures: never whitelisted. */
+const NOT_FIGURES = new Set(["id", "briefId", "references"]);
+const ISO_DAY = /^(\d{4}-\d{2}-\d{2})(?:$|T)/;
+
+/**
+ * What the brief's text may contain, built from the data given to the model:
+ *  - figures: every NUMBER value (money, counts, %, ROAS), except ids. Numbers inside text
+ *    (timestamps, summaries, order names, details) are never figures.
+ *  - orderNames: "#1234" references found in the data's text (flags, approval titles).
+ *  - dates: YYYY-MM-DD values (and the date part of timestamps) in the data.
+ */
+export function briefWhitelist(data) {
+  const figures = [], orderNames = new Set(), dates = new Set();
+  const walk = (v, key) => {
+    if (v == null || NOT_FIGURES.has(key)) return;
+    if (typeof v === "number") { if (Number.isFinite(v)) figures.push(v); return; }
+    if (typeof v === "string") {
+      const d = ISO_DAY.exec(v);
+      if (d) dates.add(d[1]);
+      for (const m of v.matchAll(/#\d+\b/g)) orderNames.add(m[0]);
+      return;
+    }
+    if (Array.isArray(v)) { for (const x of v) walk(x, key); return; }
+    if (typeof v === "object") for (const [k, x] of Object.entries(v)) walk(x, k);
+  };
+  walk(data, null);
+  return { figures, orderNames, dates };
+}
+
+const MONTHS = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
+
+/**
+ * A written figure matches a computed one within the precision it was written at:
+ * "$1,047" (whole dollars) matches 1047.2 within 0.5, "$1,047.20" within 0.005; "37%" matches
+ * 0.37 (a ratio) or 37; "2.3" matches 2.35. Sign is ignored ("lost $52" vs -52).
+ */
+function matchesFigure(figures, v, dec, { percent = false, scale = 1 } = {}) {
+  const tol = 0.5 * Math.pow(10, -dec) * scale + 1e-9;
+  const x = Math.abs(v * scale);
+  return figures.some((c) => {
+    const a = Math.abs(c);
+    return Math.abs(a - x) <= tol || (percent && Math.abs(a * 100 - x) <= tol);
+  });
 }
 
 /**
- * Numbers in the AI's text that the data doesn't contain. Each figure is matched at the
- * precision it was written in ("$1,234" within 0.5, "2.1" within 0.05); "31%" may be a
- * ratio of 0.31. Dates, times and small counts (0-31) are not checked.
+ * Every $-amount, %-figure, ROAS, order name and date in the AI's text that is not one of
+ * the computed figures / references. Plain counts ("3 orders") and clock times are not
+ * checked. Returns the offending text, in order, de-duplicated.
  */
-export function unverifiedNumbers(text, data) {
-  const known = collectNumbers(data);
-  const cleaned = String(text)
-    .replace(/\b\d{4}-\d{2}-\d{2}\b/g, " ")
-    .replace(/\b\d{1,2}:\d{2}\b/g, " ")
-    .replace(/#\d+/g, " ");
+export function unverifiedNumbers(text, data, whitelist = briefWhitelist(data)) {
+  const { figures, orderNames, dates } = whitelist;
   const bad = [];
-  for (const m of cleaned.matchAll(/(\$)?(-?\d[\d,]*(?:\.\d+)?)(k)?(%)?/gi)) {
-    const raw = m[0];
-    const digits = m[2].replace(/,/g, "");
-    let v = Number(digits);
-    if (!Number.isFinite(v)) continue;
+  let t = String(text);
+  const blank = (m) => " ".repeat(m.length);
+  // Dates: ISO and "Oct 31" style (matched on month-day against the reference dates).
+  t = t.replace(/\b\d{4}-\d{2}-\d{2}\b/g, (m) => { if (!dates.has(m)) bad.push(m); return blank(m); });
+  const monthDays = new Set([...dates].map((d) => d.slice(5)));
+  t = t.replace(/\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sept|sep|oct|nov|dec)\.?\s+(\d{1,2})(?:st|nd|rd|th)?\b/gi, (m, mon, dd) => {
+    const md = `${String(MONTHS[mon.toLowerCase().slice(0, 3)]).padStart(2, "0")}-${String(dd).padStart(2, "0")}`;
+    if (!monthDays.has(md)) bad.push(m.trim());
+    return blank(m);
+  });
+  // Order names.
+  t = t.replace(/#\d+\b/g, (m) => { if (!orderNames.has(m)) bad.push(m); return blank(m); });
+  // Clock times are not figures.
+  t = t.replace(/\b\d{1,2}:\d{2}\b/g, blank);
+  // $-amounts (also "$1.2k").
+  t = t.replace(/-?\$\s?-?(\d[\d,]*(?:\.\d+)?)(k\b)?/gi, (m, num, k) => {
+    const digits = num.replace(/,/g, "");
     const dec = (digits.split(".")[1] || "").length;
-    let tol = 0.5 * Math.pow(10, -dec) + 1e-9;
-    if (m[3]) { v *= 1000; tol *= 1000; }
-    if (!m[1] && !m[4] && !m[3] && dec === 0 && Math.abs(v) <= 31) continue;
-    const ok = known.some((c) => Math.abs(Math.abs(c) - Math.abs(v)) <= tol ||
-      (m[4] && Math.abs(Math.abs(c) * 100 - Math.abs(v)) <= tol));
-    if (!ok) bad.push(raw);
-  }
-  return [...new Set(bad)];
+    if (!matchesFigure(figures, Number(digits), dec, { scale: k ? 1000 : 1 })) bad.push(m.trim());
+    return blank(m);
+  });
+  // %-figures.
+  t = t.replace(/-?(\d[\d,]*(?:\.\d+)?)\s?%/g, (m, num) => {
+    const digits = num.replace(/,/g, "");
+    const dec = (digits.split(".")[1] || "").length;
+    if (!matchesFigure(figures, Number(digits), dec, { percent: true })) bad.push(m.trim());
+    return blank(m);
+  });
+  // ROAS: numbers written as "2.4x", the number right after "ROAS" / "break-even", and any
+  // other decimal figure (a ratio by another name).
+  const checkBare = (m, num) => {
+    const digits = num.replace(/,/g, "");
+    const dec = (digits.split(".")[1] || "").length;
+    if (!matchesFigure(figures, Number(digits), dec)) bad.push(m.trim());
+    return blank(m);
+  };
+  t = t.replace(/\b(\d+(?:\.\d+)?)\s?[x×](?![a-z])/gi, checkBare);
+  t = t.replace(/\b(?:ROAS|break-?even)(?:\s+ROAS)?\s*(?:of|was|is|at|vs\.?|:|=)?\s*(\d+(?:\.\d+)?)\b/gi, checkBare);
+  t.replace(/\b\d+\.\d+\b/g, (m) => checkBare(m, m));
+  const src = String(text);
+  return [...new Set(bad)].sort((x, y) => src.indexOf(x) - src.indexOf(y)); // in reading order
 }
 
 /* ---------------- 4. the daily run ---------------- */
 
 /**
+ * Claim today's brief. The briefs row (UNIQUE day) is the claim. A row still 'composing'
+ * after BRIEF_RECLAIM_MIN is a run that died part-way (Worker killed, deploy): one atomic
+ * UPDATE lets exactly one later run take it over. Returns { row, reclaimed } or null.
+ */
+async function claimBrief(db, day, mode, nowMs) {
+  const at = nowIso(nowMs);
+  const claim = await db.prepare(
+    `INSERT INTO briefs (day, created_at, status, mode) VALUES (?, ?, 'composing', ?) ON CONFLICT(day) DO NOTHING`
+  ).bind(day, at, mode).run();
+  if (claim.meta && claim.meta.changes === 1) {
+    return { row: await db.prepare(`SELECT id, created_at FROM briefs WHERE day = ?`).bind(day).first(), reclaimed: null };
+  }
+  const old = await db.prepare(`SELECT id, created_at, status FROM briefs WHERE day = ?`).bind(day).first();
+  const re = await db.prepare(
+    `UPDATE briefs SET created_at = ?, mode = ? WHERE day = ? AND status = 'composing' AND created_at < ?`
+  ).bind(at, mode, day, nowIso(nowMs - BRIEF_RECLAIM_MIN * 60000)).run();
+  if (!re.meta || re.meta.changes !== 1) return null;
+  await logEvent(db, {
+    actor: ACTOR, kind: "brief.reclaimed",
+    summary: `Morning brief ${day}: the run that started at ${old ? old.created_at : "?"} never finished; composing it again`,
+    data: { briefId: old && old.id, day, stuck_since: old && old.created_at }, at,
+  });
+  return { row: await db.prepare(`SELECT id, created_at FROM briefs WHERE day = ?`).bind(day).first(), reclaimed: old && old.created_at };
+}
+
+/**
  * The cron step. Safe every 15 minutes: nothing before 08:00 Eastern, and only the first
- * run after it (per Eastern day) composes. The briefs row (UNIQUE day) is the claim.
+ * run after it (per Eastern day) composes, unless that run died (see claimBrief).
  */
 export async function runBrief(env, { nowMs = Date.now(), fetchImpl = fetch } = {}) {
   const db = env.DB;
@@ -372,11 +478,11 @@ export async function runBrief(env, { nowMs = Date.now(), fetchImpl = fetch } = 
   if (minutes < BRIEF_AFTER_MIN) return { ran: false, reason: "before 08:00 Eastern" };
   const at = nowIso(nowMs);
   const mode = briefMode(env);
-  const claim = await db.prepare(
-    `INSERT INTO briefs (day, created_at, status, mode) VALUES (?, ?, 'composing', ?) ON CONFLICT(day) DO NOTHING`
-  ).bind(day, at, mode).run();
-  if (!claim.meta || claim.meta.changes !== 1) return { ran: false, reason: "already composed today" };
-  const row = await db.prepare(`SELECT id, created_at FROM briefs WHERE day = ?`).bind(day).first();
+  const claimed = await claimBrief(db, day, mode, nowMs);
+  if (!claimed) return { ran: false, reason: "already composed today" };
+  const row = claimed.row;
+  // Every later write is tied to THIS claim, so a run that was reclaimed can't overwrite it.
+  const mine = `id = ? AND created_at = ?`;
 
   let notified = false;
   try {
@@ -390,14 +496,19 @@ export async function runBrief(env, { nowMs = Date.now(), fetchImpl = fetch } = 
       aiError = "ANTHROPIC_API_KEY is not set in Cloudflare";
     } else {
       try {
-        const r = await callClaude(env, buildPrompt(data), { fetchImpl });
-        model = r.model; usage = r.usage; cost = aiCostUsd(r.model, r.usage);
-        // Log the spend at once, so a later fault (and a retry) can't hide what was paid.
-        await logEvent(db, {
-          actor: ACTOR, kind: "ai.call", target: "sys.claude", costUsd: cost,
-          summary: `Morning brief ${day}: Claude ${r.model}, ${usage.input_tokens || 0} in / ${usage.output_tokens || 0} out tokens ($${cost.toFixed(4)})`,
-          // Key names avoid "token": the event log redacts any field named like a credential.
-          data: { model: r.model, usage_in: usage.input_tokens || 0, usage_out: usage.output_tokens || 0, stop_reason: r.stop_reason }, at,
+        const r = await callClaude(env, buildPrompt(data), {
+          fetchImpl,
+          // Log the spend the moment it is known, before the answer is checked: an empty
+          // or broken answer is still paid for, and a later fault must not hide it.
+          onUsage: async (m, u, stop) => {
+            model = m; usage = u; cost = aiCostUsd(m, u);
+            await logEvent(db, {
+              actor: ACTOR, kind: "ai.call", target: "sys.claude", costUsd: cost,
+              summary: `Morning brief ${day}: Claude ${m}, ${u.input_tokens || 0} in / ${u.output_tokens || 0} out tokens ($${cost.toFixed(4)})`,
+              // Key names avoid "token": the event log redacts any field named like a credential.
+              data: { model: m, usage_in: u.input_tokens || 0, usage_out: u.output_tokens || 0, stop_reason: stop }, at,
+            });
+          },
         });
         body = r.text + (r.stop_reason === "max_tokens" ? "\n\n_(cut short at the length limit)_" : "");
         composer = "ai";
@@ -406,24 +517,26 @@ export async function runBrief(env, { nowMs = Date.now(), fetchImpl = fetch } = 
         aiError = scrubKey(err && err.message, env);
       }
     }
+    // checked: the AI text's figures all matched (a plain brief is built from the figures by code).
+    const checked = composer === "plain" || unverified.length === 0 ? 1 : 0;
     if (aiError) {
       body = `> Plain brief, built by code: the AI version is unavailable (${aiError}).\n\n${plain}`;
       await logEvent(db, { actor: ACTOR, kind: "brief.ai_failed", target: "sys.claude", summary: `Morning brief ${day}: using the plain brief (${aiError})`, at });
     } else if (unverified.length) {
-      body = `> **Check:** these numbers in the text are not in the brain's data: ${unverified.join(", ")}. Treat them as unverified.\n\n${body}`;
+      body = `> **Unverified numbers:** ${unverified.join(", ")}. These are not among the figures the brain computed; treat them as unverified.\n\n${body}`;
     }
 
     await db.prepare(
       `UPDATE briefs SET status = 'ready', body_md = ?, data = ?, model = ?, composer = ?, input_tokens = ?, output_tokens = ?,
-         cost_usd = ?, ai_error = ?, unverified = ? WHERE id = ?`
+         cost_usd = ?, ai_error = ?, unverified = ?, checked = ? WHERE ${mine}`
     ).bind(body, JSON.stringify(data), model, composer, usage ? usage.input_tokens || 0 : null, usage ? usage.output_tokens || 0 : null,
-      cost, aiError, JSON.stringify(unverified), row.id).run();
+      cost, aiError, JSON.stringify(unverified), checked, row.id, row.created_at).run();
 
     let phone = null;
     if (mode === "live") {
       phone = await notifyBrief(env, { id: row.id, created_at: row.created_at, day }, data, { nowMs, fetchImpl });
       notified = !!phone.sent;
-      await db.prepare(`UPDATE briefs SET phone = ? WHERE id = ?`).bind(JSON.stringify(phone), row.id).run();
+      await db.prepare(`UPDATE briefs SET phone = ? WHERE ${mine}`).bind(JSON.stringify(phone), row.id, row.created_at).run();
     }
     await logEvent(db, {
       actor: ACTOR,
@@ -432,12 +545,12 @@ export async function runBrief(env, { nowMs = Date.now(), fetchImpl = fetch } = 
       summary: `Morning brief ${day} ready (${composer === "ai" ? `Claude ${model}` : "plain, no AI"}` +
         `${unverified.length ? `, ${unverified.length} unverified number${unverified.length === 1 ? "" : "s"}` : ""})` +
         (mode === "shadow" ? " — shadow: Mission Control only" : phone.sent ? " — sent to Reilly's phone" : ` — phone notification failed: ${phone.reason}`),
-      data: { briefId: row.id, day, mode, composer, model, unverified }, at,
+      data: { briefId: row.id, day, mode, composer, model, unverified, checked: !!checked, reclaimed: claimed.reclaimed }, at,
     });
-    return { ran: true, day, id: row.id, mode, composer, model, body, unverified, aiError, phone, cost };
+    return { ran: true, day, id: row.id, mode, composer, model, body, unverified, checked: !!checked, aiError, phone, cost, reclaimed: claimed.reclaimed };
   } catch (err) {
     if (notified) throw err; // already on the phone: keep it, don't send a second one
-    await db.prepare(`DELETE FROM briefs WHERE id = ?`).bind(row.id).run().catch(() => {});
+    await db.prepare(`DELETE FROM briefs WHERE ${mine} AND status = 'composing'`).bind(row.id, row.created_at).run().catch(() => {});
     throw err;
   }
 }
@@ -500,10 +613,10 @@ export async function getBrief(db, id) {
 
 /** Latest finished brief for Mission Control. */
 export async function latestBrief(db) {
-  const r = await db.prepare(`SELECT id, day, created_at, mode, body_md, model, composer, input_tokens, output_tokens, cost_usd, ai_error, unverified, phone FROM briefs WHERE status = 'ready' ORDER BY day DESC LIMIT 1`).first();
+  const r = await db.prepare(`SELECT id, day, created_at, mode, body_md, model, composer, input_tokens, output_tokens, cost_usd, ai_error, unverified, checked, phone FROM briefs WHERE status = 'ready' ORDER BY day DESC LIMIT 1`).first();
   if (!r) return null;
   const j = (s) => { try { return s ? JSON.parse(s) : null; } catch { return null; } };
-  return { ...r, unverified: j(r.unverified) || [], phone: j(r.phone) };
+  return { ...r, unverified: j(r.unverified) || [], checked: r.checked == null ? null : !!r.checked, phone: j(r.phone) };
 }
 
 const BRIEF_CSS = `main{max-width:640px}h2{font-size:15px;margin:18px 0 6px;color:var(--accent)}h3,h4{font-size:14px;margin:14px 0 4px}

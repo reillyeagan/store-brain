@@ -6,7 +6,7 @@
 -- updated, so the ledger can miss older orders. The orders backfill (src/lib/orderBackfill.js)
 -- pages every order since the first day of the previous month; when it has read them all it
 -- writes this row. The P&L treats any day before covered_from (or a store with no row yet)
--- as incomplete, with profit null: an understated revenue would hide a loss.
+-- as incomplete, with profit null: a missing order hides a loss as easily as a gain.
 CREATE TABLE IF NOT EXISTS order_coverage (
   store        TEXT PRIMARY KEY,
   covered_from TEXT NOT NULL,                 -- earliest fully-covered day (YYYY-MM-DD, store timezone)
@@ -16,18 +16,21 @@ CREATE TABLE IF NOT EXISTS order_coverage (
 -- Progress of the orders backfill, per store, so a run that stops half-way resumes
 -- from its cursor instead of starting again.
 CREATE TABLE IF NOT EXISTS order_backfill (
-  store        TEXT PRIMARY KEY,
-  query_from   TEXT NOT NULL,                 -- the day it reads from (first day of the previous month)
-  cursor       TEXT,                          -- Shopify endCursor of the last page stored (null = start)
-  pages        INTEGER NOT NULL DEFAULT 0,
-  orders       INTEGER NOT NULL DEFAULT 0,    -- orders read so far
-  added        INTEGER NOT NULL DEFAULT 0,    -- of which were not in the ledger before
-  started_at   TEXT    NOT NULL,
-  updated_at   TEXT    NOT NULL,
-  completed_at TEXT,                          -- set once the first full pass is done
-  inc_since    TEXT                           -- incremental pass: re-read orders updated since this (UTC)
+  store             TEXT PRIMARY KEY,
+  query_from        TEXT NOT NULL,            -- the day it reads from (first day of the previous month, store timezone)
+  cursor            TEXT,                     -- Shopify endCursor of the last page stored (null = start)
+  pages             INTEGER NOT NULL DEFAULT 0,
+  orders            INTEGER NOT NULL DEFAULT 0, -- orders read so far
+  added             INTEGER NOT NULL DEFAULT 0, -- of which were not in the ledger before
+  started_at        TEXT    NOT NULL,
+  updated_at        TEXT    NOT NULL,
+  completed_at      TEXT,                     -- set once the first full pass is done
+  inc_since         TEXT,                     -- incremental pass: re-read orders updated since this (UTC)
+  last_full_read_at TEXT                      -- every order change up to this moment (UTC) has been read:
+                                              -- the orders input's "last successful pull" for day completeness
 );
 
--- false (0) when the AI text holds a $-amount, %-figure, ROAS, order number or date that
--- isn't one of the figures code gave it. 1 = every such number checked. Null = older rows.
+-- 1 when every $-amount, %-figure, ROAS, order name and date in the brief's text matches
+-- a figure or reference code gave the model; 0 when any doesn't (they're listed at the
+-- top as "Unverified numbers"). Null = rows from before this column.
 ALTER TABLE briefs ADD COLUMN checked INTEGER;

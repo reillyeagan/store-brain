@@ -15,17 +15,27 @@
  *             `profit_partial` then shows the same sum without the missing items, and
  *             notes.missing names them, so an unwired cost can never make a day look better.
  *
- * Revenue basis: the ledger's `orders.total` is Shopify's CURRENT total, which already has
- * refunds taken off. Refunds are booked separately on their processed day, so using it as-is
- * would subtract a refund twice and put it on the wrong day. So each order's revenue is its
- * ORIGINAL total: `total_price` from the webhook payload when we have it, otherwise the
- * current total plus that order's recorded refunds (SUCCESS + PENDING).
+ * Revenue basis: each order's ORIGINAL total (Shopify's "total before returns"), because
+ * refunds are booked separately on their processed day; the current total would subtract
+ * a refund twice and on the wrong day. It comes from the stored payload: `total_price`
+ * (webhook) or `totalPriceSet` (GraphQL pulls and the orders backfill). There is no
+ * "current total + refunds" guess any more: an order without its original total makes
+ * that day's revenue null (notes.unknown_total) until the backfill re-reads it.
  *
- * Excluded from revenue: Shopify test orders (payload `test: true`) and voided orders
- * (payment authorised then voided: no money ever moved). Counts are kept in notes.
+ * Excluded from revenue: Shopify test orders (payload `test: true`, both payload shapes)
+ * and voided orders (payment authorised then voided: no money ever moved). Counts in notes.
  *
- * A row is `complete` only when the day is over in the store's timezone AND every input
- * feed (orders, ads, payouts, refunds) is fresh. Today is always partial.
+ * Rule 4, per input: an input whose feed is stale, failing past its age limit, or not
+ * wired gives a NULL component (orders → revenue, orders, COGS; refunds; ads → ads and
+ * Guy; payouts → fees), never a number computed from stale data. Profit is then null and
+ * `profit_partial` is the sum of what is known; notes.missing names the missing parts and
+ * notes.missing_why says why. A day before the store's order coverage (or any day before
+ * the orders backfill has finished) has profit null too ("order_history").
+ *
+ * A row is `complete` only when: the day has ended in the store's timezone, every input
+ * is usable, each input's last successful pull happened at least SETTLE_MIN after the
+ * day ended (orders, refunds, ads 2 h; payouts/fees 6 h), the order history covers the day,
+ * and profit is known. Today is always partial.
  *
  * When: the last 3 days are recomputed on the 15-minute cron at most once an hour
  * (job_runs "pnl.recompute"), and again at the day close (05:00 UTC cron, which is
@@ -36,8 +46,9 @@ import { LIVE_STORE_IDS, STORES } from "../config/stores.js";
 import { evaluateFeeds, ensureFeeds } from "./freshness.js";
 import { claimJob } from "./jobRuns.js";
 import { logEvent } from "./eventlog.js";
-import { localDay, nowIso } from "./time.js";
+import { localDay, nowIso, endOfLocalDayMs } from "./time.js";
 import { minusDays } from "./adsSpend.js";
+import { orderCoverage, coveredDays } from "./orderBackfill.js";
 
 /**
  * Break-even ROAS constants. Source: docs/specs/media.md, "true break-even ROAS
@@ -59,6 +70,12 @@ export const RECOMPUTE_DAYS = 3;
 export const RECOMPUTE_EVERY_MIN = 60;
 /** The refunds pull is hourly; its watermark older than this = stale. */
 export const REFUNDS_MAX_AGE_MIN = 120;
+/**
+ * How long after a day ends each input's last successful pull must be before the day can
+ * be complete: late orders, refunds and Google's own adjustments land in the first hours;
+ * Shopify Payments fees settle later, so payouts wait 6 hours.
+ */
+export const SETTLE_MIN = Object.freeze({ orders: 120, refunds: 120, ads: 120, payouts: 360 });
 
 const ACTOR = "pnl.ledger";
 const r2 = (n) => (n == null || !Number.isFinite(Number(n)) ? null : Math.round(Number(n) * 100) / 100);
@@ -178,23 +195,37 @@ export async function productCosts(db, storeId) {
 
 /**
  * State of every input for one store: fresh | stale | failing | not_wired (| none when the
- * store has no ad account). Refunds have no feed row: their freshness is the hourly refund
- * pull's watermark in job_runs ("refunds.<store>").
+ * store has no ad account), whether its data may be used (`usable`), and `pulled_at`, the
+ * last successful pull (for day completeness).
+ *  - A failing feed (latest attempt errored) stays usable while its last success is inside
+ *    the age limit: a failed probe is evidence about the probe (rule 6), and the data is no
+ *    older than a fresh feed's could be.
+ *  - Refunds have no feed row: their freshness is the hourly refund pull's watermark in
+ *    job_runs ("refunds.<store>"), which only moves after a successful read.
+ *  - Orders: the feed is kept fresh by webhooks and the 15-minute pull, but neither reads
+ *    every change; the orders backfill's last full read is the orders input's last pull.
  */
 export async function inputFreshness(db, storeId, feeds, nowMs = Date.now()) {
   const pick = (id) => {
     const f = feeds.find((x) => x.id === id);
-    return f ? { state: f.current || f.state || "not_wired", last_ok_at: f.last_ok_at || null } : { state: "not_wired", last_ok_at: null };
+    if (!f) return { state: "not_wired", last_ok_at: null, pulled_at: null, usable: false };
+    const state = f.current || f.state || "not_wired";
+    const ageMin = f.last_ok_at ? (nowMs - Date.parse(f.last_ok_at)) / 60000 : Infinity;
+    const usable = state === "fresh" || (state === "failing" && ageMin <= Number(f.max_age_min));
+    return { state, last_ok_at: f.last_ok_at || null, pulled_at: f.last_ok_at || null, usable };
   };
   const mark = await db.prepare(`SELECT last_run_at FROM job_runs WHERE job = ?`).bind(`refunds.${storeId}`).first();
-  let refunds = { state: "not_wired", last_ok_at: null };
+  let refunds = { state: "not_wired", last_ok_at: null, pulled_at: null, usable: false };
   if (mark && mark.last_run_at) {
     const age = (nowMs - Date.parse(mark.last_run_at)) / 60000;
-    refunds = { state: age <= REFUNDS_MAX_AGE_MIN ? "fresh" : "stale", last_ok_at: mark.last_run_at };
+    const state = age <= REFUNDS_MAX_AGE_MIN ? "fresh" : "stale";
+    refunds = { state, last_ok_at: mark.last_run_at, pulled_at: mark.last_run_at, usable: state === "fresh" };
   }
+  const cov = await orderCoverage(db, storeId);
+  const orders = { ...pick(`shopify.orders.${storeId}`), pulled_at: cov.last_full_read_at };
   return {
-    orders: pick(`shopify.orders.${storeId}`),
-    ads: STORES[storeId] && STORES[storeId].adsCustomerId ? pick(`ads.spend.${storeId}`) : { state: "none", last_ok_at: null },
+    orders,
+    ads: STORES[storeId] && STORES[storeId].adsCustomerId ? pick(`ads.spend.${storeId}`) : { state: "none", last_ok_at: null, pulled_at: null, usable: true },
     payouts: pick(`shopify.payouts.${storeId}`),
     refunds,
   };
@@ -207,14 +238,20 @@ function safeJson(s) {
   try { return JSON.parse(s); } catch { return null; }
 }
 
-/** Original (pre-refund) order total. See "Revenue basis" at the top. */
-export function orderGross(order, refundedForOrder) {
+/**
+ * Original (pre-refund) order total from the stored payload. See "Revenue basis" at the
+ * top. Null when the payload doesn't carry it: never guessed from the current total.
+ */
+export function orderGross(order) {
   const raw = safeJson(order.raw);
-  if (raw && raw.total_price != null && Number.isFinite(parseFloat(raw.total_price))) {
-    return { gross: parseFloat(raw.total_price), basis: "payload" };
+  const n = (v) => (v != null && Number.isFinite(parseFloat(v)) ? parseFloat(v) : null);
+  if (raw) {
+    const webhook = n(raw.total_price);
+    if (webhook != null) return { gross: webhook, basis: "payload" };
+    const gql = n(raw.totalPriceSet && raw.totalPriceSet.shopMoney && raw.totalPriceSet.shopMoney.amount);
+    if (gql != null) return { gross: gql, basis: "totalPriceSet" };
   }
-  if (order.total == null) return { gross: null, basis: "unknown" };
-  return { gross: Number(order.total) + (refundedForOrder || 0), basis: refundedForOrder ? "current+refunds" : "current" };
+  return { gross: null, basis: "unknown" };
 }
 
 /**
@@ -224,64 +261,71 @@ export function orderGross(order, refundedForOrder) {
 export async function computeStoreDay(db, storeId, day, { nowMs = Date.now(), feeds = null, tz = storeTz(storeId) } = {}) {
   const feedRows = feeds || (await evaluateFeeds(db, nowMs));
   const fresh = await inputFreshness(db, storeId, feedRows, nowMs);
-  const today = localDay(nowMs, tz);
+  const cov = await orderCoverage(db, storeId);
   const notes = { missing: [] };
+  const why = {}; // component → why it is null
+  const notUsable = (k) => `${k} ${fresh[k].state.replace("_", " ")}`;
 
   // --- Orders and revenue ---
   const { results: orders } = await db.prepare(
     `SELECT order_id, name, total, financial_status, raw FROM orders WHERE store = ? AND local_day = ?`
   ).bind(storeId, day).all();
-  const { results: refByOrder } = await db.prepare(
-    `SELECT r.order_id, SUM(r.amount) AS amount FROM refunds r
-      WHERE r.store = ? AND r.order_id IN (SELECT order_id FROM orders WHERE store = ? AND local_day = ?)
-      GROUP BY r.order_id`
-  ).bind(storeId, storeId, day).all();
-  const refunded = new Map((refByOrder || []).map((r) => [r.order_id, Number(r.amount) || 0]));
   const counted = [];
   let excludedTest = 0, excludedVoided = 0, unknownTotal = 0;
   for (const o of orders || []) {
     const raw = safeJson(o.raw);
     if (raw && raw.test === true) { excludedTest++; continue; }
     if (String(o.financial_status || "").toLowerCase() === "voided") { excludedVoided++; continue; }
-    const g = orderGross(o, refunded.get(o.order_id));
+    const g = orderGross(o);
     if (g.gross == null) { unknownTotal++; continue; }
     counted.push({ ...o, gross: g.gross, basis: g.basis });
   }
   if (excludedTest) notes.excluded_test = excludedTest;
   if (excludedVoided) notes.excluded_voided = excludedVoided;
   if (unknownTotal) notes.unknown_total = unknownTotal;
-  const revenue = r2(counted.reduce((s, o) => s + o.gross, 0));
-  const orderCount = counted.length;
-  // No orders and the orders feed never delivered: we don't know there were none.
-  const revenueKnown = !(orderCount === 0 && fresh.orders.state === "not_wired");
+  let revenue = null, orderCount = null;
+  if (!fresh.orders.usable) why.revenue = notUsable("orders");
+  else if (unknownTotal) why.revenue = `${unknownTotal} order${unknownTotal === 1 ? "" : "s"} without an original total (re-read by the orders backfill)`;
+  else { revenue = r2(counted.reduce((s, o) => s + o.gross, 0)); orderCount = counted.length; }
+  // Order history: a day the backfill hasn't covered may be missing orders.
+  const covered = !!(cov.covered_from && cov.covered_from <= day);
+  if (!covered) {
+    why.order_history = cov.covered_from ? `order history only covers ${cov.covered_from} onwards` : "orders backfill not finished";
+    notes.orders_incomplete = why.order_history;
+  }
 
   // --- Refunds by processed day (rule 7) ---
-  const ref = await db.prepare(
-    `SELECT COUNT(*) AS n,
-            SUM(CASE WHEN status LIKE '%PENDING%' THEN amount ELSE 0 END) AS pending,
-            SUM(CASE WHEN status LIKE '%PENDING%' THEN 0 ELSE amount END) AS settled
-       FROM refunds WHERE store = ? AND local_day = ?`
-  ).bind(storeId, day).first();
-  const refundsKnown = !(Number(ref && ref.n) === 0 && fresh.refunds.state === "not_wired");
-  const refundsPending = refundsKnown ? r2(Number(ref && ref.pending) || 0) : null;
-  const refundsSuccess = refundsKnown ? r2(Number(ref && ref.settled) || 0) : null;
-  const refunds = refundsKnown ? r2(refundsPending + refundsSuccess) : null;
+  let refunds = null, refundsPending = null, refundsSuccess = null;
+  if (fresh.refunds.usable) {
+    const ref = await db.prepare(
+      `SELECT SUM(CASE WHEN status LIKE '%PENDING%' THEN amount ELSE 0 END) AS pending,
+              SUM(CASE WHEN status LIKE '%PENDING%' THEN 0 ELSE amount END) AS settled
+         FROM refunds WHERE store = ? AND local_day = ?`
+    ).bind(storeId, day).first();
+    refundsPending = r2(Number(ref && ref.pending) || 0);
+    refundsSuccess = r2(Number(ref && ref.settled) || 0);
+    refunds = r2(refundsPending + refundsSuccess);
+  } else why.refunds = notUsable("refunds");
 
   // --- Ads + Guy ---
   const adRow = await db.prepare(`SELECT cost, clicks, account_tz, currency FROM ad_spend_days WHERE store = ? AND day = ?`).bind(storeId, day).first();
-  const ads = adRow ? r2(adRow.cost) : null;
+  let ads = null;
+  if (!fresh.ads.usable) why.ads = notUsable("ads");
+  else if (!adRow) why.ads = "no ad spend row for that day";
+  else ads = r2(adRow.cost);
   if (adRow && adRow.account_tz && adRow.account_tz !== tz) notes.ads_tz = `ad account days are ${adRow.account_tz}, store days are ${tz}`;
   if (adRow && adRow.currency && adRow.currency !== "USD") notes.ads_currency = adRow.currency;
   const guyFee = guyFeeFor(storeId, day, ads);
+  if (guyFee == null) why.guy_fee = "ads unknown";
 
   // --- Shopify Payments fees on that day's charges (UTC dates → store day) ---
   let fees = null;
-  if (fresh.payouts.state !== "not_wired") {
+  if (fresh.payouts.usable) {
     const { results: txns } = await db.prepare(
       `SELECT date, fee FROM balance_txns WHERE store = ? AND test = 0 AND upper(type) = 'CHARGE' AND date >= ? AND date < ?`
     ).bind(storeId, `${minusDays(day, 1)}T00:00:00`, `${minusDays(day, -2)}T00:00:00`).all();
     fees = r2((txns || []).filter((t) => t.date && localDay(t.date, tz) === day).reduce((s, t) => s + (Number(t.fee) || 0), 0));
-  }
+  } else why.fees = notUsable("payouts");
 
   // --- COGS (estimate) ---
   const rate = await cogsRate(db, storeId);
@@ -306,7 +350,8 @@ export async function computeStoreDay(db, storeId, day, { nowMs = Date.now(), fe
     if (lineCost != null) { cogsEst += lineCost; perProduct++; }
     else { cogsEst += o.gross * rate.rate; byRate++; }
   }
-  cogsEst = revenueKnown ? r2(cogsEst) : null;
+  cogsEst = revenue != null ? r2(cogsEst) : null;
+  if (cogsEst == null) why.cogs = "revenue unknown";
   const cogsActual = null; // KFB bills are not wired yet (COGS Matcher)
   const cogs = cogsEst == null ? null : r2(cogsEst + (cogsActual || 0));
   const cogsSource = cogs == null || orderCount === 0 ? null : cogsActual ? (cogsEst ? "mixed" : "actual") : "estimate";
@@ -318,24 +363,31 @@ export async function computeStoreDay(db, storeId, day, { nowMs = Date.now(), fe
   if (rate.assumed && byRate > 0) notes.cogs_assumed = `COGS uses an ASSUMED ${Math.round(FALLBACK_COGS_RATE * 100)}% rate for ${byRate} order${byRate === 1 ? "" : "s"}`;
 
   // --- Profit ---
-  const parts = { revenue: revenueKnown ? revenue : null, refunds, cogs, ads, guy_fee: guyFee, fees };
+  const parts = { revenue, refunds, cogs, ads, guy_fee: guyFee, fees };
   for (const [k, v] of Object.entries(parts)) if (v == null) notes.missing.push(k);
+  if (!covered) notes.missing.push("order_history");
+  if (notes.missing.length) notes.missing_why = Object.fromEntries(notes.missing.map((k) => [k, why[k] || "unknown"]));
   const val = (v) => (v == null ? 0 : v);
-  const partial = r2(val(parts.revenue) - val(refunds) - val(cogs) - val(ads) - val(guyFee) - val(fees));
+  const partial = r2(val(revenue) - val(refunds) - val(cogs) - val(ads) - val(guyFee) - val(fees));
   const profit = notes.missing.length ? null : partial;
   const margin = revenue ? r4((revenue - val(cogs)) / revenue) : null;
-  const roas = ads ? r2(revenue / ads) : null;
+  const roas = ads && revenue != null ? r2(revenue / ads) : null;
 
   // --- Completeness ---
-  const isToday = day >= today;
+  const endMs = endOfLocalDayMs(day, tz);
+  const ended = nowMs >= endMs;
   const stale = Object.entries(fresh).filter(([, f]) => f.state !== "fresh" && f.state !== "none").map(([k, f]) => `${k} ${f.state}`);
-  const complete = !isToday && stale.length === 0 && profit != null && !notes.unknown_total;
-  if (isToday) notes.partial = "today: day not over";
+  const unsettled = Object.entries(fresh)
+    .filter(([k, f]) => f.state !== "none" && (!f.pulled_at || Date.parse(f.pulled_at) < endMs + SETTLE_MIN[k] * 60000))
+    .map(([k]) => `${k} not pulled ${SETTLE_MIN[k] / 60} h after the day ended`);
+  const complete = ended && stale.length === 0 && unsettled.length === 0 && covered && profit != null && !notes.unknown_total;
+  if (!ended) notes.partial = "today: day not over";
+  else if (unsettled.length) notes.unsettled = unsettled;
   if (stale.length) notes.stale_inputs = stale;
 
   return {
     store: storeId, day,
-    revenue: revenueKnown ? revenue : null, orders: revenueKnown ? orderCount : null,
+    revenue, orders: orderCount,
     refunds, refunds_success: refundsSuccess, refunds_pending: refundsPending,
     ads, clicks: adRow ? adRow.clicks : null, guy_fee: guyFee, services: guyFee, fees, chargebacks: null,
     cogs, cogs_est: cogsEst, cogs_actual: cogsActual, cogs_source: cogsSource, cogs_estimated_share: cogsShare, cogs_basis: cogsBasis,
@@ -347,6 +399,7 @@ export async function computeStoreDay(db, storeId, day, { nowMs = Date.now(), fe
     sources: {
       revenue: "orders (store-day of order time, original totals)", refunds: "refunds (processed day)",
       ads: "ad_spend_days", fees: "balance_txns CHARGE fees", cogs: "estimate (KFB bills not wired)",
+      order_coverage: cov.covered_from,
       guy: STORES[storeId] ? { rate: STORES[storeId].guyFeeRate || 0, start: STORES[storeId].guyStart || null } : null,
     },
   };
@@ -440,9 +493,9 @@ export async function runDayClose(env, { nowMs = Date.now() } = {}) {
     const notes = safeJson(r && r.notes) || {};
     await logEvent(env.DB, {
       actor: ACTOR, kind: "day.close", store: id,
-      summary: `${STORES[id].name} ${y} closed: revenue ${fmt(r && r.revenue)}, profit ${r && r.profit != null ? fmt(r.profit) : `unknown (${(notes.missing || []).join(", ") || "inputs missing"})`}` +
+      summary: `${STORES[id].name} ${y} closed: revenue ${fmt(r && r.revenue)}, profit ${r && r.profit != null ? fmt(r.profit) : `unknown (missing: ${(notes.missing || []).join(", ") || "inputs"})`}` +
         (r && r.cogs_source === "estimate" ? " (COGS estimated)" : "") +
-        (r && r.complete ? "" : ` — not complete${notes.stale_inputs ? `: ${notes.stale_inputs.join(", ")}` : ""}`),
+        (r && r.complete ? "" : ` — not complete${[...(notes.stale_inputs || []), ...(notes.unsettled || [])].length ? `: ${[...(notes.stale_inputs || []), ...(notes.unsettled || [])].join(", ")}` : ""}`),
       data: { day: y, complete: !!(r && r.complete) }, at,
     });
   }
@@ -515,6 +568,9 @@ export async function pnlState(db, { nowMs = Date.now() } = {}) {
     const mtd = sumRows(mtdRows, `${monthFrom} to ${yesterday}`);
     mtd.missing_days = missingDays(mtdRows, monthFrom, yesterday);
     if (mtd.missing_days.length) { mtd.complete = false; mtd.profit = null; }
+    const cd = coveredDays((await orderCoverage(db, id)).covered_from, monthFrom, yesterday);
+    mtd.order_history_days = cd.covered;
+    mtd.days_in_period = cd.total;
     stores.push({ id, name: STORES[id].name, today_day: today, today: todayRow, yesterday: yRow, last7, last7_sum: sumRows(last7, `${weekFrom} to ${yesterday}`), mtd });
   }
   const pick = (k) => stores.map((s) => s[k]).filter(Boolean);

@@ -19,7 +19,8 @@
  * Quiet: orders go through the same `upsertOrder` as webhooks and the pull (same
  * out-of-order guard), but no per-order events: one summary line per store.
  * Line items are not read here (cost); orders without lines use the store's COGS rate.
- * Requested cost per page: 50 orders x 10 points + 2 ≈ 502 (limit 1,000), see ORDER_FIELDS.
+ * Requested cost per page: 50 orders x 10 points + 2 = 502 (Shopify refuses anything over
+ * 1,000), see requestedCost() and ORDER_FIELDS. Throttled through job_runs, a few pages a run.
  */
 import { LIVE_STORE_IDS, STORES } from "../config/stores.js";
 import { shopifyGraphQL } from "./storeGuard.js";
@@ -27,14 +28,14 @@ import { upsertOrder } from "./shopifyWebhooks.js";
 import { ORDER_FIELDS, orderFromNode } from "./reconcile.js";
 import { claimJob } from "./jobRuns.js";
 import { logEvent } from "./eventlog.js";
-import { localDay, nowIso } from "./time.js";
-import { minusDays } from "./adsSpend.js";
+import { localDay, nowIso, startOfLocalDayMs } from "./time.js";
 
 export const BACKFILL_PAGE_SIZE = 50;
 export const BACKFILL_PAGES_PER_RUN = 4; // 200 orders per store per run keeps the Worker well inside its limits
 export const BACKFILL_EVERY_MIN = 15; // first pass: every cron run until done
 export const INCREMENTAL_EVERY_MIN = 60;
 export const INCREMENTAL_OVERLAP_MIN = 120;
+export const SHOPIFY_MAX_QUERY_COST = 1000;
 
 const ACTOR = "pnl.pullers";
 
@@ -48,6 +49,16 @@ const backfillQuery = (sortKey) => `query OrdersBackfill($first: Int!, $after: S
 export const BACKFILL_QUERY = backfillQuery("CREATED_AT");
 export const INCREMENTAL_QUERY = backfillQuery("UPDATED_AT");
 
+/**
+ * Shopify's REQUESTED cost for one page: 2 for the connection, plus per order 1 for the
+ * Order and 1 for every nested object (each `{` in ORDER_FIELDS); scalars are free.
+ * Kept as code so a field added to ORDER_FIELDS can't silently push a page over 1,000.
+ */
+export function requestedCost(first = BACKFILL_PAGE_SIZE, fields = ORDER_FIELDS) {
+  const perOrder = 1 + (fields.match(/\{/g) || []).length;
+  return 2 + first * perOrder;
+}
+
 /** First day of the previous month, in the store's timezone. */
 export function backfillFromDay(nowMs, tz) {
   const today = localDay(nowMs, tz);
@@ -56,9 +67,22 @@ export function backfillFromDay(nowMs, tz) {
   return `${y}-${String(m).padStart(2, "0")}-01`;
 }
 
-/** The earliest fully-covered day for a store, or null when its backfill hasn't finished. */
+/**
+ * A store's order history state: the earliest fully-covered day (null while the first
+ * pass hasn't finished) and when every order change was last read in full.
+ */
 export async function orderCoverage(db, storeId) {
-  return db.prepare(`SELECT covered_from, completed_at FROM order_coverage WHERE store = ?`).bind(storeId).first();
+  const c = await db.prepare(`SELECT covered_from, completed_at FROM order_coverage WHERE store = ?`).bind(storeId).first();
+  const b = await db.prepare(`SELECT last_full_read_at FROM order_backfill WHERE store = ?`).bind(storeId).first();
+  return { covered_from: c ? c.covered_from : null, completed_at: c ? c.completed_at : null, last_full_read_at: b ? b.last_full_read_at : null };
+}
+
+/** How many days of [from, to] the order history covers. */
+export function coveredDays(coveredFrom, from, to) {
+  const n = (a, b) => Math.round((Date.parse(`${b}T00:00:00Z`) - Date.parse(`${a}T00:00:00Z`)) / 86400000) + 1;
+  const total = to < from ? 0 : n(from, to);
+  if (!coveredFrom || coveredFrom > to) return { covered: 0, total };
+  return { covered: coveredFrom <= from ? total : n(coveredFrom, to), total };
 }
 
 async function readPages(env, id, store, { query, gql, cursor, opts, at, onPage }) {
@@ -105,9 +129,9 @@ export async function backfillStore(env, id, { nowMs = Date.now(), opts = {} } =
   }
 
   if (firstPass) {
-    // A day early on purpose: Shopify's search reads a bare date in the shop's timezone,
-    // and an extra day of orders costs nothing (the P&L only counts covered_from onwards).
-    const query = `created_at:>=${minusDays(st.query_from, 1)}`;
+    // The exact UTC moment the first day begins in the store's timezone: a bare date would
+    // leave it to Shopify which timezone it means, and a few hours missed is a hole.
+    const query = `created_at:>='${new Date(startOfLocalDayMs(st.query_from, tz)).toISOString()}'`;
     const r = await readPages(env, id, store, {
       query, gql: BACKFILL_QUERY, cursor: st.cursor, opts, at,
       onPage: (p) => db.prepare(
@@ -120,9 +144,10 @@ export async function backfillStore(env, id, { nowMs = Date.now(), opts = {} } =
       return { store: id, ran: true, phase: "first", done: false, read: r.read, added: r.added };
     }
     // Finished: from query_from on the ledger has every order. Anything updated while the
-    // pass ran is picked up by the first incremental pass (it starts at started_at).
-    await db.prepare(`UPDATE order_backfill SET completed_at = ?, inc_since = ?, updated_at = ? WHERE store = ?`)
-      .bind(at, st.started_at, at, id).run();
+    // pass ran is picked up by the first incremental pass (it starts at started_at), so
+    // order CHANGES are only known complete up to started_at.
+    await db.prepare(`UPDATE order_backfill SET completed_at = ?, inc_since = ?, last_full_read_at = ?, updated_at = ? WHERE store = ?`)
+      .bind(at, st.started_at, st.started_at, at, id).run();
     await db.prepare(
       `INSERT INTO order_coverage (store, covered_from, completed_at) VALUES (?, ?, ?)
        ON CONFLICT(store) DO UPDATE SET covered_from = excluded.covered_from, completed_at = excluded.completed_at`
@@ -142,7 +167,11 @@ export async function backfillStore(env, id, { nowMs = Date.now(), opts = {} } =
   const r = await readPages(env, id, store, { query, gql: INCREMENTAL_QUERY, cursor: null, opts, at, onPage: async () => {} });
   // Read in full → next pass starts now; cut short → it carries on from the last order read.
   const next = r.done ? at : (r.lastUpdated ? new Date(Date.parse(r.lastUpdated) + INCREMENTAL_OVERLAP_MIN * 60000).toISOString() : st.inc_since);
-  await db.prepare(`UPDATE order_backfill SET inc_since = ?, updated_at = ? WHERE store = ?`).bind(next, at, id).run();
+  // Only a window read to the end proves every change up to now is in the ledger.
+  await db.prepare(`UPDATE order_backfill SET inc_since = ?, last_full_read_at = CASE WHEN ? THEN ? ELSE last_full_read_at END, updated_at = ? WHERE store = ?`)
+    .bind(next, r.done ? 1 : 0, at, at, id).run();
+  await db.prepare(`UPDATE job_runs SET last_result = ? WHERE job = ?`)
+    .bind(`incremental: ${r.read} orders read${r.done ? "" : ", more next run"}`, `orders.backfill.${id}`).run();
   if (r.added) {
     await logEvent(db, {
       actor: ACTOR, kind: "orders.backfilled", store: id, target: "sys.shopify",

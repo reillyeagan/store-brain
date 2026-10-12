@@ -335,7 +335,7 @@ h1{margin:2px 0 0;font-size:24px;font-weight:600;letter-spacing:-.01em}
       }).join("")+'</div>':'<div class="empty">No parcels yet. Tracking numbers appear after KFB ships an order.</div>';
       html2+='<div class="sub">Needs attention</div>';
       html2+=sh.flags.length?sh.flags.map(function(f){
-        var hot=f.kind==="day20"||f.kind==="failed_delivery"||f.kind==="pickup_ready";
+        var hot=f.kind==="day20"||f.kind==="day20_verify"||f.kind==="failed_delivery"||f.kind==="pickup_ready";
         return '<div class="row'+(hot?" alarm":"")+'"><b>'+esc(f.store_name)+' '+esc(f.order_name)+' · '+esc(f.label)+'</b><span style="color:var(--muted);font-size:12.5px">'+esc(f.detail)+'</span><span class="meta">'+
           (f.tracking_number?'<span>'+esc(f.tracking_number)+'</span>':'')+(f.last_event_text?'<span>'+esc(String(f.last_event_text).slice(0,80))+'</span>':'')+
           (f.approval_id?'<span>approval '+esc(f.approval_id)+(f.approval_status?' · '+esc(f.approval_status):'')+'</span>':'')+'<span>flagged '+esc(ago(f.raised_at))+'</span></span></div>';
@@ -439,8 +439,8 @@ h1{margin:2px 0 0;font-size:24px;font-weight:600;letter-spacing:-.01em}
   function pctTxt(n){ return n==null?"—":(Math.round(n*1000)/10)+"%"; }
   function profitTxt(r){
     if(r.profit!=null) return '<span'+(r.profit<0?' class="bad-t"':'')+'>'+esc(amt(r.profit))+'</span>';
-    var miss=(r.notes&&r.notes.missing)||r.missing||[];
-    return '<span class="pend">— '+esc(miss.join(", ")||"inputs")+' not wired'+(r.profit_partial!=null?' · '+esc(amt(r.profit_partial))+' before those':'')+'</span>';
+    var miss=(r.notes&&r.notes.missing)||r.missing||[], why=(r.notes&&r.notes.missing_why)||{};
+    return '<span class="pend">— missing: '+esc(miss.map(function(k){return why[k]?k+" ("+why[k]+")":k;}).join(", ")||"inputs")+(r.profit_partial!=null?' · '+esc(amt(r.profit_partial))+' without those':'')+'</span>';
   }
   function cogsTxt(r){
     if(r.cogs==null) return "—";
@@ -451,7 +451,7 @@ h1{margin:2px 0 0;font-size:24px;font-weight:600;letter-spacing:-.01em}
   function statusBadge(r,today){
     if(today) return '<span class="badge warn">PARTIAL · day not over</span>';
     if(r.complete) return r.status==="restated"?'<span class="badge">restated</span>':'<span class="badge good">complete</span>';
-    var st=(r.notes&&r.notes.stale_inputs)||r.stale||[];
+    var st=((r.notes&&r.notes.stale_inputs)||r.stale||[]).concat((r.notes&&r.notes.unsettled)||[]);
     return '<span class="badge warn">not complete'+(st.length?' · '+esc(st.join(", ")):'')+'</span>';
   }
   function freshBadges(f){
@@ -493,6 +493,7 @@ h1{margin:2px 0 0;font-size:24px;font-weight:600;letter-spacing:-.01em}
       h+='<div class="row"><b>Last 7 days</b>'+daysTable(s.last7)+(s.last7_sum&&s.last7_sum.revenue!=null?kv("7-day revenue / profit",esc(amt(s.last7_sum.revenue))+' / '+(s.last7_sum.profit==null?'<span class="pend">—</span>':esc(amt(s.last7_sum.profit)))):'')+'</div>';
       var m=s.mtd||{};
       h+=pnlBlock("Month to date · "+(m.label||""),m.days?m:null);
+      if(m.days_in_period&&m.order_history_days<m.days_in_period) h+='<div class="row alarm"><span class="pend">Order history covers '+esc(m.order_history_days)+' of '+esc(m.days_in_period)+' days this month (backfill still reading); profit unknown for the rest.</span></div>';
       if(m.missing_days&&m.missing_days.length) h+='<div class="row alarm"><span class="pend">MTD is missing '+esc(m.missing_days.length)+' day(s): '+esc(m.missing_days.slice(0,6).join(", "))+'</span></div>';
     });
     return h;
@@ -519,7 +520,7 @@ h1{margin:2px 0 0;font-size:24px;font-weight:600;letter-spacing:-.01em}
     var mode=b.mode==="live"?"live (sent to your phone at 8:00)":"shadow (Mission Control only, not sent to your phone)";
     var l=b.latest;
     if(!l) return '<div class="sub">Morning brief · '+esc(mode)+'</div><div class="empty">No brief yet. The brain writes it once a day after 8:00 am Eastern.</div>';
-    var meta='<span class="meta"><span>'+esc(l.day)+'</span><span>'+esc(l.composer==="ai"?"Claude "+(l.model||""):"plain (no AI)")+'</span>'+(l.composer==="ai"?'<span>$'+esc(Number(l.cost_usd||0).toFixed(4))+'</span>':'')+'<span>'+esc(ago(l.created_at))+'</span>'+
+    var meta='<span class="meta"><span>'+esc(l.day)+'</span><span>'+esc(l.composer==="ai"?"Claude "+(l.model||""):"plain (no AI)")+'</span>'+(l.composer==="ai"?'<span>$'+esc(Number(l.cost_usd||0).toFixed(4))+'</span>'+(l.checked===false?'<span class="bad-t">numbers NOT checked</span>':l.checked?'<span>numbers checked</span>':''):'')+'<span>'+esc(ago(l.created_at))+'</span>'+
       (l.phone?'<span>'+(l.phone.sent?"sent to phone":'<span class="bad-t">phone: '+esc(l.phone.reason||"not sent")+'</span>')+'</span>':'')+'</span>';
     return '<div class="sub">Morning brief · '+esc(mode)+'</div><div class="row">'+meta+(l.ai_error?'<span class="pend" style="font-size:12px">AI unavailable: '+esc(l.ai_error)+'</span>':'')+'<div class="brief">'+mdHtml(l.body_md)+'</div></div>';
   }

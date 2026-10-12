@@ -21,11 +21,21 @@ const NY = "America/New_York";
 const iso = (ms) => new Date(ms).toISOString();
 const API_KEY = "sk-ant-api03-TESTKEY-never-log-me-1234567890";
 
-async function order(DB, store, { id, created_at, total, raw = null, status = "paid" }) {
+/** An order as a webhook stores it: raw payload with the ORIGINAL total_price (unless `raw` is given; `raw: false` = no payload). */
+async function order(DB, store, { id, created_at, total, raw = undefined, status = "paid" }) {
+  const payload = raw === undefined ? { total_price: String(total) } : raw;
   await upsertOrder(DB, STORES[store], {
     order_id: `gid://shopify/Order/${id}`, name: `#${id}`, created_at, currency: "USD",
     subtotal: total, discounts: 0, total, financial_status: status, payload_updated_at: created_at,
-  }, raw ? JSON.stringify(raw) : null, STORES[store].timezone, created_at);
+  }, payload ? JSON.stringify(payload) : null, STORES[store].timezone, created_at);
+}
+
+/** Order history: covered from `from`, every change read at `readAt`. */
+async function coverage(DB, store, from, readAt) {
+  await DB.prepare(`INSERT INTO order_coverage (store, covered_from, completed_at) VALUES (?, ?, ?)
+    ON CONFLICT(store) DO UPDATE SET covered_from = excluded.covered_from`).bind(store, from, readAt).run();
+  await DB.prepare(`INSERT INTO order_backfill (store, query_from, started_at, updated_at, completed_at, last_full_read_at) VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(store) DO UPDATE SET last_full_read_at = excluded.last_full_read_at`).bind(store, from, readAt, readAt, readAt, readAt).run();
 }
 
 async function refund(DB, store, { id, orderId, processed_at, amount, status = "SUCCESS" }) {
@@ -43,11 +53,12 @@ async function charge(DB, store, { id, date, fee, type = "CHARGE", test = 0 }) {
     VALUES (?, ?, ?, ?, 100, ?, ?, 'USD', ?, '2026-10-11T00:00:00Z')`).bind(store, `gid://t/${id}`, type, date, fee, 100 - fee, test).run();
 }
 
-/** Make every input of every live store fresh as of `nowMs`. */
+/** Make every input of every live store fresh as of `nowMs` (order history covered from 2026-01-01). */
 async function allFresh(DB, nowMs, { skip = [] } = {}) {
   await ensureFeeds(DB);
   const at = iso(nowMs - 60000);
   for (const id of LIVE_STORE_IDS) {
+    if (!skip.includes(`coverage.${id}`)) await coverage(DB, id, "2026-01-01", at);
     for (const f of [`shopify.orders.${id}`, `ads.spend.${id}`, `shopify.payouts.${id}`]) {
       if (!skip.includes(f)) await markFeedOk(DB, f, at);
     }
@@ -131,21 +142,31 @@ test("refunds are booked on their processed day, PENDING kept apart; revenue is 
   const DB = makeD1();
   const nowMs = Date.parse("2026-10-12T15:00:00Z");
   await allFresh(DB, nowMs);
-  // Order on Oct 8. The ledger's total is Shopify's CURRENT total (after $50 of refunds) = $50.
-  await order(DB, "hc", { id: 10, created_at: "2026-10-08T16:00:00Z", total: 50 });
+  // Order on Oct 8, read by a GraphQL pull: the ledger's total is Shopify's CURRENT total
+  // (after $50 of refunds) = $50; the original is in totalPriceSet = $100.
+  await order(DB, "hc", { id: 10, created_at: "2026-10-08T16:00:00Z", total: 50,
+    raw: { id: "gid://shopify/Order/10", test: false, totalPriceSet: { shopMoney: { amount: "100.0" } }, currentTotalPriceSet: { shopMoney: { amount: "50.0" } } } });
   await refund(DB, "hc", { id: 1, orderId: 10, processed_at: "2026-10-10T02:00:00Z", amount: 40, status: "SUCCESS" }); // Oct 9 22:00 EDT
   await refund(DB, "hc", { id: 2, orderId: 10, processed_at: "2026-10-09T15:00:00Z", amount: 10, status: "PENDING" });
   // A webhook order keeps its original total_price in the payload.
   await order(DB, "hc", { id: 11, created_at: "2026-10-08T17:00:00Z", total: 0, raw: { total_price: "70.00", current_total_price: "0.00" } });
 
   const d8 = await computeStoreDay(DB, "hc", "2026-10-08", { nowMs });
-  assert.equal(d8.revenue, 170, "original totals: 50 + 50 refunded, and 70 from the payload");
+  assert.equal(d8.revenue, 170, "original totals: 100 from totalPriceSet, 70 from the webhook total_price");
   assert.equal(d8.orders, 2);
   assert.equal(d8.refunds, 0, "no refund was processed on the order day");
   const d9 = await computeStoreDay(DB, "hc", "2026-10-09", { nowMs });
   assert.equal(d9.refunds, 50);
   assert.equal(d9.refunds_success, 40);
   assert.equal(d9.refunds_pending, 10);
+
+  // No guessing from "current total + refunds": an order without its original total makes revenue unknown.
+  await order(DB, "hc", { id: 12, created_at: "2026-10-08T18:00:00Z", total: 30, raw: false });
+  const again = await computeStoreDay(DB, "hc", "2026-10-08", { nowMs });
+  assert.equal(again.revenue, null);
+  assert.equal(again.profit, null);
+  assert.equal(again.notes.unknown_total, 1);
+  assert.ok(again.notes.missing.includes("revenue"));
 });
 
 test("test and voided orders are excluded and counted in notes", async () => {
@@ -154,11 +175,13 @@ test("test and voided orders are excluded and counted in notes", async () => {
   await allFresh(DB, nowMs);
   await order(DB, "hc", { id: 1, created_at: "2026-10-10T16:00:00Z", total: 100 });
   await order(DB, "hc", { id: 2, created_at: "2026-10-10T16:00:00Z", total: 100, raw: { test: true, total_price: "100.00" } });
+  // A GraphQL-shaped test order (reconcile / backfill now fetch `test`).
+  await order(DB, "hc", { id: 4, created_at: "2026-10-10T16:00:00Z", total: 100, raw: { test: true, totalPriceSet: { shopMoney: { amount: "100.0" } } } });
   await order(DB, "hc", { id: 3, created_at: "2026-10-10T16:00:00Z", total: 100, status: "voided" });
   const r = await computeStoreDay(DB, "hc", "2026-10-10", { nowMs });
   assert.equal(r.revenue, 100);
   assert.equal(r.orders, 1);
-  assert.equal(r.notes.excluded_test, 1);
+  assert.equal(r.notes.excluded_test, 2);
   assert.equal(r.notes.excluded_voided, 1);
 });
 
@@ -373,9 +396,46 @@ test("brief: numbers the data doesn't contain are flagged at the top", async () 
   const { fetchImpl } = fakeApis({ text: "## Yesterday's money\n- H&C profit $9,999.00 (great!)" });
   const r = await runBrief(briefEnv(DB), { nowMs: Date.parse("2026-10-12T12:05:00Z"), fetchImpl });
   assert.deepEqual(r.unverified, ["$9,999.00"]);
-  assert.match(r.body, /^> \*\*Check:\*\*/);
+  assert.equal(r.checked, false);
+  assert.match(r.body, /^> \*\*Unverified numbers:\*\* \$9,999\.00\./);
+  const stored = await DB.prepare(`SELECT checked, unverified FROM briefs WHERE id = ?`).bind(r.id).first();
+  assert.equal(stored.checked, 0);
   assert.deepEqual(unverifiedNumbers("ROAS 2.35 vs 1.8, margin 67%, 3 orders, $1,234", { a: 2.351, b: 1.8, m: 0.67, r: 1234 }), []);
   assert.deepEqual(unverifiedNumbers("revenue $500", { a: 499 }), ["$500"]);
+});
+
+test("brief check: only computed figures count — digits in ids, timestamps, order names and text never whitelist a number", () => {
+  const text = "lost $52; margin 37%; refunds $118; ads $1,047; profit $455.90";
+  // Every one of those digits appears in the data, but only inside ids, timestamps, names and text.
+  const data = {
+    waiting: { approvals: [{ id: 52, title: "Holt & Crane #1047 not delivered 37 days" }] },
+    money: { scheduled_payouts: [{ date: "2026-10-11", note: "payout $118.00 ref 455.90" }] },
+    feeds_not_fresh: [{ last_ok_at: "2026-10-11T10:37:52Z" }],
+    orders: { new_flags_24h: [{ order: "#118", detail: "Day 37 $1,047" }] },
+    stores: [{ yesterday: { revenue: 800, profit: 12.5, margin: 0.61, roas: 2.4 } }],
+  };
+  assert.deepEqual(unverifiedNumbers(text, data), ["$52", "37%", "$118", "$1,047", "$455.90"]);
+  assert.deepEqual(unverifiedNumbers(text, {}), ["$52", "37%", "$118", "$1,047", "$455.90"]);
+  // The same figures, computed, pass in any normalisation: 1047.2 ≡ "$1,047.20" ≡ "$1,047"; 0.37 ≡ "37%".
+  const computed = { loss: -52, margin: 0.37, refunds: 118, ads: 1047.2, profit: 455.9 };
+  assert.deepEqual(unverifiedNumbers(text, computed), []);
+  assert.deepEqual(unverifiedNumbers("ads $1,047.20, $1.05k, ROAS 2.4x vs break-even 1.8", { ads: 1047.2, roas: 2.4, be: 1.8 }), []);
+  assert.deepEqual(unverifiedNumbers("ads $1,048 · ROAS 3.1 · break-even 3", { ads: 1047.2, roas: 2.4, be: 1.8 }), ["$1,048", "ROAS 3.1", "break-even 3"]);
+  // Order names and dates: only those in the references given to the model.
+  const refs = { references: {}, x: { order: "#1231", day: "2026-10-10" } };
+  assert.deepEqual(unverifiedNumbers("#1231 on 2026-10-10 (Oct 10) at 08:00, 3 orders", refs), []);
+  assert.deepEqual(unverifiedNumbers("#1232 on 2026-10-09 and Oct 31", refs), ["#1232", "2026-10-09", "Oct 31"]);
+});
+
+test("brief: the data given to the model carries the order-name/date references it may use", async () => {
+  const DB = makeD1();
+  const nowMs = Date.parse("2026-10-12T12:05:00Z");
+  await allFresh(DB, nowMs);
+  await DB.prepare(`INSERT INTO shipment_flags (store, order_id, order_name, kind, detail, raised_at) VALUES ('hc', 'gid://shopify/Order/1231', '#1231', 'day15', 'Day 15', ?)`).bind(iso(nowMs - 3600000)).run();
+  const d = await gatherBriefData({ DB }, { nowMs });
+  assert.ok(d.references.order_names.includes("#1231"));
+  assert.ok(d.references.dates.includes("2026-10-11"));
+  assert.match((await import("../src/lib/brief.js")).SYSTEM_PROMPT, /DATA\.references/);
 });
 
 test("brief: live mode sends a phone link that only works with a valid signature; no money in the notification", async () => {
@@ -465,4 +525,168 @@ test("cogs: the Core's measured 'EUR per $1' blanket rate is used (×1.17 est. F
   assert.match(r.source, /est\. FX/);
   const m = await cogsRate(DB, "mar");
   assert.equal(m.assumed, true);
+});
+
+/* ---------------- review fixes: coverage, completeness, rule 4, AI spend, stuck briefs ---------------- */
+
+test("order coverage: a day before the backfill's coverage (or with none yet) has profit null; the brief says MTD covers X of Y days", async () => {
+  const DB = makeD1();
+  const nowMs = Date.parse("2026-10-12T15:00:00Z");
+  await allFresh(DB, nowMs, { skip: ["coverage.hc"] });
+  for (const d of ["2026-10-04", "2026-10-11"]) {
+    await order(DB, "hc", { id: d.slice(8), created_at: `${d}T16:00:00Z`, total: 100 });
+    await ads(DB, "hc", d, 10);
+  }
+  // No coverage at all yet.
+  let r = await computeStoreDay(DB, "hc", "2026-10-11", { nowMs });
+  assert.equal(r.revenue, 100, "revenue shown, but flagged");
+  assert.equal(r.profit, null);
+  assert.ok(r.notes.missing.includes("order_history"));
+  assert.equal(r.notes.missing_why.order_history, "orders backfill not finished");
+  assert.equal(r.complete, 0);
+  assert.equal(r.profit_partial, 56);
+
+  // Covered from Oct 6: Oct 11 complete, Oct 4 not.
+  await DB.prepare(`INSERT INTO order_coverage (store, covered_from, completed_at) VALUES ('hc', '2026-10-06', ?)`).bind(iso(nowMs - 60000)).run();
+  await DB.prepare(`INSERT INTO order_backfill (store, query_from, started_at, updated_at, last_full_read_at) VALUES ('hc', '2026-10-06', ?, ?, ?)`)
+    .bind(iso(nowMs - 60000), iso(nowMs - 60000), iso(nowMs - 60000)).run();
+  r = await computeStoreDay(DB, "hc", "2026-10-11", { nowMs });
+  assert.equal(r.profit, 56);
+  assert.equal(r.complete, 1);
+  const early = await computeStoreDay(DB, "hc", "2026-10-04", { nowMs });
+  assert.equal(early.profit, null);
+  assert.match(early.notes.missing_why.order_history, /only covers 2026-10-06 onwards/);
+  assert.equal(early.complete, 0);
+
+  await recomputeDays({ DB }, { nowMs, days: 12 });
+  const s = await pnlState(DB, { nowMs });
+  const hc = s.stores.find((x) => x.id === "hc");
+  assert.equal(hc.mtd.order_history_days, 6);
+  assert.equal(hc.mtd.days_in_period, 11);
+  assert.equal(hc.mtd.profit, null);
+  const d = await gatherBriefData({ DB }, { nowMs });
+  const m = d.stores.find((x) => x.id === "hc").month_to_date;
+  assert.equal(m.order_history_days_covered, 6);
+  assert.equal(m.days_in_period, 11);
+  assert.match(plainBrief(d), /Holt & Crane month to date covers 6 of 11 days/);
+});
+
+test("complete: only once the day has ended AND each input was pulled 2 h after it (payouts 6 h) AND coverage includes it", async () => {
+  const DB = makeD1();
+  // Oct 11 ends 2026-10-12T04:00Z (EDT).
+  const end = Date.parse("2026-10-12T04:00:00Z");
+  await order(DB, "hc", { id: 1, created_at: "2026-10-11T16:00:00Z", total: 100 });
+  await ads(DB, "hc", "2026-10-11", 10);
+  // 1 hour after the day ended, every feed fresh: not complete (pulls too early).
+  await allFresh(DB, end + 3600000);
+  let r = await computeStoreDay(DB, "hc", "2026-10-11", { nowMs: end + 3600000 });
+  assert.equal(r.complete, 0);
+  assert.equal(r.profit, 56, "the numbers are usable, the day just isn't settled");
+  assert.deepEqual(r.notes.unsettled.sort(), ["ads not pulled 2 h after the day ended", "orders not pulled 2 h after the day ended",
+    "payouts not pulled 6 h after the day ended", "refunds not pulled 2 h after the day ended"]);
+  // 3 hours after: orders, refunds, ads settled; payouts not yet (6 h).
+  await allFresh(DB, end + 3 * 3600000);
+  r = await computeStoreDay(DB, "hc", "2026-10-11", { nowMs: end + 3 * 3600000 });
+  assert.equal(r.complete, 0);
+  assert.deepEqual(r.notes.unsettled, ["payouts not pulled 6 h after the day ended"]);
+  // 7 hours after: complete.
+  await allFresh(DB, end + 7 * 3600000);
+  r = await computeStoreDay(DB, "hc", "2026-10-11", { nowMs: end + 7 * 3600000 });
+  assert.equal(r.complete, 1);
+  // The orders input's pull is the backfill's last FULL read, not the webhook-fed feed.
+  await DB.prepare(`UPDATE order_backfill SET last_full_read_at = ? WHERE store = 'hc'`).bind(iso(end + 3600000)).run();
+  r = await computeStoreDay(DB, "hc", "2026-10-11", { nowMs: end + 7 * 3600000 });
+  assert.equal(r.complete, 0);
+  assert.deepEqual(r.notes.unsettled, ["orders not pulled 2 h after the day ended"]);
+});
+
+test("rule 4: a stale input gives a null component (never computed from stale data); profit null, profit_partial names what's missing", async () => {
+  const DB = makeD1();
+  const nowMs = Date.parse("2026-10-12T15:00:00Z");
+  await allFresh(DB, nowMs);
+  await order(DB, "hc", { id: 1, created_at: "2026-10-11T16:00:00Z", total: 100 });
+  await refund(DB, "hc", { id: 1, orderId: 1, processed_at: "2026-10-11T18:00:00Z", amount: 5 });
+  await ads(DB, "hc", "2026-10-11", 10);
+  await charge(DB, "hc", { id: 1, date: "2026-10-11T16:00:00Z", fee: 3 });
+  let r = await computeStoreDay(DB, "hc", "2026-10-11", { nowMs });
+  assert.equal(r.profit, 100 - 5 - 33 - 10 - 1 - 3);
+
+  // Ads feed last delivered 3 h ago (limit 90 min): the stored row is NOT used.
+  await markFeedOk(DB, "ads.spend.hc", iso(nowMs - 3 * 3600000));
+  // Payouts feed past its 6 h limit.
+  await markFeedOk(DB, "shopify.payouts.hc", iso(nowMs - 7 * 3600000));
+  // Refund pull watermark 3 h old.
+  await DB.prepare(`UPDATE job_runs SET last_run_at = ? WHERE job = 'refunds.hc'`).bind(iso(nowMs - 3 * 3600000)).run();
+  r = await computeStoreDay(DB, "hc", "2026-10-11", { nowMs });
+  assert.equal(r.ads, null);
+  assert.equal(r.guy_fee, null);
+  assert.equal(r.fees, null);
+  assert.equal(r.refunds, null);
+  assert.equal(r.revenue, 100);
+  assert.equal(r.profit, null);
+  assert.equal(r.profit_partial, 67, "revenue - COGS only");
+  assert.deepEqual(r.notes.missing, ["refunds", "ads", "guy_fee", "fees"]);
+  assert.equal(r.notes.missing_why.ads, "ads stale");
+  assert.equal(r.notes.missing_why.fees, "payouts stale");
+  assert.equal(r.notes.missing_why.refunds, "refunds stale");
+  assert.equal(r.roas, null);
+
+  // Orders feed stale → revenue, orders and COGS null.
+  await markFeedOk(DB, "shopify.orders.hc", iso(nowMs - 2 * 3600000));
+  r = await computeStoreDay(DB, "hc", "2026-10-11", { nowMs });
+  assert.equal(r.revenue, null);
+  assert.equal(r.orders, null);
+  assert.equal(r.cogs, null);
+  assert.equal(r.notes.missing_why.revenue, "orders stale");
+
+  // A failing feed whose last success is still inside its age limit stays usable (rule 6).
+  await markFeedOk(DB, "shopify.orders.hc", iso(nowMs - 10 * 60000));
+  await DB.prepare(`UPDATE feeds SET last_try_at = ?, last_error = 'HTTP 502' WHERE id = 'shopify.orders.hc'`).bind(iso(nowMs - 60000)).run();
+  r = await computeStoreDay(DB, "hc", "2026-10-11", { nowMs });
+  assert.equal(r.revenue, 100);
+  assert.equal(r.complete, 0, "but the day is not complete while a feed is failing");
+});
+
+test("AI spend is logged even when Claude's answer is empty or malformed", async () => {
+  for (const content of [[], [{ type: "text", text: "   " }], "nonsense"]) {
+    const DB = makeD1();
+    const fetchImpl = async (url, init) => {
+      if (url.includes("anthropic")) {
+        const body = JSON.parse(init.body);
+        return new Response(JSON.stringify({ model: body.model, stop_reason: "end_turn", content, usage: { input_tokens: 3000, output_tokens: 400 } }), { status: 200 });
+      }
+      throw new Error("unexpected " + url);
+    };
+    const r = await runBrief(briefEnv(DB), { nowMs: Date.parse("2026-10-12T12:05:00Z"), fetchImpl });
+    assert.equal(r.composer, "plain");
+    assert.match(r.aiError, /returned no text/);
+    const ai = await evs(DB, "ai.call");
+    assert.equal(ai.length, 1, JSON.stringify(content));
+    assert.equal(JSON.parse(ai[0].data).usage_in, 3000);
+    assert.equal(ai[0].cost_usd, 0.01);
+    const b = await DB.prepare(`SELECT cost_usd, input_tokens, output_tokens FROM briefs WHERE id = ?`).bind(r.id).first();
+    assert.equal(b.cost_usd, 0.01);
+    assert.equal(b.input_tokens, 3000);
+  }
+});
+
+test("a brief stuck in 'composing' for over 30 minutes is reclaimed by the next run, once; a younger one is left alone", async () => {
+  const DB = makeD1();
+  const env = briefEnv(DB);
+  const { fetchImpl } = fakeApis();
+  const t0 = Date.parse("2026-10-12T12:00:00Z");
+  // A run that died part-way at 08:00 ET.
+  await DB.prepare(`INSERT INTO briefs (day, created_at, status, mode) VALUES ('2026-10-12', ?, 'composing', 'shadow')`).bind(iso(t0)).run();
+  assert.equal((await runBrief(env, { nowMs: t0 + 15 * 60000, fetchImpl })).ran, false, "15 min: may still be running");
+  const r = await runBrief(env, { nowMs: t0 + 31 * 60000, fetchImpl });
+  assert.equal(r.ran, true);
+  assert.equal(r.reclaimed, iso(t0));
+  const rec = await evs(DB, "brief.reclaimed");
+  assert.equal(rec.length, 1);
+  assert.match(rec[0].summary, /never finished/);
+  const rows = (await DB.prepare(`SELECT status FROM briefs`).all()).results;
+  assert.deepEqual(rows.map((x) => x.status), ["ready"]);
+  // A ready brief is never reclaimed.
+  assert.equal((await runBrief(env, { nowMs: t0 + 120 * 60000, fetchImpl })).ran, false);
+  assert.equal((await evs(DB, "brief.reclaimed")).length, 1);
 });
