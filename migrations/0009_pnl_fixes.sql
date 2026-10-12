@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS feed_coverage (
   feed         TEXT NOT NULL,                 -- 'refunds'
   start_day    TEXT NOT NULL,                 -- first day the first full read reaches back to
   covered_from TEXT,                          -- set once that first read finished (= start_day)
+  cursor_at    TEXT,                          -- full read in progress: orders updated up to here are done
   updated_at   TEXT NOT NULL,
   PRIMARY KEY (store, feed)
 );

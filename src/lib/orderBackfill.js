@@ -132,6 +132,14 @@ export async function backfillStore(env, id, { nowMs = Date.now(), opts = {} } =
     st = await db.prepare(`SELECT * FROM order_backfill WHERE store = ?`).bind(id).first();
   }
 
+  // A first pass that hasn't finished must still start inside Shopify's 60-day window: if the
+  // window moved on (e.g. the store wasn't wired for weeks), restart it from the new start.
+  if (firstPass && st && st.query_from < backfillFromDay(nowMs, tz)) {
+    await db.prepare(
+      `UPDATE order_backfill SET query_from = ?, cursor = NULL, pages = 0, orders = 0, added = 0, started_at = ?, updated_at = ? WHERE store = ? AND completed_at IS NULL`
+    ).bind(backfillFromDay(nowMs, tz), at, at, id).run();
+    st = await db.prepare(`SELECT * FROM order_backfill WHERE store = ?`).bind(id).first();
+  }
   if (firstPass) {
     // The exact UTC moment the first day begins in the store's timezone: a bare date would
     // leave it to Shopify which timezone it means, and a few hours missed is a hole.

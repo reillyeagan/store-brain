@@ -719,7 +719,34 @@ test("review fix: a loss written up as profit is flagged; ordinary decimals are 
   assert.deepEqual(unverifiedNumbers("lost $52 yesterday", data), []);
   assert.deepEqual(unverifiedNumbers("profit -$52", data), []);
   assert.deepEqual(unverifiedNumbers("written by Claude Sonnet 5.5; parcel 1.5 days late; break-even 1.9; ads $1,047; refunds $118", data), []);
-  assert.deepEqual(unverifiedNumbers("COGS at the ASSUMED 33% rate", data), []);
+  assert.deepEqual(unverifiedNumbers("COGS at the ASSUMED 33% rate", data), ["33%"], "33% only when a row is assumed");
+  assert.deepEqual(unverifiedNumbers("COGS at the ASSUMED 33% rate", { ...data, x: { cogs_rate_assumed: true } }), []);
+  assert.deepEqual(unverifiedNumbers("The net loss was $52. A loss of about $52. In the red by $52.", data), []);
+  assert.deepEqual(unverifiedNumbers("Margin was 12%", { m: { margin: -0.12 } }), ["12%"]);
+  assert.deepEqual(unverifiedNumbers("Margin was -12%", { m: { margin: -0.12 } }), []);
+});
+
+test("review fix: a failed first refunds read can't be mistaken for a full one", async () => {
+  const { pullStoreRefunds } = await import("../src/lib/refunds.js");
+  const { _resetTokenCacheForTests } = await import("../src/lib/storeGuard.js");
+  const DB = makeD1();
+  const env = { DB, SB_HC_CLIENT_ID: "a", SB_HC_CLIENT_SECRET: "b" };
+  await DB.prepare(`INSERT INTO job_runs (job, last_run_at) VALUES ('refunds.hc', '2026-10-11T15:00:00Z')`).run();
+  const queries = [];
+  let fail = true;
+  const fetchImpl = async (url, init) => {
+    if (url.includes("access_token")) return new Response(JSON.stringify({ access_token: "t", expires_in: 3600 }));
+    const b = JSON.parse(init.body); if (b.variables && b.variables.query) queries.push(b.variables.query);
+    if (fail) return new Response("boom", { status: 500 });
+    return new Response(JSON.stringify({ data: { orders: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } }, nodes: [] } }));
+  };
+  _resetTokenCacheForTests();
+  await assert.rejects(pullStoreRefunds(env, "hc", { fetchImpl, nowMs: Date.parse("2026-10-11T16:00:00Z") }));
+  fail = false;
+  await pullStoreRefunds(env, "hc", { fetchImpl, nowMs: Date.parse("2026-10-11T16:30:00Z") });
+  assert.match(queries.at(-1), /2026-08-31/, "second run still reads from the window start");
+  const cov = await DB.prepare(`SELECT covered_from FROM feed_coverage WHERE store='hc'`).first();
+  assert.equal(cov.covered_from, "2026-09-01");
 });
 
 test("review fix: backfill window never reaches past Shopify's 60-day order limit", async () => {
@@ -747,4 +774,24 @@ test("review fix: a refunds watermark without a coverage row triggers one full r
   assert.match(query, /2026-08-31/);
   const cov = await DB.prepare(`SELECT covered_from FROM feed_coverage WHERE store='hc' AND feed='refunds'`).first();
   assert.equal(cov.covered_from, "2026-09-01");
+});
+
+test("review fix: an unfinished orders backfill re-clamps to the 60-day window", async () => {
+  const { backfillStore } = await import("../src/lib/orderBackfill.js");
+  const { _resetTokenCacheForTests } = await import("../src/lib/storeGuard.js");
+  const DB = makeD1();
+  await DB.prepare(`INSERT INTO order_backfill (store, query_from, cursor, started_at, updated_at) VALUES ('hc', '2026-06-01', 'old-cursor', 'x', 'x')`).run();
+  const queries = [];
+  const fetchImpl = async (url, init) => {
+    if (url.includes("access_token")) return new Response(JSON.stringify({ access_token: "t", expires_in: 3600 }));
+    const b = JSON.parse(init.body); queries.push(b.variables);
+    return new Response(JSON.stringify({ data: { orders: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } }));
+  };
+  _resetTokenCacheForTests();
+  await backfillStore({ DB, SB_HC_CLIENT_ID: "a", SB_HC_CLIENT_SECRET: "b" }, "hc", { nowMs: Date.parse("2026-10-11T16:00:00Z"), opts: { fetchImpl } });
+  const row = await DB.prepare(`SELECT query_from FROM order_backfill WHERE store='hc'`).first();
+  assert.equal(row.query_from, "2026-09-01");
+  assert.equal(queries[0].after ?? null, null, "old cursor dropped");
+  const cov = await DB.prepare(`SELECT covered_from FROM order_coverage WHERE store='hc'`).first();
+  assert.ok(!cov || cov.covered_from >= "2026-08-14");
 });

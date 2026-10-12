@@ -92,23 +92,28 @@ export async function pullStoreRefunds(env, storeId, opts = {}) {
   const nowMs = opts.nowMs || Date.now();
   const at = nowIso(nowMs);
   const tz = store.timezone || env.TIMEZONE || "America/New_York";
-  let mark = await env.DB.prepare(`SELECT last_run_at FROM job_runs WHERE job = ?`).bind(watermarkJob(storeId)).first();
-  // A store with a watermark but no coverage row (refunds were pulled before coverage
-  // existed) gets one full read from the start window, so its coverage can be proven.
-  const covRow = await env.DB.prepare(`SELECT covered_from FROM feed_coverage WHERE store = ? AND feed = 'refunds'`).bind(storeId).first();
-  if (mark && !covRow) mark = null;
-  const initial = !mark;
-  // First read reaches back to the first day of the previous month (same window as the
-  // orders backfill), so refunds are known for every day the P&L can call complete.
-  const startDay = backfillFromDay(nowMs, tz);
-  const sinceMs = mark ? Date.parse(mark.last_run_at) - OVERLAP_MIN * 60000 : Date.parse(`${startDay}T00:00:00Z`) - 86400000;
-  if (initial) {
+  const mark = await env.DB.prepare(`SELECT last_run_at FROM job_runs WHERE job = ?`).bind(watermarkJob(storeId)).first();
+  // Coverage is only proven by ONE uninterrupted chain of reads that started at start_day
+  // (the first day of the previous month, clamped inside Shopify's 60-day window). Until
+  // that chain reaches "now", every run continues the chain from cursor_at — never from the
+  // ordinary watermark — so a failed or partial run can't be mistaken for a full read.
+  const windowStart = backfillFromDay(nowMs, tz);
+  let cov = await env.DB.prepare(`SELECT start_day, covered_from, cursor_at FROM feed_coverage WHERE store = ? AND feed = 'refunds'`).bind(storeId).first();
+  const fullMode = !cov || !cov.covered_from;
+  if (fullMode && (!cov || cov.start_day < windowStart)) {
+    // No chain yet, or the chain started outside the readable window: (re)start it.
     await env.DB.prepare(
-      `INSERT INTO feed_coverage (store, feed, start_day, covered_from, updated_at) VALUES (?, 'refunds', ?, NULL, ?)
-       ON CONFLICT(store, feed) DO UPDATE SET start_day = excluded.start_day, updated_at = excluded.updated_at
+      `INSERT INTO feed_coverage (store, feed, start_day, covered_from, cursor_at, updated_at) VALUES (?, 'refunds', ?, NULL, NULL, ?)
+       ON CONFLICT(store, feed) DO UPDATE SET start_day = excluded.start_day, cursor_at = NULL, updated_at = excluded.updated_at
        WHERE feed_coverage.covered_from IS NULL`
-    ).bind(storeId, startDay, at).run();
+    ).bind(storeId, windowStart, at).run();
+    cov = { start_day: windowStart, covered_from: null, cursor_at: null };
   }
+  const startDay = cov.start_day;
+  const initial = fullMode && !cov.cursor_at;
+  const sinceMs = fullMode
+    ? (cov.cursor_at ? Date.parse(cov.cursor_at) - OVERLAP_MIN * 60000 : Date.parse(`${startDay}T00:00:00Z`) - 86400000)
+    : (mark ? Date.parse(mark.last_run_at) - OVERLAP_MIN * 60000 : nowMs - 86400000);
   const ctx = { tz, at, initial, store, seen: 0, added: 0, changed: 0 };
 
   // 1. Orders updated since the last good pull, OLDEST first: if there are more than one
@@ -155,11 +160,15 @@ export async function pullStoreRefunds(env, storeId, opts = {}) {
   await env.DB.prepare(
     `INSERT INTO job_runs (job, last_run_at) VALUES (?, ?) ON CONFLICT(job) DO UPDATE SET last_run_at = excluded.last_run_at`
   ).bind(watermarkJob(storeId), mark2).run();
-  // The first full read has caught up to now: refunds are complete from start_day on.
-  if (!truncated) {
-    await env.DB.prepare(
-      `UPDATE feed_coverage SET covered_from = start_day, updated_at = ? WHERE store = ? AND feed = 'refunds' AND covered_from IS NULL`
-    ).bind(at, storeId).run();
+  // Full-read chain: move its own cursor, or — once it has caught up to now — prove coverage.
+  if (fullMode) {
+    if (truncated) {
+      await env.DB.prepare(`UPDATE feed_coverage SET cursor_at = ?, updated_at = ? WHERE store = ? AND feed = 'refunds' AND covered_from IS NULL`)
+        .bind(lastUpdated || cov.cursor_at || null, at, storeId).run();
+    } else {
+      await env.DB.prepare(`UPDATE feed_coverage SET covered_from = start_day, cursor_at = NULL, updated_at = ? WHERE store = ? AND feed = 'refunds' AND covered_from IS NULL`)
+        .bind(at, storeId).run();
+    }
   }
   return { store: storeId, ok: true, seen: ctx.seen, added: ctx.added, changed: ctx.changed, pendingRechecked: ids.length, truncated };
 }

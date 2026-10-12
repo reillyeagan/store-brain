@@ -360,6 +360,8 @@ export function briefWhitelist(data) {
   const walk = (v, key) => {
     if (v == null || NOT_FIGURES.has(key)) return;
     if (typeof v === "number") { if (Number.isFinite(v)) figures.push(v); return; }
+    // The prompt makes the model name the assumed 33% COGS rate: allowed only when it applies.
+    if (key === "cogs_rate_assumed" && v === true) { figures.push(0.33); return; }
     if (typeof v === "string") {
       const d = ISO_DAY.exec(v);
       if (d) dates.add(d[1]);
@@ -370,7 +372,6 @@ export function briefWhitelist(data) {
     if (typeof v === "object") for (const [k, x] of Object.entries(v)) walk(x, k);
   };
   walk(data, null);
-  figures.push(0.33); // the assumed-COGS rate the prompt tells the model to name (rule 3)
   return { figures, orderNames, dates };
 }
 
@@ -394,7 +395,8 @@ function matchesFigure(figures, v, dec, { percent = false, scale = 1, sign = 0 }
   });
 }
 
-const LOSS_BEFORE = /(?:\blost|\bloss(?:es)?(?:\s+of)?|\bdown|\bnegative|\bdeficit|\bminus|\bin the red)[\s:,]*$/i;
+// Loss wording within a few words before the amount ("the net loss was $52", "a loss of about $52").
+const LOSS_BEFORE = /\b(?:lost|loss(?:es)?|down|negative|deficit|minus|in the red)\b[^.$%\n]{0,24}$/i;
 const LOSS_AFTER = /^\s*(?:loss|lost|in the red|negative)\b/i;
 
 /**
@@ -435,10 +437,16 @@ export function unverifiedNumbers(text, data, whitelist = briefWhitelist(data)) 
     return blank(m);
   });
   // %-figures.
-  t = t.replace(/-?(\d[\d,]*(?:\.\d+)?)\s?%/g, (m, num) => {
+  t = t.replace(/[-−]?(\d[\d,]*(?:\.\d+)?)\s?%/g, (m, num, off, whole) => {
     const digits = num.replace(/,/g, "");
     const dec = (digits.split(".")[1] || "").length;
-    if (!matchesFigure(figures, Number(digits), dec, { percent: true })) bad.push(m.trim());
+    const before = whole.slice(Math.max(0, off - 30), off);
+    const negative = /[-−]/.test(m) || LOSS_BEFORE.test(before);
+    // A plain % must match a non-negative figure: "margin 12%" can't pass for −12% (rule 5).
+    const ok = negative
+      ? matchesFigure(figures, Number(digits), dec, { percent: true, sign: -1 }) || matchesFigure(figures, Number(digits), dec, { percent: true, sign: +1 })
+      : matchesFigure(figures, Number(digits), dec, { percent: true, sign: +1 });
+    if (!ok) bad.push(m.trim());
     return blank(m);
   });
   // ROAS: numbers written as "2.4x", the number right after "ROAS" / "break-even", and any
