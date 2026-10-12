@@ -4,6 +4,8 @@
  * Routes
  *   GET  /health                         public, no data — is the brain up?
  *   GET  /api/state                      Mission Control data (key required)
+ *   GET  /api/pnl?store=all|hc|aub|mar    every stored P&L day for the P&L page (key required)
+ *   GET  /api/agents/:id/events          one agent's latest events, for its page (key required)
  *   POST /api/approvals/:id/decide       Reilly's decision (key OR a signed phone link)
  *   POST /webhooks/shopify               Shopify webhooks (HMAC-verified per store)
  *   POST /webhooks/17track               17TRACK pushes (`sign` header verified; known numbers re-read from the API)
@@ -46,8 +48,8 @@
  *   SB_<STORE>_CLIENT_ID / SB_<STORE>_CLIENT_SECRET   per-store Shopify app credentials
  */
 import { STORES, LIVE_STORE_IDS } from "./config/stores.js";
-import { DEPARTMENTS, AGENTS, SERVICES, SYSTEMS } from "./config/agents.js";
-import { recentEvents, costSince, logEvent } from "./lib/eventlog.js";
+import { DEPARTMENTS, AGENTS, SERVICES, SYSTEMS, AGENT_DOES, isKnownActor } from "./config/agents.js";
+import { recentEvents, costSince, logEvent, agentEvents } from "./lib/eventlog.js";
 import { evaluateFeeds, runSentinel, ensureFeeds } from "./lib/freshness.js";
 import { listPending, decide, verifyDecisionSig, getApproval } from "./lib/approvals.js";
 import { sendTestNotification } from "./lib/phone.js";
@@ -64,10 +66,10 @@ import {
   runKfbComposer, handleKfbPage, handleKfbSent, listKfbMessages, expressOrdersToday, supplierMode,
 } from "./lib/kfbMessage.js";
 import { runTracking, handleTrackingPush, shippingState } from "./lib/tracking.js";
-import { runPnlCron, runDayClose, pnlState } from "./lib/pnl.js";
+import { runPnlCron, runDayClose, pnlState, pnlHistory } from "./lib/pnl.js";
 import { runBrief, latestBrief, handleBriefPage, briefMode } from "./lib/brief.js";
 
-export const VERSION = "0.1.0-foundation";
+export const VERSION = "0.2.0-eagano-llc";
 
 const json = (body, status = 200) =>
   new Response(JSON.stringify(body), {
@@ -118,7 +120,7 @@ async function handleState(env) {
     now: new Date().toISOString(),
     stores: Object.values(STORES).map(({ id, name, live }) => ({ id, name, live })),
     departments: DEPARTMENTS,
-    agents: AGENTS,
+    agents: AGENTS.map((a) => ({ ...a, does: AGENT_DOES[a.id] || null })),
     services: SERVICES,
     systems: SYSTEMS,
     events,
@@ -176,6 +178,17 @@ export default {
       if (path === "/api/state" && request.method === "GET") {
         if (!hasKey(request, env)) return json({ ok: false, error: "unauthorized" }, 401);
         return await handleState(env);
+      }
+      if (path === "/api/pnl" && request.method === "GET") {
+        if (!hasKey(request, env)) return json({ ok: false, error: "unauthorized" }, 401);
+        const r = await pnlHistory(env.DB, String(url.searchParams.get("store") || "all").slice(0, 10));
+        return json(r, r.ok ? 200 : 400);
+      }
+      const ae = path.match(/^\/api\/agents\/([a-z0-9_.]{1,60})\/events$/);
+      if (ae && request.method === "GET") {
+        if (!hasKey(request, env)) return json({ ok: false, error: "unauthorized" }, 401);
+        if (!isKnownActor(ae[1])) return json({ ok: false, error: "unknown agent" }, 404);
+        return json({ ok: true, id: ae[1], ...(await agentEvents(env.DB, ae[1])) });
       }
       if (path === "/api/admin/check-stores" && request.method === "POST") {
         if (!hasKey(request, env)) return json({ ok: false, error: "unauthorized" }, 401);

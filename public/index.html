@@ -3,147 +3,199 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>Mission Control · Store Brain</title>
+<title>Eagano LLC</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap">
 <style>
-/* Eagano dash language: near-black, steel accent, Inter, no colour noise. */
+/* Eagano dash language (CLAUDE.md) + one soft pastel per department (docs/specs/dashboard.md). */
 :root{
   color-scheme:dark;
-  --bg:#0b0b0d; --panel:#131316; --panel2:#17171b; --border:#26262b; --soft:#1d1d21;
-  --text:#e8e8ea; --muted:#8a8a93; --faint:#54545c;
-  --accent:#c7d2db; --accent-dim:#5e6b76; --good:#6bbf8a; --warn:#c9a36b; --bad:#c97b7b;
+  --bg:#0b0b0d; --panel:#131316; --panel2:#17171b; --border:#26262b; --soft:#1d1d22;
+  --text:#e8e8ea; --muted:#8a8a93; --faint:#54545c; --dim:#b9b9c0;
+  --accent:#c7d2db; --good:#a9dcc4; --warn:#ecdc9f; --bad:#eab0bd; --blue:#aecdef; --peach:#efc0a8;
   --font:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
   --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
 }
 *{box-sizing:border-box}
 [hidden]{display:none!important}
 html,body{margin:0;background:var(--bg);color:var(--text);font-family:var(--font);font-size:14px;line-height:1.45}
-body{padding:calc(16px + env(safe-area-inset-top,0px)) 16px calc(24px + env(safe-area-inset-bottom,0px))}
-.wrap{max-width:1560px;margin:0 auto;display:grid;gap:14px}
-header{display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:10px}
-.eyebrow{font-family:var(--mono);font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
-h1{margin:2px 0 0;font-size:24px;font-weight:600;letter-spacing:-.01em}
-.pill{font-family:var(--mono);font-size:11px;padding:3px 9px;border:1px solid var(--border);border-radius:999px;color:var(--muted);white-space:nowrap}
-.pill.good{color:var(--good);border-color:#2b3d31}.pill.warn{color:var(--warn);border-color:#4a3d29}.pill.bad{color:var(--bad);border-color:#4a2c2c}
-.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
-.tile{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px 14px;display:grid;gap:4px}
-.tile .pill{white-space:normal}
-.tile b{font-size:22px;font-weight:600;font-variant-numeric:tabular-nums}
-.main{display:grid;grid-template-columns:minmax(0,1fr) 380px;gap:14px;align-items:start}
-@media (max-width:1000px){.main{grid-template-columns:minmax(0,1fr)}}
-.stage{background:var(--panel);border:1px solid var(--border);border-radius:10px;overflow-x:auto;min-width:0}
-#map{display:block;width:100%;min-width:820px;height:auto}
-.legend svg{display:inline-block;width:12px;height:12px}
-.side{background:var(--panel);border:1px solid var(--border);border-radius:10px;min-width:0;display:flex;flex-direction:column;max-height:880px}
-.tabs{display:flex;border-bottom:1px solid var(--border);overflow-x:auto;scrollbar-width:none;-webkit-overflow-scrolling:touch}
-.tabs::-webkit-scrollbar{display:none}
-.tabs button{flex:1 0 auto;white-space:nowrap;background:none;border:0;border-bottom:2px solid transparent;color:var(--muted);font:500 12.5px var(--font);padding:12px 6px;cursor:pointer}
-.tabs button[aria-selected="true"]{color:var(--text);border-bottom-color:var(--accent)}
-.tabs button:focus-visible,.btn:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.pane{overflow:auto;padding:10px 12px;display:grid;gap:8px;align-content:start}
-.row{border:1px solid var(--soft);border-radius:8px;padding:9px 10px;display:grid;gap:3px;background:var(--panel2)}
-.row .meta{font-family:var(--mono);font-size:10.5px;color:var(--faint);display:flex;gap:8px;flex-wrap:wrap}
-.row.alarm{border-color:#4a2c2c}
-.kv{display:flex;justify-content:space-between;gap:10px;font-size:12.5px}
-.kv span:first-child{color:var(--muted)}
-.kv b{font-weight:500;font-variant-numeric:tabular-nums}
-.pend{color:var(--warn)}
-.bad-t{color:var(--bad)}
-.msg{white-space:pre-wrap;font-size:12.5px;background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:8px;margin:2px 0}
-.sub{font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin-top:4px}
-.btns{display:flex;gap:6px;flex-wrap:wrap;margin-top:4px}
-.btn{background:var(--soft);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font:500 12px var(--font);cursor:pointer}
-.btn.primary{border-color:var(--accent-dim);color:var(--accent)}
-.btn.reject{color:var(--bad)}
-.empty{color:var(--muted);text-align:center;padding:26px 10px;font-size:13px}
-.dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;vertical-align:1px;background:var(--faint)}
-.dot.fresh{background:var(--good)}.dot.stale,.dot.failing{background:var(--bad)}.dot.not_wired{background:var(--faint)}
-.lbl{fill:var(--text);font:400 10.5px var(--font)}
-.lbl.m{fill:var(--muted)}
-.dlbl{fill:var(--text);font:600 11.5px var(--font);letter-spacing:.14em}
-.edge{stroke:#2c2c32;stroke-width:1}
-.edge.hot{stroke:var(--accent);stroke-width:1.8}
+button{font-family:var(--font)}
+a{color:inherit}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.shell{display:grid;grid-template-columns:184px minmax(0,1fr);min-height:100vh}
+.side{border-right:1px solid var(--border);padding:22px 14px;position:sticky;top:0;height:100vh;display:flex;flex-direction:column;gap:2px}
+.brand{font:600 15px var(--font);padding:0 10px}
+.brand-sub{font-size:11px;color:var(--faint);padding:2px 10px 18px}
+.nav a{display:flex;justify-content:space-between;align-items:center;padding:8px 10px;border-radius:7px;color:var(--muted);text-decoration:none;font-size:13.5px}
+.nav a:hover{color:var(--text)}
+.nav a.on{background:var(--panel2);color:var(--text);font-weight:500}
+.nav .n{font-size:11px;color:var(--bad);margin-left:6px}
+.side-foot{margin-top:auto;font-size:11px;color:var(--faint);padding:0 10px;display:grid;gap:3px}
+.main{padding:20px 24px 40px;min-width:0;display:flex;flex-direction:column;gap:14px}
+@media (max-width:900px){
+  .shell{grid-template-columns:1fr}
+  .side{position:static;height:auto;flex-direction:row;flex-wrap:wrap;align-items:center;padding:12px 14px;gap:4px;border-right:0;border-bottom:1px solid var(--border)}
+  .brand-sub,.side-foot{display:none}
+  .brand{padding-right:10px}
+  .nav{display:flex;gap:2px}
+  .main{padding:14px 16px 32px}
+}
+.top{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
+.pills{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.pill{padding:5px 11px;border-radius:999px;border:1px solid var(--border);color:var(--muted);font:500 12px var(--font);background:none;cursor:pointer;white-space:nowrap}
+.pill.on{border-color:var(--accent);color:var(--text)}
+.pill.dash{border-style:dashed;color:var(--faint);cursor:default}
+.status{font-size:12px;color:var(--faint)}
+.status .ok{color:var(--good)}.status .bad{color:var(--bad)}
+.lab{font:500 11px var(--font);letter-spacing:.08em;text-transform:uppercase;color:var(--faint)}
+.box{border:1px solid var(--border);border-radius:10px;background:var(--panel);padding:16px 18px;min-width:0}
+.kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
+.kpi{border:1px solid var(--border);border-radius:10px;background:var(--panel);padding:10px 14px}
+.kpi .l{font-size:11px;color:var(--faint)}
+.kpi .v{font:600 20px var(--font);margin-top:2px;letter-spacing:-.01em;font-variant-numeric:tabular-nums}
+.kpi .s{font-size:11.5px;color:var(--muted);margin-top:1px}
+@media (max-width:700px){.kpis{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.home{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:14px;align-items:start}
+@media (max-width:1100px){.home{grid-template-columns:minmax(0,1fr)}}
+.mapbox{border:1px solid var(--border);border-radius:10px;background:#0e0e11;position:relative;overflow-x:auto}
+#map{display:block;width:100%;min-width:760px;height:auto}
+#map .lb{font:400 9.5px var(--font);fill:var(--muted)}
+#map .lb.on{fill:var(--text);font-weight:500}
+#map .hub{font:600 11px var(--font);fill:var(--text)}
+#map .sub{font:400 9px var(--font);fill:var(--faint)}
+#map .node{cursor:pointer}
+#map .node:hover .lb{fill:var(--text)}
+.legend{display:flex;gap:14px;flex-wrap:wrap;font-size:11px;color:var(--faint);padding:10px 14px;border-top:1px solid var(--border)}
+.legend i{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px;vertical-align:0}
+.col{display:flex;flex-direction:column;gap:10px;min-width:0}
+.card{border:1px solid var(--border);border-left:2px solid var(--accent);border-radius:8px;padding:10px 12px;background:var(--panel)}
+.card .t{font:500 13px var(--font);display:flex;justify-content:space-between;gap:8px}
+.card .t span{font:400 11px var(--font);color:var(--faint);white-space:nowrap}
+.card .d{font-size:12px;color:var(--muted);margin-top:3px;line-height:1.45}
+.feed .r{display:grid;grid-template-columns:42px 8px minmax(0,1fr);gap:8px;align-items:baseline;padding:7px 0;border-bottom:1px solid var(--soft);font-size:12px;color:var(--muted)}
+.feed .r .tm{font-size:11px;color:var(--faint);font-variant-numeric:tabular-nums}
+.feed .r b{color:var(--text);font-weight:500}
+.feed .r.alarm{color:var(--bad)}
+.feed .r.fresh b::after{content:" · now";color:var(--good);font-weight:400;font-size:11px}
+.dot{width:6px;height:6px;border-radius:50%;display:inline-block;background:var(--faint)}
+@keyframes blink{50%{opacity:.25}}
+.live{animation:blink 1.4s infinite}
+@media (prefers-reduced-motion:reduce){.live{animation:none}}
+.empty{color:var(--muted);text-align:center;padding:22px 10px;font-size:13px}
+.btn{background:none;color:var(--dim);border:1px solid var(--border);border-radius:8px;padding:7px 12px;font:500 12.5px var(--font);cursor:pointer}
+.btn.p{background:var(--text);color:var(--bg);border-color:var(--text)}
+.btn.g{background:var(--good);color:var(--bg);border-color:var(--good)}
+.btn.no{color:var(--bad)}
+.btn:disabled{opacity:.5;cursor:default}
+.btns{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+.msg{white-space:pre-wrap;font:12px var(--mono);color:var(--dim);background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 10px;margin-top:6px}
+.note{font-size:11.5px;color:var(--faint);margin-top:6px}
+.ok-t,.tbl td.ok-t,.kv b.ok-t{color:var(--good)}.bad-t,.tbl td.bad-t,.kv b.bad-t{color:var(--bad)}.warn-t,.tbl td.warn-t,.kv b.warn-t{color:var(--warn)}
+/* P&L */
+.blocks{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
+@media (max-width:1000px){.blocks{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.blk{border:1px solid var(--border);border-radius:10px;background:var(--panel);padding:16px 14px 14px;text-align:center;min-width:0}
+.blk .l{font:500 11px var(--font);letter-spacing:.08em;text-transform:uppercase;color:var(--faint)}
+.blk .v{font:600 30px var(--font);letter-spacing:-.02em;margin:8px 0 5px;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.blk .s{font-size:12px;color:var(--muted)}
+.tag{font:500 10px var(--font);color:var(--warn);border:1px solid #3a3426;border-radius:999px;padding:1px 7px;margin-left:6px;letter-spacing:.04em;vertical-align:1px}
+.tag.ok{color:var(--good);border-color:#2c4a3c}.tag.bad{color:var(--bad);border-color:#4a2c34}.tag.mut{color:var(--faint);border-color:var(--border)}
+.two{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,1fr);gap:12px}
+@media (max-width:1000px){.two{grid-template-columns:minmax(0,1fr)}}
+.kv{display:flex;justify-content:space-between;gap:10px;padding:7px 0;font-size:12.5px;color:var(--muted);border-bottom:1px solid var(--soft)}
+.kv:last-child{border-bottom:0}
+.kv b{font-weight:500;color:var(--text);font-variant-numeric:tabular-nums;text-align:right}
+.tbl{width:100%;border-collapse:collapse;font-size:13px;font-variant-numeric:tabular-nums}
+.tbl th{font:500 10.5px var(--font);letter-spacing:.06em;color:var(--faint);text-align:right;padding:6px 10px;text-transform:uppercase}
+.tbl td{padding:9px 10px;text-align:right;color:var(--muted);border-top:1px solid var(--soft)}
+.tbl th:first-child,.tbl td:first-child{text-align:left}
+.tbl tr.row{cursor:pointer}
+.tbl tr.row:hover td{color:var(--text)}
+.tbl tr.sel td{background:var(--panel2);color:var(--text);font-weight:500}
+.tblwrap{overflow:auto;max-height:520px}
+input[type=date]{background:var(--panel);border:1px solid var(--border);color:var(--text);border-radius:999px;padding:4px 10px;font:500 12px var(--font);color-scheme:dark}
+.funnel{display:grid;place-items:center;text-align:center;color:var(--muted);font-size:12.5px;line-height:1.6;padding:24px 10px}
+/* Brief */
+.brief-body h3,.brief-body h4{margin:14px 0 4px;font-size:13.5px;color:var(--accent)}
+.brief-body ul{margin:0;padding-left:18px}.brief-body li{margin:3px 0;font-size:13px;color:var(--dim)}
+.brief-body p{margin:6px 0;font-size:13.5px;color:var(--dim)}
+.brief-body b{color:var(--text);font-weight:500}
+.brief-body .warnbox{border:1px solid #3a3426;color:var(--warn);border-radius:8px;padding:7px 10px;font-size:12.5px;margin:6px 0}
+/* Agents */
+.agents{display:grid;grid-template-columns:240px minmax(0,1fr);gap:14px;align-items:start}
+@media (max-width:900px){.agents{grid-template-columns:minmax(0,1fr)}}
+.alist{border:1px solid var(--border);border-radius:10px;background:var(--panel);padding:12px 10px;max-height:calc(100vh - 120px);overflow:auto;position:sticky;top:20px}
+@media (max-width:900px){.alist{position:static;max-height:280px}}
+.alist .h{font:500 10.5px var(--font);letter-spacing:.08em;color:var(--faint);margin:12px 8px 4px;text-transform:uppercase}
+.alist a{display:flex;align-items:center;gap:8px;padding:4px 8px;border-radius:6px;font-size:12.5px;color:#6f6f78;text-decoration:none}
+.alist a.b{color:var(--dim)}
+.alist a.on{background:var(--panel2);color:var(--text);font-weight:500}
+.alist a:hover{color:var(--text)}
+.sw{width:7px;height:7px;border-radius:50%;flex:none}
+.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
+@media (max-width:700px){.stats{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.chip{padding:4px 10px;border:1px solid var(--border);border-radius:999px;font-size:12px;color:var(--dim)}
 .gate{position:fixed;inset:0;background:var(--bg);display:grid;place-items:center;padding:16px}
 .gate form{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:22px;display:grid;gap:12px;width:min(420px,100%)}
 .gate input{background:var(--panel2);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:10px 12px;font:14px var(--mono)}
-.legend{display:flex;gap:14px;flex-wrap:wrap;font-size:11.5px;color:var(--muted);padding:10px 14px;border-top:1px solid var(--border)}
-.legend span{display:inline-flex;align-items:center;gap:6px}
-@keyframes pulse{0%{opacity:.9;r:9}100%{opacity:0;r:22}}
-.badge{font-family:var(--mono);font-size:10px;padding:1px 7px;border:1px solid var(--border);border-radius:999px;color:var(--muted);white-space:nowrap}
-.badge.warn{color:var(--warn);border-color:#4a3d29}.badge.bad{color:var(--bad);border-color:#4a2c2c}.badge.good{color:var(--good);border-color:#2b3d31}
-.days{display:grid;gap:2px;font-size:12px;font-variant-numeric:tabular-nums}
-.days div{display:grid;grid-template-columns:52px 1fr 1fr 44px 58px;gap:6px}
-.days .h{color:var(--faint);font-family:var(--mono);font-size:10px}
-.brief h3,.brief h4{margin:12px 0 4px;font-size:13px;color:var(--accent)}.brief ul{margin:0;padding-left:16px}.brief li{margin:2px 0;font-size:12.5px}
-.brief p{margin:4px 0;font-size:12.5px}.brief .note{border:1px solid #4a3d29;color:var(--warn);border-radius:6px;padding:6px 8px;font-size:12px}
-.ping{fill:none;stroke:var(--accent);stroke-width:1.5;animation:pulse 1.6s ease-out infinite}
-@media (prefers-reduced-motion:reduce){.ping{animation:none;opacity:.6}}
+.rowx{border:1px solid var(--soft);border-radius:8px;padding:9px 10px;display:grid;gap:3px;background:var(--panel2);margin-bottom:8px;font-size:12.5px}
+.rowx.alarm{border-color:#4a2c34}
+.meta{font:10.5px var(--mono);color:var(--faint);display:flex;gap:8px;flex-wrap:wrap}
+.fd{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;background:var(--faint)}
+.fd.fresh{background:var(--good)}.fd.stale,.fd.failing{background:var(--bad)}
 </style>
 </head>
 <body>
 <div class="gate" id="gate" hidden>
   <form id="gateForm">
-    <div class="eyebrow">Store Brain</div>
-    <h1>Mission Control</h1>
-    <label for="keyIn" style="color:var(--muted);font-size:13px">Enter your Mission Control key. It stays in this browser tab only.</label>
+    <div class="lab">Store Brain</div>
+    <div style="font:600 22px var(--font)">Eagano LLC</div>
+    <label for="keyIn" style="color:var(--muted);font-size:13px">Enter your dashboard key. It stays in this browser tab only.</label>
     <input id="keyIn" type="password" autocomplete="off" required>
-    <button class="btn primary" type="submit">Open</button>
+    <button class="btn p" type="submit">Open</button>
   </form>
 </div>
 
-<div class="wrap" id="app" hidden>
-  <header>
-    <div>
-      <div class="eyebrow">Store Brain · separate from Eagano</div>
-      <h1>Mission Control</h1>
+<div class="shell" id="app" hidden>
+  <aside class="side">
+    <div class="brand">Eagano LLC</div>
+    <div class="brand-sub">store brain · every agent</div>
+    <nav class="nav" id="nav">
+      <a href="#/home" data-p="home">Home</a>
+      <a href="#/pnl" data-p="pnl">P&amp;L</a>
+      <a href="#/brief" data-p="brief">Brief <span class="n" id="needN"></span></a>
+      <a href="#/agents" data-p="agents">Agents</a>
+    </nav>
+    <div class="side-foot"><span id="ver">—</span><span id="aiCost"></span></div>
+  </aside>
+  <main class="main">
+    <div class="top">
+      <div class="pills" id="stores"></div>
+      <span class="status" id="status">—</span>
     </div>
-    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-      <span class="pill" id="updated">—</span>
-      <span class="pill" id="version">—</span>
-    </div>
-  </header>
-  <div class="tiles" id="tiles"></div>
-  <div class="main">
-    <div class="stage">
-      <svg id="map" viewBox="0 0 1200 900" role="img" aria-label="Live map of the Store Brain"></svg>
-      <div class="legend">
-        <span><svg width="12" height="12"><circle cx="6" cy="6" r="4.5" fill="none" stroke="#54545c"/></svg>Planned</span>
-        <span><svg width="12" height="12"><circle cx="6" cy="6" r="4.5" fill="none" stroke="#c7d2db" stroke-width="1.5"/></svg>Built</span>
-        <span><svg width="12" height="12"><circle cx="6" cy="6" r="4.5" fill="#c9a36b"/></svg>Shadow</span>
-        <span><svg width="12" height="12"><circle cx="6" cy="6" r="4.5" fill="#c7d2db"/></svg>Live</span>
-        <span><svg width="12" height="12"><circle cx="6" cy="6" r="5" fill="none" stroke="#c7d2db"/></svg>Pulsing = acted in the last 2 min</span>
-      </div>
-    </div>
-    <aside class="side">
-      <div class="tabs" role="tablist">
-        <button role="tab" aria-selected="true" data-tab="activity" id="tab-activity">Activity</button>
-        <button role="tab" aria-selected="false" data-tab="approvals" id="tab-approvals">Approvals</button>
-        <button role="tab" aria-selected="false" data-tab="supplier" id="tab-supplier">Supplier</button>
-        <button role="tab" aria-selected="false" data-tab="brief" id="tab-brief">Brief</button>
-        <button role="tab" aria-selected="false" data-tab="pnl" id="tab-pnl">P&amp;L</button>
-        <button role="tab" aria-selected="false" data-tab="money" id="tab-money">Money</button>
-        <button role="tab" aria-selected="false" data-tab="shipping" id="tab-shipping">Shipping</button>
-        <button role="tab" aria-selected="false" data-tab="feeds" id="tab-feeds">Feeds</button>
-        <button role="tab" aria-selected="false" data-tab="setup" id="tab-setup">Setup</button>
-      </div>
-      <div class="pane" id="pane"></div>
-    </aside>
-  </div>
+    <div id="page"></div>
+  </main>
 </div>
 
 <script>
 (function(){
   "use strict";
-  var KEY_STORE="sb_mc_key";
-  var key=null, state=null, tab="activity", timer=null;
+  var KEY_STORE="sb_mc_key", STORE_PICK="sb_store";
+  var key=null, state=null, timer=null, pnlData=null, pnlStore=null, pnlAt=0, agentCache={};
+  var store="all", route={p:"home"}, pnlSel={period:"day",day:null};
+  var busyUntil=0;
   var $=function(s){return document.querySelector(s)};
-  var esc=function(s){return String(s==null?"":s).replace(/[&<>"]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]})};
+  var esc=function(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})};
+  var PAL={core:"#c7d2db",media:"#c3b5e8",cs:"#efc0a8",sup:"#a9dcc4",pnl:"#ecdc9f",risk:"#eab0bd",ful:"#aecdef",cat:"#d5c2ea"};
+  var SHORT={hc:"Holt & Crane",aub:"Auberlane",mar:"Marlowe"};
+  var WORKING_MS=120000;
 
+  /* ---------------- key + loading ---------------- */
   function getKey(){
-    /* #key=... in the address (never ?key=), so the key is never sent to the server in a URL */
+    /* #key=... in the address (never ?key=), so the key never reaches the server in a URL */
     var m=/(?:^|[#&])key=([^&]+)/.exec(location.hash), k=m?decodeURIComponent(m[1]):null;
-    if(k){ try{sessionStorage.setItem(KEY_STORE,k)}catch(e){} history.replaceState(null,"",location.pathname); return k; }
+    if(k){ try{sessionStorage.setItem(KEY_STORE,k)}catch(e){} history.replaceState(null,"",location.pathname+"#/home"); return k; }
     try{ return sessionStorage.getItem(KEY_STORE) }catch(e){ return null }
   }
   function showGate(msg){
@@ -155,351 +207,179 @@ h1{margin:2px 0 0;font-size:24px;font-weight:600;letter-spacing:-.01em}
     try{sessionStorage.setItem(KEY_STORE,key)}catch(err){}
     load();
   });
+  function api(path,opt){ opt=opt||{}; opt.headers=Object.assign({"x-store-brain-key":key},opt.headers||{}); opt.cache="no-store"; return fetch(path,opt); }
 
   async function load(){
     if(!key){ showGate(); return; }
     try{
-      var r=await fetch("/api/state",{headers:{"x-store-brain-key":key},cache:"no-store"});
+      var r=await api("/api/state");
       if(r.status===401){ try{sessionStorage.removeItem(KEY_STORE)}catch(e){} key=null; showGate("That key didn't work."); return; }
       if(!r.ok) throw new Error("HTTP "+r.status);
       state=await r.json();
       $("#gate").hidden=true; $("#app").hidden=false;
-      if(!(tab==="setup"&&setupBusy)) render();
+      if(Date.now()>busyUntil) render();
     }catch(err){
-      $("#updated").textContent="Can't reach the brain: "+err.message;
-      $("#updated").className="pill bad";
+      $("#status").innerHTML='<span class="bad">Can\'t reach the brain: '+esc(err.message)+'</span>';
     }
-    clearTimeout(timer); timer=setTimeout(load,15000);
+    clearTimeout(timer); timer=setTimeout(load,10000);
   }
 
-  /* ---------------- map ---------------- */
-  var NS="http://www.w3.org/2000/svg";
-  function el(t,a,p){var e=document.createElementNS(NS,t);for(var k in a)e.setAttribute(k,a[k]);(p||svg).appendChild(e);return e}
-  var svg=$("#map"), pos={};
-  var C={x:500,y:450};
-  function anc(c){return c>.25?"start":c<-.25?"end":"middle"}
-
-  function layout(){
-    pos={};
-    pos["core"]={x:C.x,y:C.y,r:36};
-    var mgr=state.agents.filter(function(a){return a.dept==="core"});
-    mgr.forEach(function(a,i){var t=-Math.PI/2+i*2*Math.PI/mgr.length;pos[a.id]={x:C.x+Math.cos(t)*88,y:C.y+Math.sin(t)*88,r:6,ang:t}});
-    var depts=state.departments.filter(function(d){return d.id!=="core"});
-    var step=2*Math.PI/depts.length;
-    state.services.forEach(function(s,i){var t=-Math.PI/2+(i+.5)*(2*Math.PI/state.services.length);pos[s.id]={x:C.x+Math.cos(t)*160,y:C.y+Math.sin(t)*160,r:5,ang:t,sq:true}});
-    depts.forEach(function(d,i){
-      var t=-Math.PI/2+i*step, x=C.x+Math.cos(t)*285, y=C.y+Math.sin(t)*285;
-      pos[d.id]={x:x,y:y,r:22,ang:t};
-      var subs=state.agents.filter(function(a){return a.dept===d.id}), n=subs.length, spread=Math.min(Math.PI*.95,n*.37);
-      subs.forEach(function(a,j){var b=t-spread/2+(n===1?spread/2:j*spread/(n-1));pos[a.id]={x:x+Math.cos(b)*84,y:y+Math.sin(b)*84,r:6,ang:b,j:j}});
-    });
-    state.systems.forEach(function(s,i){pos[s.id]={x:1100,y:150+i*80,r:0,sys:true}});
+  /* ---------------- routing ---------------- */
+  function parseRoute(){
+    var h=location.hash.replace(/^#\/?/,"").split("/");
+    var p=["home","pnl","brief","agents"].indexOf(h[0])>=0?h[0]:"home";
+    return {p:p,a:h[1]?decodeURIComponent(h[1]):null,b:h[2]?decodeURIComponent(h[2]):null};
   }
+  window.addEventListener("hashchange",function(){ if(/key=/.test(location.hash)) return; route=parseRoute(); busyUntil=0; if(state) render(); window.scrollTo(0,0); });
+  try{ var sp=localStorage.getItem(STORE_PICK); if(sp) store=sp; }catch(e){}
 
-  function render(){
-    var now=Date.now();
-    $("#updated").textContent="Updated "+new Date(state.now).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"});
-    $("#updated").className="pill";
-    $("#version").textContent="v"+state.version;
-
-    // tiles
-    var feeds=state.feeds, fresh=feeds.filter(function(f){return f.state==="fresh"}).length;
-    var bad=feeds.filter(function(f){return f.state==="stale"||f.state==="failing"}).length;
-    var unwired=feeds.filter(function(f){return f.state==="not_wired"}).length;
-    var dayStartMs=Date.parse(state.todayStart);
-    var today=state.events.filter(function(e){return Date.parse(e.at)>=dayStartMs}).length;
-    var live=state.agents.filter(function(a){return a.status==="live"}).length;
-    $("#tiles").innerHTML=
-      tile("Stores live",state.stores.filter(function(s){return s.live}).length+" / "+state.stores.length,"")+
-      tile("Feeds fresh",fresh+" / "+feeds.length, bad?bad+" stale or failing":unwired?unwired+" not wired yet":"all fresh", bad?"bad":"")+
-      tile("Waiting on you",state.approvals.length,"approvals","")+
-      (function(sh){ sh=sh||{flags:[]}; var q=sh.quota;
-        return tile("Parcels flagged",sh.flags.length, sh.quotaLow?"17TRACK quota low: "+q.remain+" left":!sh.wired?"17TRACK not wired":q&&q.remain!=null?q.remain+" registrations left":"", sh.quotaLow?"warn":""); })(state.shipping)+
-      tile("Actions today",today,"events","")+
-      tile("Agents live",live+" / "+state.agents.length,"rest built or planned","")+
-      tile("AI cost today","$"+Number(state.aiCostToday||0).toFixed(2),"","");
-
-    // map
-    while(svg.firstChild) svg.removeChild(svg.firstChild);
-    layout();
-    var gE=el("g",{}), gN=el("g",{});
-    el("circle",{cx:C.x,cy:C.y,r:160,fill:"none",stroke:"#5e6b76","stroke-opacity":.5,"stroke-dasharray":"2 6"},gE);
-    var recent=state.events.filter(function(e){return now-Date.parse(e.at)<120000});
-    var active={}, hotLinks=[];
-    recent.forEach(function(e){active[e.actor]=1; if(e.target) {active[e.target]=1; hotLinks.push([e.actor,e.target]);}});
-    function line(a,b,hot){ if(!pos[a]||!pos[b])return; el("line",{x1:pos[a].x,y1:pos[a].y,x2:pos[b].x,y2:pos[b].y,class:"edge"+(hot?" hot":"")},gE); }
-    state.agents.forEach(function(a){ line(a.dept==="core"?"core":a.dept,a.id,false) });
-    state.departments.forEach(function(d){ if(d.id!=="core") line("core",d.id,false) });
-    hotLinks.forEach(function(l){ line(l[0],l[1],true) });
-
-    // core
-    el("circle",{cx:C.x,cy:C.y,r:36,fill:"#e8e8ea"},gN);
-    var ct=el("text",{x:C.x,y:C.y+4,"text-anchor":"middle",class:"dlbl"},gN); ct.textContent="CORE"; ct.style.fill="#0b0b0d";
-    // departments
-    state.departments.forEach(function(d){ if(d.id==="core")return; var p=pos[d.id];
-      el("circle",{cx:p.x,cy:p.y,r:22,fill:"#17171b",stroke:"#5e6b76"},gN);
-      var ca=Math.cos(p.ang),sa=Math.sin(p.ang);
-      var t=el("text",{x:p.x-ca*32,y:p.y-sa*32+(Math.abs(ca)<.3?(sa>0?-4:14):4),"text-anchor":Math.abs(ca)<.3?"middle":(ca<0?"start":"end"),class:"dlbl"},gN); t.textContent=d.short.toUpperCase();
-    });
-    // agents
-    state.agents.forEach(function(a){ var p=pos[a.id];
-      var st=a.status, fill=st==="live"?"#c7d2db":st==="shadow"?"#c9a36b":"#0b0b0d", stroke=st==="planned"?"#54545c":"#c7d2db";
-      if(active[a.id]) el("circle",{cx:p.x,cy:p.y,r:9,class:"ping"},gN);
-      var c=el("circle",{cx:p.x,cy:p.y,r:6,fill:fill,stroke:stroke,"stroke-width":st==="built"?1.6:1},gN);
-      var tt=el("title",{},c); tt.textContent=a.name+" · "+(a.kind==="ai"?"AI":"code")+" · "+a.level+" · "+st;
-      var c2=Math.cos(p.ang), s2=Math.sin(p.ang), vert=Math.abs(c2)<.45 && a.dept!=="core";
-      var lx=p.x+c2*11, ly=p.y+s2*11+4+(vert&&p.j%2?13*Math.sign(s2):0);
-      var t=el("text",{x:lx,y:ly,"text-anchor":vert?(c2>=0?"start":"end"):anc(c2),class:"lbl"+(st==="planned"?" m":"")},gN); t.textContent=a.name;
-    });
-    // services
-    state.services.forEach(function(s){ var p=pos[s.id];
-      if(active[s.id]) el("circle",{cx:p.x,cy:p.y,r:9,class:"ping"},gN);
-      el("rect",{x:p.x-5,y:p.y-5,width:10,height:10,rx:2,fill:"#0b0b0d",stroke:s.status==="planned"?"#54545c":"#c7d2db","stroke-width":1.4},gN);
-      var t=el("text",{x:p.x+Math.cos(p.ang)*13,y:p.y+Math.sin(p.ang)*13+4,"text-anchor":anc(Math.cos(p.ang)),class:"lbl m","font-family":"ui-monospace,Menlo,monospace","font-size":"9.5"},gN); t.textContent=s.name;
-    });
-    // systems
-    var h=el("text",{x:1100,y:118,"text-anchor":"middle",class:"lbl m"},gN); h.textContent="SYSTEMS";
-    state.systems.forEach(function(s){ var p=pos[s.id];
-      el("rect",{x:p.x-70,y:p.y-15,width:140,height:30,rx:6,fill:"#131316",stroke:active[s.id]?"#c7d2db":"#26262b"},gN);
-      var t=el("text",{x:p.x,y:p.y+4,"text-anchor":"middle",class:"lbl"},gN); t.textContent=s.name;
-    });
-
-    renderPane();
-  }
-  function tile(label,value,sub,cls){
-    return '<div class="tile"><span class="eyebrow">'+esc(label)+'</span><b>'+esc(value)+'</b>'+(sub?'<span class="pill '+(cls||"")+'" style="justify-self:start">'+esc(sub)+'</span>':"")+'</div>';
-  }
-
-  /* ---------------- side panel ---------------- */
-  document.querySelectorAll(".tabs button").forEach(function(b){
-    b.addEventListener("click",function(){ tab=b.dataset.tab; document.querySelectorAll(".tabs button").forEach(function(x){x.setAttribute("aria-selected",x===b?"true":"false")}); renderPane(); });
-  });
-  function agentName(id){ var a=state.agents.find(function(x){return x.id===id}) || state.services.find(function(x){return x.id===id}) || state.systems.find(function(x){return x.id===id}); return a?a.name:id; }
+  /* ---------------- helpers ---------------- */
+  function liveStores(){ return (state.stores||[]).filter(function(s){return s.live}); }
+  function storeName(id){ var s=(state.stores||[]).find(function(x){return x.id===id}); return SHORT[id]||(s?s.name:id); }
+  function agentOf(id){ return (state.agents||[]).find(function(x){return x.id===id}); }
+  function actorName(id){ var a=agentOf(id)||(state.services||[]).find(function(x){return x.id===id})||(state.systems||[]).find(function(x){return x.id===id}); return a?a.name:id; }
+  function deptOf(id){ var a=agentOf(id); return a?a.dept:(String(id).indexOf("svc.")===0||String(id).indexOf("sys.")===0?"core":String(id).split(".")[0]); }
+  function colorOf(id){ return PAL[deptOf(id)]||"#8a8a93"; }
   function ago(iso){ var m=Math.round((Date.now()-Date.parse(iso))/60000); if(m<1)return "just now"; if(m<60)return m+" min ago"; var h=Math.round(m/60); return h<48?h+" h ago":Math.round(h/24)+" d ago"; }
+  function hm(iso){ var d=new Date(iso); return d.toLocaleTimeString([], {hour:"2-digit",minute:"2-digit",hour12:false}); }
+  function money(n,signed){ if(n==null||!isFinite(n)) return "—"; var s=Math.abs(n).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}); return (n<0?"−$":(signed&&n>0?"+$":"$"))+s; }
+  function pct(n,dp){ return n==null||!isFinite(n)?"—":(n*100).toFixed(dp==null?1:dp)+"%"; }
+  function x2(n){ return n==null||!isFinite(n)?"—":n.toFixed(2)+"x"; }
+  function inStore(e){ return store==="all"||!e.store||e.store===store; }
+  function isAlarm(e){ return /alarm|error|failed|mismatch/i.test(e.kind||""); }
+  function recentEvents(){ var now=Date.now(); return (state.events||[]).filter(function(e){return now-Date.parse(e.at)<WORKING_MS}); }
+  function workingAgents(){ var set={}; recentEvents().forEach(function(e){ if(agentOf(e.actor)) set[e.actor]=1; }); return Object.keys(set); }
+  function builtCount(){ return (state.agents||[]).filter(function(a){return a.status!=="planned"}).length; }
 
-  function renderPane(){
-    var p=$("#pane");
-    if(tab==="activity"){
-      if(!state.events.length){ p.innerHTML='<div class="empty">No activity yet. Events appear here the moment any agent acts.</div>'; return; }
-      p.innerHTML=state.events.slice(0,120).map(function(e){
-        var alarm=/alarm|error|failed|mismatch/i.test(e.kind);
-        return '<div class="row'+(alarm?" alarm":"")+'"><span>'+esc(e.summary)+'</span><span class="meta"><span>'+esc(agentName(e.actor))+'</span>'+(e.target?'<span>→ '+esc(agentName(e.target))+'</span>':"")+(e.store?'<span>'+esc(e.store.toUpperCase())+'</span>':"")+'<span>'+esc(ago(e.at))+'</span></span></div>';
-      }).join("");
-    } else if(tab==="approvals"){
-      if(!state.approvals.length){ p.innerHTML='<div class="empty">Nothing is waiting on you.</div>'; return; }
-      p.innerHTML=state.approvals.map(function(a){
-        return '<div class="row" id="approval-'+a.id+'"><b>'+esc(a.title)+'</b><span class="meta"><span>'+esc(agentName(a.requested_by))+'</span>'+(a.store?'<span>'+esc(a.store.toUpperCase())+'</span>':"")+'<span>'+esc(ago(a.created_at))+'</span></span>'+
-          a.options.map(function(o){return o.detail?'<span style="color:var(--muted);font-size:12.5px">'+esc(o.label)+': '+esc(o.detail)+'</span>':""}).join("")+
-          '<div class="btns">'+a.options.map(function(o){return '<button class="btn primary" data-ap="'+a.id+'" data-choice="'+esc(o.id)+'">'+esc(o.label)+'</button>'}).join("")+
-          '<button class="btn reject" data-ap="'+a.id+'" data-choice="reject">Reject</button></div></div>';
-      }).join("");
-      p.querySelectorAll("button[data-ap]").forEach(function(b){ b.addEventListener("click",function(){ decideApproval(b.dataset.ap,b.dataset.choice,b) }) });
-    } else if(tab==="supplier"){
-      var sup=state.supplier||{kfbMessages:[],expressToday:[],mode:"shadow"};
-      var html='<div class="sub">Express orders today</div>';
-      html+=sup.expressToday.length?sup.expressToday.map(function(o){
-        return '<div class="row"><span>'+esc(o.store_name)+' '+esc(o.name)+'</span><span class="meta"><span>'+esc(o.shipping_title||"express")+'</span><span>'+(o.asked_in?"asked KFB (message "+esc(o.asked_in)+")":"not asked yet")+'</span><span>'+esc(ago(o.created_at))+'</span></span></div>';
-      }).join(""):'<div class="empty">No express orders today.</div>';
-      html+='<div class="sub">KFB messages · '+(sup.mode==="live"?"live (sent to your phone)":"shadow (drafts only, not sent to your phone)")+'</div>';
-      html+=sup.kfbMessages.length?sup.kfbMessages.map(function(m){
-        var st=m.status==="sent"?"sent "+ago(m.sent_at):m.status;
-        return '<div class="row" id="kfb-'+m.id+'"><div class="msg">'+esc(m.body)+'</div><span class="meta"><span>'+esc(m.local_day)+'</span><span>'+esc(m.mode)+'</span><span>'+esc(st)+'</span><span>'+esc(m.item_count)+' order'+(m.item_count===1?"":"s")+'</span></span>'+
-          '<div class="btns"><button class="btn" data-copy="'+m.id+'">Copy</button>'+(m.status!=="sent"?'<button class="btn primary" data-sent="'+m.id+'">Mark sent</button>':"")+'</div></div>';
-      }).join(""):'<div class="empty">No KFB messages yet. The brain checks once a day after 6:45 pm Eastern.</div>';
-      p.innerHTML=html;
-      p.querySelectorAll("button[data-copy]").forEach(function(b){ b.addEventListener("click",function(){
-        var m=sup.kfbMessages.find(function(x){return String(x.id)===b.dataset.copy});
-        if(m&&navigator.clipboard) navigator.clipboard.writeText(m.body).then(function(){b.textContent="Copied"},function(){b.textContent="Copy failed"});
-      }) });
-      p.querySelectorAll("button[data-sent]").forEach(function(b){ b.addEventListener("click",function(){ markSent(b.dataset.sent,b) }) });
-    } else if(tab==="pnl"){
-      p.innerHTML=renderPnl(state.pnl||{stores:[],group:{}});
-    } else if(tab==="brief"){
-      p.innerHTML=renderBrief(state.brief||{});
-    } else if(tab==="money"){
-      p.innerHTML=renderMoney(state.money||{stores:[]});
-    } else if(tab==="shipping"){
-      var sh=state.shipping||{wired:false,counts:{},labels:{},flags:[],registerErrors:[]};
-      var html2='';
-      if(!sh.wired) html2+='<div class="row alarm"><span>17TRACK is not wired: add TRACKING_API_KEY in Cloudflare (Setup bat 9). Tracking numbers are still collected from Shopify.</span></div>';
-      var q=sh.quota;
-      html2+='<div class="row'+(sh.quotaLow?" alarm":"")+'"><span>'+(q&&q.remain!=null?'<b>'+esc(q.remain)+'</b> tracking registrations left'+(q.total!=null?' of '+esc(q.total):''):'Quota not read yet')+'</span><span class="meta">'+
-        (sh.quotaLow?'<span style="color:var(--warn)">low: new parcels stop being tracked at 0</span>':'')+
-        '<span>last 17TRACK sync '+(sh.lastSync?esc(ago(sh.lastSync)):'never')+'</span><span>Shopify numbers read '+(sh.lastCollect?esc(ago(sh.lastCollect)):'never')+'</span></span></div>';
-      html2+='<div class="sub">Parcels · last 60 days</div>';
-      var order=["not_registered","not_checked","awaiting_pickup","in_transit","out_for_delivery","pickup_ready","failed_attempt","exception","expired","unknown","delivered"];
-      var keys=Object.keys(sh.counts||{}).sort(function(a,b){return order.indexOf(a)-order.indexOf(b)});
-      html2+=keys.length?'<div class="row">'+keys.map(function(k){
-        var warn=k==="failed_attempt"||k==="pickup_ready"||k==="exception";
-        return '<span style="display:flex;justify-content:space-between"><span'+(warn?' style="color:var(--warn)"':'')+'>'+esc((sh.labels&&sh.labels[k])||k)+'</span><b style="font-variant-numeric:tabular-nums">'+esc(sh.counts[k])+'</b></span>';
-      }).join("")+'</div>':'<div class="empty">No parcels yet. Tracking numbers appear after KFB ships an order.</div>';
-      html2+='<div class="sub">Needs attention</div>';
-      html2+=sh.flags.length?sh.flags.map(function(f){
-        var hot=f.kind==="day20"||f.kind==="day20_verify"||f.kind==="failed_delivery"||f.kind==="pickup_ready";
-        return '<div class="row'+(hot?" alarm":"")+'"><b>'+esc(f.store_name)+' '+esc(f.order_name)+' · '+esc(f.label)+'</b><span style="color:var(--muted);font-size:12.5px">'+esc(f.detail)+'</span><span class="meta">'+
-          (f.tracking_number?'<span>'+esc(f.tracking_number)+'</span>':'')+(f.last_event_text?'<span>'+esc(String(f.last_event_text).slice(0,80))+'</span>':'')+
-          (f.approval_id?'<span>approval '+esc(f.approval_id)+(f.approval_status?' · '+esc(f.approval_status):'')+'</span>':'')+'<span>flagged '+esc(ago(f.raised_at))+'</span></span></div>';
-      }).join(""):'<div class="empty">Nothing stuck, failed or late.</div>';
-      if(sh.registerErrors&&sh.registerErrors.length){
-        html2+='<div class="sub">17TRACK couldn\'t take these numbers</div>'+sh.registerErrors.map(function(r){
-          return '<div class="row"><span>'+esc(r.store_name)+' '+esc(r.order_name)+' · '+esc(r.tracking_number)+'</span><span class="meta"><span>'+esc(r.register_error)+'</span></span></div>';
-        }).join("");
-      }
-      p.innerHTML=html2;
-    } else if(tab==="setup"){
-      p.innerHTML='<div class="row"><b>1 · Check the store connections</b><span style="color:var(--muted);font-size:12.5px">Logs in to each store with its own app, confirms it is the right shop, and lists the access Shopify granted. Read-only.</span><div class="btns"><button class="btn primary" id="btnCheck">Check stores</button></div><div id="outCheck"></div></div>'+
-        '<div class="row"><b>2 · Connect order + refund notifications</b><span style="color:var(--muted);font-size:12.5px">Tells each store to notify the brain the moment an order or refund happens. Checked against Shopify afterwards.</span><div class="btns"><button class="btn primary" id="btnHooks">Connect notifications</button></div><div id="outHooks"></div></div>'+
-        '<div class="row"><b>3 · Test your phone</b><span style="color:var(--muted);font-size:12.5px">Sends one plain message through Pushover. If it shows up on your phone, approvals and alerts will reach you.</span><div class="btns"><button class="btn primary" id="btnPhone">Send test notification</button></div><div id="outPhone"></div></div>'+
-        '<div class="row"><b>4 · Connect Google</b><span style="color:var(--muted);font-size:12.5px">One sign-in with reillyworking26@gmail.com gives the brain Gmail, Google Ads (watch only), Merchant Center and Sheets. Google will call the app unverified: click Advanced, then Go to Store Brain, and tick every box.</span><div class="btns"><button class="btn primary" id="btnGoogle">Connect Google</button></div><div id="outGoogle"></div></div>'+
-        '<div class="row"><b>5 · Store inboxes</b><span style="color:var(--muted);font-size:12.5px">Each store\'s own customer-service Gmail, connected separately (Gmail only). Sign in as that inbox when Google asks.</span><div id="outBoxes"><span class="meta">Checking…</span></div></div>'+
-        '<div class="row"><b>Connections</b><span style="color:var(--muted);font-size:12.5px">Which keys are in Cloudflare (names only, values are never shown).</span><div id="outConn"><span class="meta">Checking…</span></div></div>';
-      $("#btnGoogle").addEventListener("click",async function(){
-        var b=$("#btnGoogle"); b.disabled=true; $("#outGoogle").innerHTML='<span class="meta">Opening Google…</span>';
-        try{ var r=await fetch("/api/admin/google/start",{method:"POST",headers:{"x-store-brain-key":key}}); var j=await r.json();
-          if(j.ok&&j.url){ window.location.assign(j.url); return; }
-          $("#outGoogle").innerHTML='<span style="color:var(--bad)">✗ '+esc(j.error||("HTTP "+r.status))+'</span>';
-        }catch(e){ $("#outGoogle").innerHTML='<span style="color:var(--bad)">Couldn\'t reach the brain.</span>'; }
-        b.disabled=false;
-      });
-      (async function(){
-        try{ var r=await fetch("/api/admin/connections",{headers:{"x-store-brain-key":key}}); var j=await r.json(); if(!j.ok) throw 0;
-          var rows=Object.keys(j.secrets).map(function(n){ return '<div>'+(j.secrets[n]?'<span style="color:var(--good)">✓</span>':'<span style="color:var(--faint)">·</span>')+' <span class="meta">'+esc(n)+'</span></div>'; }).join("");
-          var g=j.google||{}; var gl=(g.connected===false&&g.account)?'<div><span style="color:var(--warn)">!</span> Google: saved but not verified — click Connect Google again</div>':g.connected?('<div><span style="color:var(--good)">✓</span> Google: '+esc(g.account)+' <span class="meta">'+esc((g.granted||[]).join(", "))+(g.missing&&g.missing.length?' · missing: '+esc(g.missing.join(", ")):'')+(g.verified_at?' · checked '+esc(ago(g.verified_at)):'')+'</span></div>'):'<div><span style="color:var(--faint)">·</span> Google: not connected</div>';
-          $("#outConn").innerHTML=gl+rows;
-          var bx=(j.mailboxes||[]).filter(function(m){return m.mailbox;});
-          $("#outBoxes").innerHTML=(bx.length?bx.map(function(m){ return '<div style="margin:6px 0">'+(m.connected?'<span style="color:var(--good)">✓</span>':(m.account?'<span style="color:var(--warn)">!</span>':'<span style="color:var(--faint)">·</span>'))+' '+esc(m.name)+' <span class="meta">'+esc(m.mailbox)+(m.connected&&m.verified_at?' · checked '+esc(ago(m.verified_at)):(m.account?' · saved but not verified':' · not connected'))+'</span> <button class="btn" data-box="'+esc(m.store)+'">'+(m.connected?'Reconnect':'Connect')+'</button></div>'; }).join(""):'<span class="meta">No store inboxes set up yet.</span>')+
-            (j.mailboxes||[]).filter(function(m){return !m.mailbox;}).map(function(m){ return '<div class="meta">'+esc(m.name)+': no inbox set up yet</div>'; }).join("");
-          document.querySelectorAll("button[data-box]").forEach(function(b){ b.addEventListener("click",async function(){
-            b.disabled=true;
-            try{ var r2=await fetch("/api/admin/google/start",{method:"POST",headers:{"x-store-brain-key":key,"content-type":"application/json"},body:JSON.stringify({target:b.dataset.box})}); var j2=await r2.json();
-              if(j2.ok&&j2.url){ window.location.assign(j2.url); return; } b.insertAdjacentHTML("afterend",' <span style="color:var(--bad)">'+esc(j2.error||"failed")+'</span>');
-            }catch(e){} b.disabled=false; }); });
-        }catch(e){ $("#outConn").innerHTML='<span class="meta">Couldn\'t load connections.</span>'; }
-      })();
-      $("#btnPhone").addEventListener("click",function(){ runSetup("/api/admin/test-notification",$("#btnPhone"),$("#outPhone"),function(r){
-        return r.sent?'<span style="color:var(--good)">✓ Sent</span> <span class="meta">check your phone. If nothing arrives within a minute, the user key belongs to a different Pushover account.</span>':'<span style="color:var(--bad)">✗ '+esc(r.reason||"not sent")+'</span>'; }) });
-      $("#btnCheck").addEventListener("click",function(){ runSetup("/api/admin/check-stores",$("#btnCheck"),$("#outCheck"),function(r){
-        return r.ok?'<span style="color:var(--good)">✓ '+esc(r.name)+'</span> <span class="meta">'+esc(r.domain)+(r.missing&&r.missing.length?' · missing: '+esc(r.missing.join(", ")):' · all access granted')+'</span>':'<span style="color:var(--bad)">✗ '+esc(r.name)+': '+esc(r.error)+'</span>'; }) });
-      $("#btnHooks").addEventListener("click",function(){ runSetup("/api/admin/webhooks",$("#btnHooks"),$("#outHooks"),function(r){
-        return r.verified?'<span style="color:var(--good)">✓ '+esc(r.name)+'</span> <span class="meta">connected and verified</span>':'<span style="color:var(--bad)">✗ '+esc(r.name)+': '+esc((r.errors||[]).join(" | ")||"not verified")+'</span>'; }) });
-    } else {
-      p.innerHTML=state.feeds.map(function(f){
-        var label={fresh:"Fresh",stale:"Stale",failing:"Failing",not_wired:"Not wired yet"}[f.state]||f.state;
-        return '<div class="row'+(f.state==="stale"||f.state==="failing"?" alarm":"")+'"><span><span class="dot '+esc(f.state)+'"></span>'+esc(f.label)+'</span><span class="meta"><span>'+esc(label)+'</span>'+(f.last_ok_at?'<span>last delivered '+esc(ago(f.last_ok_at))+'</span>':"")+'<span>limit '+esc(f.max_age_min)+' min</span>'+(f.last_error?'<span>'+esc(f.last_error)+'</span>':"")+'</span></div>';
-      }).join("");
-    }
-  }
-  /* ---------------- money ---------------- */
-  var FEED_LBL={fresh:"Fresh",stale:"Stale",failing:"Failing",not_wired:"Not wired yet"};
-  function amt(n,cur){ return n==null?"—":Number(n).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})+(cur?" "+cur:""); }
-  function feedLine(name,f){
-    f=f||{state:"not_wired"};
-    return '<span class="meta"><span><span class="dot '+esc(f.state)+'"></span>'+esc(name)+': '+esc(FEED_LBL[f.state]||f.state)+'</span>'+(f.last_ok_at?'<span>last delivered '+esc(ago(f.last_ok_at))+'</span>':"")+(f.last_error&&f.state!=="fresh"?'<span class="bad-t">'+esc(f.last_error)+'</span>':"")+'</span>';
-  }
-  function kv(k,v,cls){ return '<div class="kv"><span>'+esc(k)+'</span><b'+(cls?' class="'+cls+'"':"")+'>'+v+'</b></div>'; }
-  function renderMoney(m){
-    if(!m.stores.length) return '<div class="empty">No live stores.</div>';
-    return m.stores.map(function(s){
-      var h='<div class="sub">'+esc(s.name)+'</div>';
-      // Ads spend
-      var a=s.ads, ah='<div class="row'+(s.adsFeed.state==="stale"||s.adsFeed.state==="failing"?" alarm":"")+'"><b>Google Ads spend</b>';
-      if(!a){ ah+='<span style="color:var(--muted);font-size:12.5px">No spend data yet (shown as absent, never as zero).</span>'; }
-      else{
-        ah+=kv("Yesterday"+(a.yesterday?" · "+a.yesterday.day:""),a.yesterday?esc(amt(a.yesterday.cost,a.currency))+' <span class="meta">· '+esc(a.yesterday.clicks)+' clicks · conv. '+esc(amt(a.yesterday.conv_value))+'</span>':"—")+
-            kv("Last 7 days"+(a.last7?" · "+a.last7.from.slice(5)+" to "+a.last7.to.slice(5):""),a.last7?esc(amt(a.last7.cost,a.currency))+' <span class="meta">· '+esc(a.last7.clicks)+' clicks · conv. '+esc(amt(a.last7.conv_value))+'</span>':"—")+
-            kv("Today so far (partial)",a.today?esc(amt(a.today.cost,a.currency)):"—")+
-            '<span class="meta"><span>account time '+esc(a.account_tz||"?")+'</span></span>';
-      }
-      ah+=feedLine("Ads feed",s.adsFeed)+'</div>';
-      // Shopify balance + payouts
-      var ph='<div class="row'+(s.payoutsFeed.state==="stale"||s.payoutsFeed.state==="failing"?" alarm":"")+'"><b>Shopify Payments</b>';
-      ph+=kv("Balance",s.balance?esc(amt(s.balance.amount,s.balance.currency))+' <span class="meta">· as of '+esc(ago(s.balance.as_of))+'</span>':"—");
-      ph+=s.payouts.length?s.payouts.map(function(p){
-        var chk=p.check_result==="mismatch"?'<span class="bad-t">doesn\'t add up</span>':p.check_result==="match"?'adds up':p.check_result==="unverified"?'not checked yet':'';
-        var st=p.status==="PAID"?"paid":p.status==="SCHEDULED"?'<span class="pend">scheduled</span>':'<span class="bad-t">'+esc(String(p.status||"").toLowerCase())+'</span>';
-        return kv(String(p.issued_at||"").slice(0,10),esc(amt(p.net,p.currency))+' <span class="meta">· '+st+(chk?' · '+chk:"")+'</span>');
-      }).join(""):'<span style="color:var(--muted);font-size:12.5px">No payouts recorded yet.</span>';
-      ph+=feedLine("Payouts feed",s.payoutsFeed)+'</div>';
-      // Refunds by processed day
-      var r=s.refunds, rh='<div class="row"><b>Refunds by processed day</b>';
-      rh+=r.byDay.length?r.byDay.map(function(d){
-        return kv(d.day,esc(d.n)+' · '+esc(amt(d.amount))+(d.pending_n?' <span class="pend">('+esc(d.pending_n)+' pending, '+esc(amt(d.pending_amount))+')</span>':""));
-      }).join(""):'<span style="color:var(--muted);font-size:12.5px">No refunds processed '+esc(r.from)+' to '+esc(r.to)+'.</span>';
-      if(r.pending.length){
-        rh+='<span class="pend" style="font-size:12.5px;margin-top:4px">PENDING — money not yet back with the customer:</span>'+r.pending.map(function(p){
-          return kv(p.local_day||"?",'<span class="pend">'+esc(amt(p.amount))+' · '+esc(p.status)+'</span>');
-        }).join("");
-      }
-      rh+='</div>';
-      return h+ah+ph+rh;
-    }).join("")+((m.jobs||[]).length?'<div class="sub">Last runs</div><div class="row">'+m.jobs.map(function(j){ return kv(j.job,esc(ago(j.last_run_at))+(j.last_result&&j.last_result!=="ok"?' <span class="bad-t">'+esc(j.last_result)+'</span>':"")); }).join("")+'</div>':"");
+  /* ---------------- frame ---------------- */
+  function render(){
+    route=parseRoute();
+    document.querySelectorAll("#nav a").forEach(function(a){ a.classList.toggle("on",a.dataset.p===route.p); });
+    $("#ver").textContent="v"+state.version;
+    $("#aiCost").textContent="AI today $"+Number(state.aiCostToday||0).toFixed(2);
+    var need=needs().length; $("#needN").textContent=need?need:"";
+    var feeds=state.feeds||[], bad=feeds.filter(function(f){return f.state==="stale"||f.state==="failing"}).length;
+    $("#status").innerHTML='Updated '+esc(hm(state.now))+' · '+(bad?'<span class="bad">● '+bad+' feed'+(bad>1?"s":"")+' stale</span>':'<span class="ok">● all feeds fresh</span>');
+    var ls=liveStores();
+    if(store!=="all"&&!ls.some(function(s){return s.id===store})) store="all";
+    $("#stores").innerHTML='<button class="pill'+(store==="all"?" on":"")+'" data-s="all">All stores</button>'+
+      ls.map(function(s){return '<button class="pill'+(store===s.id?" on":"")+'" data-s="'+esc(s.id)+'">'+esc(storeName(s.id))+'</button>'}).join("")+
+      '<span class="pill dash" title="New stores come with the Store Factory">+ Add store</span>';
+    document.querySelectorAll("#stores [data-s]").forEach(function(b){ b.addEventListener("click",function(){ store=b.dataset.s; try{localStorage.setItem(STORE_PICK,store)}catch(e){} busyUntil=0; render(); }); });
+    var pg=$("#page");
+    if(route.p==="home") pg.innerHTML=homePage();
+    else if(route.p==="pnl") { pg.innerHTML=pnlShell(); loadPnl(); }
+    else if(route.p==="brief") pg.innerHTML=briefPage();
+    else pg.innerHTML=agentsPage();
+    wire();
   }
 
-  /* ---------------- P&L ---------------- */
-  function pctTxt(n){ return n==null?"—":(Math.round(n*1000)/10)+"%"; }
-  function profitTxt(r){
-    if(r.profit!=null) return '<span'+(r.profit<0?' class="bad-t"':'')+'>'+esc(amt(r.profit))+'</span>';
-    var miss=(r.notes&&r.notes.missing)||r.missing||[], why=(r.notes&&r.notes.missing_why)||{};
-    return '<span class="pend">— missing: '+esc(miss.map(function(k){return why[k]?k+" ("+why[k]+")":k;}).join(", ")||"inputs")+(r.profit_partial!=null?' · '+esc(amt(r.profit_partial))+' without those':'')+'</span>';
+  /* ---------------- HOME ---------------- */
+  function yesterdayRow(){
+    var pl=state.pnl||{stores:[],group:{}};
+    if(store==="all") return pl.group&&pl.group.yesterday;
+    var s=(pl.stores||[]).find(function(x){return x.id===store}); return s&&s.yesterday;
   }
-  function cogsTxt(r){
-    if(r.cogs==null) return "—";
-    var b=r.cogs_basis||{}, assumed=b.rate_assumed&&b.orders_by_rate>0||r.cogs_assumed;
-    var share=r.cogs_estimated_share;
-    return esc(amt(r.cogs))+' <span class="meta">· '+(share==null?"":esc(pctTxt(share))+' estimate')+(b.rate!=null&&b.orders_by_rate?' · rate '+esc(pctTxt(b.rate)):'')+'</span>'+(assumed?' <span class="badge warn">ASSUMED 33%</span>':'');
+  function homePage(){
+    var y=yesterdayRow()||{}, w=workingAgents();
+    var prof=y.profit;
+    var kpis='<div class="kpis">'+
+      kpi("Yesterday revenue",money(y.revenue),y.orders!=null?y.orders+" orders":"")+
+      kpi("Yesterday profit",prof==null?"—":money(prof,true),prof==null?(y.revenue!=null?"not final yet":""):(!y.complete?"not final yet":(y.cogs_estimated_share>0?"COGS estimated":"final")),prof==null?"":prof<0?"bad-t":"ok-t")+
+      kpi("Yesterday ROAS",x2(y.roas),y.breakeven_roas!=null?"break-even "+x2(y.breakeven_roas):"",y.roas!=null&&y.breakeven_roas!=null?(y.roas>=y.breakeven_roas?"ok-t":"bad-t"):"")+
+      kpi("Agents running",w.length+" now",builtCount()+" of "+state.agents.length+" built")+'</div>';
+    var map='<div class="mapbox"><svg id="map" viewBox="0 0 1100 840" role="img" aria-label="Every agent; working agents pulse, moving dots are hand-offs">'+mapSvg()+'</svg>'+
+      '<div class="legend"><span><i style="border:1px solid var(--good);box-shadow:0 0 0 3px rgba(169,220,196,.15)"></i>working now (acted in the last 2 min)</span><span>moving dots = a real hand-off or a log entry</span><span><i style="background:var(--accent)"></i>built</span><span><i style="border:1px solid var(--faint)"></i>planned</span><span>click an agent to open it</span></div></div>';
+    var n=needs();
+    var wait='<div class="lab" style="display:flex;justify-content:space-between"><span>Waiting on you · '+n.length+'</span><a href="#/brief" style="text-transform:none;letter-spacing:0;color:var(--muted)">open Brief →</a></div>'+
+      (n.length?n.slice(0,5).map(function(x){ return '<a href="#/brief" style="text-decoration:none"><div class="card" style="border-left-color:'+x.color+'"><div class="t">'+esc(x.title)+'<span>'+esc(x.who)+'</span></div><div class="d">'+esc(x.detail)+'</div></div></a>'; }).join(""):'<div class="card" style="border-left-color:var(--good)"><div class="d">Nothing is waiting on you.</div></div>');
+    var feed='<div class="lab" style="display:flex;justify-content:space-between;margin-top:6px"><span>Activity · live</span><span style="color:var(--good);text-transform:none;letter-spacing:0"><span class="dot live" style="background:var(--good);margin-right:5px"></span>'+w.length+' agent'+(w.length===1?"":"s")+' working</span></div>'+feedHtml(25);
+    return kpis+'<div class="home">'+map+'<div class="col">'+wait+feed+'</div></div>';
   }
-  function statusBadge(r,today){
-    if(today) return '<span class="badge warn">PARTIAL · day not over</span>';
-    if(r.complete) return r.status==="restated"?'<span class="badge">restated</span>':'<span class="badge good">complete</span>';
-    var st=((r.notes&&r.notes.stale_inputs)||r.stale||[]).concat((r.notes&&r.notes.unsettled)||[]);
-    return '<span class="badge warn">not complete'+(st.length?' · '+esc(st.join(", ")):'')+'</span>';
-  }
-  function freshBadges(f){
-    if(!f) return "";
-    return '<span class="meta">'+["orders","ads","payouts","refunds"].map(function(k){ var s=(f[k]||{}).state||"not_wired"; if(s==="none")return "";
-      return '<span><span class="dot '+esc(s)+'"></span>'+esc(k)+': '+esc(FEED_LBL[s]||s)+'</span>'; }).join("")+'</span>';
-  }
-  function pnlBlock(title,r,o){
-    o=o||{};
-    if(!r) return '<div class="row"><b>'+esc(title)+'</b><span style="color:var(--muted);font-size:12.5px">No P&amp;L row yet.</span></div>';
-    var h='<div class="row'+(o.today?'':(!r.complete?' alarm':''))+'"><span style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap"><b>'+esc(title)+'</b>'+statusBadge(r,o.today)+'</span>';
-    h+=kv("Revenue",esc(amt(r.revenue))+(r.orders!=null?' <span class="meta">· '+esc(r.orders)+' orders</span>':''));
-    h+=kv("Refunds (processed)",esc(amt(r.refunds))+(r.refunds_pending?' <span class="pend">· '+esc(amt(r.refunds_pending))+' PENDING</span>':''));
-    h+=kv("COGS",cogsTxt(r));
-    h+=kv("Ads",esc(amt(r.ads)));
-    h+=kv("Guy fee",esc(amt(r.guy_fee)));
-    h+=kv("Shopify fees",r.fees==null?'<span class="meta">not wired</span>':esc(amt(r.fees)));
-    h+=kv("Profit",profitTxt(r));
-    h+=kv("Margin",esc(pctTxt(r.margin)));
-    h+=kv("ROAS vs break-even",(r.roas==null?"—":esc(r.roas.toFixed(2)))+' / '+(r.breakeven_roas==null?"—":esc(r.breakeven_roas.toFixed(2)))+(r.roas!=null&&r.breakeven_roas!=null?(r.roas>=r.breakeven_roas?' <span class="meta">above</span>':' <span class="bad-t">below</span>'):''));
-    if(o.fresh) h+=freshBadges(r.freshness);
-    return h+'</div>';
-  }
-  function daysTable(rows){
-    if(!rows||!rows.length) return '<span class="meta">No closed days recorded yet.</span>';
-    return '<div class="days"><div class="h"><span>day</span><span>revenue</span><span>profit</span><span>est.</span><span></span></div>'+rows.map(function(r){
-      return '<div><span>'+esc(r.day.slice(5))+'</span><span>'+esc(amt(r.revenue))+'</span><span>'+(r.profit==null?'<span class="pend">—</span>':'<span'+(r.profit<0?' class="bad-t"':'')+'>'+esc(amt(r.profit))+'</span>')+'</span><span>'+esc(r.cogs_estimated_share==null?"—":pctTxt(r.cogs_estimated_share))+'</span><span>'+(r.complete?'<span class="meta">ok</span>':'<span class="pend">open</span>')+'</span></div>';
+  function kpi(l,v,s,cls){ return '<div class="kpi"><div class="l">'+esc(l)+'</div><div class="v '+(cls||"")+'">'+esc(v)+'</div>'+(s?'<div class="s">'+esc(s)+'</div>':"")+'</div>'; }
+  function feedHtml(limit,big){
+    var ev=(state.events||[]).filter(inStore).slice(0,limit);
+    if(!ev.length) return '<div class="empty">No activity yet. Every agent action appears here the moment it happens.</div>';
+    var now=Date.now();
+    return '<div class="feed">'+ev.map(function(e){
+      var fresh=now-Date.parse(e.at)<WORKING_MS;
+      return '<div class="r'+(isAlarm(e)?" alarm":"")+(fresh?" fresh":"")+'"'+(big?' style="font-size:13px"':'')+'><span class="tm" title="'+esc(new Date(e.at).toLocaleString())+'">'+esc(hm(e.at))+'</span><span class="dot'+(fresh?" live":"")+'" style="background:'+colorOf(e.actor)+'"></span><span><a href="#/agents/'+esc(e.actor)+'" style="text-decoration:none"><b>'+esc(actorName(e.actor))+'</b></a> · '+esc(e.summary)+(e.store&&store==="all"?' <span style="color:var(--faint)">· '+esc(storeName(e.store))+'</span>':"")+'</span></div>';
     }).join("")+'</div>';
   }
-  function renderPnl(pl){
-    if(!pl.stores||!pl.stores.length) return '<div class="empty">No live stores.</div>';
-    var g=pl.group||{};
-    var h='<div class="row"><span style="font-size:12.5px;color:var(--muted)">COGS is an <b>estimate</b> until KFB bills are wired. Today is partial and never final. A dash means the input isn\'t wired (never zero).</span></div>';
-    h+='<div class="sub">Group</div>'+pnlBlock("Yesterday",g.yesterday)+pnlBlock("Month to date",g.mtd&&g.mtd.days?g.mtd:null)+pnlBlock("Today so far",g.today,{today:true});
-    pl.stores.forEach(function(s){
-      h+='<div class="sub">'+esc(s.name)+'</div>';
-      h+=pnlBlock("Yesterday"+(s.yesterday?" · "+s.yesterday.day:""),s.yesterday,{fresh:true});
-      h+=pnlBlock("Today so far · "+s.today_day,s.today,{today:true});
-      h+='<div class="row"><b>Last 7 days</b>'+daysTable(s.last7)+(s.last7_sum&&s.last7_sum.revenue!=null?kv("7-day revenue / profit",esc(amt(s.last7_sum.revenue))+' / '+(s.last7_sum.profit==null?'<span class="pend">—</span>':esc(amt(s.last7_sum.profit)))):'')+'</div>';
-      var m=s.mtd||{};
-      h+=pnlBlock("Month to date · "+(m.label||""),m.days?m:null);
-      if(m.days_in_period&&m.order_history_days<m.days_in_period) h+='<div class="row alarm"><span class="pend">Order history covers '+esc(m.order_history_days)+' of '+esc(m.days_in_period)+' days this month (backfill still reading); profit unknown for the rest.</span></div>';
-      if(m.missing_days&&m.missing_days.length) h+='<div class="row alarm"><span class="pend">MTD is missing '+esc(m.missing_days.length)+' day(s): '+esc(m.missing_days.slice(0,6).join(", "))+'</span></div>';
+
+  /* map geometry (same layout as the approved concept): Core + manager ring in the middle,
+     departments around it, each department's agents stacked in a column on its outer side. */
+  var GEO=null;
+  function geometry(){
+    if(GEO) return GEO;
+    var g={pos:{},hubs:{}}, cx=550, cy=420, r=function(n){return Math.round(n*10)/10};
+    var core=state.agents.filter(function(a){return a.dept==="core"});
+    core.forEach(function(a,i){ var t=-Math.PI/2+i*2*Math.PI/core.length; g.pos[a.id]={x:r(cx+92*Math.cos(t)),y:r(cy+92*Math.sin(t)),side:Math.cos(t)>=0?1:-1}; });
+    g.pos.core={x:cx,y:cy};
+    var depts=state.departments.filter(function(d){return d.id!=="core"});
+    depts.forEach(function(d,i){
+      var t=-Math.PI/2+(i+.5)*2*Math.PI/depts.length, hx=r(cx+300*Math.cos(t)), hy=r(cy+300*Math.sin(t));
+      var side=Math.abs(Math.cos(t))<.2?1:Math.sign(Math.cos(t));
+      g.hubs[d.id]={x:hx,y:hy,t:t,side:side}; g.pos[d.id]={x:hx,y:hy};
+      var ag=state.agents.filter(function(a){return a.dept===d.id});
+      ag.forEach(function(a,j){ g.pos[a.id]={x:r(hx+side*78),y:r(hy+(j-(ag.length-1)/2)*19),side:side,hub:d.id}; });
     });
-    return h;
+    GEO=g; return g;
   }
-  /* ---------------- brief ---------------- */
-  /* Same safe subset as the server: escape everything first, then ## / - / ** / _ / > only. */
+  function mapSvg(){
+    var g=geometry(), cx=550, cy=420, lines="", anim="", nodes="", labels="", now=Date.now();
+    var recent=recentEvents(), working={};
+    recent.forEach(function(e){ working[e.actor]=1; if(e.target&&agentOf(e.target)) working[e.target]=1; });
+    lines+='<circle cx="'+cx+'" cy="'+cy+'" r="92" fill="none" stroke="#26262b" stroke-dasharray="2 4"/>';
+    var depts=state.departments.filter(function(d){return d.id!=="core"});
+    depts.forEach(function(d){
+      var h=g.hubs[d.id], c=PAL[d.id], t=h.t;
+      var hot=state.agents.some(function(a){return a.dept===d.id&&working[a.id]});
+      lines+='<line x1="'+(cx+34*Math.cos(t))+'" y1="'+(cy+34*Math.sin(t))+'" x2="'+(h.x-28*Math.cos(t))+'" y2="'+(h.y-28*Math.sin(t))+'" stroke="'+c+'" stroke-opacity="'+(hot?.6:.22)+'"/>';
+      var ag=state.agents.filter(function(a){return a.dept===d.id}), built=ag.filter(function(a){return a.status!=="planned"}).length;
+      ag.forEach(function(a){
+        var p=g.pos[a.id], on=a.status!=="planned", mx=h.x+h.side*44;
+        lines+='<path d="M'+(h.x+h.side*28)+' '+h.y+' C'+mx+' '+h.y+' '+mx+' '+p.y+' '+p.x+' '+p.y+'" fill="none" stroke="'+c+'" stroke-opacity="'+(working[a.id]?.8:on?.5:.15)+'"/>';
+      });
+      nodes+='<circle cx="'+h.x+'" cy="'+h.y+'" r="28" fill="#131316" stroke="'+c+'" stroke-width="1.2"/>';
+      labels+='<text x="'+h.x+'" y="'+(h.y+1)+'" text-anchor="middle" class="hub" style="font-size:10.5px">'+esc(d.short)+'</text><text x="'+h.x+'" y="'+(h.y+12)+'" text-anchor="middle" class="sub">'+built+'/'+ag.length+'</text>';
+    });
+    nodes+='<circle cx="'+cx+'" cy="'+cy+'" r="34" fill="#131316" stroke="#c7d2db" stroke-width="1.2"/>';
+    labels+='<text x="'+cx+'" y="'+(cy-2)+'" text-anchor="middle" class="hub" style="font-size:12px">Core</text><text x="'+cx+'" y="'+(cy+12)+'" text-anchor="middle" class="sub">event log</text>';
+    // Hand-offs: each event of the last 2 minutes sends a dot from its agent to the Core (the
+    // event log), and to its target when the target is another agent. Real events only.
+    var seen={};
+    recent.slice(0,24).forEach(function(e,i){
+      var a=g.pos[e.actor]; if(!a) return;
+      var c=colorOf(e.actor), to=e.target&&agentOf(e.target)?g.pos[e.target]:g.pos.core, k=e.actor+">"+(e.target||"core");
+      if(seen[k]) return; seen[k]=1;
+      anim+='<circle r="2.6" fill="'+c+'"><animateMotion dur="2.2s" begin="'+(i*.35).toFixed(2)+'s" repeatCount="indefinite" path="M'+a.x+' '+a.y+' L'+to.x+' '+to.y+'"/></circle>';
+    });
+    state.agents.forEach(function(a){
+      var p=g.pos[a.id], c=PAL[a.dept]||"#8a8a93", on=a.status!=="planned", w=working[a.id];
+      if(w) anim+='<circle cx="'+p.x+'" cy="'+p.y+'" r="5" fill="none" stroke="'+c+'" stroke-width="1.2"><animate attributeName="r" values="5;13" dur="1.8s" repeatCount="indefinite"/><animate attributeName="stroke-opacity" values=".9;0" dur="1.8s" repeatCount="indefinite"/></circle>';
+      var right=a.dept==="core"?p.side>0:p.side>0;
+      nodes+='<a href="#/agents/'+esc(a.id)+'" class="node"><title>'+esc(a.name+" · "+(a.kind==="ai"?"AI":"code")+" · "+a.status+(a.does?" — "+a.does:""))+'</title><circle cx="'+p.x+'" cy="'+p.y+'" r="'+(on?5:4)+'" fill="'+(on?c:"#0b0b0d")+'" stroke="'+c+'" stroke-opacity="'+(on?1:.55)+'" stroke-width="1.2"/>'+
+        '<text x="'+(p.x+(right?9:-9))+'" y="'+(p.y+3.3)+'" text-anchor="'+(right?"start":"end")+'" class="lb'+(on||w?" on":"")+'">'+esc(a.name)+'</text></a>';
+    });
+    return lines+anim+nodes+labels;
+  }
+
+  /* ---------------- waiting on you ---------------- */
+  function needs(){
+    var out=[];
+    (state.approvals||[]).forEach(function(a){ if(store!=="all"&&a.store&&a.store!==store) return;
+      out.push({kind:"approval",id:a.id,title:a.title,who:actorName(a.requested_by),detail:(a.store?storeName(a.store)+" · ":"")+ago(a.created_at),color:colorOf(a.requested_by),a:a}); });
+    var sup=state.supplier||{kfbMessages:[]};
+    (sup.kfbMessages||[]).forEach(function(m){ if(m.status==="sent") return;
+      out.push({kind:"kfb",id:m.id,title:"KFB message ready",who:"Relay",detail:m.item_count+" item"+(m.item_count===1?"":"s")+" · "+m.local_day+(m.mode==="shadow"?" · shadow":""),color:PAL.sup,m:m}); });
+    var hot={day20:1,day20_verify:1,failed_delivery:1,pickup_ready:1};
+    ((state.shipping||{}).flags||[]).forEach(function(f){ if(!hot[f.kind]||f.approval_id) return; if(store!=="all"&&f.store&&f.store!==store) return;
+      out.push({kind:"flag",title:f.store_name+" "+f.order_name+" · "+f.label,who:"Tracking",detail:f.detail,color:PAL.ful,f:f}); });
+    return out;
+  }
+
+  /* ---------------- BRIEF ---------------- */
   function mdHtml(md){
     var out=[], list=false;
     function inline(t){ return esc(t).replace(/\*\*([^*]+)\*\*/g,"<b>$1</b>").replace(/(^|\s)_([^_]+)_(?=\s|$|[.,;:)])/g,"$1<i>$2</i>"); }
@@ -508,53 +388,337 @@ h1{margin:2px 0 0;font-size:24px;font-weight:600;letter-spacing:-.01em}
       if(!bullet&&list){ out.push("</ul>"); list=false; }
       if(!t) return;
       if(bullet){ if(!list){out.push("<ul>");list=true;} out.push("<li>"+inline(t.replace(/^[-*•]\s+/,""))+"</li>"); return; }
-      var hm=/^(#{1,3})\s+(.*)$/.exec(t);
-      if(hm){ var n=hm[1].length+2; out.push("<h"+n+">"+inline(hm[2])+"</h"+n+">"); return; }
-      if(t.charAt(0)===">"){ out.push('<div class="note">'+inline(t.replace(/^>\s*/,""))+"</div>"); return; }
+      var h=/^(#{1,3})\s+(.*)$/.exec(t);
+      if(h){ var n=h[1].length+2; out.push("<h"+n+">"+inline(h[2])+"</h"+n+">"); return; }
+      if(t.charAt(0)===">"){ out.push('<div class="warnbox">'+inline(t.replace(/^>\s*/,""))+"</div>"); return; }
       out.push("<p>"+inline(t)+"</p>");
     });
     if(list) out.push("</ul>");
     return out.join("");
   }
-  function renderBrief(b){
-    var mode=b.mode==="live"?"live (sent to your phone at 8:00)":"shadow (Mission Control only, not sent to your phone)";
-    var l=b.latest;
-    if(!l) return '<div class="sub">Morning brief · '+esc(mode)+'</div><div class="empty">No brief yet. The brain writes it once a day after 8:00 am Eastern.</div>';
-    var meta='<span class="meta"><span>'+esc(l.day)+'</span><span>'+esc(l.composer==="ai"?"Claude "+(l.model||""):"plain (no AI)")+'</span>'+(l.composer==="ai"?'<span>$'+esc(Number(l.cost_usd||0).toFixed(4))+'</span>'+(l.checked===false?'<span class="bad-t">numbers NOT checked</span>':l.checked?'<span>numbers checked</span>':''):'')+'<span>'+esc(ago(l.created_at))+'</span>'+
-      (l.phone?'<span>'+(l.phone.sent?"sent to phone":'<span class="bad-t">phone: '+esc(l.phone.reason||"not sent")+'</span>')+'</span>':'')+'</span>';
-    return '<div class="sub">Morning brief · '+esc(mode)+'</div><div class="row">'+meta+(l.ai_error?'<span class="pend" style="font-size:12px">AI unavailable: '+esc(l.ai_error)+'</span>':'')+'<div class="brief">'+mdHtml(l.body_md)+'</div></div>';
+  function briefPage(){
+    var b=state.brief||{}, l=b.latest;
+    var mode=b.mode==="live"?"sent to your phone at 8:00":"shadow · not sent to your phone yet";
+    var top='<div class="box"><div class="lab" style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap"><span>This morning'+(l?" · "+esc(l.day):"")+'</span><span style="text-transform:none;letter-spacing:0">'+esc(mode)+'</span></div>'+
+      (l?('<div class="brief-body">'+(l.ai_error?'<div class="warnbox">AI unavailable, plain brief: '+esc(l.ai_error)+'</div>':'')+mdHtml(l.body_md)+'</div><div class="note">'+esc(l.composer==="ai"?"Claude "+(l.model||""):"plain (no AI)")+(l.checked===false?' · <span class="bad-t">numbers NOT checked</span>':l.checked?" · every number checked against the ledger":"")+' · '+esc(ago(l.created_at))+'</div>')
+        :'<div class="empty">No brief yet. The brain writes it once a day at 8:00 am Eastern.</div>')+'</div>';
+    var live='<div class="box"><div class="lab" style="display:flex;justify-content:space-between"><span>What has happened · live</span><span style="color:var(--good);text-transform:none;letter-spacing:0"><span class="dot live" style="background:var(--good);margin-right:5px"></span>updating</span></div>'+feedHtml(60,true)+'</div>';
+    var n=needs();
+    var need='<div class="box"><div class="lab" style="display:flex;justify-content:space-between"><span>What needs you · '+n.length+'</span><span style="text-transform:none;letter-spacing:0">approvals live here</span></div><div class="col" style="margin-top:12px">'+
+      (n.length?n.map(needCard).join(""):'<div class="empty">Nothing needs you right now.</div>')+'</div>'+expressBox()+'</div>';
+    return '<div class="two"><div class="col">'+top+live+'</div><div class="col">'+need+'</div></div>';
+  }
+  function needCard(x){
+    if(x.kind==="approval"){ var a=x.a;
+      return '<div class="card" id="ap-'+a.id+'" style="border-left-color:'+x.color+'"><div class="t">'+esc(a.title)+'<span>'+esc(x.who)+'</span></div><div class="d">'+esc(x.detail)+'</div>'+
+        (a.options||[]).map(function(o){return o.detail?'<div class="d">'+esc(o.label)+': '+esc(o.detail)+'</div>':""}).join("")+
+        '<div class="btns">'+(a.options||[]).map(function(o,i){return '<button class="btn'+(i===0?" p":"")+'" data-ap="'+a.id+'" data-choice="'+esc(o.id)+'">'+esc(o.label)+'</button>'}).join("")+'<button class="btn no" data-ap="'+a.id+'" data-choice="reject">Reject</button></div></div>';
+    }
+    if(x.kind==="kfb"){ var m=x.m;
+      return '<div class="card" style="border-left-color:'+x.color+'"><div class="t">KFB message ready<span>Relay</span></div><div class="d">'+esc(x.detail)+' · copy it into WhatsApp, then mark it sent</div><div class="msg">'+esc(m.body)+'</div>'+
+        '<div class="btns"><button class="btn g" data-copy="'+m.id+'">Copy</button><button class="btn" data-sent="'+m.id+'">Mark sent</button></div></div>';
+    }
+    return '<div class="card" style="border-left-color:'+x.color+'"><div class="t">'+esc(x.title)+'<span>'+esc(x.who)+'</span></div><div class="d">'+esc(x.detail)+'</div></div>';
+  }
+  function expressBox(){
+    var ex=((state.supplier||{}).expressToday||[]).filter(function(o){return !o.asked_in});
+    if(!ex.length) return "";
+    return '<div class="note" style="margin-top:12px">Express orders today not in a KFB message yet: '+ex.map(function(o){return esc(storeName(o.store)+" "+o.name)}).join(", ")+'. Relay adds them after 6:45 pm.</div>';
   }
 
-  var setupBusy=false;
-  async function runSetup(path,btn,out,line){
-    setupBusy=true; btn.disabled=true; out.innerHTML='<span class="meta">Working…</span>';
+  /* ---------------- P&L ---------------- */
+  var PERIODS=[["day","Day"],["d7","Last 7"],["d28","Last 28"],["d365","Last 365"],["all","All time"]];
+  function pnlShell(){ return '<div id="pnl">'+(pnlData&&pnlStore===store?pnlBody():'<div class="empty">Loading the P&amp;L…</div>')+'</div>'; }
+  async function loadPnl(force){
+    if(!force&&pnlData&&pnlStore===store&&Date.now()-pnlAt<60000) return;
     try{
-      var r=await fetch(path,{method:"POST",headers:{"x-store-brain-key":key}});
-      var b=await r.json();
-      out.innerHTML=b.ok?b.results.map(function(x){return '<div>'+line(x)+'</div>'}).join(""):'<span style="color:var(--bad)">'+esc(b.error||("HTTP "+r.status))+'</span>';
-    }catch(e){ out.innerHTML='<span style="color:var(--bad)">Couldn\'t reach the brain.</span>'; }
-    btn.disabled=false; setTimeout(function(){setupBusy=false},20000);
+      var want=store, r=await api("/api/pnl?store="+encodeURIComponent(want));
+      var j=await r.json(); if(!j.ok) throw new Error(j.error||("HTTP "+r.status));
+      if(want!==store) return;
+      pnlData=j; pnlStore=want; pnlAt=Date.now();
+      if(route.p==="pnl"&&$("#pnl")){ $("#pnl").innerHTML=pnlBody(); wirePnl(); }
+    }catch(e){ if($("#pnl")) $("#pnl").innerHTML='<div class="empty">Couldn\'t load the P&amp;L: '+esc(e.message)+'</div>'; }
+  }
+  function addDays(day,n){ var d=new Date(day+"T12:00:00Z"); d.setUTCDate(d.getUTCDate()+n); return d.toISOString().slice(0,10); }
+  function fmtDay(day,long){ var d=new Date(day+"T12:00:00Z"); return d.toLocaleDateString(undefined,long?{weekday:"short",month:"short",day:"numeric",timeZone:"UTC"}:{month:"short",day:"numeric",timeZone:"UTC"}); }
+  function breakeven(margin){ if(margin==null||!isFinite(margin)) return null; var d=margin*(1-0.119)-0.0334; return d>0?1/d:null; }
+  /* Sum days the same way the server does: any unknown part makes the total unknown (rule 5). */
+  function sumDays(rows){
+    var keys=["revenue","orders","refunds","refunds_pending","ads","guy_fee","fees","cogs","cogs_est","profit"], o={n:rows.length};
+    keys.forEach(function(k){ o[k]=rows.length&&rows.every(function(r){return r[k]!=null})?rows.reduce(function(s,r){return s+Number(r[k])},0):null; });
+    var known=rows.filter(function(r){return r.profit!=null});
+    o.profit_known=known.reduce(function(s,r){return s+Number(r.profit)},0); o.known_days=known.length;
+    o.complete=rows.length>0&&rows.every(function(r){return r.complete});
+    o.cogs_est_share=o.cogs?(o.cogs_est||0)/o.cogs:null;
+    o.margin=o.revenue&&o.profit!=null?o.profit/o.revenue:null;
+    o.gross_margin=o.revenue&&o.cogs!=null?(o.revenue-o.cogs)/o.revenue:null;
+    o.roas=o.ads?o.revenue/o.ads:null;
+    o.be=breakeven(o.gross_margin);
+    o.aov=o.orders?o.revenue/o.orders:null;
+    o.missing=[]; o.stale=[]; o.missing_stores=[];
+    rows.forEach(function(r){ (r.missing||[]).forEach(function(m){ if(o.missing.indexOf(m)<0) o.missing.push(m) }); (r.stale||[]).forEach(function(m){ if(o.stale.indexOf(m)<0) o.stale.push(m) }); (r.missing_stores||[]).forEach(function(m){ if(o.missing_stores.indexOf(m)<0) o.missing_stores.push(m) }); });
+    return o;
+  }
+  function periodRows(){
+    var days=pnlData.days||[], sel=pnlSel.day||pnlData.today, p=pnlSel.period;
+    if(p==="all") return {rows:days,from:days.length?days[days.length-1].day:sel,to:days.length?days[0].day:sel};
+    var n=p==="day"?1:p==="d7"?7:p==="d28"?28:365, from=addDays(sel,-(n-1));
+    return {rows:days.filter(function(r){return r.day>=from&&r.day<=sel}),from:from,to:sel,n:n};
+  }
+  function pnlBody(){
+    var d=pnlData; if(!d) return "";
+    if(!pnlSel.day||pnlSel.day>d.today) pnlSel.day=d.today;
+    var pr=periodRows(), s=sumDays(pr.rows), first=d.days.length?d.days[d.days.length-1].day:null;
+    var isToday=pnlSel.period==="day"&&pnlSel.day===d.today;
+    var verdict=s.profit==null?'<span class="tag mut">PROFIT NOT KNOWN YET</span>':s.profit>=0?'<span class="tag ok">PROFITABLE</span>':'<span class="tag bad">LOSS</span>';
+    var periodTxt=pnlSel.period==="day"?fmtDay(pnlSel.day,true)+(isToday?" · today so far":""):fmtDay(pr.from)+" – "+fmtDay(pr.to)+(pr.n&&s.n<pr.n?" · "+s.n+" of "+pr.n+" days on record":"");
+    var head='<div class="top"><div class="pills">'+PERIODS.map(function(p){return '<button class="pill'+(pnlSel.period===p[0]?" on":"")+'" data-per="'+p[0]+'">'+p[1]+'</button>'}).join("")+
+      '<span style="width:6px"></span><button class="pill" data-step="-1" aria-label="Previous day">‹</button><input type="date" id="pnlDay" value="'+esc(pnlSel.day)+'" max="'+esc(d.today)+'"'+(first?' min="'+esc(first)+'"':'')+'><button class="pill" data-step="1" aria-label="Next day">›</button></div>'+
+      '<div class="pills"><span class="status">'+esc(periodTxt)+'</span>'+verdict+'</div></div>';
+    var cogsTag=s.cogs_est_share>0?'<span class="tag">'+(s.cogs_est_share>=.999?"EST.":pct(s.cogs_est_share,0)+" EST.")+'</span>':s.cogs!=null?'<span class="tag ok">REAL</span>':"";
+    var fr=(s.refunds||0)+(s.fees||0);
+    var blocks='<div class="blocks">'+
+      blk("Revenue",money(s.revenue),s.orders!=null?s.orders+" orders · gross, refunds below":"")+
+      blk("Net profit",s.profit==null?"—":money(s.profit,true),s.profit==null?profitWhy(s):"margin "+pct(s.margin),s.profit==null?"":s.profit<0?"bad-t":"ok-t")+
+      blk("ROAS",x2(s.roas),s.be!=null?"break-even "+x2(s.be):"",s.roas!=null&&s.be!=null?(s.roas>=s.be?"ok-t":"bad-t"):"")+
+      blk("Ad spend",money(s.ads),s.guy_fee!=null?"+ Guy 10% "+money(s.guy_fee):"")+
+      blk("COGS"+cogsTag,money(s.cogs),s.cogs_est_share>0?"KFB rate estimate until real costs land":s.cogs!=null?"real KFB costs":"")+
+      blk("Orders",s.orders==null?"—":String(s.orders),s.aov!=null?"AOV "+money(s.aov):"")+
+      blk("CVR","—","needs Shopify reports access")+
+      blk("Fees &amp; refunds",s.fees==null&&s.refunds==null?"—":money(fr),"fees "+money(s.fees)+" · refunds "+money(s.refunds)+(s.refunds_pending?" ("+money(s.refunds_pending)+" pending)":""))+
+    '</div>';
+    var funnel='<div class="box"><div class="lab">Funnel</div><div class="funnel"><div><b style="color:var(--text);font-weight:500">Not wired yet</b><br>Sessions, add to cart and checkout come from Shopify\'s analytics.<br>Each store app needs the read-only <span style="font-family:var(--mono)">read_reports</span> access, with your OK.<br>Until then the funnel and CVR stay blank, never guessed.</div></div></div>';
+    var right='<div class="col">'+(store==="all"?byStore(pr.rows):"")+sureBox(pr.rows,s,isToday)+'</div>';
+    var table='<div class="box"><div class="lab">Every day · click a row to open it'+(first?' · history starts '+esc(fmtDay(first))+'':'')+'</div><div class="tblwrap"><table class="tbl"><thead><tr><th>Date</th><th>Revenue</th><th>Ad spend</th><th>ROAS</th><th>Orders</th><th>COGS</th><th>Fees+refunds</th><th>Profit</th><th>Status</th></tr></thead><tbody>'+
+      (d.days.length?d.days.map(function(r){
+        var c=r.profit==null?"":r.profit<0?"bad-t":"ok-t", sel=pnlSel.period==="day"&&r.day===pnlSel.day;
+        return '<tr class="row'+(sel?" sel":"")+'" data-day="'+esc(r.day)+'"><td>'+esc(fmtDay(r.day))+(r.day===d.today?' <span class="tag">today</span>':'')+'</td><td>'+money(r.revenue)+'</td><td>'+money(r.ads)+'</td><td class="'+(r.roas!=null&&r.breakeven_roas!=null?(r.roas>=r.breakeven_roas?"ok-t":"bad-t"):"")+'">'+x2(r.roas)+'</td><td>'+(r.orders==null?"—":r.orders)+'</td><td>'+money(r.cogs)+'</td><td>'+(r.fees==null&&r.refunds==null?"—":money((r.fees||0)+(r.refunds||0)))+'</td><td class="'+c+'">'+(r.profit==null?"—":money(r.profit,true))+'</td><td>'+rowStatus(r,d.today)+'</td></tr>';
+      }).join(""):'<tr><td colspan="9" class="empty">No P&amp;L days stored yet.</td></tr>')+'</tbody></table></div></div>';
+    return '<div class="col" style="gap:14px">'+head+blocks+'<div class="two">'+funnel+right+'</div>'+table+'</div>';
+  }
+  /* lHtml is built here from fixed text (+ a tag), never from data. */
+  function blk(lHtml,v,s,cls){ return '<div class="blk"><div class="l">'+lHtml+'</div><div class="v '+(cls||"")+'">'+esc(v)+'</div><div class="s">'+esc(s||"")+'</div></div>'; }
+  function profitWhy(s){
+    if(s.missing_stores.length) return "missing a day for "+s.missing_stores.map(storeName).join(", ");
+    if(s.missing.length) return "waiting on "+s.missing.join(", ");
+    if(s.stale.length) return "stale: "+s.stale.join(", ");
+    if(s.n&&s.known_days<s.n) return "unknown for "+(s.n-s.known_days)+" of "+s.n+" days";
+    return s.n?"not known yet":"no days on record";
+  }
+  function rowStatus(r,today){
+    if(r.day===today) return '<span class="warn-t">live</span>';
+    if(r.complete&&(r.cogs_estimated_share||0)>0) return '<span class="warn-t">COGS est.</span>';
+    if(r.complete) return '<span style="color:var(--faint)">final</span>';
+    return '<span class="warn-t">open</span>';
+  }
+  function byStore(rows){
+    var per={}; rows.forEach(function(r){ (r.per_store||[]).forEach(function(p){ var o=per[p.store]||(per[p.store]={revenue:0,ads:0,profit:0,rev_ok:true,ads_ok:true,profit_ok:true}); if(p.revenue==null)o.rev_ok=false;else o.revenue+=p.revenue; if(p.ads==null)o.ads_ok=false;else o.ads+=p.ads; if(p.profit==null)o.profit_ok=false;else o.profit+=p.profit; }); });
+    var ids=Object.keys(per); if(!ids.length) return "";
+    return '<div class="box"><div class="lab">By store</div>'+ids.map(function(id){ var o=per[id], roas=o.rev_ok&&o.ads_ok&&o.ads?o.revenue/o.ads:null;
+      return '<div class="kv"><span style="color:var(--text)">'+esc(storeName(id))+'</span><b>'+(o.rev_ok?money(o.revenue):"—")+' · <span class="'+(o.profit_ok?(o.profit<0?"bad-t":"ok-t"):"")+'">'+(o.profit_ok?money(o.profit,true):"profit —")+'</span> · '+x2(roas)+'</b></div>'; }).join("")+'</div>';
+  }
+  function feedState(kind){
+    var ids=store==="all"?liveStores().map(function(s){return s.id}):[store];
+    var fs=(state.feeds||[]).filter(function(f){return f.store&&ids.indexOf(f.store)>=0&&f.id.indexOf(kind)===0});
+    if(!fs.length) return {state:"not_wired"};
+    var worst=fs.find(function(f){return f.state==="stale"||f.state==="failing"})||fs.find(function(f){return f.state==="not_wired"});
+    if(worst) return worst;
+    var oldest=fs.map(function(f){return f.last_ok_at}).filter(Boolean).sort()[0];
+    return {state:"fresh",last_ok_at:oldest};
+  }
+  function sureBox(rows,s,isToday){
+    var line=function(label,ok,txt){ return '<div class="kv"><span>'+esc(label)+'</span><b class="'+(ok===true?"ok-t":ok===false?"warn-t":"")+'">● '+esc(txt)+'</b></div>'; };
+    var f=function(k,label){ var st=feedState(k); return line(label,st.state==="fresh",st.state==="fresh"?"fresh · "+ago(st.last_ok_at):st.state==="not_wired"?"not wired":st.state); };
+    var h='<div class="box"><div class="lab">How sure is this '+(pnlSel.period==="day"?"day":"period")+'</div>'+
+      f("shopify.orders","Revenue (Shopify orders)")+f("ads.spend","Ad spend (Google Ads)")+f("shopify.payouts","Fees (Shopify payouts)")+
+      line("Refunds (by processed date)",s.refunds!=null,s.refunds!=null?"in":"not known yet")+
+      line("COGS",s.cogs_est_share==null?null:s.cogs_est_share===0,s.cogs==null?"not known yet":s.cogs_est_share>0?"estimate until KFB costs land":"real")+
+      '<div class="note">'+(isToday?"Today is live: numbers move as orders and spend come in. ":"")+'A day turns final once every input has been read after it ended. Unknown is shown as —, never as $0.</div></div>';
+    return h;
+  }
+  function wirePnl(){
+    document.querySelectorAll("[data-per]").forEach(function(b){ b.addEventListener("click",function(){ pnlSel.period=b.dataset.per; $("#pnl").innerHTML=pnlBody(); wirePnl(); }); });
+    document.querySelectorAll("[data-step]").forEach(function(b){ b.addEventListener("click",function(){ var nd=addDays(pnlSel.day,Number(b.dataset.step)); if(nd>pnlData.today) return; pnlSel.day=nd; $("#pnl").innerHTML=pnlBody(); wirePnl(); }); });
+    var di=$("#pnlDay"); if(di){ di.addEventListener("focus",function(){ busyUntil=Date.now()+30000; }); di.addEventListener("blur",function(){ busyUntil=0; }); }
+    if(di) di.addEventListener("change",function(){ if(/^\d{4}-\d{2}-\d{2}$/.test(di.value)){ pnlSel.day=di.value; $("#pnl").innerHTML=pnlBody(); wirePnl(); } });
+    document.querySelectorAll("tr[data-day]").forEach(function(tr){ tr.addEventListener("click",function(){ pnlSel.period="day"; pnlSel.day=tr.dataset.day; $("#pnl").innerHTML=pnlBody(); wirePnl(); window.scrollTo({top:0,behavior:"smooth"}); }); });
+  }
+
+  /* ---------------- AGENTS ---------------- */
+  var DEPT_PAGES=[["supplier","Supplier · KFB messages","sup"],["shipping","Shipping · parcels","ful"],["money","Money · ads, payouts, refunds","pnl"],["feeds","Feeds · freshness","core"],["setup","Setup · connections","core"]];
+  function agentsPage(){
+    var sel=route.a||"core.briefer";
+    var list='<nav class="alist"><div class="h">Department pages</div>'+DEPT_PAGES.map(function(d){return '<a href="#/agents/page/'+d[0]+'" class="b'+(route.a==="page"&&route.b===d[0]?" on":"")+'"><span class="sw" style="background:'+PAL[d[2]]+'"></span>'+esc(d[1])+'</a>'}).join("");
+    var w={}; workingAgents().forEach(function(id){w[id]=1});
+    state.departments.forEach(function(d){
+      list+='<div class="h">'+esc(d.short)+'</div>';
+      state.agents.filter(function(a){return a.dept===d.id}).forEach(function(a){
+        var on=a.status!=="planned";
+        list+='<a href="#/agents/'+esc(a.id)+'" class="'+(on?"b":"")+(sel===a.id?" on":"")+'"><span class="sw'+(w[a.id]?" live":"")+'" style="'+(on?"background:"+PAL[d.id]:"border:1px solid "+PAL[d.id]+";opacity:.6")+'"></span>'+esc(a.name)+'</a>';
+      });
+    });
+    list+='</nav>';
+    var right=route.a==="page"?deptPage(route.b):agentDetail(sel);
+    return '<div class="agents">'+list+'<div class="col" id="agentMain">'+right+'</div></div>';
+  }
+  function agentDetail(id){
+    var a=agentOf(id); if(!a) return '<div class="box"><div class="empty">No agent called '+esc(id)+'.</div></div>';
+    var d=state.departments.find(function(x){return x.id===a.dept})||{name:a.dept}, c=PAL[a.dept];
+    var working=workingAgents().indexOf(id)>=0;
+    var stLbl={planned:"planned · not built yet",built:"built · shadow (drafts and logs, nothing leaves without you)",shadow:"shadow",live:"live"}[a.status]||a.status;
+    var cached=agentCache[id];
+    var head='<div class="box"><div style="font-size:12px;color:var(--faint)">'+esc(d.name)+' · '+(a.kind==="ai"?"uses Claude":"plain code")+' · '+esc(a.level==="L0"?"proposes, you approve":a.level==="L1"?"acts within limits, reports after":"runs quietly, shows in the brief")+'</div>'+
+      '<div style="display:flex;align-items:center;gap:10px;margin-top:4px;flex-wrap:wrap"><span class="sw'+(working?" live":"")+'" style="width:10px;height:10px;background:'+(a.status!=="planned"?c:"none")+';border:1px solid '+c+'"></span><span style="font:600 24px var(--font);letter-spacing:-.01em">'+esc(a.name)+'</span>'+(working?'<span class="tag ok">WORKING NOW</span>':'')+'<span class="tag mut">'+esc(a.status.toUpperCase())+'</span></div>'+
+      '<div style="font-size:13.5px;color:var(--dim);margin-top:8px;max-width:720px">'+esc(a.does||"")+'</div><div class="note">'+esc(stLbl)+'. Names can change: tell Claude the name you want.</div></div>';
+    var stats='<div class="stats">'+
+      kpi("Actions, last 7 days",cached?String(cached.week.events):"…","")+
+      kpi("AI cost, last 7 days",cached?"$"+Number(cached.week.cost_usd||0).toFixed(2):"…",a.kind==="ai"?"":"plain code: $0")+
+      kpi("Last action",cached&&cached.events.length?ago(cached.events[0].at):cached?"never":"…","")+
+      kpi("Go-live","per store",a.status==="live"?"live":"shadow everywhere")+'</div>';
+    var ev=cached?cached.events:null;
+    var runs='<div class="box"><div class="lab">Latest actions</div>'+(ev==null?'<div class="empty">Loading…</div>':ev.length?'<div class="feed">'+ev.filter(inStore).slice(0,40).map(function(e){
+      return '<div class="r'+(isAlarm(e)?" alarm":"")+'"><span class="tm" title="'+esc(new Date(e.at).toLocaleString())+'">'+esc(hm(e.at))+'</span><span class="dot" style="background:'+colorOf(e.actor)+'"></span><span>'+(e.actor!==id?'<b>'+esc(actorName(e.actor))+'</b> → ':'')+esc(e.summary)+' <span style="color:var(--faint)">· '+esc(ago(e.at))+(e.store?" · "+esc(storeName(e.store)):"")+'</span></span></div>';
+    }).join("")+'</div>':'<div class="empty">'+(a.status==="planned"?"Not built yet, so no actions.":"No actions logged yet.")+'</div>')+'</div>';
+    var talks={}; (ev||[]).forEach(function(e){ if(e.actor===id&&e.target) talks["→ "+actorName(e.target)]=1; if(e.target===id&&e.actor!==id) talks["← "+actorName(e.actor)]=1; });
+    var tk=Object.keys(talks);
+    var talk='<div class="box"><div class="lab">Talks to</div>'+(tk.length?'<div class="chips">'+tk.map(function(t){return '<span class="chip">'+esc(t)+'</span>'}).join("")+'</div>':'<div class="note">No hand-offs logged yet.</div>')+'</div>';
+    var gl='<div class="box"><div class="lab">Go live · per store (only you)</div>'+liveStores().map(function(s){return '<div class="kv"><span style="color:var(--text)">'+esc(storeName(s.id))+'</span><b class="'+(a.status==="live"?"ok-t":"warn-t")+'">'+(a.status==="live"?"live":a.status==="planned"?"not built":"shadow")+'</b></div>'}).join("")+
+      '<div class="note">The go-live switches arrive with the next build. Until then every built agent stays in shadow, and only you can make one live.</div></div>';
+    if(!cached) loadAgent(id);
+    return head+stats+'<div class="two">'+runs+'<div class="col">'+gl+talk+'</div></div>';
+  }
+  async function loadAgent(id){
+    try{ var r=await api("/api/agents/"+encodeURIComponent(id)+"/events"); var j=await r.json(); if(!j.ok) throw new Error(j.error);
+      agentCache[id]=j; setTimeout(function(){ delete agentCache[id]; },30000);
+      if(route.p==="agents"&&route.a===id&&$("#agentMain")){ $("#agentMain").innerHTML=agentDetail(id); }
+    }catch(e){ agentCache[id]={events:[],week:{events:0,cost_usd:0}}; }
+  }
+
+  /* department pages: the old Mission Control tabs, restyled */
+  var FEED_LBL={fresh:"Fresh",stale:"Stale",failing:"Failing",not_wired:"Not wired yet"};
+  function kvx(k,v,cls){ return '<div class="kv"><span>'+esc(k)+'</span><b'+(cls?' class="'+cls+'"':"")+'>'+v+'</b></div>'; }
+  function deptPage(p){
+    var title=(DEPT_PAGES.find(function(d){return d[0]===p})||[0,"Page"])[1];
+    var h='<div class="box"><div style="font:600 20px var(--font)">'+esc(title)+'</div></div><div class="box">';
+    if(p==="supplier") h+=supplierHtml();
+    else if(p==="shipping") h+=shippingHtml();
+    else if(p==="money") h+=moneyHtml();
+    else if(p==="feeds") h+=feedsHtml();
+    else if(p==="setup") h+=setupHtml();
+    else h+='<div class="empty">No such page.</div>';
+    return h+'</div>';
+  }
+  function supplierHtml(){
+    var sup=state.supplier||{kfbMessages:[],expressToday:[],mode:"shadow"};
+    var h='<div class="lab">Express orders today</div>';
+    h+=sup.expressToday.length?sup.expressToday.filter(inStore).map(function(o){ return '<div class="rowx"><span>'+esc(storeName(o.store))+' '+esc(o.name)+'</span><span class="meta"><span>'+esc(o.shipping_title||"express")+'</span><span>'+(o.asked_in?"in KFB message "+esc(o.asked_in):"not asked yet")+'</span><span>'+esc(ago(o.created_at))+'</span></span></div>'; }).join(""):'<div class="empty">No express orders today.</div>';
+    h+='<div class="lab" style="margin-top:10px">KFB messages · '+(sup.mode==="live"?"live (to your phone)":"shadow (drafts only)")+'</div>';
+    h+=sup.kfbMessages.length?sup.kfbMessages.map(function(m){
+      return '<div class="rowx"><div class="msg">'+esc(m.body)+'</div><span class="meta"><span>'+esc(m.local_day)+'</span><span>'+esc(m.mode)+'</span><span>'+esc(m.status==="sent"?"sent "+ago(m.sent_at):m.status)+'</span></span>'+
+        '<div class="btns"><button class="btn" data-copy="'+m.id+'">Copy</button>'+(m.status!=="sent"?'<button class="btn" data-sent="'+m.id+'">Mark sent</button>':"")+'</div></div>';
+    }).join(""):'<div class="empty">No KFB messages yet. Relay checks once a day after 6:45 pm Eastern.</div>';
+    return h;
+  }
+  function shippingHtml(){
+    var sh=state.shipping||{wired:false,counts:{},labels:{},flags:[],registerErrors:[]}, h="";
+    if(!sh.wired) h+='<div class="rowx alarm">17TRACK is not wired: add TRACKING_API_KEY (bat 9). Tracking numbers are still collected from Shopify.</div>';
+    var q=sh.quota;
+    h+='<div class="rowx'+(sh.quotaLow?" alarm":"")+'"><span>'+(q&&q.remain!=null?'<b>'+esc(q.remain)+'</b> tracking registrations left'+(q.total!=null?' of '+esc(q.total):''):'Quota not read yet')+'</span><span class="meta"><span>last 17TRACK sync '+(sh.lastSync?esc(ago(sh.lastSync)):'never')+'</span><span>Shopify numbers read '+(sh.lastCollect?esc(ago(sh.lastCollect)):'never')+'</span></span></div>';
+    var order=["not_registered","not_checked","awaiting_pickup","in_transit","out_for_delivery","pickup_ready","failed_attempt","exception","expired","unknown","delivered"];
+    var keys=Object.keys(sh.counts||{}).sort(function(a,b){return order.indexOf(a)-order.indexOf(b)});
+    h+='<div class="lab" style="margin-top:10px">Parcels · last 60 days</div>'+(keys.length?keys.map(function(k){ return kvx((sh.labels&&sh.labels[k])||k,esc(sh.counts[k]),/failed|pickup_ready|exception/.test(k)?"warn-t":""); }).join(""):'<div class="empty">No parcels yet.</div>');
+    h+='<div class="lab" style="margin-top:10px">Needs attention</div>'+(sh.flags.filter(inStore).length?sh.flags.filter(inStore).map(function(f){
+      var hot=/day20|failed_delivery|pickup_ready/.test(f.kind);
+      return '<div class="rowx'+(hot?" alarm":"")+'"><b style="font-weight:500">'+esc(f.store_name)+' '+esc(f.order_name)+' · '+esc(f.label)+'</b><span style="color:var(--muted)">'+esc(f.detail)+'</span><span class="meta">'+(f.tracking_number?'<span>'+esc(f.tracking_number)+'</span>':'')+(f.approval_id?'<span>approval '+esc(f.approval_id)+(f.approval_status?' · '+esc(f.approval_status):'')+'</span>':'')+'<span>flagged '+esc(ago(f.raised_at))+'</span></span></div>';
+    }).join(""):'<div class="empty">Nothing stuck, failed or late.</div>');
+    return h;
+  }
+  function moneyHtml(){
+    var m=state.money||{stores:[]}; if(!m.stores.length) return '<div class="empty">No live stores.</div>';
+    var amt=function(n,c){ return n==null?"—":Number(n).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})+(c?" "+c:""); };
+    var fl=function(name,f){ f=f||{state:"not_wired"}; return '<span class="meta"><span><span class="fd '+esc(f.state)+'"></span>'+esc(name)+': '+esc(FEED_LBL[f.state]||f.state)+'</span>'+(f.last_ok_at?'<span>last '+esc(ago(f.last_ok_at))+'</span>':"")+'</span>'; };
+    return m.stores.filter(function(s){return store==="all"||s.id===store}).map(function(s){
+      var a=s.ads, h='<div class="lab" style="margin-top:10px">'+esc(s.name)+'</div><div class="rowx"><b style="font-weight:500">Google Ads spend</b>';
+      h+=a?kvx("Yesterday",a.yesterday?esc(amt(a.yesterday.cost,a.currency)):"—")+kvx("Last 7 days",a.last7?esc(amt(a.last7.cost,a.currency)):"—")+kvx("Today so far",a.today?esc(amt(a.today.cost,a.currency)):"—"):'<span style="color:var(--muted)">No spend data yet (absent, never zero).</span>';
+      h+=fl("Ads feed",s.adsFeed)+'</div><div class="rowx"><b style="font-weight:500">Shopify Payments</b>'+kvx("Balance",s.balance?esc(amt(s.balance.amount,s.balance.currency)):"—");
+      h+=(s.payouts||[]).slice(0,6).map(function(p){ return kvx(String(p.issued_at||"").slice(0,10),esc(amt(p.net,p.currency))+' · '+esc(String(p.status||"").toLowerCase())+(p.check_result==="mismatch"?' · <span class="bad-t">doesn\'t add up</span>':"")); }).join("");
+      h+=fl("Payouts feed",s.payoutsFeed)+'</div><div class="rowx"><b style="font-weight:500">Refunds by processed day</b>'+((s.refunds||{}).byDay||[]).map(function(d){ return kvx(d.day,esc(d.n)+' · '+esc(amt(d.amount))+(d.pending_n?' <span class="warn-t">('+esc(d.pending_n)+' pending)</span>':"")); }).join("")+'</div>';
+      return h;
+    }).join("");
+  }
+  function feedsHtml(){
+    return (state.feeds||[]).filter(function(f){return store==="all"||!f.store||f.store===store}).map(function(f){
+      return '<div class="rowx'+(f.state==="stale"||f.state==="failing"?" alarm":"")+'"><span><span class="fd '+esc(f.state)+'"></span>'+esc(f.label)+'</span><span class="meta"><span>'+esc(FEED_LBL[f.state]||f.state)+'</span>'+(f.last_ok_at?'<span>last delivered '+esc(ago(f.last_ok_at))+'</span>':"")+'<span>limit '+esc(f.max_age_min)+' min</span>'+(f.last_error?'<span>'+esc(f.last_error)+'</span>':"")+'</span></div>';
+    }).join("");
+  }
+  function setupHtml(){
+    return '<div class="rowx"><b style="font-weight:500">1 · Check the store connections</b><span style="color:var(--muted)">Logs in to each store with its own app and confirms it is the right shop. Read-only.</span><div class="btns"><button class="btn p" data-setup="/api/admin/check-stores" data-kind="stores">Check stores</button></div><div class="out"></div></div>'+
+      '<div class="rowx"><b style="font-weight:500">2 · Connect order + refund notifications</b><span style="color:var(--muted)">Tells each store to notify the brain the moment an order or refund happens.</span><div class="btns"><button class="btn p" data-setup="/api/admin/webhooks" data-kind="hooks">Connect notifications</button></div><div class="out"></div></div>'+
+      '<div class="rowx"><b style="font-weight:500">3 · Test your phone</b><span style="color:var(--muted)">Sends one plain message through Pushover.</span><div class="btns"><button class="btn p" data-setup="/api/admin/test-notification" data-kind="phone">Send test notification</button></div><div class="out"></div></div>'+
+      '<div class="rowx"><b style="font-weight:500">4 · Connect Google</b><span style="color:var(--muted)">One sign-in with reillyworking26@gmail.com: Gmail, Google Ads (watch only), Merchant Center and Sheets.</span><div class="btns"><button class="btn p" data-google="main">Connect Google</button></div><div class="out"></div></div>'+
+      '<div class="rowx"><b style="font-weight:500">5 · Store inboxes and connections</b><div id="outConn"><span class="meta">Checking…</span></div></div>';
+  }
+
+  /* ---------------- actions ---------------- */
+  function wire(){
+    if(route.p==="pnl") wirePnl();
+    document.querySelectorAll("button[data-ap]").forEach(function(b){ b.addEventListener("click",function(){ decide(b.dataset.ap,b.dataset.choice,b) }) });
+    document.querySelectorAll("button[data-copy]").forEach(function(b){ b.addEventListener("click",function(){
+      var m=((state.supplier||{}).kfbMessages||[]).find(function(x){return String(x.id)===b.dataset.copy});
+      if(m&&navigator.clipboard) navigator.clipboard.writeText(m.body).then(function(){b.textContent="Copied"},function(){b.textContent="Copy failed"});
+      busyUntil=Date.now()+15000;
+    }) });
+    document.querySelectorAll("button[data-sent]").forEach(function(b){ b.addEventListener("click",function(){ markSent(b.dataset.sent,b) }) });
+    document.querySelectorAll("button[data-setup]").forEach(function(b){ b.addEventListener("click",function(){ runSetup(b) }) });
+    document.querySelectorAll("button[data-google]").forEach(function(b){ b.addEventListener("click",function(){ google(b.dataset.google,b) }) });
+    if($("#outConn")) loadConnections();
+  }
+  function result(btn,ok,txt){ var out=btn.closest(".card,.rowx"); out.insertAdjacentHTML("beforeend",'<div class="note '+(ok?"ok-t":"bad-t")+'">'+esc(txt)+'</div>'); }
+  async function decide(id,choice,btn){
+    busyUntil=Date.now()+20000;
+    btn.closest(".card").querySelectorAll("button").forEach(function(x){x.disabled=true});
+    try{ var r=await api("/api/approvals/"+id+"/decide",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({choice:choice})}); var b=await r.json();
+      result(btn,b.ok,b.ok?(b.status==="approved"?"Approved":"Rejected"):"Not recorded: "+(b.error||"error"));
+    }catch(e){ result(btn,false,"Couldn't reach the brain. Nothing was recorded."); }
+    busyUntil=0; setTimeout(load,800);
   }
   async function markSent(id,btn){
-    var row=btn.closest(".row"); btn.disabled=true;
-    try{
-      var r=await fetch("/api/kfb/"+id+"/sent",{method:"POST",headers:{"x-store-brain-key":key}});
-      var b=await r.json();
-      row.insertAdjacentHTML("beforeend",'<span class="meta" style="color:'+(b.ok?"var(--good)":"var(--bad)")+'">'+(b.ok?"Recorded as sent":"Not recorded: "+esc(b.error))+'</span>');
-    }catch(e){ btn.disabled=false; row.insertAdjacentHTML("beforeend",'<span class="meta" style="color:var(--bad)">Couldn\'t reach the brain. Nothing was recorded.</span>'); }
-    setTimeout(load,800);
+    busyUntil=Date.now()+20000; btn.disabled=true;
+    try{ var r=await api("/api/kfb/"+id+"/sent",{method:"POST"}); var b=await r.json(); result(btn,b.ok,b.ok?"Recorded as sent":"Not recorded: "+(b.error||"error")); }
+    catch(e){ btn.disabled=false; result(btn,false,"Couldn't reach the brain. Nothing was recorded."); }
+    busyUntil=0; setTimeout(load,800);
   }
-  async function decideApproval(id,choice,btn){
-    var row=btn.closest(".row"); row.querySelectorAll("button").forEach(function(x){x.disabled=true});
-    try{
-      var r=await fetch("/api/approvals/"+id+"/decide",{method:"POST",headers:{"x-store-brain-key":key,"content-type":"application/json"},body:JSON.stringify({choice:choice})});
-      var b=await r.json();
-      row.insertAdjacentHTML("beforeend",'<span class="meta" style="color:'+(b.ok?"var(--good)":"var(--bad)")+'">'+(b.ok?(b.status==="approved"?"Approved":"Rejected"):"Not recorded: "+esc(b.error))+'</span>');
-    }catch(e){ row.insertAdjacentHTML("beforeend",'<span class="meta" style="color:var(--bad)">Couldn\'t reach the brain. Nothing was recorded.</span>'); }
-    setTimeout(load,800);
+  async function runSetup(btn){
+    busyUntil=Date.now()+30000; btn.disabled=true; var out=btn.closest(".rowx").querySelector(".out"); out.innerHTML='<span class="meta">Working…</span>';
+    try{ var r=await api(btn.dataset.setup,{method:"POST"}); var b=await r.json(); var k=btn.dataset.kind;
+      out.innerHTML=b.ok?b.results.map(function(x){
+        if(k==="phone") return '<div class="'+(x.sent?"ok-t":"bad-t")+'">'+(x.sent?"✓ Sent, check your phone":"✗ "+esc(x.reason||"not sent"))+'</div>';
+        if(k==="hooks") return '<div class="'+(x.verified?"ok-t":"bad-t")+'">'+(x.verified?"✓ ":"✗ ")+esc(x.name)+(x.verified?" connected and verified":": "+esc((x.errors||[]).join(" | ")||"not verified"))+'</div>';
+        return '<div class="'+(x.ok?"ok-t":"bad-t")+'">'+(x.ok?"✓ ":"✗ ")+esc(x.name)+(x.ok?' <span class="meta">'+esc(x.domain)+(x.missing&&x.missing.length?' · missing: '+esc(x.missing.join(", ")):' · all access granted')+'</span>':": "+esc(x.error))+'</div>';
+      }).join(""):'<span class="bad-t">'+esc(b.error||("HTTP "+r.status))+'</span>';
+    }catch(e){ out.innerHTML='<span class="bad-t">Couldn\'t reach the brain.</span>'; }
+    btn.disabled=false;
+  }
+  async function google(target,btn){
+    btn.disabled=true;
+    try{ var r=await api("/api/admin/google/start",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({target:target})}); var j=await r.json();
+      if(j.ok&&j.url){ window.location.assign(j.url); return; } result(btn,false,j.error||"failed");
+    }catch(e){ result(btn,false,"Couldn't reach the brain."); }
+    btn.disabled=false;
+  }
+  async function loadConnections(){
+    try{ var r=await api("/api/admin/connections"); var j=await r.json(); if(!j.ok) throw 0;
+      var g=j.google||{};
+      var h=(g.connected?'<div class="ok-t">✓ Google: '+esc(g.account)+(g.missing&&g.missing.length?' <span class="warn-t">· missing: '+esc(g.missing.join(", "))+'</span>':'')+'</div>':'<div class="warn-t">· Google: '+(g.account?"saved but not verified, connect again":"not connected")+'</div>');
+      h+=(j.mailboxes||[]).map(function(m){ return '<div style="margin:6px 0">'+(m.connected?'<span class="ok-t">✓</span>':'<span class="warn-t">·</span>')+' '+esc(m.name)+' <span class="meta" style="display:inline">'+esc(m.mailbox||"no inbox set up yet")+(m.mailbox?(m.connected?" · connected":" · not connected"):"")+'</span>'+(m.mailbox?' <button class="btn" data-google="'+esc(m.store)+'">'+(m.connected?"Reconnect":"Connect")+'</button>':'')+'</div>'; }).join("");
+      h+='<div class="meta" style="margin-top:8px">'+Object.keys(j.secrets).map(function(n){return (j.secrets[n]?"✓ ":"· ")+esc(n)}).join(" · ")+'</div>';
+      $("#outConn").innerHTML=h;
+      document.querySelectorAll("#outConn button[data-google]").forEach(function(b){ b.addEventListener("click",function(){ google(b.dataset.google,b) }) });
+      busyUntil=Date.now()+60000;
+    }catch(e){ $("#outConn").innerHTML='<span class="meta">Couldn\'t load connections.</span>'; }
   }
 
-  key=getKey(); load();
+  key=getKey(); route=parseRoute(); load();
 })();
 </script>
 </body>

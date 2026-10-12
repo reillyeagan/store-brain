@@ -612,3 +612,19 @@ test("reconcile: GraphQL order maps to the webhook shape", () => {
   assert.equal(o.total, 12.34);
   assert.equal(o.financial_status, "paid");
 });
+
+test("worker: /api/agents/:id/events needs the key, knows only real agents, returns its events", async () => {
+  const { makeD1 } = await import("./helpers/d1.js");
+  const { logEvent } = await import("../src/lib/eventlog.js");
+  const DB = makeD1();
+  const env = { DB, MC_KEY: "k".repeat(32) };
+  await logEvent(DB, { actor: "sup.relay", kind: "kfb.drafted", summary: "drafted", target: "sys.phone" });
+  await logEvent(DB, { actor: "ful.tracking", kind: "x", summary: "other" });
+  const h = { headers: { "x-store-brain-key": "k".repeat(32) } };
+  assert.equal((await worker.fetch(new Request("https://b/api/agents/sup.relay/events"), env)).status, 401);
+  assert.equal((await worker.fetch(new Request("https://b/api/agents/sup.nobody/events", h), env)).status, 404);
+  const j = await (await worker.fetch(new Request("https://b/api/agents/sup.relay/events", h), env)).json();
+  assert.equal(j.ok, true);
+  assert.equal(j.events.length, 1);
+  assert.equal(j.week.events, 1);
+});

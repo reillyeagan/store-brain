@@ -4,7 +4,7 @@ import { makeD1 } from "./helpers/d1.js";
 
 import {
   computeStoreDay, writePnlRow, recomputeDays, runPnlCron, runDayClose, pnlState,
-  guyFeeFor, breakevenRoas, cogsRate, parseRate, FALLBACK_COGS_RATE,
+  guyFeeFor, breakevenRoas, cogsRate, parseRate, FALLBACK_COGS_RATE, pnlHistory,
 } from "../src/lib/pnl.js";
 import {
   runBrief, unverifiedNumbers, briefHtml, handleBriefPage, verifyBriefSig, aiCostUsd, plainBrief, gatherBriefData,
@@ -302,15 +302,15 @@ test("a closed day whose numbers move is marked restated and logged", async () =
   assert.equal((await evs(DB, "pnl.restated")).length, 1);
 });
 
-test("the cron recomputes 3 days per live store, at most hourly", async () => {
+test("the cron recomputes 3 days per live store, every 15-minute tick (not twice in one tick)", async () => {
   const DB = makeD1();
   const nowMs = Date.parse("2026-10-12T15:00:00Z");
   await allFresh(DB, nowMs);
   const a = await runPnlCron({ DB }, { nowMs });
   assert.equal(a.ran, true);
   assert.equal(a.rows.length, 3 * LIVE_STORE_IDS.length);
-  assert.equal((await runPnlCron({ DB }, { nowMs: nowMs + 15 * 60000 })).ran, false);
-  assert.equal((await runPnlCron({ DB }, { nowMs: nowMs + 60 * 60000 })).ran, true);
+  assert.equal((await runPnlCron({ DB }, { nowMs: nowMs + 60000 })).ran, false, "a second run in the same tick is skipped");
+  assert.equal((await runPnlCron({ DB }, { nowMs: nowMs + 15 * 60000 })).ran, true, "the next tick recomputes");
 });
 
 test("Mission Control state: today partial, yesterday, MTD; group null when a store's part is unknown", async () => {
@@ -796,4 +796,50 @@ test("review fix: an unfinished orders backfill re-clamps to the 60-day window",
   assert.equal(queries[0].after ?? null, null, "old cursor dropped");
   const cov = await DB.prepare(`SELECT covered_from FROM order_coverage WHERE store='hc'`).first();
   assert.ok(!cov || cov.covered_from >= "2026-08-14");
+});
+
+/* ---------------- P&L page history (/api/pnl) ---------------- */
+
+test("P&L history: one store's days newest first; the group sums stores and is null-profit when a store's day is missing", async () => {
+  const DB = makeD1();
+  const nowMs = Date.parse("2026-10-03T15:00:00Z");
+  await allFresh(DB, nowMs);
+  await order(DB, "hc", { id: 1, created_at: "2026-10-02T16:00:00Z", total: 100 });
+  await order(DB, "aub", { id: 2, created_at: "2026-10-02T17:00:00Z", total: 50 });
+  await recomputeDays({ DB }, { nowMs, days: 3 });
+
+  const hc = await pnlHistory(DB, "hc", { nowMs });
+  assert.equal(hc.ok, true);
+  assert.deepEqual(hc.days.map((d) => d.day), ["2026-10-03", "2026-10-02", "2026-10-01"]);
+  assert.equal(hc.days[1].revenue, 100);
+
+  const all = await pnlHistory(DB, "all", { nowMs });
+  const y = all.days.find((d) => d.day === "2026-10-02");
+  assert.equal(y.revenue, 150, "group revenue is the sum of the stores");
+  assert.equal(y.per_store.length, LIVE_STORE_IDS.length);
+  assert.deepEqual(y.missing_stores, []);
+
+  // Remove Marlowe's row for that day: the group can't claim a profit for it.
+  await DB.prepare(`DELETE FROM pnl_days WHERE store = 'mar' AND day = '2026-10-02'`).run();
+  const all2 = await pnlHistory(DB, "all", { nowMs });
+  const y2 = all2.days.find((d) => d.day === "2026-10-02");
+  assert.deepEqual(y2.missing_stores, ["mar"]);
+  assert.equal(y2.profit, null);
+  assert.equal(y2.complete, false);
+
+  assert.equal((await pnlHistory(DB, "cc", { nowMs })).ok, false, "a store that isn't live has no P&L");
+});
+
+test("worker: /api/pnl needs the key and returns the history", async () => {
+  const DB = makeD1();
+  const env = { DB, MC_KEY: "k".repeat(32) };
+  const no = await worker.fetch(new Request("https://brain.example/api/pnl?store=all"), env);
+  assert.equal(no.status, 401);
+  const res = await worker.fetch(new Request("https://brain.example/api/pnl?store=all", { headers: { "x-store-brain-key": "k".repeat(32) } }), env);
+  assert.equal(res.status, 200);
+  const j = await res.json();
+  assert.equal(j.ok, true);
+  assert.ok(Array.isArray(j.days));
+  const bad = await worker.fetch(new Request("https://brain.example/api/pnl?store=zzz", { headers: { "x-store-brain-key": "k".repeat(32) } }), env);
+  assert.equal(bad.status, 400);
 });

@@ -67,7 +67,7 @@ export const FALLBACK_COGS_RATE = 0.33;
 export const EUR_USD_ESTIMATE = 1.17;
 /** How many days (today included) the hourly job recomputes. */
 export const RECOMPUTE_DAYS = 3;
-export const RECOMPUTE_EVERY_MIN = 60;
+export const RECOMPUTE_EVERY_MIN = 15; // every cron tick: today's numbers as fresh as the feeds
 /** The refunds pull is hourly; its watermark older than this = stale. */
 export const REFUNDS_MAX_AGE_MIN = 120;
 /**
@@ -477,7 +477,7 @@ export async function recomputeDays(env, { nowMs = Date.now(), days = RECOMPUTE_
   return out;
 }
 
-/** The 15-minute cron step: recompute at most once an hour. */
+/** The 15-minute cron step: recompute the last few days (today included). */
 export async function runPnlCron(env, { nowMs = Date.now() } = {}) {
   if (!LIVE_STORE_IDS.length) return { ran: false, reason: "no live stores" };
   if (!(await claimJob(env.DB, "pnl.recompute", RECOMPUTE_EVERY_MIN, nowMs))) return { ran: false, reason: "not due" };
@@ -594,4 +594,37 @@ export async function pnlState(db, { nowMs = Date.now() } = {}) {
     })(),
   };
   return { stores, group, guy: Object.fromEntries(LIVE_STORE_IDS.map((id) => [id, { rate: STORES[id].guyFeeRate || 0, start: STORES[id].guyStart || null }])) };
+}
+
+/**
+ * The P&L page: every stored day for one live store, or for the group ("all").
+ *
+ * A group day is the sum of every live store's row for that day. If any live store has no
+ * row for the day, the group day is marked `missing_stores` and its profit is null: a sum
+ * of only the stores we have would understate costs (rule 5). The page sums periods
+ * itself with the same rule (any null part → null total).
+ */
+export async function pnlHistory(db, store = "all", { nowMs = Date.now() } = {}) {
+  const ids = store === "all" ? LIVE_STORE_IDS : LIVE_STORE_IDS.filter((id) => id === store);
+  if (!ids.length) return { ok: false, error: "unknown store" };
+  const marks = ids.map(() => "?").join(", ");
+  const { results } = await db.prepare(`SELECT * FROM pnl_days WHERE store IN (${marks}) ORDER BY day DESC`).bind(...ids).all();
+  const rows = (results || []).map(parseRow);
+  const byDay = new Map();
+  for (const r of rows) { if (!byDay.has(r.day)) byDay.set(r.day, []); byDay.get(r.day).push(r); }
+  const days = [];
+  for (const [day, list] of byDay) {
+    const sum = sumRows(list, day);
+    sum.day = day;
+    sum.per_store = list.map((r) => ({ store: r.store, revenue: r.revenue, profit: r.profit, ads: r.ads, roas: r.roas, complete: !!r.complete }));
+    sum.missing_stores = ids.filter((id) => !list.some((r) => r.store === id));
+    if (sum.missing_stores.length) { sum.complete = false; sum.profit = null; }
+    sum.computed_at = list.map((r) => r.computed_at).filter(Boolean).sort()[0] || null;
+    sum.status = list.map((r) => r.status).includes("restated") ? "restated" : null;
+    days.push(sum);
+  }
+  const today = localDay(nowMs, storeTz(ids[0]));
+  const coverage = [];
+  for (const id of ids) coverage.push({ store: id, covered_from: (await orderCoverage(db, id)).covered_from || null });
+  return { ok: true, store, stores: ids, today, days, coverage, guy: Object.fromEntries(ids.map((id) => [id, { rate: STORES[id].guyFeeRate || 0, start: STORES[id].guyStart || null }])) };
 }

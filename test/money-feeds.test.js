@@ -357,8 +357,11 @@ test("money jobs: each runs on its own schedule, and one throwing doesn't stop t
   assert.deepEqual(ran, ["ads", "payouts", "refunds"]);
   assert.equal((await evs(DB, "error.money_job")).length, 1);
   ran.length = 0;
+  await runMoneyJobs({ DB }, { jobs, nowMs: t0 + 15 * 60000 });
+  assert.deepEqual(ran, ["ads", "refunds"], "payouts waits an hour; ads and refunds run every 15 min");
+  ran.length = 0;
   await runMoneyJobs({ DB }, { jobs, nowMs: t0 + 60 * 60000 });
-  assert.deepEqual(ran, ["ads", "refunds"], "payouts waits 6 h; hourly jobs run");
+  assert.deepEqual(ran, ["ads", "payouts", "refunds"], "payouts runs hourly");
 });
 
 test("cron: a broken money feed never stops the Freshness Sentinel", async () => {

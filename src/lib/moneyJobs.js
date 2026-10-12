@@ -1,6 +1,6 @@
 /**
- * Money feeds on the 15-minute cron: Google Ads spend (hourly), Shopify payouts (every
- * 6 h) and refund events (hourly), each throttled through job_runs.
+ * Money feeds on the 15-minute cron: Google Ads spend (every 15 min), Shopify payouts
+ * (hourly) and refund events (every 15 min), each throttled through job_runs.
  *
  * Isolation: each job runs in its own try. One job throwing never stops the others, and
  * this whole function never throws, so the order pull, KFB composer and Freshness

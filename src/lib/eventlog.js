@@ -69,6 +69,18 @@ export async function recentEvents(db, { limit = 200, sinceIso = null } = {}) {
   return (results || []).map((r) => ({ ...r, data: r.data ? safeJson(r.data) : null }));
 }
 
+/**
+ * One agent's page: its latest events (as actor or as target) and how many it has logged
+ * in the last 7 days. `id` must be a known actor (checked by the caller).
+ */
+export async function agentEvents(db, id, { limit = 60, nowMs = Date.now() } = {}) {
+  const lim = Math.min(Math.max(parseInt(limit, 10) || 60, 1), 200);
+  const { results } = await db.prepare(`SELECT * FROM events WHERE actor = ? OR target = ? ORDER BY id DESC LIMIT ?`).bind(id, id, lim).all();
+  const since = new Date(nowMs - 7 * 86400000).toISOString();
+  const c = await db.prepare(`SELECT COUNT(*) AS n, COALESCE(SUM(cost_usd), 0) AS cost FROM events WHERE actor = ? AND at >= ?`).bind(id, since).first();
+  return { events: (results || []).map((r) => ({ ...r, data: r.data ? safeJson(r.data) : null })), week: { events: (c && c.n) || 0, cost_usd: (c && c.cost) || 0 } };
+}
+
 /** Total AI cost logged since a moment (for Mission Control's cost tile). */
 export async function costSince(db, sinceIso) {
   const row = await db

@@ -11,9 +11,11 @@
 import { nowIso } from "./time.js";
 
 export const JOBS = Object.freeze({
-  "ads.spend": { everyMin: 60, label: "Google Ads spend" },
-  payouts: { everyMin: 6 * 60, label: "Shopify payouts" },
-  refunds: { everyMin: 60, label: "Refund events" },
+  // Ads and refunds every cron tick (15 min): Reilly wants revenue and spend "updating as
+  // frequently as possible" (2026-10-11). Payout fees hourly: Shopify settles them in batches.
+  "ads.spend": { everyMin: 15, label: "Google Ads spend" },
+  payouts: { everyMin: 60, label: "Shopify payouts" },
+  refunds: { everyMin: 15, label: "Refund events" },
 });
 
 const SLACK_MIN = 5;
