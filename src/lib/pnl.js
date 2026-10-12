@@ -296,7 +296,11 @@ export async function computeStoreDay(db, storeId, day, { nowMs = Date.now(), fe
 
   // --- Refunds by processed day (rule 7) ---
   let refunds = null, refundsPending = null, refundsSuccess = null;
-  if (fresh.refunds.usable) {
+  // Days before the refunds' first full read are unknown, not $0 (rule 5).
+  const refCov = await db.prepare(`SELECT covered_from FROM feed_coverage WHERE store = ? AND feed = 'refunds'`).bind(storeId).first().catch(() => null);
+  const refundsCovered = !!(refCov && refCov.covered_from && refCov.covered_from <= day);
+  if (fresh.refunds.usable && !refundsCovered) why.refunds = refCov && refCov.covered_from ? `refunds only read from ${refCov.covered_from}` : "first refund read not finished";
+  else if (fresh.refunds.usable) {
     const ref = await db.prepare(
       `SELECT SUM(CASE WHEN status LIKE '%PENDING%' THEN amount ELSE 0 END) AS pending,
               SUM(CASE WHEN status LIKE '%PENDING%' THEN 0 ELSE amount END) AS settled
@@ -320,7 +324,12 @@ export async function computeStoreDay(db, storeId, day, { nowMs = Date.now(), fe
 
   // --- Shopify Payments fees on that day's charges (UTC dates → store day) ---
   let fees = null;
-  if (fresh.payouts.usable) {
+  // Fees are only known from the day after the oldest balance transaction stored: older
+  // days were never read, and a missing fee would flatter profit (rule 5).
+  const oldest = await db.prepare(`SELECT MIN(date) AS d FROM balance_txns WHERE store = ? AND test = 0`).bind(storeId).first().catch(() => null);
+  const feesFrom = oldest && oldest.d ? minusDays(localDay(oldest.d, tz), -1) : null;
+  if (fresh.payouts.usable && !(feesFrom && feesFrom <= day)) why.fees = feesFrom ? `fees only read from ${feesFrom}` : "no balance transactions read yet";
+  else if (fresh.payouts.usable) {
     const { results: txns } = await db.prepare(
       `SELECT date, fee FROM balance_txns WHERE store = ? AND test = 0 AND upper(type) = 'CHARGE' AND date >= ? AND date < ?`
     ).bind(storeId, `${minusDays(day, 1)}T00:00:00`, `${minusDays(day, -2)}T00:00:00`).all();

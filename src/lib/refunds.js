@@ -14,6 +14,7 @@
  *   Order.refunds(first) → Refund { id createdAt processedAt transactions { nodes {
  *   id kind status processedAt createdAt amountSet { shopMoney { amount currencyCode } } } } }
  */
+import { backfillFromDay } from "./orderBackfill.js";
 import { LIVE_STORE_IDS, STORES } from "../config/stores.js";
 import { shopifyGraphQL } from "./storeGuard.js";
 import { summarizeRefund, upsertRefund } from "./shopifyWebhooks.js";
@@ -93,7 +94,16 @@ export async function pullStoreRefunds(env, storeId, opts = {}) {
   const tz = store.timezone || env.TIMEZONE || "America/New_York";
   const mark = await env.DB.prepare(`SELECT last_run_at FROM job_runs WHERE job = ?`).bind(watermarkJob(storeId)).first();
   const initial = !mark;
-  const sinceMs = mark ? Date.parse(mark.last_run_at) - OVERLAP_MIN * 60000 : nowMs - FIRST_LOOKBACK_DAYS * 86400000;
+  // First read reaches back to the first day of the previous month (same window as the
+  // orders backfill), so refunds are known for every day the P&L can call complete.
+  const startDay = backfillFromDay(nowMs, tz);
+  const sinceMs = mark ? Date.parse(mark.last_run_at) - OVERLAP_MIN * 60000 : Date.parse(`${startDay}T00:00:00Z`) - 86400000;
+  if (initial) {
+    await env.DB.prepare(
+      `INSERT INTO feed_coverage (store, feed, start_day, covered_from, updated_at) VALUES (?, 'refunds', ?, NULL, ?)
+       ON CONFLICT(store, feed) DO NOTHING`
+    ).bind(storeId, startDay, at).run();
+  }
   const ctx = { tz, at, initial, store, seen: 0, added: 0, changed: 0 };
 
   // 1. Orders updated since the last good pull, OLDEST first: if there are more than one
@@ -125,7 +135,7 @@ export async function pullStoreRefunds(env, storeId, opts = {}) {
   if (initial && ctx.added) {
     await logEvent(env.DB, {
       actor: "pnl.refunds", kind: "refunds.imported", store: storeId, target: "sys.shopify",
-      summary: `${store.name}: first refund check, recorded ${ctx.added} refund${ctx.added === 1 ? "" : "s"} from the last ${FIRST_LOOKBACK_DAYS} days`, at,
+      summary: `${store.name}: first refund check, recorded ${ctx.added} refund${ctx.added === 1 ? "" : "s"} since ${startDay}`, at,
     });
   }
   if (truncated) {
@@ -140,6 +150,12 @@ export async function pullStoreRefunds(env, storeId, opts = {}) {
   await env.DB.prepare(
     `INSERT INTO job_runs (job, last_run_at) VALUES (?, ?) ON CONFLICT(job) DO UPDATE SET last_run_at = excluded.last_run_at`
   ).bind(watermarkJob(storeId), mark2).run();
+  // The first full read has caught up to now: refunds are complete from start_day on.
+  if (!truncated) {
+    await env.DB.prepare(
+      `UPDATE feed_coverage SET covered_from = start_day, updated_at = ? WHERE store = ? AND feed = 'refunds' AND covered_from IS NULL`
+    ).bind(at, storeId).run();
+  }
   return { store: storeId, ok: true, seen: ctx.seen, added: ctx.added, changed: ctx.changed, pendingRechecked: ids.length, truncated };
 }
 

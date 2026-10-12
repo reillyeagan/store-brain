@@ -50,7 +50,7 @@ async function ads(DB, store, day, cost, tz = NY) {
 
 async function charge(DB, store, { id, date, fee, type = "CHARGE", test = 0 }) {
   await DB.prepare(`INSERT INTO balance_txns (store, txn_id, type, date, amount, fee, net, currency, test, fetched_at)
-    VALUES (?, ?, ?, ?, 100, ?, ?, 'USD', ?, '2026-10-11T00:00:00Z')`).bind(store, `gid://t/${id}`, type, date, fee, 100 - fee, test).run();
+    VALUES (?, ?, ?, ?, 100, ?, ?, 'USD', ?, '2026-10-11T00:00:00Z') ON CONFLICT(store, txn_id) DO NOTHING`).bind(store, `gid://t/${id}`, type, date, fee, 100 - fee, test).run();
 }
 
 /** Make every input of every live store fresh as of `nowMs` (order history covered from 2026-01-01). */
@@ -64,7 +64,11 @@ async function allFresh(DB, nowMs, { skip = [] } = {}) {
     }
     if (!skip.includes(`refunds.${id}`)) {
       await DB.prepare(`INSERT INTO job_runs (job, last_run_at) VALUES (?, ?) ON CONFLICT(job) DO UPDATE SET last_run_at = excluded.last_run_at`).bind(`refunds.${id}`, at).run();
+      await DB.prepare(`INSERT INTO feed_coverage (store, feed, start_day, covered_from, updated_at) VALUES (?, 'refunds', '2026-01-01', '2026-01-01', ?)
+        ON CONFLICT(store, feed) DO NOTHING`).bind(id, at).run();
     }
+    // Fees are known from the day after the oldest stored balance transaction: anchor history.
+    if (!skip.includes(`fees.${id}`)) await charge(DB, id, { id: `anchor-${id}`, date: "2026-01-01T12:00:00Z", fee: 0, type: "ADJUSTMENT" });
   }
 }
 
@@ -689,4 +693,21 @@ test("a brief stuck in 'composing' for over 30 minutes is reclaimed by the next 
   // A ready brief is never reclaimed.
   assert.equal((await runBrief(env, { nowMs: t0 + 120 * 60000, fetchImpl })).ran, false);
   assert.equal((await evs(DB, "brief.reclaimed")).length, 1);
+});
+
+
+test("rule 5: refunds and fees before their first full read are unknown (null), never $0", async () => {
+  const DB = makeD1();
+  const nowMs = Date.parse("2026-10-11T18:00:00Z");
+  await allFresh(DB, nowMs, { skip: ["fees.hc"] });
+  await DB.prepare(`UPDATE feed_coverage SET covered_from = '2026-10-09' WHERE store = 'hc' AND feed = 'refunds'`).run();
+  await charge(DB, "hc", { id: "t1", date: "2026-10-09T16:00:00Z", fee: 2 });
+  const { computeStoreDay } = await import("../src/lib/pnl.js");
+  const early = await computeStoreDay(DB, "hc", "2026-10-08", { nowMs });
+  assert.equal(early.refunds, null);
+  assert.equal(early.fees, null);
+  assert.equal(early.profit, null);
+  const later = await computeStoreDay(DB, "hc", "2026-10-10", { nowMs });
+  assert.equal(later.refunds, 0);
+  assert.equal(later.fees, 0);
 });

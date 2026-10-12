@@ -34,3 +34,15 @@ CREATE TABLE IF NOT EXISTS order_backfill (
 -- a figure or reference code gave the model; 0 when any doesn't (they're listed at the
 -- top as "Unverified numbers"). Null = rows from before this column.
 ALTER TABLE briefs ADD COLUMN checked INTEGER;
+
+-- From which day a derived input (refunds, Shopify fees) is complete for a store. Before
+-- this day the input was never read, so the P&L must show it as unknown (null), never as
+-- $0: a missing refund or fee makes profit look better than it was (rule 5).
+CREATE TABLE IF NOT EXISTS feed_coverage (
+  store        TEXT NOT NULL,
+  feed         TEXT NOT NULL,                 -- 'refunds'
+  start_day    TEXT NOT NULL,                 -- first day the first full read reaches back to
+  covered_from TEXT,                          -- set once that first read finished (= start_day)
+  updated_at   TEXT NOT NULL,
+  PRIMARY KEY (store, feed)
+);
