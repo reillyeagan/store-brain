@@ -92,7 +92,11 @@ export async function pullStoreRefunds(env, storeId, opts = {}) {
   const nowMs = opts.nowMs || Date.now();
   const at = nowIso(nowMs);
   const tz = store.timezone || env.TIMEZONE || "America/New_York";
-  const mark = await env.DB.prepare(`SELECT last_run_at FROM job_runs WHERE job = ?`).bind(watermarkJob(storeId)).first();
+  let mark = await env.DB.prepare(`SELECT last_run_at FROM job_runs WHERE job = ?`).bind(watermarkJob(storeId)).first();
+  // A store with a watermark but no coverage row (refunds were pulled before coverage
+  // existed) gets one full read from the start window, so its coverage can be proven.
+  const covRow = await env.DB.prepare(`SELECT covered_from FROM feed_coverage WHERE store = ? AND feed = 'refunds'`).bind(storeId).first();
+  if (mark && !covRow) mark = null;
   const initial = !mark;
   // First read reaches back to the first day of the previous month (same window as the
   // orders backfill), so refunds are known for every day the P&L can call complete.
@@ -101,7 +105,8 @@ export async function pullStoreRefunds(env, storeId, opts = {}) {
   if (initial) {
     await env.DB.prepare(
       `INSERT INTO feed_coverage (store, feed, start_day, covered_from, updated_at) VALUES (?, 'refunds', ?, NULL, ?)
-       ON CONFLICT(store, feed) DO NOTHING`
+       ON CONFLICT(store, feed) DO UPDATE SET start_day = excluded.start_day, updated_at = excluded.updated_at
+       WHERE feed_coverage.covered_from IS NULL`
     ).bind(storeId, startDay, at).run();
   }
   const ctx = { tz, at, initial, store, seen: 0, added: 0, changed: 0 };

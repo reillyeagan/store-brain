@@ -711,3 +711,40 @@ test("rule 5: refunds and fees before their first full read are unknown (null), 
   assert.equal(later.refunds, 0);
   assert.equal(later.fees, 0);
 });
+
+test("review fix: a loss written up as profit is flagged; ordinary decimals are not", async () => {
+  const { unverifiedNumbers } = await import("../src/lib/brief.js");
+  const data = { group: { yesterday: { profit: -52, revenue: 400, refunds: 118, ads: 1047.2, breakeven_roas: 1.9 } }, references: [] };
+  assert.deepEqual(unverifiedNumbers("profit $52 (good day)", data), ["$52"]);
+  assert.deepEqual(unverifiedNumbers("lost $52 yesterday", data), []);
+  assert.deepEqual(unverifiedNumbers("profit -$52", data), []);
+  assert.deepEqual(unverifiedNumbers("written by Claude Sonnet 5.5; parcel 1.5 days late; break-even 1.9; ads $1,047; refunds $118", data), []);
+  assert.deepEqual(unverifiedNumbers("COGS at the ASSUMED 33% rate", data), []);
+});
+
+test("review fix: backfill window never reaches past Shopify's 60-day order limit", async () => {
+  const { backfillFromDay } = await import("../src/lib/orderBackfill.js");
+  assert.equal(backfillFromDay(Date.parse("2026-10-11T16:00:00Z"), "America/New_York"), "2026-09-01");
+  // Aug 31 → first of July is 61 days back: clamped.
+  assert.equal(backfillFromDay(Date.parse("2026-08-31T16:00:00Z"), "America/New_York"), "2026-07-04");
+});
+
+test("review fix: a refunds watermark without a coverage row triggers one full read and gets coverage", async () => {
+  const { pullStoreRefunds } = await import("../src/lib/refunds.js");
+  const DB = makeD1();
+  await DB.prepare(`INSERT INTO job_runs (job, last_run_at) VALUES ('refunds.hc', '2026-10-11T15:00:00Z')`).run();
+  let query = null;
+  const env = { DB, SB_HC_CLIENT_ID: "a", SB_HC_CLIENT_SECRET: "b" };
+  const fetchImpl = async (url, init) => {
+    if (url.includes("access_token")) return new Response(JSON.stringify({ access_token: "t", expires_in: 3600 }));
+    const b = JSON.parse(init.body); query = query || b.variables && b.variables.query;
+    return new Response(JSON.stringify({ data: { orders: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } }, nodes: [] } }));
+  };
+  const { _resetTokenCacheForTests } = await import("../src/lib/storeGuard.js");
+  _resetTokenCacheForTests();
+  const r = await pullStoreRefunds(env, "hc", { fetchImpl, nowMs: Date.parse("2026-10-11T16:00:00Z") });
+  assert.equal(r.ok, true);
+  assert.match(query, /2026-08-31/);
+  const cov = await DB.prepare(`SELECT covered_from FROM feed_coverage WHERE store='hc' AND feed='refunds'`).first();
+  assert.equal(cov.covered_from, "2026-09-01");
+});

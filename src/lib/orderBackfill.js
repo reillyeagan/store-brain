@@ -64,7 +64,11 @@ export function backfillFromDay(nowMs, tz) {
   const today = localDay(nowMs, tz);
   let y = Number(today.slice(0, 4)), m = Number(today.slice(5, 7)) - 1;
   if (m === 0) { m = 12; y--; }
-  return `${y}-${String(m).padStart(2, "0")}-01`;
+  const firstOfPrev = `${y}-${String(m).padStart(2, "0")}-01`;
+  // Without read_all_orders Shopify only returns the last 60 days, silently. Never claim
+  // coverage for a day it may have hidden: clamp to 58 full days back.
+  const limit = localDay(nowMs - 58 * 86400000, tz);
+  return firstOfPrev > limit ? firstOfPrev : limit;
 }
 
 /**

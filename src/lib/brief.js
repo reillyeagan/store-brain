@@ -370,6 +370,7 @@ export function briefWhitelist(data) {
     if (typeof v === "object") for (const [k, x] of Object.entries(v)) walk(x, k);
   };
   walk(data, null);
+  figures.push(0.33); // the assumed-COGS rate the prompt tells the model to name (rule 3)
   return { figures, orderNames, dates };
 }
 
@@ -380,14 +381,21 @@ const MONTHS = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8,
  * "$1,047" (whole dollars) matches 1047.2 within 0.5, "$1,047.20" within 0.005; "37%" matches
  * 0.37 (a ratio) or 37; "2.3" matches 2.35. Sign is ignored ("lost $52" vs -52).
  */
-function matchesFigure(figures, v, dec, { percent = false, scale = 1 } = {}) {
+function matchesFigure(figures, v, dec, { percent = false, scale = 1, sign = 0 } = {}) {
   const tol = 0.5 * Math.pow(10, -dec) * scale + 1e-9;
   const x = Math.abs(v * scale);
   return figures.some((c) => {
+    // sign: +1 the text presents it as a gain/plain amount, -1 as a loss; 0 = don't care.
+    // A loss written up as profit must NOT pass (rule 5: errors run in the flattering direction).
+    if (sign > 0 && c < 0) return false;
+    if (sign < 0 && c > 0) return false;
     const a = Math.abs(c);
     return Math.abs(a - x) <= tol || (percent && Math.abs(a * 100 - x) <= tol);
   });
 }
+
+const LOSS_BEFORE = /(?:\blost|\bloss(?:es)?(?:\s+of)?|\bdown|\bnegative|\bdeficit|\bminus|\bin the red)[\s:,]*$/i;
+const LOSS_AFTER = /^\s*(?:loss|lost|in the red|negative)\b/i;
 
 /**
  * Every $-amount, %-figure, ROAS, order name and date in the AI's text that is not one of
@@ -412,10 +420,18 @@ export function unverifiedNumbers(text, data, whitelist = briefWhitelist(data)) 
   // Clock times are not figures.
   t = t.replace(/\b\d{1,2}:\d{2}\b/g, blank);
   // $-amounts (also "$1.2k").
-  t = t.replace(/-?\$\s?-?(\d[\d,]*(?:\.\d+)?)(k\b)?/gi, (m, num, k) => {
+  t = t.replace(/[-−]?\$\s?[-−]?(\d[\d,]*(?:\.\d+)?)(k\b)?/gi, (m, num, k, off, whole) => {
     const digits = num.replace(/,/g, "");
     const dec = (digits.split(".")[1] || "").length;
-    if (!matchesFigure(figures, Number(digits), dec, { scale: k ? 1000 : 1 })) bad.push(m.trim());
+    const before = whole.slice(Math.max(0, off - 30), off);
+    const after = whole.slice(off + m.length, off + m.length + 20);
+    const negative = /[-−]/.test(m) || /\(\s*$/.test(before) || LOSS_BEFORE.test(before) || LOSS_AFTER.test(after);
+    // Plain amounts may be costs (stored positive) or profits: a plain amount must match a
+    // non-negative figure; a written loss must match a negative one (or a positive cost).
+    const ok = negative
+      ? matchesFigure(figures, Number(digits), dec, { scale: k ? 1000 : 1, sign: -1 }) || matchesFigure(figures, Number(digits), dec, { scale: k ? 1000 : 1, sign: +1 })
+      : matchesFigure(figures, Number(digits), dec, { scale: k ? 1000 : 1, sign: +1 });
+    if (!ok) bad.push(m.trim());
     return blank(m);
   });
   // %-figures.
@@ -435,7 +451,8 @@ export function unverifiedNumbers(text, data, whitelist = briefWhitelist(data)) 
   };
   t = t.replace(/\b(\d+(?:\.\d+)?)\s?[x×](?![a-z])/gi, checkBare);
   t = t.replace(/\b(?:ROAS|break-?even)(?:\s+ROAS)?\s*(?:of|was|is|at|vs\.?|:|=)?\s*(\d+(?:\.\d+)?)\b/gi, checkBare);
-  t.replace(/\b\d+\.\d+\b/g, (m) => checkBare(m, m));
+  // Other bare decimals ("Sonnet 5.5", "1.5 days") are ordinary text, not checked: only
+  // $, %, ×/x and ROAS/break-even figures are claims about the numbers.
   const src = String(text);
   return [...new Set(bad)].sort((x, y) => src.indexOf(x) - src.indexOf(y)); // in reading order
 }
