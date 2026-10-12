@@ -829,12 +829,17 @@ test("P&L history: one store's days newest first; the group sums stores and is n
   for (const k of ["revenue", "ads", "cogs", "fees", "refunds", "orders", "roas", "breakeven_roas"]) {
     assert.equal(y2[k], null, `group ${k} is unknown when a store's day is missing (a partial sum would understate)`);
   }
-  // Before a store's first stored day it simply wasn't tracked: that's not a gap.
+  // A store expected from its coverage start is missing even if its rows start later
+  // (history still filling): the group day stays unknown, never a partial "profit".
   await DB.prepare(`DELETE FROM pnl_days WHERE store = 'mar' AND day = '2026-10-01'`).run();
   const all3 = await pnlHistory(DB, "all", { nowMs });
   const d1 = all3.days.find((d) => d.day === "2026-10-01");
-  assert.deepEqual(d1.missing_stores, [], "Marlowe's first stored day is now 10-02, so 10-01 isn't counted missing");
-  assert.notEqual(d1.revenue, null);
+  assert.deepEqual(d1.missing_stores, ["mar"]);
+  assert.equal(d1.ads, null);
+  // Before a store's coverage start it simply wasn't tracked yet: not a gap.
+  await DB.prepare(`UPDATE order_coverage SET covered_from = '2026-10-03' WHERE store = 'mar'`).run();
+  const all4 = await pnlHistory(DB, "all", { nowMs });
+  assert.deepEqual(all4.days.find((d) => d.day === "2026-10-01").missing_stores, []);
 
   assert.equal((await pnlHistory(DB, "cc", { nowMs })).ok, false, "a store that isn't live has no P&L");
 });
@@ -861,12 +866,43 @@ test("history fill: days since order coverage with no P&L row are computed, a fe
   await order(DB, "hc", { id: 7, created_at: "2026-09-20T16:00:00Z", total: 80 });
   const a = await fillMissingDays({ DB }, { nowMs });
   assert.equal(a.length, FILL_PER_TICK);
-  assert.deepEqual(a[0], { store: "hc", day: "2026-09-20" });
+  assert.deepEqual(a[0], { store: "hc", day: "2026-09-20", kind: "filled" });
   const row = await DB.prepare(`SELECT revenue FROM pnl_days WHERE store = 'hc' AND day = '2026-09-20'`).first();
   assert.equal(row.revenue, 80);
   // Keeps going on later ticks until every day up to the recompute window has a row.
   for (let i = 0; i < 10; i++) await fillMissingDays({ DB }, { nowMs });
   const n = await DB.prepare(`SELECT COUNT(*) AS n FROM pnl_days WHERE store = 'hc' AND day >= '2026-09-20' AND day <= '2026-10-08'`).first();
   assert.equal(n.n, 19);
-  assert.equal((await fillMissingDays({ DB }, { nowMs })).length, 0, "nothing left to fill");
+  const last = await fillMissingDays({ DB }, { nowMs });
+  assert.equal(last.filter((x) => x.kind === "filled").length, 0, "nothing left to fill");
+  assert.ok(last.length <= FILL_PER_TICK, "revisits of incomplete old days stay bounded per tick");
+});
+
+test("history fill: uneven fill across stores never gives a group day without every store", async () => {
+  const DB = makeD1();
+  const nowMs = Date.parse("2026-10-11T15:00:00Z");
+  await allFresh(DB, nowMs);
+  await DB.prepare(`UPDATE order_coverage SET covered_from = '2026-09-20'`).run();
+  for (const id of LIVE_STORE_IDS) for (let d = 20; d <= 30; d++) await ads(DB, id, `2026-09-${d}`, 50);
+  await recomputeDays({ DB }, { nowMs, days: 3 });
+  await fillMissingDays({ DB }, { nowMs }); // one tick: only Holt & Crane's oldest days so far
+  const all = await pnlHistory(DB, "all", { nowMs });
+  const d = all.days.find((x) => x.day === "2026-09-21");
+  assert.ok(d.missing_stores.length > 0);
+  assert.equal(d.ads, null, "never $50 of a true $150");
+  assert.equal(d.profit, null);
+});
+
+test("history fill: skips a store whose orders feed is stale; revisits incomplete old rows", async () => {
+  const DB = makeD1();
+  const nowMs = Date.parse("2026-10-11T15:00:00Z");
+  await allFresh(DB, nowMs, { skip: ["shopify.orders.hc"] });
+  await DB.prepare(`UPDATE order_coverage SET covered_from = '2026-10-01'`).run();
+  const a = await fillMissingDays({ DB }, { nowMs });
+  assert.ok(a.every((x) => x.store !== "hc"), "no blank days written for a stale store");
+  // An old incomplete row gets recomputed on a later tick.
+  await DB.prepare(`UPDATE pnl_days SET complete = 0, computed_at = '2026-01-01T00:00:00Z' WHERE store = 'aub' AND day = '2026-10-01'`).run();
+  for (let i = 0; i < 5; i++) await fillMissingDays({ DB }, { nowMs });
+  const r = await DB.prepare(`SELECT computed_at FROM pnl_days WHERE store = 'aub' AND day = '2026-10-01'`).first();
+  assert.notEqual(r.computed_at, "2026-01-01T00:00:00Z");
 });

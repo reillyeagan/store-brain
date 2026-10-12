@@ -484,7 +484,20 @@ export async function runPnlCron(env, { nowMs = Date.now() } = {}) {
   const rows = await recomputeDays(env, { nowMs });
   // The P&L page shows every day since the order history starts; the recompute only covers
   // the last few. Fill older days that have no row yet, a few per tick (bounded work).
-  const filled = await fillMissingDays(env, { nowMs }).catch(() => []);
+  let filled = [];
+  try {
+    filled = await fillMissingDays(env, { nowMs });
+  } catch (err) {
+    // Not fatal to the recompute, but never silent: at most one alarm an hour.
+    const since = new Date(nowMs - 60 * 60000).toISOString();
+    const recent = await env.DB.prepare(`SELECT id FROM events WHERE kind = 'error.pnl_fill' AND at >= ? LIMIT 1`).bind(since).first().catch(() => null);
+    if (!recent) {
+      await logEvent(env.DB, {
+        actor: ACTOR, kind: "error.pnl_fill", summary: `P&L history fill failed; it will try again in 15 minutes (${String(err && err.message).slice(0, 200)})`,
+        at: nowIso(nowMs),
+      }).catch(() => {});
+    }
+  }
   const closed = rows.filter((r) => r.complete).length;
   await env.DB.prepare(`UPDATE job_runs SET last_result = ? WHERE job = 'pnl.recompute'`)
     .bind(`ok: ${rows.length} rows, ${closed} complete${filled.length ? `, ${filled.length} history days filled` : ""}`).run();
@@ -495,16 +508,22 @@ export async function runPnlCron(env, { nowMs = Date.now() } = {}) {
 export const FILL_PER_TICK = 12;
 
 /**
- * Days from the store's order coverage start up to the recompute window that have no P&L
- * row yet, oldest first, at most `limit` across stores. They're computed with the same
- * rules as any other day (unknown inputs stay null).
+ * History upkeep, a few days per tick:
+ *  1. days from the store's order coverage start up to the recompute window that have no
+ *     P&L row yet (oldest first), then
+ *  2. older rows that are still not complete, least recently computed first, so they pick
+ *     up late inputs (payout fees, later real KFB costs) instead of staying frozen.
+ * Skipped for a store whose orders feed isn't fresh: a day computed then would just be
+ * blank. Same rules as any other day (unknown inputs stay null).
  */
 export async function fillMissingDays(env, { nowMs = Date.now(), limit = FILL_PER_TICK } = {}) {
   const db = env.DB;
   const feeds = await evaluateFeeds(db, nowMs);
+  const fresh = (id) => { const f = feeds.find((x) => x.id === `shopify.orders.${id}`); return f && f.current === "fresh"; };
   const at = nowIso(nowMs);
   const out = [];
-  for (const id of LIVE_STORE_IDS) {
+  const usable = LIVE_STORE_IDS.filter(fresh);
+  for (const id of usable) {
     if (out.length >= limit) break;
     const from = (await orderCoverage(db, id)).covered_from;
     if (!from) continue;
@@ -516,7 +535,19 @@ export async function fillMissingDays(env, { nowMs = Date.now(), limit = FILL_PE
       if (have.has(d)) continue;
       const row = await computeStoreDay(db, id, d, { nowMs, feeds });
       await writePnlRow(db, row, at);
-      out.push({ store: id, day: d });
+      out.push({ store: id, day: d, kind: "filled" });
+    }
+  }
+  if (out.length < limit && usable.length) {
+    const marks = usable.map(() => "?").join(", ");
+    const cutoff = minusDays(localDay(nowMs, storeTz(usable[0])), RECOMPUTE_DAYS);
+    const { results } = await db.prepare(
+      `SELECT store, day FROM pnl_days WHERE complete = 0 AND store IN (${marks}) AND day <= ? ORDER BY computed_at ASC, day ASC LIMIT ?`
+    ).bind(...usable, cutoff, limit - out.length).all();
+    for (const r of results || []) {
+      const row = await computeStoreDay(db, r.store, r.day, { nowMs, feeds });
+      await writePnlRow(db, row, at);
+      out.push({ store: r.store, day: r.day, kind: "revisited" });
     }
   }
   return out;
@@ -646,8 +677,15 @@ export async function pnlHistory(db, store = "all", { nowMs = Date.now() } = {})
   const marks = ids.map(() => "?").join(", ");
   const { results } = await db.prepare(`SELECT * FROM pnl_days WHERE store IN (${marks}) ORDER BY day DESC`).bind(...ids).all();
   const rows = (results || []).map(parseRow);
+  // When each store is expected to have a row: from its order coverage start (the brain
+  // tracks it from then), not from its first stored row, which may lag while history is
+  // still being filled. Without coverage, fall back to its first row.
   const firstDay = {};
   for (const r of rows) if (!firstDay[r.store] || r.day < firstDay[r.store]) firstDay[r.store] = r.day;
+  for (const id of ids) {
+    const cov = (await orderCoverage(db, id)).covered_from;
+    if (cov) firstDay[id] = cov;
+  }
   const byDay = new Map();
   for (const r of rows) { if (!byDay.has(r.day)) byDay.set(r.day, []); byDay.get(r.day).push(r); }
   const days = [];
@@ -655,8 +693,8 @@ export async function pnlHistory(db, store = "all", { nowMs = Date.now() } = {})
     const sum = sumRows(list, day);
     sum.day = day;
     sum.per_store = list.map((r) => ({ store: r.store, revenue: r.revenue, profit: r.profit, ads: r.ads, roas: r.roas, complete: !!r.complete }));
-    // A store "should" have a row from its first stored day on; before that it simply
-    // wasn't being tracked yet (e.g. a store that went live later), which isn't a gap.
+    // A store "should" have a row from its coverage start on; before that it simply wasn't
+    // being tracked yet (e.g. a store that went live later), which isn't a gap.
     sum.missing_stores = ids.filter((id) => firstDay[id] && firstDay[id] <= day && !list.some((r) => r.store === id));
     if (sum.missing_stores.length) {
       // A sum of only the stores we have would understate costs and revenue (rule 5): the
