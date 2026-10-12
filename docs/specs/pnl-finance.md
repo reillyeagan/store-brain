@@ -113,3 +113,6 @@ The old tracker estimated. The new one reads Shopify Payments directly with each
 ## Real-time orders (lesson from the Eagano dash, 2026-10-10)
 On the current Eagano dash, H&C updates within about a minute but Auberlane and Marlowe lag 5–10 min. Cause, found in the worker code: the page's own pull calls `/shopify/pull` **without a store parameter**, which defaults to H&C, so only H&C is refreshed on page open or refresh; the other stores wait for the 15-minute cron.
 **Store Brain design:** each store's app subscribes to Shopify **webhooks** (`orders/create`, `orders/updated`, `refunds/create`). An order lands in the ledger and on the P&L dashboard within seconds, for every store. The hourly/close pulls remain as the reconciliation backstop.
+
+## Guy's fee (Reilly, 2026-10-11)
+"10% is constant its been going on since the 7th" → 10% of ad spend per store from **2026-09-07**, every day since. (His September invoice also covered Sep 1–6; the books follow Reilly's start date.)
