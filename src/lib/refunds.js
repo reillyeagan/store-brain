@@ -1,10 +1,10 @@
 /**
- * Refund events puller — the hourly backstop behind the refunds/create webhook.
+ * Refund events puller — the 15-minute backstop behind the refunds/create webhook.
  *
  * Why: refunds are EVENTS (rule 7), booked on the day the refund transaction was
  * PROCESSED, in the store's timezone, and PENDING ones count (with their status).
  * Webhooks catch new refunds in seconds, but a PENDING refund only turns SUCCESS (or
- * FAILURE) later and Shopify sends no refunds/create for that. So every hour we:
+ * FAILURE) later and Shopify sends no refunds/create for that. So every 15 minutes we:
  *   1. re-read orders updated since the last good pull (minus 2 h overlap), and
  *   2. re-read every order whose refund is still PENDING in the ledger.
  * Both go through summarizeRefund, the same rule the webhook uses.
@@ -72,7 +72,7 @@ async function storeRefunds(env, storeId, nodes, ctx) {
         if (initial) continue; // first import: one summary line, not one per refund
         await logEvent(env.DB, {
           actor: "pnl.refunds", kind: "refund.backfilled", store: storeId, target: "sys.shopify",
-          summary: `${store.name} ${o.name || "order"} refund $${r.amount.toFixed(2)} (${r.status}) — found by the hourly check`,
+          summary: `${store.name} ${o.name || "order"} refund $${r.amount.toFixed(2)} (${r.status}) — found by the refund check`,
           data: { refundId: r.refund_id, orderId: o.id }, at,
         });
       } else if (before.status !== r.status || Number(before.amount) !== r.amount) {
@@ -151,7 +151,7 @@ export async function pullStoreRefunds(env, storeId, opts = {}) {
   if (truncated) {
     await logEvent(env.DB, {
       actor: "pnl.refunds", kind: "refunds.partial", store: storeId, target: "sys.shopify",
-      summary: `${store.name}: more updated orders than one refund check reads (${pages * ORDERS_PER_PAGE}+); the rest are read next hour`, at,
+      summary: `${store.name}: more updated orders than one refund check reads (${pages * ORDERS_PER_PAGE}+); the rest are read on the next check`, at,
     });
   }
   // Watermark only after a successful read: "now" when the window was read in full, else
@@ -173,7 +173,7 @@ export async function pullStoreRefunds(env, storeId, opts = {}) {
   return { store: storeId, ok: true, seen: ctx.seen, added: ctx.added, changed: ctx.changed, pendingRechecked: ids.length, truncated };
 }
 
-/** The hourly job across live stores. One store's failure never stops the others. */
+/** The refunds job across live stores. One store's failure never stops the others. */
 export async function pullRefunds(env, opts = {}) {
   const out = [];
   for (const id of LIVE_STORE_IDS) {

@@ -22,9 +22,9 @@
  *   GET  /                               Mission Control page (static, no data until a key is given)
  *
  * Crons
- *   every 15 min  reconciliation pull → orders backfill (history for the P&L) → money feeds (Ads spend hourly, payouts every 6 h, refunds
- *                 hourly; throttled in job_runs) → tracking (collect hourly, 17TRACK polls as due, checks)
- *                 → P&L recompute (last 3 days, hourly) → morning brief (once per day after 08:00 ET)
+ *   every 15 min  reconciliation pull → orders backfill (history for the P&L) → money feeds (Ads spend and refunds every
+ *                 15 min, payouts hourly; throttled in job_runs) → tracking (collect hourly, 17TRACK polls as due, checks)
+ *                 → P&L recompute (last 3 days + a few missing history days, every tick) → morning brief (once per day after 08:00 ET)
  *                 → KFB composer (once per day after 18:45 ET) → Freshness Sentinel
  *   daily 05:00Z  P&L day close (01:00 EDT / 00:00 EST: "yesterday" is always the day that just ended)
  *
@@ -292,7 +292,7 @@ export default {
             summary: `Order history check failed to start; it will try again in 15 minutes (${String(err && err.message).slice(0, 200)})`,
           }).catch(() => {});
         }
-        // Money feeds: throttled (hourly / 6-hourly) and isolated from each other inside.
+        // Money feeds: throttled (15 min / hourly) and isolated from each other inside.
         try {
           await runMoneyJobs(env);
         } catch (err) {
@@ -301,13 +301,13 @@ export default {
             summary: `Money feeds failed to start; they will try again in 15 minutes (${String(err && err.message).slice(0, 200)})`,
           }).catch(() => {});
         }
-        // P&L: last 3 days, at most hourly (after the money feeds, so it uses their latest rows).
+        // P&L: last 3 days every tick (after the money feeds, so it uses their latest rows).
         try {
           await runPnlCron(env);
         } catch (err) {
           await logEvent(env.DB, {
             actor: "pnl.ledger", kind: "error.pnl",
-            summary: `P&L recompute failed; it will try again next hour (${String(err && err.message).slice(0, 200)})`,
+            summary: `P&L recompute failed; it will try again in 15 minutes (${String(err && err.message).slice(0, 200)})`,
           }).catch(() => {});
         }
         // Morning brief: once per Eastern day after 08:00. Its own try, like every step.

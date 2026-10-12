@@ -65,10 +65,10 @@ export const FALLBACK_COGS_RATE = 0.33;
  * Always flagged as an estimate; replaced by the actual card rate (decision 2026-10-10).
  */
 export const EUR_USD_ESTIMATE = 1.17;
-/** How many days (today included) the hourly job recomputes. */
+/** How many days (today included) the 15-minute job recomputes. */
 export const RECOMPUTE_DAYS = 3;
 export const RECOMPUTE_EVERY_MIN = 15; // every cron tick: today's numbers as fresh as the feeds
-/** The refunds pull is hourly; its watermark older than this = stale. */
+/** The refunds pull runs every 15 min; its watermark older than this = stale. */
 export const REFUNDS_MAX_AGE_MIN = 120;
 /**
  * How long after a day ends each input's last successful pull must be before the day can
@@ -482,10 +482,44 @@ export async function runPnlCron(env, { nowMs = Date.now() } = {}) {
   if (!LIVE_STORE_IDS.length) return { ran: false, reason: "no live stores" };
   if (!(await claimJob(env.DB, "pnl.recompute", RECOMPUTE_EVERY_MIN, nowMs))) return { ran: false, reason: "not due" };
   const rows = await recomputeDays(env, { nowMs });
+  // The P&L page shows every day since the order history starts; the recompute only covers
+  // the last few. Fill older days that have no row yet, a few per tick (bounded work).
+  const filled = await fillMissingDays(env, { nowMs }).catch(() => []);
   const closed = rows.filter((r) => r.complete).length;
   await env.DB.prepare(`UPDATE job_runs SET last_result = ? WHERE job = 'pnl.recompute'`)
-    .bind(`ok: ${rows.length} rows, ${closed} complete`).run();
-  return { ran: true, rows };
+    .bind(`ok: ${rows.length} rows, ${closed} complete${filled.length ? `, ${filled.length} history days filled` : ""}`).run();
+  return { ran: true, rows, filled };
+}
+
+/** Days filled per tick at most: each one is a handful of D1 reads, kept well inside a tick. */
+export const FILL_PER_TICK = 12;
+
+/**
+ * Days from the store's order coverage start up to the recompute window that have no P&L
+ * row yet, oldest first, at most `limit` across stores. They're computed with the same
+ * rules as any other day (unknown inputs stay null).
+ */
+export async function fillMissingDays(env, { nowMs = Date.now(), limit = FILL_PER_TICK } = {}) {
+  const db = env.DB;
+  const feeds = await evaluateFeeds(db, nowMs);
+  const at = nowIso(nowMs);
+  const out = [];
+  for (const id of LIVE_STORE_IDS) {
+    if (out.length >= limit) break;
+    const from = (await orderCoverage(db, id)).covered_from;
+    if (!from) continue;
+    const last = minusDays(localDay(nowMs, storeTz(id)), RECOMPUTE_DAYS);
+    if (from > last) continue;
+    const { results } = await db.prepare(`SELECT day FROM pnl_days WHERE store = ? AND day >= ? AND day <= ?`).bind(id, from, last).all();
+    const have = new Set((results || []).map((r) => r.day));
+    for (let d = from; d <= last && out.length < limit; d = minusDays(d, -1)) {
+      if (have.has(d)) continue;
+      const row = await computeStoreDay(db, id, d, { nowMs, feeds });
+      await writePnlRow(db, row, at);
+      out.push({ store: id, day: d });
+    }
+  }
+  return out;
 }
 
 /**
@@ -604,12 +638,16 @@ export async function pnlState(db, { nowMs = Date.now() } = {}) {
  * of only the stores we have would understate costs (rule 5). The page sums periods
  * itself with the same rule (any null part → null total).
  */
+const SUM_KEYS = ["revenue", "orders", "refunds", "refunds_success", "refunds_pending", "ads", "guy_fee", "fees", "cogs", "cogs_est", "profit", "profit_partial", "margin", "roas", "breakeven_roas", "cogs_estimated_share"];
+
 export async function pnlHistory(db, store = "all", { nowMs = Date.now() } = {}) {
   const ids = store === "all" ? LIVE_STORE_IDS : LIVE_STORE_IDS.filter((id) => id === store);
   if (!ids.length) return { ok: false, error: "unknown store" };
   const marks = ids.map(() => "?").join(", ");
   const { results } = await db.prepare(`SELECT * FROM pnl_days WHERE store IN (${marks}) ORDER BY day DESC`).bind(...ids).all();
   const rows = (results || []).map(parseRow);
+  const firstDay = {};
+  for (const r of rows) if (!firstDay[r.store] || r.day < firstDay[r.store]) firstDay[r.store] = r.day;
   const byDay = new Map();
   for (const r of rows) { if (!byDay.has(r.day)) byDay.set(r.day, []); byDay.get(r.day).push(r); }
   const days = [];
@@ -617,8 +655,15 @@ export async function pnlHistory(db, store = "all", { nowMs = Date.now() } = {})
     const sum = sumRows(list, day);
     sum.day = day;
     sum.per_store = list.map((r) => ({ store: r.store, revenue: r.revenue, profit: r.profit, ads: r.ads, roas: r.roas, complete: !!r.complete }));
-    sum.missing_stores = ids.filter((id) => !list.some((r) => r.store === id));
-    if (sum.missing_stores.length) { sum.complete = false; sum.profit = null; }
+    // A store "should" have a row from its first stored day on; before that it simply
+    // wasn't being tracked yet (e.g. a store that went live later), which isn't a gap.
+    sum.missing_stores = ids.filter((id) => firstDay[id] && firstDay[id] <= day && !list.some((r) => r.store === id));
+    if (sum.missing_stores.length) {
+      // A sum of only the stores we have would understate costs and revenue (rule 5): the
+      // whole group day is unknown, not just its profit.
+      for (const k of SUM_KEYS) sum[k] = null;
+      sum.complete = false;
+    }
     sum.computed_at = list.map((r) => r.computed_at).filter(Boolean).sort()[0] || null;
     sum.status = list.map((r) => r.status).includes("restated") ? "restated" : null;
     days.push(sum);

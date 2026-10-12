@@ -1,8 +1,8 @@
 /**
  * Job throttle — lets slower jobs ride on the 15-minute cron.
  *
- * Why: the Worker has one 15-minute cron. Ads spend should run hourly, payouts every
- * 6 hours, refunds hourly. Each job "claims" its run in `job_runs` with one atomic
+ * Why: the Worker has one 15-minute cron. Ads spend and refunds run every tick, payouts
+ * hourly. Each job "claims" its run in `job_runs` with one atomic
  * statement, so two cron runs that overlap can never both run it.
  *
  * Intervals are claimed with a 5-minute slack (an hourly job claims after 55 min),

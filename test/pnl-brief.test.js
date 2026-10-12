@@ -4,7 +4,7 @@ import { makeD1 } from "./helpers/d1.js";
 
 import {
   computeStoreDay, writePnlRow, recomputeDays, runPnlCron, runDayClose, pnlState,
-  guyFeeFor, breakevenRoas, cogsRate, parseRate, FALLBACK_COGS_RATE, pnlHistory,
+  guyFeeFor, breakevenRoas, cogsRate, parseRate, FALLBACK_COGS_RATE, pnlHistory, fillMissingDays, FILL_PER_TICK,
 } from "../src/lib/pnl.js";
 import {
   runBrief, unverifiedNumbers, briefHtml, handleBriefPage, verifyBriefSig, aiCostUsd, plainBrief, gatherBriefData,
@@ -826,6 +826,15 @@ test("P&L history: one store's days newest first; the group sums stores and is n
   assert.deepEqual(y2.missing_stores, ["mar"]);
   assert.equal(y2.profit, null);
   assert.equal(y2.complete, false);
+  for (const k of ["revenue", "ads", "cogs", "fees", "refunds", "orders", "roas", "breakeven_roas"]) {
+    assert.equal(y2[k], null, `group ${k} is unknown when a store's day is missing (a partial sum would understate)`);
+  }
+  // Before a store's first stored day it simply wasn't tracked: that's not a gap.
+  await DB.prepare(`DELETE FROM pnl_days WHERE store = 'mar' AND day = '2026-10-01'`).run();
+  const all3 = await pnlHistory(DB, "all", { nowMs });
+  const d1 = all3.days.find((d) => d.day === "2026-10-01");
+  assert.deepEqual(d1.missing_stores, [], "Marlowe's first stored day is now 10-02, so 10-01 isn't counted missing");
+  assert.notEqual(d1.revenue, null);
 
   assert.equal((await pnlHistory(DB, "cc", { nowMs })).ok, false, "a store that isn't live has no P&L");
 });
@@ -842,4 +851,22 @@ test("worker: /api/pnl needs the key and returns the history", async () => {
   assert.ok(Array.isArray(j.days));
   const bad = await worker.fetch(new Request("https://brain.example/api/pnl?store=zzz", { headers: { "x-store-brain-key": "k".repeat(32) } }), env);
   assert.equal(bad.status, 400);
+});
+
+test("history fill: days since order coverage with no P&L row are computed, a few per tick, oldest first", async () => {
+  const DB = makeD1();
+  const nowMs = Date.parse("2026-10-11T15:00:00Z");
+  await allFresh(DB, nowMs);
+  await DB.prepare(`UPDATE order_coverage SET covered_from = '2026-09-20'`).run();
+  await order(DB, "hc", { id: 7, created_at: "2026-09-20T16:00:00Z", total: 80 });
+  const a = await fillMissingDays({ DB }, { nowMs });
+  assert.equal(a.length, FILL_PER_TICK);
+  assert.deepEqual(a[0], { store: "hc", day: "2026-09-20" });
+  const row = await DB.prepare(`SELECT revenue FROM pnl_days WHERE store = 'hc' AND day = '2026-09-20'`).first();
+  assert.equal(row.revenue, 80);
+  // Keeps going on later ticks until every day up to the recompute window has a row.
+  for (let i = 0; i < 10; i++) await fillMissingDays({ DB }, { nowMs });
+  const n = await DB.prepare(`SELECT COUNT(*) AS n FROM pnl_days WHERE store = 'hc' AND day >= '2026-09-20' AND day <= '2026-10-08'`).first();
+  assert.equal(n.n, 19);
+  assert.equal((await fillMissingDays({ DB }, { nowMs })).length, 0, "nothing left to fill");
 });

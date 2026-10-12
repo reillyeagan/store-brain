@@ -217,12 +217,13 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
       if(!r.ok) throw new Error("HTTP "+r.status);
       state=await r.json();
       $("#gate").hidden=true; $("#app").hidden=false;
-      if(Date.now()>busyUntil) render();
+      if(Date.now()>busyUntil&&!selecting()) render();
     }catch(err){
       $("#status").innerHTML='<span class="bad">Can\'t reach the brain: '+esc(err.message)+'</span>';
     }
-    clearTimeout(timer); timer=setTimeout(load,10000);
+    clearTimeout(timer); timer=setTimeout(load,document.hidden?60000:10000);
   }
+  document.addEventListener("visibilitychange",function(){ if(!document.hidden&&key){ clearTimeout(timer); load(); } });
 
   /* ---------------- routing ---------------- */
   function parseRoute(){
@@ -230,7 +231,7 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
     var p=["home","pnl","brief","agents"].indexOf(h[0])>=0?h[0]:"home";
     return {p:p,a:h[1]?decodeURIComponent(h[1]):null,b:h[2]?decodeURIComponent(h[2]):null};
   }
-  window.addEventListener("hashchange",function(){ if(/key=/.test(location.hash)) return; route=parseRoute(); busyUntil=0; if(state) render(); window.scrollTo(0,0); });
+  window.addEventListener("hashchange",function(){ if(/key=/.test(location.hash)) return; var prev=route.p; route=parseRoute(); busyUntil=0; if(state){ render(); if(prev!==route.p||route.p==="agents") window.scrollTo(0,0); } });
   try{ var sp=localStorage.getItem(STORE_PICK); if(sp) store=sp; }catch(e){}
 
   /* ---------------- helpers ---------------- */
@@ -247,17 +248,21 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
   function x2(n){ return n==null||!isFinite(n)?"—":n.toFixed(2)+"x"; }
   function inStore(e){ return store==="all"||!e.store||e.store===store; }
   function isAlarm(e){ return /alarm|error|failed|mismatch/i.test(e.kind||""); }
-  function recentEvents(){ var now=Date.now(); return (state.events||[]).filter(function(e){return now-Date.parse(e.at)<WORKING_MS}); }
+  function recentEvents(){ var now=Date.now(); return (state.events||[]).filter(function(e){return now-Date.parse(e.at)<WORKING_MS&&inStore(e)}); }
   function workingAgents(){ var set={}; recentEvents().forEach(function(e){ if(agentOf(e.actor)) set[e.actor]=1; }); return Object.keys(set); }
   function builtCount(){ return (state.agents||[]).filter(function(a){return a.status!=="planned"}).length; }
+
+  /* Don't redraw under a text selection (e.g. copying part of a KFB message). */
+  function selecting(){ var sel=window.getSelection&&window.getSelection(); return !!(sel&&!sel.isCollapsed&&$("#page")&&$("#page").contains(sel.anchorNode)); }
 
   /* ---------------- frame ---------------- */
   function render(){
     route=parseRoute();
+    var keep={y:window.scrollY,tbl:$(".tblwrap")?$(".tblwrap").scrollTop:0,list:$(".alist")?$(".alist").scrollTop:0,p:route.p};
     document.querySelectorAll("#nav a").forEach(function(a){ a.classList.toggle("on",a.dataset.p===route.p); });
     $("#ver").textContent="v"+state.version;
     $("#aiCost").textContent="AI today $"+Number(state.aiCostToday||0).toFixed(2);
-    var need=needs().length; $("#needN").textContent=need?need:"";
+    var need=needs(true).length; $("#needN").textContent=need?need:"";
     var feeds=state.feeds||[], bad=feeds.filter(function(f){return f.state==="stale"||f.state==="failing"}).length;
     $("#status").innerHTML='Updated '+esc(hm(state.now))+' · '+(bad?'<span class="bad">● '+bad+' feed'+(bad>1?"s":"")+' stale</span>':'<span class="ok">● all feeds fresh</span>');
     var ls=liveStores();
@@ -272,7 +277,9 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
     else if(route.p==="brief") pg.innerHTML=briefPage();
     else pg.innerHTML=agentsPage();
     wire();
+    restoreScroll(keep);
   }
+  function restoreScroll(k){ if(k.p!==route.p) return; if($(".tblwrap")) $(".tblwrap").scrollTop=k.tbl; if($(".alist")) $(".alist").scrollTop=k.list; window.scrollTo(0,k.y); }
 
   /* ---------------- HOME ---------------- */
   function yesterdayRow(){
@@ -329,7 +336,7 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
   function mapSvg(){
     var g=geometry(), cx=550, cy=420, lines="", anim="", nodes="", labels="", now=Date.now();
     var recent=recentEvents(), working={};
-    recent.forEach(function(e){ working[e.actor]=1; if(e.target&&agentOf(e.target)) working[e.target]=1; });
+    recent.forEach(function(e){ working[e.actor]=1; });
     lines+='<circle cx="'+cx+'" cy="'+cy+'" r="92" fill="none" stroke="#26262b" stroke-dasharray="2 4"/>';
     var depts=state.departments.filter(function(d){return d.id!=="core"});
     depts.forEach(function(d){
@@ -366,15 +373,17 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
   }
 
   /* ---------------- waiting on you ---------------- */
-  function needs(){
-    var out=[];
-    (state.approvals||[]).forEach(function(a){ if(store!=="all"&&a.store&&a.store!==store) return;
+  function etDay(ms){ return new Date(ms).toLocaleDateString("en-CA",{timeZone:"America/New_York"}); }
+  function needs(allStores){
+    var out=[], st=allStores?"all":store, since=etDay(Date.now()-86400000);
+    (state.approvals||[]).forEach(function(a){ if(st!=="all"&&a.store&&a.store!==st) return;
       out.push({kind:"approval",id:a.id,title:a.title,who:actorName(a.requested_by),detail:(a.store?storeName(a.store)+" · ":"")+ago(a.created_at),color:colorOf(a.requested_by),a:a}); });
     var sup=state.supplier||{kfbMessages:[]};
-    (sup.kfbMessages||[]).forEach(function(m){ if(m.status==="sent") return;
+    /* Only today's or yesterday's unsent message: an old shadow draft isn't waiting on you. */
+    (sup.kfbMessages||[]).forEach(function(m){ if(m.status==="sent"||m.local_day<since) return;
       out.push({kind:"kfb",id:m.id,title:"KFB message ready",who:"Relay",detail:m.item_count+" item"+(m.item_count===1?"":"s")+" · "+m.local_day+(m.mode==="shadow"?" · shadow":""),color:PAL.sup,m:m}); });
     var hot={day20:1,day20_verify:1,failed_delivery:1,pickup_ready:1};
-    ((state.shipping||{}).flags||[]).forEach(function(f){ if(!hot[f.kind]||f.approval_id) return; if(store!=="all"&&f.store&&f.store!==store) return;
+    ((state.shipping||{}).flags||[]).forEach(function(f){ if(!hot[f.kind]||f.approval_id) return; if(st!=="all"&&f.store&&f.store!==st) return;
       out.push({kind:"flag",title:f.store_name+" "+f.order_name+" · "+f.label,who:"Tracking",detail:f.detail,color:PAL.ful,f:f}); });
     return out;
   }
@@ -398,7 +407,7 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
   }
   function briefPage(){
     var b=state.brief||{}, l=b.latest;
-    var mode=b.mode==="live"?"sent to your phone at 8:00":"shadow · not sent to your phone yet";
+    var mode=b.mode!=="live"?"shadow · not sent to your phone yet":!l?"goes to your phone at 8:00":l.phone&&l.phone.sent?"sent to your phone":"phone: not sent"+(l.phone&&l.phone.reason?" ("+l.phone.reason+")":"");
     var top='<div class="box"><div class="lab" style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap"><span>This morning'+(l?" · "+esc(l.day):"")+'</span><span style="text-transform:none;letter-spacing:0">'+esc(mode)+'</span></div>'+
       (l?('<div class="brief-body">'+(l.ai_error?'<div class="warnbox">AI unavailable, plain brief: '+esc(l.ai_error)+'</div>':'')+mdHtml(l.body_md)+'</div><div class="note">'+esc(l.composer==="ai"?"Claude "+(l.model||""):"plain (no AI)")+(l.checked===false?' · <span class="bad-t">numbers NOT checked</span>':l.checked?" · every number checked against the ledger":"")+' · '+esc(ago(l.created_at))+'</div>')
         :'<div class="empty">No brief yet. The brain writes it once a day at 8:00 am Eastern.</div>')+'</div>';
@@ -410,13 +419,13 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
   }
   function needCard(x){
     if(x.kind==="approval"){ var a=x.a;
-      return '<div class="card" id="ap-'+a.id+'" style="border-left-color:'+x.color+'"><div class="t">'+esc(a.title)+'<span>'+esc(x.who)+'</span></div><div class="d">'+esc(x.detail)+'</div>'+
+      return '<div class="card" id="ap-'+esc(a.id)+'" style="border-left-color:'+x.color+'"><div class="t">'+esc(a.title)+'<span>'+esc(x.who)+'</span></div><div class="d">'+esc(x.detail)+'</div>'+
         (a.options||[]).map(function(o){return o.detail?'<div class="d">'+esc(o.label)+': '+esc(o.detail)+'</div>':""}).join("")+
-        '<div class="btns">'+(a.options||[]).map(function(o,i){return '<button class="btn'+(i===0?" p":"")+'" data-ap="'+a.id+'" data-choice="'+esc(o.id)+'">'+esc(o.label)+'</button>'}).join("")+'<button class="btn no" data-ap="'+a.id+'" data-choice="reject">Reject</button></div></div>';
+        '<div class="btns">'+(a.options||[]).map(function(o,i){return '<button class="btn'+(i===0?" p":"")+'" data-ap="'+esc(a.id)+'" data-choice="'+esc(o.id)+'">'+esc(o.label)+'</button>'}).join("")+'<button class="btn no" data-ap="'+esc(a.id)+'" data-choice="reject">Reject</button></div></div>';
     }
     if(x.kind==="kfb"){ var m=x.m;
       return '<div class="card" style="border-left-color:'+x.color+'"><div class="t">KFB message ready<span>Relay</span></div><div class="d">'+esc(x.detail)+' · copy it into WhatsApp, then mark it sent</div><div class="msg">'+esc(m.body)+'</div>'+
-        '<div class="btns"><button class="btn g" data-copy="'+m.id+'">Copy</button><button class="btn" data-sent="'+m.id+'">Mark sent</button></div></div>';
+        '<div class="btns"><button class="btn g" data-copy="'+esc(m.id)+'">Copy</button><button class="btn" data-sent="'+esc(m.id)+'">Mark sent</button></div></div>';
     }
     return '<div class="card" style="border-left-color:'+x.color+'"><div class="t">'+esc(x.title)+'<span>'+esc(x.who)+'</span></div><div class="d">'+esc(x.detail)+'</div></div>';
   }
@@ -436,14 +445,14 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
       var j=await r.json(); if(!j.ok) throw new Error(j.error||("HTTP "+r.status));
       if(want!==store) return;
       pnlData=j; pnlStore=want; pnlAt=Date.now();
-      if(route.p==="pnl"&&$("#pnl")){ $("#pnl").innerHTML=pnlBody(); wirePnl(); }
+      if(route.p==="pnl"&&$("#pnl")&&Date.now()>busyUntil){ var t=$(".tblwrap")?$(".tblwrap").scrollTop:0; $("#pnl").innerHTML=pnlBody(); wirePnl(); if($(".tblwrap")) $(".tblwrap").scrollTop=t; }
     }catch(e){ if($("#pnl")) $("#pnl").innerHTML='<div class="empty">Couldn\'t load the P&amp;L: '+esc(e.message)+'</div>'; }
   }
   function addDays(day,n){ var d=new Date(day+"T12:00:00Z"); d.setUTCDate(d.getUTCDate()+n); return d.toISOString().slice(0,10); }
   function fmtDay(day,long){ var d=new Date(day+"T12:00:00Z"); return d.toLocaleDateString(undefined,long?{weekday:"short",month:"short",day:"numeric",timeZone:"UTC"}:{month:"short",day:"numeric",timeZone:"UTC"}); }
   function breakeven(margin){ if(margin==null||!isFinite(margin)) return null; var d=margin*(1-0.119)-0.0334; return d>0?1/d:null; }
   /* Sum days the same way the server does: any unknown part makes the total unknown (rule 5). */
-  function sumDays(rows){
+  function sumDays(rows,gapDays){
     var keys=["revenue","orders","refunds","refunds_pending","ads","guy_fee","fees","cogs","cogs_est","profit"], o={n:rows.length};
     keys.forEach(function(k){ o[k]=rows.length&&rows.every(function(r){return r[k]!=null})?rows.reduce(function(s,r){return s+Number(r[k])},0):null; });
     var known=rows.filter(function(r){return r.profit!=null});
@@ -455,50 +464,65 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
     o.roas=o.ads?o.revenue/o.ads:null;
     o.be=breakeven(o.gross_margin);
     o.aov=o.orders?o.revenue/o.orders:null;
+    o.cogs_assumed=rows.some(function(r){return r.cogs_assumed});
+    /* Days missing inside the period: totals would leave their costs out (rule 5), so the
+       money sums are unknown, not partial. */
+    o.gap_days=gapDays||0;
+    if(o.gap_days){ ["revenue","orders","refunds","refunds_pending","ads","guy_fee","fees","cogs","cogs_est","profit","margin","gross_margin","roas","be","aov","cogs_est_share"].forEach(function(k){o[k]=null}); o.complete=false; }
     o.missing=[]; o.stale=[]; o.missing_stores=[];
     rows.forEach(function(r){ (r.missing||[]).forEach(function(m){ if(o.missing.indexOf(m)<0) o.missing.push(m) }); (r.stale||[]).forEach(function(m){ if(o.stale.indexOf(m)<0) o.stale.push(m) }); (r.missing_stores||[]).forEach(function(m){ if(o.missing_stores.indexOf(m)<0) o.missing_stores.push(m) }); });
     return o;
   }
+  function dayCount(a,b){ return Math.round((Date.parse(b+"T12:00:00Z")-Date.parse(a+"T12:00:00Z"))/86400000)+1; }
+  /* The period, clipped to when records start (before that the brain wasn't tracking yet,
+     which isn't a gap). Days missing after that make the totals unknown. */
   function periodRows(){
-    var days=pnlData.days||[], sel=pnlSel.day||pnlData.today, p=pnlSel.period;
-    if(p==="all") return {rows:days,from:days.length?days[days.length-1].day:sel,to:days.length?days[0].day:sel};
-    var n=p==="day"?1:p==="d7"?7:p==="d28"?28:365, from=addDays(sel,-(n-1));
-    return {rows:days.filter(function(r){return r.day>=from&&r.day<=sel}),from:from,to:sel,n:n};
+    var days=pnlData.days||[], sel=pnlSel.day||pnlData.today, p=pnlSel.period, first=days.length?days[days.length-1].day:sel;
+    var n=p==="day"?1:p==="d7"?7:p==="d28"?28:p==="d365"?365:null;
+    var from=n?addDays(sel,-(n-1)):first, to=p==="all"?(days.length?days[0].day:sel):sel;
+    var clipped=from<first?first:from;
+    var rows=days.filter(function(r){return r.day>=clipped&&r.day<=to});
+    var expected=clipped>to?0:dayCount(clipped,to);
+    return {rows:rows,from:from,to:to,n:n,clipped:clipped!==from?clipped:null,gap:Math.max(0,expected-rows.length)};
   }
   function pnlBody(){
     var d=pnlData; if(!d) return "";
     if(!pnlSel.day||pnlSel.day>d.today) pnlSel.day=d.today;
-    var pr=periodRows(), s=sumDays(pr.rows), first=d.days.length?d.days[d.days.length-1].day:null;
-    var isToday=pnlSel.period==="day"&&pnlSel.day===d.today;
-    var verdict=s.profit==null?'<span class="tag mut">PROFIT NOT KNOWN YET</span>':s.profit>=0?'<span class="tag ok">PROFITABLE</span>':'<span class="tag bad">LOSS</span>';
-    var periodTxt=pnlSel.period==="day"?fmtDay(pnlSel.day,true)+(isToday?" · today so far":""):fmtDay(pr.from)+" – "+fmtDay(pr.to)+(pr.n&&s.n<pr.n?" · "+s.n+" of "+pr.n+" days on record":"");
+    var pr=periodRows(), s=sumDays(pr.rows,pr.gap), first=d.days.length?d.days[d.days.length-1].day:null;
+    var isToday=pr.to===d.today;
+    /* Today's spend lags Google by hours, so a period ending today gets no verdict yet. */
+    var verdict=s.profit==null?'<span class="tag mut">PROFIT NOT KNOWN</span>':isToday?'<span class="tag">SO FAR · ADS LAG</span>':s.profit>=0?'<span class="tag ok">PROFITABLE</span>':'<span class="tag bad">LOSS</span>';
+    var periodTxt=pnlSel.period==="day"?fmtDay(pnlSel.day,true)+(pnlSel.day===d.today?" · today so far":""):fmtDay(pr.clipped||pr.from)+" – "+fmtDay(pr.to)+(pr.clipped?" · records start "+fmtDay(pr.clipped):"")+(pr.gap?" · "+pr.gap+" day"+(pr.gap>1?"s":"")+" missing":"");
     var head='<div class="top"><div class="pills">'+PERIODS.map(function(p){return '<button class="pill'+(pnlSel.period===p[0]?" on":"")+'" data-per="'+p[0]+'">'+p[1]+'</button>'}).join("")+
       '<span style="width:6px"></span><button class="pill" data-step="-1" aria-label="Previous day">‹</button><input type="date" id="pnlDay" value="'+esc(pnlSel.day)+'" max="'+esc(d.today)+'"'+(first?' min="'+esc(first)+'"':'')+'><button class="pill" data-step="1" aria-label="Next day">›</button></div>'+
       '<div class="pills"><span class="status">'+esc(periodTxt)+'</span>'+verdict+'</div></div>';
     var cogsTag=s.cogs_est_share>0?'<span class="tag">'+(s.cogs_est_share>=.999?"EST.":pct(s.cogs_est_share,0)+" EST.")+'</span>':s.cogs!=null?'<span class="tag ok">REAL</span>':"";
-    var fr=(s.refunds||0)+(s.fees||0);
+    var fr=s.refunds==null||s.fees==null?null:s.refunds+s.fees;
+    var guyRates=Object.keys(d.guy||{}).map(function(k){return d.guy[k].rate}).filter(function(x){return x>0});
+    var guyLbl=guyRates.length?"+ Guy "+Math.round(guyRates[0]*100)+"% ":"+ Guy ";
     var blocks='<div class="blocks">'+
       blk("Revenue",money(s.revenue),s.orders!=null?s.orders+" orders · gross, refunds below":"")+
       blk("Net profit",s.profit==null?"—":money(s.profit,true),s.profit==null?profitWhy(s):"margin "+pct(s.margin),s.profit==null?"":s.profit<0?"bad-t":"ok-t")+
       blk("ROAS",x2(s.roas),s.be!=null?"break-even "+x2(s.be):"",s.roas!=null&&s.be!=null?(s.roas>=s.be?"ok-t":"bad-t"):"")+
-      blk("Ad spend",money(s.ads),s.guy_fee!=null?"+ Guy 10% "+money(s.guy_fee):"")+
-      blk("COGS"+cogsTag,money(s.cogs),s.cogs_est_share>0?"KFB rate estimate until real costs land":s.cogs!=null?"real KFB costs":"")+
+      blk("Ad spend",money(s.ads),s.guy_fee?guyLbl+money(s.guy_fee):s.ads!=null?"no media-buyer fee these days":"")+
+      blk("COGS"+cogsTag+(s.cogs_assumed?'<span class="tag bad">33% ASSUMED</span>':''),money(s.cogs),s.cogs_assumed?"no measured rate for some orders":s.cogs_est_share>0?"KFB rate estimate until real costs land":s.cogs!=null?"real KFB costs":"")+
       blk("Orders",s.orders==null?"—":String(s.orders),s.aov!=null?"AOV "+money(s.aov):"")+
       blk("CVR","—","needs Shopify reports access")+
-      blk("Fees &amp; refunds",s.fees==null&&s.refunds==null?"—":money(fr),"fees "+money(s.fees)+" · refunds "+money(s.refunds)+(s.refunds_pending?" ("+money(s.refunds_pending)+" pending)":""))+
+      blk("Fees &amp; refunds",money(fr),"fees "+money(s.fees)+" · refunds "+money(s.refunds)+(s.refunds_pending?" ("+money(s.refunds_pending)+" pending)":""))+
     '</div>';
     var funnel='<div class="box"><div class="lab">Funnel</div><div class="funnel"><div><b style="color:var(--text);font-weight:500">Not wired yet</b><br>Sessions, add to cart and checkout come from Shopify\'s analytics.<br>Each store app needs the read-only <span style="font-family:var(--mono)">read_reports</span> access, with your OK.<br>Until then the funnel and CVR stay blank, never guessed.</div></div></div>';
-    var right='<div class="col">'+(store==="all"?byStore(pr.rows):"")+sureBox(pr.rows,s,isToday)+'</div>';
+    var right='<div class="col">'+(store==="all"?byStore(pr.rows,pr.gap):"")+sureBox(pr.rows,s,pnlSel.day===d.today&&pnlSel.period==="day")+'</div>';
     var table='<div class="box"><div class="lab">Every day · click a row to open it'+(first?' · history starts '+esc(fmtDay(first))+'':'')+'</div><div class="tblwrap"><table class="tbl"><thead><tr><th>Date</th><th>Revenue</th><th>Ad spend</th><th>ROAS</th><th>Orders</th><th>COGS</th><th>Fees+refunds</th><th>Profit</th><th>Status</th></tr></thead><tbody>'+
       (d.days.length?d.days.map(function(r){
         var c=r.profit==null?"":r.profit<0?"bad-t":"ok-t", sel=pnlSel.period==="day"&&r.day===pnlSel.day;
-        return '<tr class="row'+(sel?" sel":"")+'" data-day="'+esc(r.day)+'"><td>'+esc(fmtDay(r.day))+(r.day===d.today?' <span class="tag">today</span>':'')+'</td><td>'+money(r.revenue)+'</td><td>'+money(r.ads)+'</td><td class="'+(r.roas!=null&&r.breakeven_roas!=null?(r.roas>=r.breakeven_roas?"ok-t":"bad-t"):"")+'">'+x2(r.roas)+'</td><td>'+(r.orders==null?"—":r.orders)+'</td><td>'+money(r.cogs)+'</td><td>'+(r.fees==null&&r.refunds==null?"—":money((r.fees||0)+(r.refunds||0)))+'</td><td class="'+c+'">'+(r.profit==null?"—":money(r.profit,true))+'</td><td>'+rowStatus(r,d.today)+'</td></tr>';
+        return '<tr class="row'+(sel?" sel":"")+'" data-day="'+esc(r.day)+'"><td>'+esc(fmtDay(r.day))+(r.day===d.today?' <span class="tag">today</span>':'')+'</td><td>'+money(r.revenue)+'</td><td>'+money(r.ads)+'</td><td class="'+(r.roas!=null&&r.breakeven_roas!=null?(r.roas>=r.breakeven_roas?"ok-t":"bad-t"):"")+'">'+x2(r.roas)+'</td><td>'+(r.orders==null?"—":r.orders)+'</td><td>'+money(r.cogs)+'</td><td>'+(r.fees==null||r.refunds==null?"—":money(r.fees+r.refunds))+'</td><td class="'+c+'">'+(r.profit==null?"—":money(r.profit,true))+'</td><td>'+rowStatus(r,d.today)+'</td></tr>';
       }).join(""):'<tr><td colspan="9" class="empty">No P&amp;L days stored yet.</td></tr>')+'</tbody></table></div></div>';
     return '<div class="col" style="gap:14px">'+head+blocks+'<div class="two">'+funnel+right+'</div>'+table+'</div>';
   }
   /* lHtml is built here from fixed text (+ a tag), never from data. */
   function blk(lHtml,v,s,cls){ return '<div class="blk"><div class="l">'+lHtml+'</div><div class="v '+(cls||"")+'">'+esc(v)+'</div><div class="s">'+esc(s||"")+'</div></div>'; }
   function profitWhy(s){
+    if(s.gap_days) return s.gap_days+" day"+(s.gap_days>1?"s":"")+" in this period not on record yet";
     if(s.missing_stores.length) return "missing a day for "+s.missing_stores.map(storeName).join(", ");
     if(s.missing.length) return "waiting on "+s.missing.join(", ");
     if(s.stale.length) return "stale: "+s.stale.join(", ");
@@ -511,9 +535,12 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
     if(r.complete) return '<span style="color:var(--faint)">final</span>';
     return '<span class="warn-t">open</span>';
   }
-  function byStore(rows){
+  function byStore(rows,gap){
     var per={}; rows.forEach(function(r){ (r.per_store||[]).forEach(function(p){ var o=per[p.store]||(per[p.store]={revenue:0,ads:0,profit:0,rev_ok:true,ads_ok:true,profit_ok:true}); if(p.revenue==null)o.rev_ok=false;else o.revenue+=p.revenue; if(p.ads==null)o.ads_ok=false;else o.ads+=p.ads; if(p.profit==null)o.profit_ok=false;else o.profit+=p.profit; }); });
     var ids=Object.keys(per); if(!ids.length) return "";
+    /* A store with fewer days than the period is missing days: its sums are unknown. */
+    var need=rows.length+(gap||0);
+    ids.forEach(function(id){ var c=0; rows.forEach(function(r){ if((r.per_store||[]).some(function(p){return p.store===id})) c++; }); if(c<need){ per[id].rev_ok=per[id].ads_ok=per[id].profit_ok=false; } });
     return '<div class="box"><div class="lab">By store</div>'+ids.map(function(id){ var o=per[id], roas=o.rev_ok&&o.ads_ok&&o.ads?o.revenue/o.ads:null;
       return '<div class="kv"><span style="color:var(--text)">'+esc(storeName(id))+'</span><b>'+(o.rev_ok?money(o.revenue):"—")+' · <span class="'+(o.profit_ok?(o.profit<0?"bad-t":"ok-t"):"")+'">'+(o.profit_ok?money(o.profit,true):"profit —")+'</span> · '+x2(roas)+'</b></div>'; }).join("")+'</div>';
   }
@@ -530,7 +557,8 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
     var line=function(label,ok,txt){ return '<div class="kv"><span>'+esc(label)+'</span><b class="'+(ok===true?"ok-t":ok===false?"warn-t":"")+'">● '+esc(txt)+'</b></div>'; };
     var f=function(k,label){ var st=feedState(k); return line(label,st.state==="fresh",st.state==="fresh"?"fresh · "+ago(st.last_ok_at):st.state==="not_wired"?"not wired":st.state); };
     var h='<div class="box"><div class="lab">How sure is this '+(pnlSel.period==="day"?"day":"period")+'</div>'+
-      f("shopify.orders","Revenue (Shopify orders)")+f("ads.spend","Ad spend (Google Ads)")+f("shopify.payouts","Fees (Shopify payouts)")+
+      f("shopify.orders","Revenue (Shopify orders)")+f("ads.spend","Ad spend (Google Ads)")+
+      (s.fees==null&&!s.gap_days?line("Fees (Shopify payouts)",false,"not known for this "+(pnlSel.period==="day"?"day":"period")):f("shopify.payouts","Fees (Shopify payouts)"))+
       line("Refunds (by processed date)",s.refunds!=null,s.refunds!=null?"in":"not known yet")+
       line("COGS",s.cogs_est_share==null?null:s.cogs_est_share===0,s.cogs==null?"not known yet":s.cogs_est_share>0?"estimate until KFB costs land":"real")+
       '<div class="note">'+(isToday?"Today is live: numbers move as orders and spend come in. ":"")+'A day turns final once every input has been read after it ended. Unknown is shown as —, never as $0.</div></div>';
@@ -566,17 +594,17 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
     var d=state.departments.find(function(x){return x.id===a.dept})||{name:a.dept}, c=PAL[a.dept];
     var working=workingAgents().indexOf(id)>=0;
     var stLbl={planned:"planned · not built yet",built:"built · shadow (drafts and logs, nothing leaves without you)",shadow:"shadow",live:"live"}[a.status]||a.status;
-    var cached=agentCache[id];
+    var cached=agentCache[id], err=cached&&cached.error;
     var head='<div class="box"><div style="font-size:12px;color:var(--faint)">'+esc(d.name)+' · '+(a.kind==="ai"?"uses Claude":"plain code")+' · '+esc(a.level==="L0"?"proposes, you approve":a.level==="L1"?"acts within limits, reports after":"runs quietly, shows in the brief")+'</div>'+
       '<div style="display:flex;align-items:center;gap:10px;margin-top:4px;flex-wrap:wrap"><span class="sw'+(working?" live":"")+'" style="width:10px;height:10px;background:'+(a.status!=="planned"?c:"none")+';border:1px solid '+c+'"></span><span style="font:600 24px var(--font);letter-spacing:-.01em">'+esc(a.name)+'</span>'+(working?'<span class="tag ok">WORKING NOW</span>':'')+'<span class="tag mut">'+esc(a.status.toUpperCase())+'</span></div>'+
       '<div style="font-size:13.5px;color:var(--dim);margin-top:8px;max-width:720px">'+esc(a.does||"")+'</div><div class="note">'+esc(stLbl)+'. Names can change: tell Claude the name you want.</div></div>';
     var stats='<div class="stats">'+
-      kpi("Actions, last 7 days",cached?String(cached.week.events):"…","")+
-      kpi("AI cost, last 7 days",cached?"$"+Number(cached.week.cost_usd||0).toFixed(2):"…",a.kind==="ai"?"":"plain code: $0")+
-      kpi("Last action",cached&&cached.events.length?ago(cached.events[0].at):cached?"never":"…","")+
+      kpi("Actions, last 7 days",err?"—":cached?String(cached.week.events):"…",err?"couldn't load":"")+
+      kpi("AI cost, last 7 days",err?"—":cached?"$"+Number(cached.week.cost_usd||0).toFixed(2):"…",err?"couldn't load":a.kind==="ai"?"":"plain code")+
+      kpi("Last action",err?"—":cached&&cached.events.length?ago(cached.events[0].at):cached?"never":"…","")+
       kpi("Go-live","per store",a.status==="live"?"live":"shadow everywhere")+'</div>';
     var ev=cached?cached.events:null;
-    var runs='<div class="box"><div class="lab">Latest actions</div>'+(ev==null?'<div class="empty">Loading…</div>':ev.length?'<div class="feed">'+ev.filter(inStore).slice(0,40).map(function(e){
+    var runs='<div class="box"><div class="lab">Latest actions</div>'+(err?'<div class="empty">Couldn\'t load this agent\'s actions ('+esc(err)+'). Retrying shortly.</div>':ev==null?'<div class="empty">Loading…</div>':ev.length?'<div class="feed">'+ev.filter(inStore).slice(0,40).map(function(e){
       return '<div class="r'+(isAlarm(e)?" alarm":"")+'"><span class="tm" title="'+esc(new Date(e.at).toLocaleString())+'">'+esc(hm(e.at))+'</span><span class="dot" style="background:'+colorOf(e.actor)+'"></span><span>'+(e.actor!==id?'<b>'+esc(actorName(e.actor))+'</b> → ':'')+esc(e.summary)+' <span style="color:var(--faint)">· '+esc(ago(e.at))+(e.store?" · "+esc(storeName(e.store)):"")+'</span></span></div>';
     }).join("")+'</div>':'<div class="empty">'+(a.status==="planned"?"Not built yet, so no actions.":"No actions logged yet.")+'</div>')+'</div>';
     var talks={}; (ev||[]).forEach(function(e){ if(e.actor===id&&e.target) talks["→ "+actorName(e.target)]=1; if(e.target===id&&e.actor!==id) talks["← "+actorName(e.actor)]=1; });
@@ -591,7 +619,11 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
     try{ var r=await api("/api/agents/"+encodeURIComponent(id)+"/events"); var j=await r.json(); if(!j.ok) throw new Error(j.error);
       agentCache[id]=j; setTimeout(function(){ delete agentCache[id]; },30000);
       if(route.p==="agents"&&route.a===id&&$("#agentMain")){ $("#agentMain").innerHTML=agentDetail(id); }
-    }catch(e){ agentCache[id]={events:[],week:{events:0,cost_usd:0}}; }
+    }catch(e){
+      /* A failed read is not "0 actions": show it as unknown and retry in 30 s. */
+      agentCache[id]={error:String(e&&e.message||"failed"),events:null,week:null}; setTimeout(function(){ delete agentCache[id]; },30000);
+      if(route.p==="agents"&&route.a===id&&$("#agentMain")) $("#agentMain").innerHTML=agentDetail(id);
+    }
   }
 
   /* department pages: the old Mission Control tabs, restyled */
@@ -615,7 +647,7 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
     h+='<div class="lab" style="margin-top:10px">KFB messages · '+(sup.mode==="live"?"live (to your phone)":"shadow (drafts only)")+'</div>';
     h+=sup.kfbMessages.length?sup.kfbMessages.map(function(m){
       return '<div class="rowx"><div class="msg">'+esc(m.body)+'</div><span class="meta"><span>'+esc(m.local_day)+'</span><span>'+esc(m.mode)+'</span><span>'+esc(m.status==="sent"?"sent "+ago(m.sent_at):m.status)+'</span></span>'+
-        '<div class="btns"><button class="btn" data-copy="'+m.id+'">Copy</button>'+(m.status!=="sent"?'<button class="btn" data-sent="'+m.id+'">Mark sent</button>':"")+'</div></div>';
+        '<div class="btns"><button class="btn" data-copy="'+esc(m.id)+'">Copy</button>'+(m.status!=="sent"?'<button class="btn" data-sent="'+esc(m.id)+'">Mark sent</button>':"")+'</div></div>';
     }).join(""):'<div class="empty">No KFB messages yet. Relay checks once a day after 6:45 pm Eastern.</div>';
     return h;
   }
@@ -629,8 +661,9 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
     h+='<div class="lab" style="margin-top:10px">Parcels · last 60 days</div>'+(keys.length?keys.map(function(k){ return kvx((sh.labels&&sh.labels[k])||k,esc(sh.counts[k]),/failed|pickup_ready|exception/.test(k)?"warn-t":""); }).join(""):'<div class="empty">No parcels yet.</div>');
     h+='<div class="lab" style="margin-top:10px">Needs attention</div>'+(sh.flags.filter(inStore).length?sh.flags.filter(inStore).map(function(f){
       var hot=/day20|failed_delivery|pickup_ready/.test(f.kind);
-      return '<div class="rowx'+(hot?" alarm":"")+'"><b style="font-weight:500">'+esc(f.store_name)+' '+esc(f.order_name)+' · '+esc(f.label)+'</b><span style="color:var(--muted)">'+esc(f.detail)+'</span><span class="meta">'+(f.tracking_number?'<span>'+esc(f.tracking_number)+'</span>':'')+(f.approval_id?'<span>approval '+esc(f.approval_id)+(f.approval_status?' · '+esc(f.approval_status):'')+'</span>':'')+'<span>flagged '+esc(ago(f.raised_at))+'</span></span></div>';
+      return '<div class="rowx'+(hot?" alarm":"")+'"><b style="font-weight:500">'+esc(f.store_name)+' '+esc(f.order_name)+' · '+esc(f.label)+'</b><span style="color:var(--muted)">'+esc(f.detail)+'</span><span class="meta">'+(f.tracking_number?'<span>'+esc(f.tracking_number)+'</span>':'')+(f.last_event_text?'<span>'+esc(String(f.last_event_text).slice(0,80))+'</span>':'')+(f.approval_id?'<span>approval '+esc(f.approval_id)+(f.approval_status?' · '+esc(f.approval_status):'')+'</span>':'')+'<span>flagged '+esc(ago(f.raised_at))+'</span></span></div>';
     }).join(""):'<div class="empty">Nothing stuck, failed or late.</div>');
+    if(sh.registerErrors&&sh.registerErrors.length) h+='<div class="lab" style="margin-top:10px">17TRACK couldn\'t take these numbers</div>'+sh.registerErrors.map(function(r){ return '<div class="rowx"><span>'+esc(r.store_name)+' '+esc(r.order_name)+' · '+esc(r.tracking_number)+'</span><span class="meta"><span>'+esc(r.register_error)+'</span></span></div>'; }).join("");
     return h;
   }
   function moneyHtml(){
@@ -673,20 +706,24 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
     document.querySelectorAll("button[data-google]").forEach(function(b){ b.addEventListener("click",function(){ google(b.dataset.google,b) }) });
     if($("#outConn")) loadConnections();
   }
+  /* Success: refresh soon. Failure: keep the message on screen for 12 s before redrawing. */
+  function afterAction(ok){ if(ok){ busyUntil=0; setTimeout(load,800); } else { busyUntil=Date.now()+12000; clearTimeout(timer); timer=setTimeout(load,12500); } }
   function result(btn,ok,txt){ var out=btn.closest(".card,.rowx"); out.insertAdjacentHTML("beforeend",'<div class="note '+(ok?"ok-t":"bad-t")+'">'+esc(txt)+'</div>'); }
   async function decide(id,choice,btn){
     busyUntil=Date.now()+20000;
     btn.closest(".card").querySelectorAll("button").forEach(function(x){x.disabled=true});
+    var ok=false;
     try{ var r=await api("/api/approvals/"+id+"/decide",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({choice:choice})}); var b=await r.json();
-      result(btn,b.ok,b.ok?(b.status==="approved"?"Approved":"Rejected"):"Not recorded: "+(b.error||"error"));
+      ok=!!b.ok; result(btn,b.ok,b.ok?(b.status==="approved"?"Approved":"Rejected"):"Not recorded: "+(b.error||"error"));
     }catch(e){ result(btn,false,"Couldn't reach the brain. Nothing was recorded."); }
-    busyUntil=0; setTimeout(load,800);
+    afterAction(ok);
   }
   async function markSent(id,btn){
     busyUntil=Date.now()+20000; btn.disabled=true;
-    try{ var r=await api("/api/kfb/"+id+"/sent",{method:"POST"}); var b=await r.json(); result(btn,b.ok,b.ok?"Recorded as sent":"Not recorded: "+(b.error||"error")); }
+    var ok=false;
+    try{ var r=await api("/api/kfb/"+id+"/sent",{method:"POST"}); var b=await r.json(); ok=!!b.ok; result(btn,b.ok,b.ok?"Recorded as sent":"Not recorded: "+(b.error||"error")); if(!b.ok) btn.disabled=false; }
     catch(e){ btn.disabled=false; result(btn,false,"Couldn't reach the brain. Nothing was recorded."); }
-    busyUntil=0; setTimeout(load,800);
+    afterAction(ok);
   }
   async function runSetup(btn){
     busyUntil=Date.now()+30000; btn.disabled=true; var out=btn.closest(".rowx").querySelector(".out"); out.innerHTML='<span class="meta">Working…</span>';

@@ -391,3 +391,15 @@ test("state: /api/state carries the Money tab data, absent stays absent", async 
   assert.equal(hc.refunds.pending.length, 1);
   assert.equal(hc.refunds.byDay[0].pending_n, 1);
 });
+
+test("money jobs: a job failing every tick logs its alarm at most once an hour, with a truthful retry time", async () => {
+  const DB = makeD1();
+  const jobs = [{ job: "ads.spend", actor: "pnl.pullers", run: async () => { throw new Error("boom"); } }];
+  const t0 = Date.parse("2026-10-11T12:00:00Z");
+  for (let i = 0; i < 4; i++) await runMoneyJobs({ DB }, { jobs, nowMs: t0 + i * 15 * 60000 });
+  const e = await evs(DB, "error.money_job");
+  assert.equal(e.length, 1, "four failures in an hour, one alarm row");
+  assert.match(e[0].summary, /about 15 minutes/);
+  await runMoneyJobs({ DB }, { jobs, nowMs: t0 + 61 * 60000 });
+  assert.equal((await evs(DB, "error.money_job")).length, 2, "a new alarm after an hour");
+});

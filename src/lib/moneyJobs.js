@@ -33,15 +33,24 @@ export async function runMoneyJobs(env, { nowMs = Date.now(), jobs = MONEY_JOBS,
       await noteJobResult(env.DB, j.job, bad
         ? `errors: ${results.filter((r) => r.error).map((r) => `${r.store}: ${r.error}`).join(" | ")}`
         : "ok");
-      // Retry a failed run in 30 min rather than waiting a whole interval (rule 6).
+      // Retry a failed run in 30 min rather than waiting a whole interval (rule 6); jobs
+      // that run every 15 min just retry on the next tick.
       if (bad) await retrySoon(env.DB, j.job, every, 30, nowMs);
     } catch (err) {
       out[j.job] = { error: String(err && err.message) };
       await retrySoon(env.DB, j.job, every, 30, nowMs).catch(() => {});
-      await logEvent(env.DB, {
-        actor: j.actor, kind: "error.money_job",
-        summary: `${JOBS[j.job].label} job failed; it will try again in about 30 minutes (${String(err && err.message).slice(0, 200)})`,
-      }).catch(() => {});
+      // A job that keeps failing every 15 minutes would flood the activity feed: log the
+      // same job's failure at most once an hour (the job still retries every tick).
+      const since = new Date(nowMs - 60 * 60000).toISOString();
+      const recent = await env.DB.prepare(`SELECT id FROM events WHERE kind = 'error.money_job' AND actor = ? AND at >= ? LIMIT 1`)
+        .bind(j.actor, since).first().catch(() => null);
+      if (!recent) {
+        await logEvent(env.DB, {
+          actor: j.actor, kind: "error.money_job",
+          summary: `${JOBS[j.job].label} job failed; it will try again in about ${Math.min(every, 30)} minutes (${String(err && err.message).slice(0, 200)})`,
+          at: new Date(nowMs).toISOString(),
+        }).catch(() => {});
+      }
     }
   }
   return out;
