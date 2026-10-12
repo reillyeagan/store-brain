@@ -840,6 +840,11 @@ test("P&L history: one store's days newest first; the group sums stores and is n
   await DB.prepare(`UPDATE order_coverage SET covered_from = '2026-10-03' WHERE store = 'mar'`).run();
   const all4 = await pnlHistory(DB, "all", { nowMs });
   assert.deepEqual(all4.days.find((d) => d.day === "2026-10-01").missing_stores, []);
+  // A store whose history read hasn't finished (no coverage row) is expected as far back as
+  // the others, so those group days stay unknown.
+  await DB.prepare(`DELETE FROM order_coverage WHERE store = 'mar'`).run();
+  const all5 = await pnlHistory(DB, "all", { nowMs });
+  assert.deepEqual(all5.days.find((d) => d.day === "2026-10-01").missing_stores, ["mar"]);
 
   assert.equal((await pnlHistory(DB, "cc", { nowMs })).ok, false, "a store that isn't live has no P&L");
 });

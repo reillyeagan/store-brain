@@ -682,10 +682,15 @@ export async function pnlHistory(db, store = "all", { nowMs = Date.now() } = {})
   // still being filled. Without coverage, fall back to its first row.
   const firstDay = {};
   for (const r of rows) if (!firstDay[r.store] || r.day < firstDay[r.store]) firstDay[r.store] = r.day;
+  const noCoverage = [];
   for (const id of ids) {
     const cov = (await orderCoverage(db, id)).covered_from;
-    if (cov) firstDay[id] = cov;
+    if (cov) firstDay[id] = cov; else noCoverage.push(id);
   }
+  // A live store whose history read hasn't finished is expected as far back as any other
+  // store: until it finishes, those group days are unknown rather than missing its costs.
+  const earliest = Object.values(firstDay).sort()[0];
+  for (const id of noCoverage) if (earliest) firstDay[id] = earliest;
   const byDay = new Map();
   for (const r of rows) { if (!byDay.has(r.day)) byDay.set(r.day, []); byDay.get(r.day).push(r); }
   const days = [];
