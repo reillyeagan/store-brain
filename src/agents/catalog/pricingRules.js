@@ -114,23 +114,29 @@ export function costToUsd(cost, fx = EUR_USD_ESTIMATE) {
     else { amount = Number(cost.amount ?? cost.cost); currency = String(cost.currency || "USD").toUpperCase(); }
   }
   if (!Number.isFinite(amount) || amount <= 0) return null;
-  if (currency === "USD") return { usd: round2(amount), currency, fxEstimated: false, fx: null };
+  // Costs round UP to the cent (never cheaper than they are).
+  if (currency === "USD") return { usd: ceil2(amount), currency, fxEstimated: false, fx: null };
   if (currency === "EUR") {
     const rate = Number(fx);
     if (!Number.isFinite(rate) || rate <= 0) return null;
-    return { usd: round2(amount * rate), currency, fxEstimated: rate === EUR_USD_ESTIMATE, fx: rate, eur: amount };
+    // Converted costs round UP to the cent: a cost must never come out cheaper than it is.
+    return { usd: ceil2(amount * rate), currency, fxEstimated: rate === EUR_USD_ESTIMATE, fx: rate, eur: amount };
   }
   return null; // any other currency: not handled, so not used
 }
 
 const round2 = (n) => Math.round(n * 100) / 100;
-const round4 = (n) => Math.round(n * 10000) / 10000;
+const ceil2 = (n) => Math.ceil(n * 100 - 1e-6) / 100;
 
-/** COGS as a share of price (0.31 = 31%), or null when either side is unknown. */
+/**
+ * COGS as a share of price (0.31 = 31%), or null when either side is unknown.
+ * NOT rounded: band checks compare the exact share, so 33.004% is above a 33% band top
+ * (rounding would have counted it in band — the flattering direction). Round only for display.
+ */
 export function cogsPct(costUsd, price) {
   const c = Number(costUsd), p = Number(price);
   if (!Number.isFinite(c) || !Number.isFinite(p) || c <= 0 || p <= 0) return null;
-  return round4(c / p);
+  return c / p;
 }
 
 const clamp = (p, rules) => Math.min(Math.max(p, rules.floor), rules.ceiling);

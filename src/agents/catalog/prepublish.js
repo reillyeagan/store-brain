@@ -6,8 +6,10 @@
  *   within the rules ($44.95–$144.95, Marlowe $49.95 floor, .95 ending, COGS band if cost is
  *   known), a valid compare-at tier (and which tier it should take if the spread is short),
  *   images, a size option, a size chart in the library, cost on file, title and description,
- *   SEO title/description, and no duplicate handle ("name-1" next to "name").
- * Inputs: `cat_products` (fresh copy), Core costs, `size_charts`, Pricing's tier spread.
+ *   SEO title/description, no duplicate handle ("name-1" next to "name"), and the Supplier's
+ *   Supply Pre-flight (preflightProduct: a confirmed KFB supply line, quoted and not denied).
+ * Inputs: `cat_products` (fresh copy), Core costs (per variant), `size_charts`, Pricing's tier
+ *   spread, Supplier `kfb_quotes` via preflightProduct.
  * Outputs: a `cat_runs` row (per-product checklist) and one digest event per store per day.
  *   Reilly publishes products himself; this never edits, drafts or publishes anything.
  */
@@ -15,7 +17,8 @@ import { logEvent } from "../../lib/eventlog.js";
 import { nowIso } from "../../lib/time.js";
 import { STORES } from "../../config/stores.js";
 import { validatePrice, tierDistribution, assignTier, tierOf } from "./pricingRules.js";
-import { saveRun, readCosts, productCost, getRun } from "./common.js";
+import { saveRun, readCosts, productCost, variantCost, getRun } from "./common.js";
+import { preflightProduct } from "../supplier/index.js";
 
 export const AGENT = "cat.prepublish";
 export const DEFAULT_NEW_DAYS = 3;
@@ -37,6 +40,10 @@ export function checkNewProduct(storeId, p, ctx) {
   if (!hasSize) add("no_size_option", "medium", "No Size option");
   else if (!ctx.hasSizeChart) add("no_size_chart", "low", "No size chart in the library yet");
   if (!ctx.cost) add("cost_unknown", "medium", "No cost on file (KFB quote not in the Core yet)");
+  else if (ctx.cost.partial) add("cost_partial", "low", "Cost on file for only some variants (the others aren't judged on COGS)");
+  // The Supplier's pre-publish gate: a confirmed supply line (quoted, not denied).
+  if (ctx.supply && ctx.supply.error) add("supply_preflight_unavailable", "info", `Supply pre-flight couldn't run: ${ctx.supply.error}`);
+  else if (ctx.supply && !ctx.supply.ok) add("supply_preflight", "medium", `Supply pre-flight: ${(ctx.supply.reasons || []).join("; ")}`);
   if (!p.seo_title || !p.seo_description) add("seo_basics", "info", "SEO title/description not set (Shopify falls back to title/description)");
   const m = /^(.*)-(\d+)$/.exec(p.handle || "");
   if (m && ctx.handles.has(m[1])) add("possible_duplicate", "medium", `Handle looks like a copy of "${m[1]}"`);
@@ -44,7 +51,9 @@ export function checkNewProduct(storeId, p, ctx) {
 
   let suggestedTier = null;
   for (const v of p.variants || []) {
-    const r = validatePrice(storeId, { price: v.price, compareAt: v.compareAt, cost: ctx.cost ? ctx.cost.usd : null });
+    // Each variant on its own cost; a variant with no cost is judged on floor/ceiling/ending only.
+    const vc = ctx.costs ? variantCost(ctx.costs, p, v) : null;
+    const r = validatePrice(storeId, { price: v.price, compareAt: v.compareAt, cost: vc ? vc.usd : null });
     if (!r) continue;
     for (const i of r.issues) {
       if (i.severity === "info") continue;
@@ -62,6 +71,22 @@ export function checkNewProduct(storeId, p, ctx) {
     product_id: p.product_id, handle: p.handle, title: p.title, published_at: p.published_at, created_at: p.created_at,
     passed: !problems.some((x) => x.severity !== "info"), severity: worst, issues: problems, suggested_tier: suggestedTier,
   };
+}
+
+/**
+ * The Supplier's Supply Pre-flight for one product (spec: Catalog's pre-publish gate calls it).
+ * Guarded: if the Supplier tables are missing or it fails, the check says so (info) instead of
+ * failing the whole New-Product Check. Pure read on the Supplier side.
+ */
+export async function supplyCheck(db, storeId, p) {
+  if (!p.handle) return { error: "product has no handle" };
+  try {
+    const prices = (p.variants || []).map((v) => v.price).filter((x) => x != null);
+    const r = await preflightProduct(db, storeId, p.handle, { price: prices.length ? Math.max(...prices) : null });
+    return { ok: !!r.ok, reasons: r.reasons || [], quote_status: r.quote ? r.quote.status : null };
+  } catch (err) {
+    return { error: String(err && err.message).slice(0, 160) };
+  }
 }
 
 export async function runPrepublishStore(env, storeId, products, { nowMs, day }) {
@@ -86,9 +111,13 @@ export async function runPrepublishStore(env, storeId, products, { nowMs, day })
       .map((p) => tierOf(storeId, p.variants[0].price, p.variants[0].compareAt));
     tierCounts = tierDistribution(tiers).counts;
   }
-  const results = fresh.map((p) => checkNewProduct(storeId, p, {
-    cost: productCost(costs, p), hasSizeChart: charted.has(p.product_id), handles, tierCounts,
-  }));
+  const results = [];
+  for (const p of fresh) {
+    results.push(checkNewProduct(storeId, p, {
+      cost: productCost(costs, p), costs, hasSizeChart: charted.has(p.product_id), handles, tierCounts,
+      supply: await supplyCheck(db, storeId, p),
+    }));
+  }
   const rank = { high: 3, medium: 2, low: 1, info: 0 };
   results.sort((a, b) => rank[b.severity] - rank[a.severity]);
   const failed = results.filter((r) => !r.passed).length;

@@ -82,7 +82,7 @@ export function safeJson(s) {
 
 /**
  * Log an event at most once per `withinMin` for the same actor + kind + store, so a problem
- * that persists every 15 minutes can't flood the activity feed (pattern from moneyJobs.js).
+ * that persists on every catalog run can't flood the activity feed (pattern from moneyJobs.js).
  */
 export async function logEventOnce(db, e, nowMs, withinMin = 60) {
   const since = nowIso(nowMs - withinMin * 60000);
@@ -137,9 +137,22 @@ export async function readCosts(db, storeId) {
 }
 
 /**
- * One product's cost. A product-level cost wins; otherwise the DEAREST known variant cost
- * (errors run in the flattering direction, so the brain assumes the higher cost).
- * Returns null when nothing is known ("cost unknown"; never a guess).
+ * One VARIANT's cost: a product-level cost (KFB quotes whole products) applies to every variant;
+ * otherwise that variant's own SKU cost; otherwise null ("cost unknown" — no COGS proposal for it).
+ * A variant never borrows a sibling's cost: a cheap variant judged on a dear one's cost would
+ * get a raise it doesn't need.
+ */
+export function variantCost(costs, product, variant) {
+  const direct = costs.get(`product:${product.product_id}`);
+  if (direct) return direct;
+  return (variant && variant.sku && costs.get(`sku:${variant.sku}`)) || null;
+}
+
+/**
+ * A product-level SUMMARY cost, for counts ("cost known for N products") and for remembering
+ * a hold's cost. A product-level cost wins; otherwise the DEAREST known variant cost (the
+ * conservative side); `partial` says some variants have no cost. Never used to judge one
+ * variant's price — that's variantCost. Null when nothing is known (never a guess).
  */
 export function productCost(costs, product) {
   const direct = costs.get(`product:${product.product_id}`);
@@ -155,15 +168,68 @@ export function productCost(costs, product) {
   return { ...best, partial: known < (product.variants || []).length };
 }
 
+/* ---------------- standing holds ---------------- */
+
 /**
- * H&C standing hold (Reilly, 09-01): outerwear held at $114.95 under band. Recognised by
- * product type or tags; the hold covers COGS findings only (floor/ceiling/ending still apply).
+ * H&C standing hold (Reilly, 09-01, supplier spec): "H&C outerwear held at $114.95 under band.
+ * A held product is never re-proposed unless its cost changes."
+ * Outerwear is recognised the same way everywhere: product type, tags AND title.
+ * The hold covers COGS findings only (floor/ceiling/ending/compare-at still apply).
  */
-const OUTERWEAR = /\b(outerwear|coat|overcoat|topcoat|peacoat|pea coat|parka|jacket|trench|puffer)\b/i;
-export function isHeld(storeId, product, price) {
-  if (storeId !== "hc" || Math.abs(Number(price) - 114.95) > 0.004) return false;
-  const text = [product.product_type || "", ...(product.tags || [])].join(" ");
+export const HOLD_PRICE = 114.95;
+const OUTERWEAR = /\b(outerwear|coats?|overcoats?|topcoats?|peacoats?|pea coats?|parkas?|jackets?|trench|trenchcoats?|puffers?)\b/i;
+
+export function isOuterwear(product) {
+  const text = [product.product_type || "", ...(product.tags || []), product.title || ""].join(" | ");
   return OUTERWEAR.test(text);
+}
+
+/** Could this product/price be under the standing hold? (store + outerwear + $114.95) */
+export function isHoldCandidate(storeId, product, price) {
+  return storeId === "hc" && Math.abs(Number(price) - HOLD_PRICE) <= 0.004 && isOuterwear(product);
+}
+
+/**
+ * Work out which products are held, remembering each hold's cost in `cat_holds`:
+ *  - first sighting → the hold is recorded with today's cost (null if unknown) → held;
+ *  - recorded cost unknown, cost now known → the first known cost is remembered → still held
+ *    (learning the cost is not a change in it);
+ *  - recorded cost known and today's cost differs by a cent or more → NOT held: re-proposed,
+ *    with the reason (the row is kept, so the lift is stable and visible);
+ *  - cost now unknown → still held (unknown is not a change).
+ * Returns Map productId → {held, since, held_cost, cost_now, reason}.
+ */
+export async function resolveHolds(db, storeId, products, costs, nowMs) {
+  const out = new Map();
+  const candidates = products.filter((p) => (p.variants || []).some((v) => isHoldCandidate(storeId, p, v.price)));
+  if (!candidates.length) return out;
+  const { results } = await db.prepare(`SELECT * FROM cat_holds WHERE store = ?`).bind(storeId).all();
+  const rows = new Map((results || []).map((r) => [r.product_id, r]));
+  const at = nowIso(nowMs);
+  for (const p of candidates) {
+    const pc = productCost(costs, p);
+    const now = pc ? pc.usd : null;
+    const row = rows.get(p.product_id);
+    if (!row) {
+      await db.prepare(`INSERT OR IGNORE INTO cat_holds (store, product_id, price, cost_usd, held_at, cost_seen_at) VALUES (?, ?, ?, ?, ?, ?)`)
+        .bind(storeId, p.product_id, HOLD_PRICE, now, at, now == null ? null : at).run();
+      out.set(p.product_id, { held: true, since: at, held_cost: now, cost_now: now, reason: "standing hold: outerwear at $114.95 (Reilly 09-01)" });
+      continue;
+    }
+    if (row.cost_usd == null && now != null) {
+      await db.prepare(`UPDATE cat_holds SET cost_usd = ?, cost_seen_at = ? WHERE store = ? AND product_id = ? AND cost_usd IS NULL`)
+        .bind(now, at, storeId, p.product_id).run();
+      out.set(p.product_id, { held: true, since: row.held_at, held_cost: now, cost_now: now, reason: "standing hold (first known cost remembered)" });
+      continue;
+    }
+    if (row.cost_usd != null && now != null && Math.abs(now - row.cost_usd) >= 0.01) {
+      out.set(p.product_id, { held: false, since: row.held_at, held_cost: row.cost_usd, cost_now: now,
+        reason: `hold lifted: cost changed from ${money(row.cost_usd)} to ${money(now)} since the hold` });
+      continue;
+    }
+    out.set(p.product_id, { held: true, since: row.held_at, held_cost: row.cost_usd, cost_now: now, reason: "standing hold: outerwear at $114.95 (Reilly 09-01)" });
+  }
+  return out;
 }
 
 export const money = (n) => (n == null ? "?" : `$${Number(n).toFixed(2)}`);

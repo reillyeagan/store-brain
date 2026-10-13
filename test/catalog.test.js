@@ -6,13 +6,13 @@ import { encryptToken, _resetGoogleCacheForTests } from "../src/lib/google.js";
 import { EUR_USD_ESTIMATE } from "../src/lib/pnl.js";
 
 import * as R from "../src/agents/catalog/pricingRules.js";
-import { syncStore, getSync, cacheReady, PAGE_SIZE, PRODUCTS_QUERY } from "../src/agents/catalog/sync.js";
-import { checkProduct } from "../src/agents/catalog/pricing.js";
+import { syncStore, getSync, cacheReady, PAGE_SIZE, PAGES_PER_TICK, PRODUCTS_QUERY } from "../src/agents/catalog/sync.js";
+import { checkProduct, SHADOW_NOTE } from "../src/agents/catalog/pricing.js";
 import { judgeProduct, contributionPerDollar } from "../src/agents/catalog/marginGuard.js";
 import { statusProposals } from "../src/agents/catalog/status.js";
-import { checkNewProduct } from "../src/agents/catalog/prepublish.js";
+import { checkNewProduct, supplyCheck } from "../src/agents/catalog/prepublish.js";
 import { findingFromProduct, merchantIdFor } from "../src/agents/catalog/feedHealth.js";
-import { readCosts, productCost, isHeld, claimDaily } from "../src/agents/catalog/common.js";
+import { readCosts, productCost, isHoldCandidate, isOuterwear, resolveHolds, claimDaily } from "../src/agents/catalog/common.js";
 import { runCatalog, catalogState } from "../src/agents/catalog/index.js";
 
 const HC_DOMAIN = "jmzjx1-it.myshopify.com";
@@ -223,13 +223,13 @@ test("sync: full read spreads over ticks with a saved cursor, then deltas use th
   assert.match(PRODUCTS_QUERY, /updatedAt/);
 
   const r1 = await syncStore(env, "hc", { nowMs: NOW, fetchImpl: fake.fetchImpl });
-  assert.equal(r1.read, 3 * PAGE_SIZE);
+  assert.equal(r1.read, PAGES_PER_TICK * PAGE_SIZE);
   assert.equal(r1.completed, false);
   assert.equal(cacheReady(await getSync(env.DB, "hc"), NOW).ready, false, "not trusted before the first full read completes");
   const r2 = await syncStore(env, "hc", { nowMs: NOW + 15 * 60000, fetchImpl: fake.fetchImpl });
   assert.equal(r2.completed, true);
   assert.equal(r2.kind, "full");
-  assert.equal(fake.calls[3].variables.after, "c:30", "resumed from the saved cursor");
+  assert.equal(fake.calls[PAGES_PER_TICK].variables.after, `c:${PAGES_PER_TICK * PAGE_SIZE}`, "resumed from the saved cursor");
   let s = await getSync(env.DB, "hc");
   assert.equal(s.watermark, "2026-10-09T00:00:00Z");
   assert.ok(cacheReady(s, NOW + 20 * 60000).ready);
@@ -281,45 +281,115 @@ function cached(n, opts = {}) {
   };
 }
 
-test("pricing: H&C outerwear held at $114.95 is not re-proposed on COGS; floor still applies elsewhere", () => {
+/** A cost map like readCosts returns: {"product:<gid>": usd, "sku:<SKU>": usd}. */
+const costMap = (o) => new Map(Object.entries(o).map(([k, usd]) => [k, { usd, fxEstimated: false, key: `cost:${k}` }]));
+const pid = (n) => `gid://shopify/Product/${n}`;
+
+test("pricing: a held product is not re-proposed on COGS; floor still applies elsewhere; cost unknown → no COGS judgement", () => {
   const coat = { ...cached(1, { price: 114.95 }), product_type: "Outerwear" };
-  assert.equal(isHeld("hc", coat, 114.95), true);
-  assert.equal(isHeld("aub", coat, 114.95), false);
-  const f = checkProduct("hc", coat, { usd: 45 }); // 39% COGS, but held
+  assert.equal(isHoldCandidate("hc", coat, 114.95), true);
+  assert.equal(isHoldCandidate("aub", coat, 114.95), false);
+  assert.equal(isHoldCandidate("hc", coat, 109.95), false);
+  const f = checkProduct("hc", coat, costMap({ [`product:${pid(1)}`]: 45 }), { held: true }); // 39% COGS, but held
   assert.equal(f.ok, true);
   assert.equal(f.held, true);
-  const shirt = checkProduct("hc", cached(2, { price: 39.95 }), null);
+  const notHeld = checkProduct("hc", coat, costMap({ [`product:${pid(1)}`]: 45 }), null);
+  assert.equal(notHeld.ok, false);
+  const shirt = checkProduct("hc", cached(2, { price: 39.95 }));
   assert.equal(shirt.ok, false);
   assert.equal(shirt.changes[0].new_price, 44.95);
   assert.equal(shirt.cost_usd, null);
 });
 
+test("holds: outerwear found by type, tags or title alike; the hold's cost is remembered and a cost change re-proposes", async () => {
+  const DB = makeD1();
+  const byTitle = { ...cached(1, { price: 114.95 }), title: "Wool Overcoat", product_type: "Apparel", tags: [] };
+  const byTag = { ...cached(2, { price: 114.95 }), product_type: "Apparel", tags: ["Jackets"] };
+  const shirt = { ...cached(3, { price: 114.95 }), product_type: "Shirt" };
+  for (const p of [byTitle, byTag]) assert.equal(isOuterwear(p), true);
+  assert.equal(isOuterwear(shirt), false);
+
+  // Day 1: cost $45 → hold recorded with that cost; product 2's cost is unknown → still held.
+  let holds = await resolveHolds(DB, "hc", [byTitle, byTag, shirt], costMap({ [`product:${pid(1)}`]: 45 }), NOW);
+  assert.equal(holds.get(pid(1)).held, true);
+  assert.equal(holds.get(pid(1)).held_cost, 45);
+  assert.equal(holds.get(pid(2)).held, true);
+  assert.equal(holds.has(pid(3)), false);
+  // Day 2: same cost → held; product 2's first known cost is remembered → held.
+  holds = await resolveHolds(DB, "hc", [byTitle, byTag], costMap({ [`product:${pid(1)}`]: 45, [`product:${pid(2)}`]: 50 }), NOW + 86400000);
+  assert.equal(holds.get(pid(1)).held, true);
+  assert.equal(holds.get(pid(2)).held, true);
+  assert.equal((await DB.prepare(`SELECT cost_usd FROM cat_holds WHERE product_id = ?`).bind(pid(2)).first()).cost_usd, 50);
+  // Day 3: product 1's cost changed → hold lifted and re-proposed, with the reason.
+  const costs = costMap({ [`product:${pid(1)}`]: 48, [`product:${pid(2)}`]: 50 });
+  holds = await resolveHolds(DB, "hc", [byTitle, byTag], costs, NOW + 2 * 86400000);
+  const h = holds.get(pid(1));
+  assert.equal(h.held, false);
+  assert.match(h.reason, /cost changed from \$45\.00 to \$48\.00/);
+  const f = checkProduct("hc", byTitle, costs, h);
+  assert.equal(f.ok, false);
+  assert.ok(f.issues.some((i) => i.code === "hold_lifted"));
+  assert.ok(f.changes[0].new_price > 114.95, "re-proposed to band");
+  // Cost unknown later is not a change → held.
+  holds = await resolveHolds(DB, "hc", [byTag], new Map(), NOW + 3 * 86400000);
+  assert.equal(holds.get(pid(2)).held, true);
+});
+
+test("pricing: each variant is judged on its own cost; a variant without a cost gets no COGS proposal", () => {
+  const p = cached(9, { variants: [variant("A", 74.95), variant("B", 54.95), variant("C", 54.95)] });
+  const costs = costMap({ "sku:SKU-A": 25, "sku:SKU-B": 15 }); // C unknown
+  const f = checkProduct("hc", p, costs);
+  const byVariant = Object.fromEntries(f.changes.map((c) => [c.variant_id.split("/").pop(), c]));
+  assert.equal(byVariant.A.new_price, 75.95, "A: 25/74.95 = 33.4% → raise to 75.95");
+  assert.equal(byVariant.B.new_price, 50.95, "B: 15/54.95 = 27.3% → cut to the dearest .95 at ≥29% (not raised on A's cost)");
+  assert.equal(byVariant.C, undefined, "C: cost unknown → no COGS proposal");
+  assert.equal(f.cost_partial, true);
+  // Margin Guard uses the same per-variant costs.
+  const m = judgeProduct("hc", p, costs);
+  assert.equal(m.cost_usd, 25);
+  assert.equal(m.variants_cost_unknown, 1);
+});
+
+test("rules: COGS is compared unrounded (33.004% is above a 33% band) and EUR costs round up", () => {
+  // $33.00 at $99.99 = 33.0033%: rounding to 4 places would have called it 33.00% (in band).
+  const r = R.validatePrice("hc", { price: 99.99, cost: 33 });
+  assert.ok(r.issues.some((i) => i.code === "cogs_above_band"), "33.003% must not count as in band");
+  assert.equal(R.cogsPct(33.004, 100), 0.33004);
+  assert.equal(R.costToUsd(33.004).usd, 33.01, "a cost never rounds down");
+  assert.ok(R.validatePrice("hc", { price: 100, cost: 33.004 }).issues.some((i) => i.code === "cogs_above_band"));
+  assert.ok(!R.validatePrice("hc", { price: 100, cost: 33 }).issues.some((i) => i.code === "cogs_above_band"), "exactly 33% is in band");
+  assert.equal(R.costToUsd({ eur: 10.01 }).usd, 11.72, "€10.01 × 1.17 = 11.7117 → $11.72, never rounded down");
+});
+
 test("margin guard: unknown cost is never assumed; loss after fees and out-of-band are flagged with break-even ROAS", async () => {
   const DB = makeD1();
-  await DB.prepare(`INSERT INTO core_facts (store, area, key, value, source, observed_at) VALUES ('hc','product','cost:sku:SKU-1','{"eur":30}','test','2026-10-10')`).run();
-  await DB.prepare(`INSERT INTO core_facts (store, area, key, value, source, observed_at) VALUES ('hc','product','cost:product:gid://shopify/Product/2','18','test','2026-10-10')`).run();
+  // Same keys/format the Supplier Quote Desk writes (source "kfb_quote").
+  await DB.prepare(`INSERT INTO core_facts (store, area, key, value, source, observed_at) VALUES ('hc','product','cost:sku:SKU-1','{"eur":30}','kfb_quote','2026-10-10')`).run();
+  await DB.prepare(`INSERT INTO core_facts (store, area, key, value, source, observed_at) VALUES ('hc','product','cost:product:gid://shopify/Product/2','18','kfb_quote','2026-10-10')`).run();
   const costs = await readCosts(DB, "hc");
   const p1 = cached(1, { price: 44.95 }), p2 = cached(2, { price: 64.95 }), p3 = cached(3);
   const c1 = productCost(costs, p1);
   assert.equal(c1.usd, 35.1);
   assert.equal(c1.fxEstimated, true);
   assert.equal(productCost(costs, p3), null, "no cost → null, not 33%");
-  const f1 = judgeProduct("hc", p1, c1); // 78% COGS
+  assert.equal(judgeProduct("hc", p3, costs), null);
+  const f1 = judgeProduct("hc", p1, costs); // 78% COGS
   assert.ok(f1.issues.some((i) => i.code === "cogs_above_band"));
   assert.equal(f1.breakeven_roas, 6.26); // 1 / (0.2191 × 0.881 − 0.0334)
   // 18 / 64.95 = 27.7%: under H&C's 29% band bottom → flagged low (priced above the rules).
-  const f2 = judgeProduct("hc", p2, productCost(costs, p2));
+  const f2 = judgeProduct("hc", p2, costs);
   assert.equal(f2.severity, "low");
   assert.deepEqual(f2.issues.map((i) => i.code), ["cogs_below_band"]);
-  assert.equal(judgeProduct("hc", cached(4, { price: 64.95 }), { usd: 20 }), null, "30.8% is in band");
+  assert.equal(judgeProduct("hc", cached(4, { price: 64.95 }), costMap({ [`product:${pid(4)}`]: 20 })), null, "30.8% is in band");
+  assert.equal(judgeProduct("hc", p1, costs, { held: true }), null, "held: band flags suppressed (and it's not a loss)");
 });
 
 test("margin guard: contribution after refunds and fees, and the loss line", () => {
   assert.equal(contributionPerDollar(0.3), Math.round((0.7 * 0.881 - 0.0334) * 10000) / 10000);
   assert.ok(contributionPerDollar(0.97) < 0);
   const p = cached(1, { price: 44.95 });
-  const f = judgeProduct("hc", p, { usd: 44 });
-  assert.ok(f.issues.some((i) => i.code === "loss_after_fees"));
+  const f = judgeProduct("hc", p, costMap({ [`product:${pid(1)}`]: 44 }), { held: true });
+  assert.ok(f.issues.some((i) => i.code === "loss_after_fees"), "a hold never hides a loss");
   assert.equal(f.breakeven_roas, null, "can't break even at any ROAS");
 });
 
@@ -517,4 +587,49 @@ test("daily claim is atomic: two overlapping runs can't both claim the same day"
   assert.equal(await claimDaily(DB, "x", "2026-10-13", NOW), true);
   assert.equal(await claimDaily(DB, "x", "2026-10-13", NOW), false);
   assert.equal(await claimDaily(DB, "x", "2026-10-14", NOW), true);
+});
+
+test("approval: says when the $144.95 ceiling stops the band, offers the waiver as its own option, and says nothing is written", async () => {
+  const env = await freshEnv();
+  const catalog = [product(1, { price: 144.95 }), product(2, { price: 39.95 })];
+  const fake = fakeShopify(() => catalog);
+  // $60 at $144.95 = 41% COGS: the ceiling stops H&C's 33% band.
+  await env.DB.prepare(`INSERT INTO core_facts (store, area, key, value, source, observed_at) VALUES ('hc','product','cost:sku:SKU-1','60','kfb_quote','2026-10-10')`).run();
+  await runCatalog(env, { nowMs: NOW, fetchImpl: fake.fetchImpl });
+  const ap = (await env.DB.prepare(`SELECT * FROM approvals WHERE requested_by = 'cat.pricing'`).all()).results;
+  assert.equal(ap.length, 1);
+  const opts = JSON.parse(ap[0].options);
+  assert.deepEqual(opts.map((o) => o.id), ["approve_batch", "waive_ceiling", "leave"]);
+  const waive = opts.find((o) => o.id === "waive_ceiling");
+  assert.match(waive.label, /Waive the \$144\.95 ceiling for 1 product/);
+  assert.match(waive.detail, /Product 1: stays \$144\.95/);
+  assert.match(waive.detail, /ceiling stops it reaching its COGS band \(COGS 41\.4% even at \$144\.95\)/);
+  assert.ok(!/Product 1/.test(opts[0].detail), "the capped product isn't in the price batch (no price change)");
+  assert.equal(SHADOW_NOTE, "Shadow: approving records your yes; nothing is written to Shopify — change it yourself.");
+  assert.ok(ap[0].title.includes("approving records your yes; nothing is written to Shopify — change it yourself"));
+  for (const o of opts) assert.ok(o.detail.includes("nothing is written to Shopify — change it yourself"), o.id);
+});
+
+test("new-product check: calls the Supplier's preflightProduct gate and shows its flags; a failing gate doesn't break the check", async () => {
+  const DB = makeD1();
+  const p = { ...cached(1, { price: 64.95 }), handle: "linen-shirt" };
+  const none = await supplyCheck(DB, "hc", p);
+  assert.equal(none.ok, false);
+  assert.match(none.reasons[0], /no KFB quote on file/);
+  const ins = (status, remark, at) => DB.prepare(`INSERT INTO kfb_quotes (store, product_handle, status, cost, currency, quoted_at, remark, source, imported_at) VALUES ('hc','linen-shirt',?,?, 'EUR', ?, ?, 'manual', ?)`)
+    .bind(status, status === "quoted" ? 12 : null, at, remark, at).run();
+  await ins("quoted", null, "2026-10-10T00:00:00Z");
+  assert.equal((await supplyCheck(DB, "hc", p)).ok, true);
+  await ins("denied", "out of stock at factory", "2026-10-12T00:00:00Z");
+  const denied = await supplyCheck(DB, "hc", p);
+  assert.equal(denied.ok, false);
+  assert.match(denied.reasons[0], /KFB denied it: "out of stock at factory"/);
+  const r = checkNewProduct("hc", p, { cost: null, handles: new Set(), tierCounts: null, supply: denied });
+  assert.ok(r.issues.some((i) => i.code === "supply_preflight" && /denied/.test(i.message)));
+  // Supplier tables missing / broken → info, not a crash.
+  const broken = { prepare() { throw new Error("no such table: kfb_quotes"); } };
+  const err = await supplyCheck(broken, "hc", p);
+  assert.match(err.error, /no such table/);
+  const r2 = checkNewProduct("hc", p, { cost: null, handles: new Set(), tierCounts: null, supply: err });
+  assert.ok(r2.issues.some((i) => i.code === "supply_preflight_unavailable" && i.severity === "info"));
 });
