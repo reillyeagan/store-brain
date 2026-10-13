@@ -984,3 +984,15 @@ test("brief: a restated closed day reaches the brief only when money moved by $5
   assert.ok(txt.includes("big one"));
   assert.ok(!txt.includes("penny"));
 });
+
+test("brief: dozens of tiny restatements never push a real alarm out", async () => {
+  const DB = makeD1();
+  const nowMs = Date.parse("2026-10-12T12:05:00Z");
+  await allFresh(DB, nowMs);
+  const { logEvent } = await import("../src/lib/eventlog.js");
+  await logEvent(DB, { actor: "pnl.pullers", kind: "error.money_job", summary: "REAL ALARM", at: iso(nowMs - 7200000) });
+  for (let i = 0; i < 60; i++) await logEvent(DB, { actor: "pnl.ledger", kind: "pnl.restated", store: "hc", summary: "penny", data: { day: "2026-10-10", changed: ["ads"], before: { ads: 1 }, after: { ads: 1.01 } }, at: iso(nowMs - 3600000) });
+  const txt = JSON.stringify(await gatherBriefData({ DB }, { nowMs }));
+  assert.ok(txt.includes("REAL ALARM"));
+  assert.ok(!txt.includes("penny"));
+});

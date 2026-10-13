@@ -173,13 +173,17 @@ export async function gatherBriefData(env, { nowMs = Date.now() } = {}) {
     `SELECT store, amount, processed_at FROM refunds WHERE status LIKE '%PENDING%' AND store IN (${marks}) ORDER BY processed_at`
   ).bind(...LIVE_STORE_IDS).all();
 
-  // Risk: alarms and errors in the last 24 hours.
+  // Risk: alarms and errors in the last 24 hours. Restatements are read separately, so
+  // a run of tiny ones can never push a real alarm out of the list.
   const { results: alarmRows } = await db.prepare(
-    `SELECT kind, store, summary, data FROM events
-      WHERE at >= ? AND (kind IN ('payout.mismatch', 'feed.alarm', 'pnl.restated') OR kind LIKE 'error.%')
+    `SELECT kind, store, summary FROM events
+      WHERE at >= ? AND (kind IN ('payout.mismatch', 'feed.alarm') OR kind LIKE 'error.%')
         AND (? = 1 OR kind NOT LIKE 'error.tracking%')
-      ORDER BY id DESC LIMIT 40`
+      ORDER BY id DESC LIMIT 8`
   ).bind(nowIso(nowMs - 86400000), tracking ? 1 : 0).all();
+  const { results: restatedRows } = await db.prepare(
+    `SELECT kind, store, summary, data FROM events WHERE at >= ? AND kind = 'pnl.restated' ORDER BY id DESC LIMIT 200`
+  ).bind(nowIso(nowMs - 86400000)).all();
   // A restated closed day matters when money moved by $5 or more; penny re-reads of ad
   // spend are noise. Older events without "after" values are kept (can't tell, so show).
   const bigRestatement = (e) => {
@@ -187,7 +191,7 @@ export async function gatherBriefData(env, { nowMs = Date.now() } = {}) {
     if (!d || !d.after || !d.before) return true;
     return (d.changed || []).some((k) => d.before[k] == null || d.after[k] == null || Math.abs(Number(d.after[k]) - Number(d.before[k])) >= 5);
   };
-  const alarms = (alarmRows || []).filter((e) => e.kind !== "pnl.restated" || bigRestatement(e)).slice(0, 8);
+  const alarms = [...(alarmRows || []), ...(restatedRows || []).filter(bigRestatement).slice(0, 4).map(({ kind, store, summary }) => ({ kind, store, summary }))];
 
   const data = {
     brief_day: day,
@@ -628,8 +632,12 @@ export async function rewriteBrief(env, { nowMs = Date.now(), fetchImpl = fetch 
     return { ok: false, error: "A rewrite is already running" };
   }
   if (lastStart && cur.status === "ready") return { ok: false, error: `It was rewritten less than ${REWRITE_MIN_GAP_MIN} minutes ago` };
-  const claim = await db.prepare(`UPDATE briefs SET status = 'rewriting' WHERE id = ? AND created_at = ? AND status IN ('ready', 'rewriting')`)
-    .bind(cur.id, cur.created_at).run();
+  // One statement, so two clicks can't both start a rewrite: 'ready', or a 'rewriting' that
+  // died (no rewrite started in the last few minutes).
+  const claim = await db.prepare(
+    `UPDATE briefs SET status = 'rewriting' WHERE id = ? AND created_at = ? AND (status = 'ready' OR (status = 'rewriting' AND NOT EXISTS
+       (SELECT 1 FROM events WHERE kind = 'brief.rewrite_started' AND at >= ?)))`
+  ).bind(cur.id, cur.created_at, nowIso(nowMs - REWRITE_STALE_MIN * 60000)).run();
   if (!claim.meta || claim.meta.changes !== 1) return { ok: false, error: "The brief changed meanwhile; try again" };
   await logEvent(db, { actor: ACTOR, kind: "brief.rewrite_started", summary: `Morning brief ${day}: rewriting on Reilly's request`, data: { briefId: cur.id }, at });
   try {
