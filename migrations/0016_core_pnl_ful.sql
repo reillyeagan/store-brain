@@ -3,10 +3,10 @@
 -- Fulfillment Order-to-Supplier Watcher.
 -- Additive only: CREATE TABLE IF NOT EXISTS. Nothing existing is renamed, dropped or rewritten.
 
-/* ---------------- Core ---------------- */
+-- ---------------- Core ----------------
 
 -- Everything the Store Brain learns that must also reach Eagano's vault (Reilly 2026-10-11:
--- Eagano "is the TRUE ultimate data hub for EVERYTHING"). The worker only QUEUES; Claude on
+-- Eagano "is the TRUE ultimate data hub for EVERYTHING"). The worker only QUEUES, Claude on
 -- Reilly's PC reads the queue, files each item in the vault, and marks it copied.
 CREATE TABLE IF NOT EXISTS vault_outbox (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS agent_cursors (
   updated_at  TEXT    NOT NULL
 );
 
-/* ---------------- P&L extras ---------------- */
+-- ---------------- P&L extras ----------------
 
 -- Analyst: the code-computed explanation of profit change, per store (or 'all') per day.
 CREATE TABLE IF NOT EXISTS pnl_analysis (
@@ -87,15 +87,15 @@ CREATE TABLE IF NOT EXISTS calendar_reminders (
 -- KFB bills, as the KFB morning session will read them (view only). Empty until then.
 CREATE TABLE IF NOT EXISTS kfb_bills (
   bill_id       TEXT    PRIMARY KEY,
-  kfb_shop_code TEXT,                         -- e.g. jmzjx1-it; the ONLY way a bill is tied to a store
+  kfb_shop_code TEXT,                         -- e.g. jmzjx1-it, the ONLY way a bill is tied to a store
   billed_at     TEXT,
   currency      TEXT    NOT NULL DEFAULT 'EUR',
-  total_eur     REAL,                         -- bill total; null = sum of its lines
-  usd_charged   REAL,                         -- exact USD the card was charged for this bill (decision 3); null = not known yet
+  total_eur     REAL,                         -- bill total, null = sum of its lines
+  usd_charged   REAL,                         -- exact USD the card was charged for this bill (decision 3), null = not known yet
   fx_source     TEXT,                         -- e.g. "wf_alert:<gmail id>"
   paid_at       TEXT,
   imported_at   TEXT    NOT NULL,
-  matched_sig   TEXT                          -- COGS Matcher: the bill's state (lines, EUR, card amount) last matched; differs = re-match
+  matched_sig   TEXT                          -- COGS Matcher: the bill's state (lines, EUR, card amount) last matched, differs = re-match
 );
 
 -- Every line on a KFB bill: parent orders AND all suborders (never filtered by price > 0).
@@ -123,7 +123,7 @@ CREATE TABLE IF NOT EXISTS cogs_matches (
   order_name   TEXT,
   local_day    TEXT    NOT NULL,              -- the order's store day (the P&L day it lands on)
   cost_eur     REAL    NOT NULL,              -- parent + all suborders, incl. fees and shipping
-  cost_usd     REAL,                          -- at the exact card rate; null while waiting on FX
+  cost_usd     REAL,                          -- at the exact card rate, null while waiting on FX
   fx_rate      REAL,
   status       TEXT    NOT NULL,              -- matched | waiting_fx | low_hold (under half the estimate: held as estimate until a later bill or Reilly confirms)
   bill_ids     TEXT,                          -- JSON array
@@ -161,12 +161,12 @@ CREATE TABLE IF NOT EXISTS funnel_runs (
   last_try_at  TEXT    NOT NULL
 );
 
-/* ---------------- Fulfillment ---------------- */
+-- ---------------- Fulfillment ----------------
 
 -- Orders as KFB lists them (filled by the KFB morning session, view only). Empty until then.
 CREATE TABLE IF NOT EXISTS kfb_orders (
   kfb_order_id   TEXT    PRIMARY KEY,
-  kfb_shop_code  TEXT    NOT NULL,            -- ties the order to a store; never the order number alone
+  kfb_shop_code  TEXT    NOT NULL,            -- ties the order to a store, never the order number alone
   order_ref      TEXT    NOT NULL,            -- Shopify order number as KFB shows it
   kfb_created_at TEXT,
   status         TEXT,
