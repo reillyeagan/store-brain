@@ -12,7 +12,7 @@ keep_vars = true
 # Background checks. Every 15 minutes: freshness sentinel + reconciliation pulls.
 # 05:00 UTC daily (~midnight-1am Eastern): day close. Exact close logic lives in code.
 [triggers]
-crons = ["*/15 * * * *", "0 5 * * *"]
+crons = ["*/15 * * * *", "0 5 * * *", "1-59/5 * * * *"]
 
 # The ledger. Create it once with: wrangler d1 create store-brain-ledger
 # then paste the database_id it prints below.

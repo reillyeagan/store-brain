@@ -23,7 +23,8 @@ export const SUPPLIER_DECISIONS = Object.freeze([
 export async function ensureSupplierDecisions(db, { nowMs = Date.now() } = {}) {
   let added = 0;
   for (const d of SUPPLIER_DECISIONS) {
-    const have = await db.prepare(`SELECT id FROM decisions WHERE topic = ? AND words = ? LIMIT 1`).bind(d.topic, d.words).first();
+    // Skip words already recorded under any topic (the Decision Keeper seeds some of the same quotes).
+    const have = await db.prepare(`SELECT id FROM decisions WHERE words = ? LIMIT 1`).bind(d.words).first();
     if (have) continue;
     await db.prepare(`INSERT INTO decisions (at, topic, words, scope, settled) VALUES (?, ?, ?, ?, 1)`).bind(d.at, d.topic, d.words, d.scope).run();
     added++;

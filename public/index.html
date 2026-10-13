@@ -650,6 +650,7 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
     var d=pnlData; if(!d) return "";
     if(!pnlSel.day||pnlSel.day>d.today) pnlSel.day=d.today;
     var pr=periodRows(), s=sumDays(pr.rows,pr.gap), first=d.days.length?d.days[d.days.length-1].day:null;
+    var fun=funnelData(pr);
     var isToday=pr.to===d.today;
     /* Today's spend lags Google by hours, so a period ending today gets no verdict yet. */
     var verdict=s.profit==null?'<span class="tag mut">PROFIT NOT KNOWN</span>':isToday?'<span class="tag">SO FAR · ADS LAG</span>':s.profit>=0?'<span class="tag ok">PROFITABLE</span>':'<span class="tag bad">LOSS</span>';
@@ -668,10 +669,10 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
       blk("Ad spend",money(s.ads),s.guy_fee?guyLbl+money(s.guy_fee):s.ads!=null?"no media-buyer fee these days":"")+
       blk("COGS"+cogsTag+(s.cogs_assumed?'<span class="tag bad">33% ASSUMED</span>':''),money(s.cogs),s.cogs_assumed?"no measured rate for some orders":s.cogs_est_share>0?"KFB rate estimate until real costs land":s.cogs!=null?"real KFB costs":"")+
       blk("Orders",s.orders==null?"—":String(s.orders),s.aov!=null?"AOV "+money(s.aov):"")+
-      blk("CVR","—","needs Shopify reports access")+
+      blk("CVR",fun&&fun.totals&&fun.totals.conversion_rate!=null?pct(fun.totals.conversion_rate,2):"—",fun&&fun.totals&&fun.totals.sessions!=null?fun.totals.sessions.toLocaleString()+" sessions":"funnel not wired yet")+
       blk("Fees &amp; refunds",money(fr),"fees "+money(s.fees)+" · refunds "+money(s.refunds)+(s.refunds_pending?" ("+money(s.refunds_pending)+" pending)":""))+
     '</div>';
-    var funnel='<div class="box"><div class="lab">Funnel</div><div class="funnel"><div><b style="color:var(--text);font-weight:500">Not wired yet</b><br>Sessions, add to cart and checkout come from Shopify\'s analytics.<br>Each store app needs the read-only <span style="font-family:var(--mono)">read_reports</span> access, with your OK.<br>Until then the funnel and CVR stay blank, never guessed.</div></div></div>';
+    var funnel=funnelBox(pr);
     var right='<div class="col">'+(store==="all"?byStore(pr.rows,pr.gap):"")+sureBox(pr.rows,s,pnlSel.day===d.today&&pnlSel.period==="day")+'</div>';
     var trend=trendChart(d.days,pnlSel.day||d.today);
     var table='<div class="box"><div class="lab">Every day · click a row to open it'+(first?' · history starts '+esc(fmtDay(first))+'':'')+'</div><div class="tblwrap"><table class="tbl"><thead><tr><th>Date</th><th>Revenue</th><th>Ad spend</th><th>ROAS</th><th>Orders</th><th>COGS</th><th>Fees+refunds</th><th>Profit</th><th>Status</th></tr></thead><tbody>'+
@@ -710,6 +711,28 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
       rows.forEach(function(r,i){ if(r[k]!=null) g+='<circle cx="'+x(i).toFixed(1)+'" cy="'+y(r[k]).toFixed(1)+'" r="2.2" fill="'+(k==="revenue"?"#b9d3ff":"#ffd36e")+'" pointer-events="none"/>'; }); });
     var key='<span><i style="background:#b9d3ff"></i>revenue</span><span><i style="background:#ffd36e"></i>ad spend</span><span><i style="background:#6fe3b4"></i>profit</span><span><i style="background:#ff8fab"></i>loss</span><span><i style="background:#3a3a44"></i>profit unknown</span><span>faded bar = not final</span>';
     return '<div class="box"><div class="lab" style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px"><span>Last 28 days · click a day</span><span class="legend" style="padding:0;border:0;text-transform:none;letter-spacing:0">'+key+'</span></div><svg class="chart" viewBox="0 0 '+W+' '+H+'" role="img" aria-label="Revenue, ad spend and profit, last 28 days">'+g+'</svg></div>';
+  }
+  /* Shopify sessions funnel for the selected period (null until the funnel feed is wired). */
+  var funCache={};
+  function funnelData(pr){
+    var from=pr.clipped||pr.from, k=store+"|"+from+"|"+pr.to, c=funCache[k];
+    if(!c){ funCache[k]={loading:true}; (async function(){ try{ var r=await api("/api/funnel?store="+encodeURIComponent(store)+"&from="+from+"&to="+pr.to); funCache[k]=await r.json(); }catch(e){ funCache[k]={ok:false,error:"couldn't load"}; }
+      if(route.p==="pnl"&&$("#pnl")&&Date.now()>busyUntil){ var t=$(".tblwrap")?$(".tblwrap").scrollTop:0; $("#pnl").innerHTML=pnlBody(); wirePnl(); if($(".tblwrap")) $(".tblwrap").scrollTop=t; } })(); return null; }
+    return c.ok?c:null;
+  }
+  function funnelBox(pr){
+    var f=funnelData(pr), t=f&&f.totals;
+    if(!f||!t||t.sessions==null){
+      var why=f&&f.status?Object.keys(f.status).map(function(k){return storeName(k)+": "+(f.status[k].reason||f.status[k].state)}).join(" · "):"";
+      return '<div class="box"><div class="lab">Funnel</div><div class="funnel"><div><b style="color:var(--text);font-weight:500">Not wired yet</b><br>Sessions, add to cart and checkout come from Shopify\'s analytics (read_reports).<br>'+(why?esc(why)+'<br>':'')+'Until then the funnel and CVR stay blank, never guessed.</div></div></div>';
+    }
+    var steps=[["Sessions",t.sessions,"of all traffic",null],["Added to cart",t.cart_sessions,"of sessions",t.sessions],["Reached checkout",t.checkout_sessions,"of added to cart",t.cart_sessions],["Orders",t.converted_sessions,"of reached checkout",t.checkout_sessions]];
+    var W=[300,96,64,44], h='';
+    steps.forEach(function(st,i){ var w=t.sessions?Math.max(14,Math.round(300*st[1]/t.sessions)):14;
+      h+='<div style="display:grid;grid-template-columns:1fr 300px 1fr;align-items:center;gap:12px;height:62px"><div style="text-align:right"><div style="font:500 13px var(--font)">'+st[0]+'</div><div class="note" style="margin:0">'+(t.sessions?pct(st[1]/t.sessions,2)+" of sessions":"")+'</div></div>'+
+        '<div style="display:grid;place-items:center"><div style="height:46px;width:'+w+'px;border-radius:6px;background:'+(i===3?"#6fe3b4":"#5f6b78")+';opacity:'+(i===3?.9:.6)+'"></div></div>'+
+        '<div><div style="font:600 17px var(--font)">'+esc(st[1].toLocaleString())+'</div><div class="note" style="margin:0">'+(st[3]?pct(st[1]/st[3],0)+" "+st[2]:st[2])+'</div></div></div>'; });
+    return '<div class="box"><div class="lab">Funnel'+(f.wired?'':' · some stores not wired')+'</div><div style="margin-top:8px">'+h+'</div></div>';
   }
   function blk(lHtml,v,s,cls){ return '<div class="blk"><div class="l">'+lHtml+'</div><div class="v '+(cls||"")+'">'+esc(v)+'</div><div class="s">'+esc(s||"")+'</div></div>'; }
   function profitWhy(s){
@@ -765,7 +788,11 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
   }
 
   /* ---------------- AGENTS ---------------- */
-  var DEPT_PAGES=[["supplier","Supplier · KFB messages","sup"],["shipping","Shipping · parcels","ful"],["money","Money · ads, payouts, refunds","pnl"],["feeds","Feeds · freshness","core"],["setup","Setup · connections","core"]];
+  var DEPT_PAGES=[["cs","Customer Service · inbox & drafts","cs"],["media","Media · ads & Guy","media"],["catalog","Catalog · prices & products","cat"],["risk","Risk · disputes & fraud","risk"],["supplier-agents","Supplier · quotes & sizes","sup"],["supplier","Supplier · KFB messages","sup"],["core","Core · decisions & incidents","core"],["pnl-extras","P&L · analyst & calendar","pnl"],["fulfillment","Fulfillment · order watch","ful"],["money","Money · ads, payouts, refunds","pnl"],["shipping","Shipping · parcels","ful"],["feeds","Feeds · freshness","core"],["setup","Setup · connections","core"]];
+  /* Dashboard page → /api/dept/:id. Everything a department reports is drawn generically. */
+  var DEPT_API={cs:"cs",media:"media",catalog:"catalog",risk:"risk","supplier-agents":"supplier",core:"core","pnl-extras":"pnl",fulfillment:"fulfillment"};
+  var AGENT_PAGE={cs:"cs",media:"media",cat:"catalog",risk:"risk",sup:"supplier-agents",core:"core",pnl:"pnl-extras",ful:"fulfillment"};
+  var deptCache={};
   function agentsPage(){
     var sel=route.a||"core.briefer";
     var list='<nav class="alist"><div class="h">Department pages</div>'+DEPT_PAGES.map(function(d){return '<a href="#/agents/page/'+d[0]+'" class="b'+(route.a==="page"&&route.b===d[0]?" on":"")+'"><span class="sw" style="background:'+PAL[d[2]]+'"></span>'+esc(d[1])+'</a>'}).join("");
@@ -789,7 +816,7 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
     var cached=agentCache[id], err=cached&&cached.error;
     var head='<div class="box"><div style="font-size:12px;color:var(--faint)">'+esc(d.name)+' · '+(a.kind==="ai"?"uses Claude":"plain code")+' · '+esc(a.level==="L0"?"proposes, you approve":a.level==="L1"?"acts within limits, reports after":"runs quietly, shows in the brief")+'</div>'+
       '<div style="display:flex;align-items:center;gap:10px;margin-top:4px;flex-wrap:wrap"><span class="sw'+(working?" live":"")+'" style="width:10px;height:10px;background:'+(isOn(a)?c:"none")+';border:1px solid '+c+'"></span><span style="font:600 24px var(--font);letter-spacing:-.01em">'+esc(a.name)+'</span>'+(working?'<span class="tag ok">WORKING NOW</span>':'')+'<span class="tag mut">'+esc(a.status.toUpperCase())+'</span></div>'+
-      '<div style="font-size:13.5px;color:var(--dim);margin-top:8px;max-width:720px">'+esc(a.does||"")+'</div><div class="note">'+esc(stLbl)+'. Names can change: tell Claude the name you want.</div></div>';
+      '<div style="font-size:13.5px;color:var(--dim);margin-top:8px;max-width:720px">'+esc(a.does||"")+'</div>'+(AGENT_PAGE[a.dept]?'<div class="note"><a href="#/agents/page/'+AGENT_PAGE[a.dept]+'" style="color:var(--blue)">See what this department found →</a></div>':'')+'<div class="note">'+esc(stLbl)+'. Names can change: tell Claude the name you want.</div></div>';
     var stats='<div class="stats">'+
       kpi("Actions, last 7 days",err?"—":cached?String(cached.week.events):"…",err?"couldn't load":"")+
       kpi("AI cost, last 7 days",err?"—":cached?"$"+Number(cached.week.cost_usd||0).toFixed(2):"…",err?"couldn't load":a.kind==="ai"?"":"plain code")+
@@ -824,13 +851,62 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
   function deptPage(p){
     var title=(DEPT_PAGES.find(function(d){return d[0]===p})||[0,"Page"])[1];
     var h='<div class="box"><div style="font:600 20px var(--font)">'+esc(title)+'</div></div><div class="box">';
-    if(p==="supplier") h+=supplierHtml();
+    if(DEPT_API[p]) h+=deptHtml(p);
+    else if(p==="supplier") h+=supplierHtml();
     else if(p==="shipping") h+=shippingHtml();
     else if(p==="money") h+=moneyHtml();
     else if(p==="feeds") h+=feedsHtml();
     else if(p==="setup") h+=setupHtml();
     else h+='<div class="empty">No such page.</div>';
     return h+'</div>';
+  }
+  /* ---- generic department page: draws whatever the department's state contains ---- */
+  function deptHtml(p){
+    var c=deptCache[p];
+    if(!c||Date.now()-c.at>30000){ loadDept(p); if(!c) return '<div class="empty">Loading…</div>'; }
+    if(c.error) return '<div class="empty bad-t">Couldn\'t load this page ('+esc(c.error)+'). Retrying shortly.</div>';
+    return '<div class="note" style="margin:0 0 10px">Shadow mode: everything here is what the agents found or propose. Nothing was sent or changed.</div>'+jsonHtml(c.data,0);
+  }
+  async function loadDept(p){
+    if(deptCache[p]&&deptCache[p].loading) return;
+    deptCache[p]=Object.assign(deptCache[p]||{},{loading:true});
+    try{ var r=await api("/api/dept/"+DEPT_API[p]); var j=await r.json(); if(!j.ok) throw new Error(j.error||("HTTP "+r.status));
+      deptCache[p]={at:Date.now(),data:j.state};
+    }catch(e){ deptCache[p]={at:Date.now(),error:String(e&&e.message||"failed")}; }
+    if(route.p==="agents"&&route.a==="page"&&route.b===p&&$("#agentMain")&&Date.now()>busyUntil) $("#agentMain").innerHTML=deptPage(p);
+  }
+  function human(k){ k=String(k).replace(/_/g," "); return k.charAt(0).toUpperCase()+k.slice(1); }
+  function cell(v){
+    if(v==null) return '<span style="color:var(--faint)">—</span>';
+    if(typeof v==="boolean") return v?'<span class="ok-t">yes</span>':'<span style="color:var(--faint)">no</span>';
+    if(typeof v==="number") return esc(Number.isInteger(v)?v:Math.round(v*100)/100);
+    if(typeof v==="object"){ var t=JSON.stringify(v); return '<span style="color:var(--muted);font-family:var(--mono);font-size:11px">'+esc(t.length>90?t.slice(0,90)+"…":t)+'</span>'; }
+    var str=String(v); if(/^\d{4}-\d{2}-\d{2}T/.test(str)) return '<span title="'+esc(str)+'">'+esc(ago(str))+'</span>';
+    return esc(str.length>140?str.slice(0,140)+"…":str);
+  }
+  function jsonHtml(v,depth){
+    depth=depth||0;
+    if(v==null) return '<div class="note">—</div>';
+    if(Array.isArray(v)){
+      if(!v.length) return '<div class="note">None.</div>';
+      if(v.every(function(x){return x==null||typeof x!=="object"})) return '<div style="font-size:12.5px;color:var(--dim)">'+v.map(function(x){return cell(x)}).join(", ")+'</div>';
+      var cols=[]; v.slice(0,6).forEach(function(o){ if(o&&typeof o==="object") Object.keys(o).forEach(function(k){ if(cols.indexOf(k)<0&&cols.length<8) cols.push(k); }); });
+      return '<div class="tblwrap" style="max-height:420px"><table class="tbl" style="font-size:12px"><thead><tr>'+cols.map(function(k){return '<th style="text-align:left">'+esc(human(k))+'</th>'}).join("")+'</tr></thead><tbody>'+
+        v.slice(0,40).map(function(o){ return '<tr>'+cols.map(function(k){ var x=o&&typeof o==="object"?o[k]:o; return '<td style="text-align:left;vertical-align:top">'+(typeof x==="string"&&x.length>140?'<div style="white-space:pre-wrap;max-width:520px">'+esc(x)+'</div>':cell(x))+'</td>'; }).join("")+'</tr>'; }).join("")+
+        '</tbody></table></div>'+(v.length>40?'<div class="note">+'+(v.length-40)+' more</div>':'');
+    }
+    if(typeof v==="object"){
+      var keys=Object.keys(v), prim=keys.filter(function(k){return v[k]==null||typeof v[k]!=="object"}), nest=keys.filter(function(k){return v[k]!=null&&typeof v[k]==="object"});
+      var h=prim.length?'<div style="margin-bottom:6px">'+prim.map(function(k){ var x=v[k];
+        if(typeof x==="string"&&x.length>140) return '<div class="kv" style="display:block"><span>'+esc(human(k))+'</span><div style="white-space:pre-wrap;color:var(--dim);margin-top:4px">'+esc(x)+'</div></div>';
+        return '<div class="kv"><span>'+esc(human(k))+'</span><b>'+cell(x)+'</b></div>'; }).join("")+'</div>':'';
+      nest.forEach(function(k){
+        h+=depth<1?'<div class="box" style="margin-top:12px;background:var(--panel2)"><div class="lab" style="margin-bottom:8px">'+esc(human(k))+'</div>'+jsonHtml(v[k],depth+1)+'</div>'
+          :'<div class="lab" style="margin:12px 0 6px">'+esc(human(k))+'</div>'+jsonHtml(v[k],depth+1);
+      });
+      return h;
+    }
+    return '<div>'+cell(v)+'</div>';
   }
   function supplierHtml(){
     var sup=state.supplier||{kfbMessages:[],expressToday:[],mode:"shadow"};

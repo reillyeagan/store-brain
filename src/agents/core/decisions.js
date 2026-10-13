@@ -113,7 +113,8 @@ export async function recordDecision(db, { topic, words, scope = "all", at = nul
 export async function seedDecisions(db, { nowMs = Date.now() } = {}) {
   let added = 0;
   for (const s of SEED_DECISIONS) {
-    const have = await db.prepare(`SELECT id FROM decisions WHERE topic = ? AND words = ? LIMIT 1`).bind(s.topic, s.words).first();
+    // Skip words already recorded under any topic (the Supplier seed records some of the same quotes).
+    const have = await db.prepare(`SELECT id FROM decisions WHERE words = ? LIMIT 1`).bind(s.words).first();
     if (have) continue;
     const newer = await db.prepare(`SELECT id FROM decisions WHERE topic = ? LIMIT 1`).bind(s.topic).first();
     if (newer) continue; // the topic already has words from Reilly; the seed doesn't overrule them

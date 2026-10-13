@@ -7,6 +7,10 @@
  *   GET  /api/pnl?store=all|hc|aub|mar    every stored P&L day for the P&L page (key required)
  *   GET  /api/agents/:id/events          one agent's latest events, for its page (key required)
  *   POST /api/brief/rewrite              compose today's brief again from fresh numbers (key required)
+ *   GET  /api/dept/:id                   one department's dashboard data (cs, media, catalog, risk, supplier, core, pnl, fulfillment)
+ *   GET  /api/funnel?store&from&to        Shopify sessions funnel for the P&L page (key required)
+ *   GET  /api/vault/outbox               facts/decisions waiting to be copied to the Eagano vault (key required)
+ *   POST /api/vault/outbox/copied        mark them copied, body {ids:[...]} (key required)
  *   POST /api/approvals/:id/decide       Reilly's decision (key OR a signed phone link)
  *   POST /webhooks/shopify               Shopify webhooks (HMAC-verified per store)
  *   POST /webhooks/17track               17TRACK pushes (`sign` header verified; known numbers re-read from the API)
@@ -27,6 +31,7 @@
  *                 15 min, payouts hourly; throttled in job_runs) → tracking (collect hourly, 17TRACK polls as due, checks)
  *                 → P&L recompute (last 3 days + a few missing history days, every tick) → morning brief (once per day after 08:00 ET)
  *                 → KFB composer (once per day after 18:45 ET) → Freshness Sentinel
+ *   every 5 min   (minutes 1, 6, 11, ...) one department agent run, in rotation (src/agents/index.js)
  *   daily 05:00Z  P&L day close (01:00 EDT / 00:00 EST: "yesterday" is always the day that just ended)
  *
  * Secrets (Reilly adds these in Cloudflare; never in this repo):
@@ -69,6 +74,9 @@ import {
 import { runTracking, handleTrackingPush, shippingState } from "./lib/tracking.js";
 import { runPnlCron, runDayClose, pnlState, pnlHistory } from "./lib/pnl.js";
 import { runBrief, latestBrief, handleBriefPage, briefMode, rewriteBrief } from "./lib/brief.js";
+import { runDepartmentSlot, departmentState, DEPARTMENTS_RUN } from "./agents/index.js";
+import { funnelFor } from "./agents/pnl/index.js";
+import { vaultOutbox, markVaultCopied } from "./agents/core/librarian.js";
 
 export const VERSION = "0.2.0-eagano-llc";
 
@@ -191,6 +199,29 @@ export default {
         if (!isKnownActor(ae[1])) return json({ ok: false, error: "unknown agent" }, 404);
         return json({ ok: true, id: ae[1], ...(await agentEvents(env.DB, ae[1])) });
       }
+      const dm = path.match(/^\/api\/dept\/([a-z]{2,12})$/);
+      if (dm && request.method === "GET") {
+        if (!hasKey(request, env)) return json({ ok: false, error: "unauthorized" }, 401);
+        if (!DEPARTMENTS_RUN[dm[1]]) return json({ ok: false, error: "unknown department" }, 404);
+        return json({ ok: true, dept: dm[1], state: await departmentState(env, dm[1]) });
+      }
+      if (path === "/api/funnel" && request.method === "GET") {
+        if (!hasKey(request, env)) return json({ ok: false, error: "unauthorized" }, 401);
+        const day = (k) => { const v = String(url.searchParams.get(k) || ""); return /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : null; };
+        const from = day("from"), to = day("to");
+        if (!from || !to || from > to) return json({ ok: false, error: "from/to required (YYYY-MM-DD)" }, 400);
+        const r = await funnelFor(env.DB, String(url.searchParams.get("store") || "all").slice(0, 10), from, to);
+        return json(r, r.ok ? 200 : 400);
+      }
+      if (path === "/api/vault/outbox" && request.method === "GET") {
+        if (!hasKey(request, env)) return json({ ok: false, error: "unauthorized" }, 401);
+        return json({ ok: true, items: await vaultOutbox(env.DB, { limit: url.searchParams.get("limit") || 50 }) });
+      }
+      if (path === "/api/vault/outbox/copied" && request.method === "POST") {
+        if (!hasKey(request, env)) return json({ ok: false, error: "unauthorized" }, 401);
+        const body = await request.json().catch(() => ({}));
+        return json({ ok: true, marked: await markVaultCopied(env.DB, Array.isArray(body.ids) ? body.ids : []) });
+      }
       if (path === "/api/brief/rewrite" && request.method === "POST") {
         if (!hasKey(request, env)) return json({ ok: false, error: "unauthorized" }, 401);
         const r = await rewriteBrief(env);
@@ -265,6 +296,10 @@ export default {
   async scheduled(event, env, ctx) {
     ctx.waitUntil(
       (async () => {
+        if (event.cron === "1-59/5 * * * *") {
+          await runDepartmentSlot(env); // never throws
+          return;
+        }
         if (event.cron === "0 5 * * *") {
           try {
             await ensureFeeds(env.DB);

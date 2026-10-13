@@ -201,15 +201,18 @@ test("router: the first tick starts at the newest event; later events with a rea
   await runRouter({ DB }, { nowMs: T0 });
   assert.equal((await evs(DB, "route.handoff")).length, 0); // history isn't replayed
   await logEvent(DB, { actor: "pnl.money_map", kind: "payout.mismatch", summary: "new", store: "hc", at: iso(T0 + 1000) });
-  await logEvent(DB, { actor: "risk.x", kind: "dispute.created", summary: "planned target", at: iso(T0 + 1000) });
+  // Disputes go to the Chargeback Agent (built 2026-10-13, so it's a ready target now).
+  await logEvent(DB, { actor: "risk.x", kind: "dispute.created", summary: "dispute", at: iso(T0 + 1000) });
   const r = await runRouter({ DB }, { nowMs: T0 + 2000 });
-  assert.equal(r.routed, 1);
-  assert.equal(r.waiting, 1);
+  assert.equal(r.routed, 2);
+  assert.equal(r.waiting, 0);
   await runRouter({ DB }, { nowMs: T0 + 3000 });
   const h = await evs(DB, "route.handoff");
-  assert.equal(h.length, 1);
-  assert.equal(h[0].target, "pnl.ledger");
-  assert.equal(h[0].store, "hc");
+  assert.equal(h.length, 2, "each routed once, never again");
+  const ledger = h.find((x) => x.target === "pnl.ledger");
+  assert.ok(ledger);
+  assert.equal(ledger.store, "hc");
+  assert.ok(h.find((x) => x.target === "risk.chargebacks"));
 });
 
 /* ---------------- department entry points ---------------- */

@@ -636,3 +636,24 @@ test("dashboard page: its script parses (a stray quote would leave Reilly with a
   assert.ok(m, "inline script present");
   assert.doesNotThrow(() => new Function(m[1]));
 });
+
+test("departments: the 5-minute cron runs one department per slot, every department at least hourly; /api/dept needs the key", async () => {
+  const { ROTATION, departmentForMinute, DEPARTMENTS_RUN } = await import("../src/agents/index.js");
+  for (const d of Object.keys(DEPARTMENTS_RUN)) assert.ok(ROTATION.includes(d), `${d} runs every hour`);
+  assert.equal(departmentForMinute(1), ROTATION[0]);
+  assert.equal(departmentForMinute(56), ROTATION[11]);
+  const { makeD1 } = await import("./helpers/d1.js");
+  const DB = makeD1();
+  const env = { DB, MC_KEY: "k".repeat(32) };
+  assert.equal((await worker.fetch(new Request("https://b/api/dept/cs"), env)).status, 401);
+  const h = { headers: { "x-store-brain-key": "k".repeat(32) } };
+  assert.equal((await worker.fetch(new Request("https://b/api/dept/nope", h), env)).status, 404);
+  for (const d of Object.keys(DEPARTMENTS_RUN)) {
+    const r = await worker.fetch(new Request(`https://b/api/dept/${d}`, h), env);
+    assert.equal(r.status, 200, d);
+  }
+  // The cron slot never throws, even with no network and nothing wired.
+  let p; const ctx = { waitUntil: (x) => { p = x; } };
+  await worker.scheduled({ cron: "1-59/5 * * * *" }, { DB }, ctx);
+  await p;
+});

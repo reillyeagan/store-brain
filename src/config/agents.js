@@ -24,65 +24,65 @@ const a = (id, dept, name, kind, level, status = "planned") => ({ id, dept, name
 
 export const AGENTS = Object.freeze([
   // Manager (around the Core)
-  a("core.router", "core", "Router", "code", "L2"),
+  a("core.router", "core", "Router", "code", "L2", "built"),
   // Morning brief at 8:00 ET: numbers by code, words by Claude, plain fallback. Shadow until
   // Reilly sets BRIEF_PHONE_LIVE = "1".
   a("core.briefer", "core", "Briefer", "ai", "L2", "built"),
   a("core.approvals", "core", "Approvals Desk", "code", "L1", "built"),
-  a("core.decisions", "core", "Decision Keeper", "code", "L2"),
-  a("core.librarian", "core", "Librarian", "ai", "L2"),
-  a("core.auditor", "core", "Auditor", "ai", "L2"),
-  a("core.incidents", "core", "Incident Desk", "ai", "L1"),
+  a("core.decisions", "core", "Decision Keeper", "code", "L2", "built"),
+  a("core.librarian", "core", "Librarian", "ai", "L2", "built"),
+  a("core.auditor", "core", "Auditor", "ai", "L2", "built"),
+  a("core.incidents", "core", "Incident Desk", "ai", "L1", "built"),
 
   // Media
-  a("media.performance", "media", "Performance Analyst", "ai", "L2"),
-  a("media.search_terms", "media", "Search Terms & Exclusions", "ai", "L0"),
-  a("media.budget", "media", "Budget Strategist", "ai", "L0"),
-  a("media.products", "media", "Product Performance", "code", "L0"),
-  a("media.season", "media", "Keyword & Season", "ai", "L2"),
-  a("media.guy_monitor", "media", "Guy Monitor", "code", "L1"),
-  a("media.conversions", "media", "Conversion Integrity", "code", "L0"),
+  a("media.performance", "media", "Performance Analyst", "ai", "L2", "built"),
+  a("media.search_terms", "media", "Search Terms & Exclusions", "ai", "L0", "built"),
+  a("media.budget", "media", "Budget Strategist", "ai", "L0", "built"),
+  a("media.products", "media", "Product Performance", "code", "L0", "built"),
+  a("media.season", "media", "Keyword & Season", "ai", "L2", "built"),
+  a("media.guy_monitor", "media", "Guy Monitor", "code", "L1", "built"),
+  a("media.conversions", "media", "Conversion Integrity", "code", "L0", "built"),
 
   // Customer service
-  a("cs.triage", "cs", "Inbox Triage", "ai", "L2"),
-  a("cs.order_context", "cs", "Order Context", "code", "L2"),
-  a("cs.reply_writer", "cs", "Reply Writer", "ai", "L0"),
-  a("cs.escalation", "cs", "Escalation Desk", "ai", "L0"),
-  a("cs.obligations", "cs", "Obligations Tracker", "code", "L1"),
-  a("cs.retention", "cs", "Retention", "ai", "L0"),
+  a("cs.triage", "cs", "Inbox Triage", "ai", "L2", "built"),
+  a("cs.order_context", "cs", "Order Context", "code", "L2", "built"),
+  a("cs.reply_writer", "cs", "Reply Writer", "ai", "L0", "built"),
+  a("cs.escalation", "cs", "Escalation Desk", "ai", "L0", "built"),
+  a("cs.obligations", "cs", "Obligations Tracker", "code", "L1", "built"),
+  a("cs.retention", "cs", "Retention", "ai", "L0", "built"),
 
   // Supplier
-  a("sup.quote_desk", "sup", "Quote Desk", "code", "L1"),
-  a("sup.denial_sync", "sup", "Denial Sync", "code", "L0"),
-  a("sup.preflight", "sup", "Supply Pre-flight", "code", "L0"),
-  a("sup.similar_qc", "sup", "\"Similar ones\" QC", "ai", "L0"),
+  a("sup.quote_desk", "sup", "Quote Desk", "code", "L1", "built"),
+  a("sup.denial_sync", "sup", "Denial Sync", "code", "L0", "built"),
+  a("sup.preflight", "sup", "Supply Pre-flight", "code", "L0", "built"),
+  a("sup.similar_qc", "sup", "\"Similar ones\" QC", "ai", "L0", "built"),
   // Relay writes the KFB copy-paste messages. v1 (express asks) is plain code, shadow by default;
   // later asks from email (sizes, addresses) will use AI, hence kind "ai".
   a("sup.relay", "sup", "Relay", "ai", "L0", "built"),
-  a("sup.digest", "sup", "Supplier Digest", "ai", "L2"),
-  a("sup.size_charts", "sup", "Size-Chart Checker", "ai", "L0"),
+  a("sup.digest", "sup", "Supplier Digest", "ai", "L2", "built"),
+  a("sup.size_charts", "sup", "Size-Chart Checker", "ai", "L0", "built"),
   a("sup.scout", "sup", "Sourcing Scout", "ai", "L0"),
-  a("sup.claims", "sup", "Claims & Credits", "code", "L0"),
+  a("sup.claims", "sup", "Claims & Credits", "code", "L0", "built"),
 
   // P&L
-  // Built and running (orders, ads spend, backfill): marked built 2026-10-13.
+  // Built and running (orders, ads spend, backfill, Shopify funnel): marked built 2026-10-13.
   a("pnl.pullers", "pnl", "Data Pullers", "code", "L2", "built"),
-  a("pnl.cogs", "pnl", "COGS Matcher", "code", "L2"),
+  a("pnl.cogs", "pnl", "COGS Matcher", "code", "L2", "built"),
   a("pnl.refunds", "pnl", "Refund Reconciler", "code", "L2", "built"),
   // Daily P&L rows in the ledger (pnl_days). Sheets writing comes later, after the shadow gate.
   a("pnl.ledger", "pnl", "Ledger Keeper", "code", "L2", "built"),
-  a("pnl.analyst", "pnl", "Analyst", "ai", "L2"),
+  a("pnl.analyst", "pnl", "Analyst", "ai", "L2", "built"),
   a("pnl.money_map", "pnl", "Money Map", "code", "L2", "built"),
-  a("pnl.calendar", "pnl", "Tax, Admin & Triggers", "code", "L1"),
+  a("pnl.calendar", "pnl", "Tax, Admin & Triggers", "code", "L1", "built"),
 
   // Risk
-  a("risk.chargebacks", "risk", "Chargeback Agent", "ai", "L0"),
-  a("risk.account_health", "risk", "Account Health", "code", "L2"),
-  a("risk.claims_audit", "risk", "Claims Auditor", "ai", "L0"),
-  a("risk.fraud", "risk", "Fraud Screen", "code", "L0"),
+  a("risk.chargebacks", "risk", "Chargeback Agent", "ai", "L0", "built"),
+  a("risk.account_health", "risk", "Account Health", "code", "L2", "built"),
+  a("risk.claims_audit", "risk", "Claims Auditor", "ai", "L0", "built"),
+  a("risk.fraud", "risk", "Fraud Screen", "code", "L0", "built"),
 
   // Fulfillment
-  a("ful.order_watch", "ful", "Order-to-Supplier Watcher", "code", "L1"),
+  a("ful.order_watch", "ful", "Order-to-Supplier Watcher", "code", "L1", "built"),
   // Tracking Sync: Shopify tracking numbers → 17TRACK, stuck-pickup / failed-delivery flags,
   // proof of delivery to R2. Shadow-safe (nothing reaches a customer).
   a("ful.tracking", "ful", "Tracking Sync", "code", "L1", "off"), // switched off by Reilly 2026-10-13
@@ -92,10 +92,10 @@ export const AGENTS = Object.freeze([
   a("ful.exceptions", "ful", "Exception Fixer", "ai", "L0"),
 
   // Catalog
-  a("cat.pricing", "cat", "Pricing", "code", "L0"),
-  a("cat.margin_guard", "cat", "Margin Guard", "code", "L0"),
-  a("cat.status", "cat", "Product Status", "code", "L1"),
-  a("cat.prepublish", "cat", "New-Product Check", "code", "L2"),
+  a("cat.pricing", "cat", "Pricing", "code", "L0", "built"),
+  a("cat.margin_guard", "cat", "Margin Guard", "code", "L0", "built"),
+  a("cat.status", "cat", "Product Status", "code", "L1", "built"),
+  a("cat.prepublish", "cat", "New-Product Check", "code", "L2", "built"),
   a("cat.feed_health", "cat", "Merchant Center Health", "code", "L0"),
   // Dropped 2026-10-11 (Reilly): content & size notes, import builder, theme desk.
 ]);
@@ -163,20 +163,20 @@ export const AGENT_DOES = Object.freeze({
   "sup.relay": "Writes the daily KFB message for Reilly to copy and paste: express orders, parcels no carrier picked up, and later size, colour and address changes.",
   "sup.digest": "Summarises supplier activity for the brief.",
   "sup.size_charts": "Checks every order's size against the supplier chart and customer complaints, and suggests the right size to send.",
-  "sup.scout": "Looks for better or backup suppliers.",
+  "sup.scout": "Flags product categories that keep failing at KFB (finding new suppliers is out of scope for now).",
   "sup.claims": "Tracks claims and credits owed by KFB.",
   "pnl.pullers": "Pulls orders, ad spend, refunds and fees into the ledger.",
-  "pnl.cogs": "Matches real KFB costs to orders so COGS stops being an estimate.",
+  "pnl.cogs": "Matches real KFB costs to orders so COGS stops being an estimate (waiting on KFB bills).",
   "pnl.refunds": "Books refunds on the day they were processed, PENDING included.",
   "pnl.ledger": "Computes each store's daily P&L, marks days final only when every input is in.",
   "pnl.analyst": "Explains why profit moved.",
   "pnl.money_map": "Tracks Shopify payouts, balances and fees.",
   "pnl.calendar": "Tracks tax, admin deadlines and money triggers.",
   "risk.chargebacks": "Prepares chargeback evidence before the deadline.",
-  "risk.account_health": "Watches Shopify and Merchant Center account health.",
-  "risk.claims_audit": "Audits shipping and supplier claims.",
+  "risk.account_health": "Watches Shopify Payments health, the 90-day dispute rate and the refund rate.",
+  "risk.claims_audit": "Checks storefront promises (delivery times, returns, origin, urgency) against reality.",
   "risk.fraud": "Screens Shopify orders for fraud (rarely needs Reilly).",
-  "ful.order_watch": "Checks every order reached KFB.",
+  "ful.order_watch": "Checks every order reached KFB (waiting on the KFB morning session).",
   "ful.tracking": "Syncs tracking numbers with 17TRACK and flags parcels stuck, waiting for pickup or failed.",
   "ful.late": "Flags day-15 and day-20 parcels and asks Reilly: reship or refund.",
   "ful.exceptions": "Proposes fixes for delivery problems.",

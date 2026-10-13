@@ -27,9 +27,9 @@ export const DIGEST_AFTER_MIN = 7 * 60;
 
 /** Bills summary, or null when no bill has ever been imported (not wired ≠ zero). */
 export async function billsSummary(db, nowMs = Date.now()) {
-  const any = await db.prepare(`SELECT COUNT(*) AS n, MAX(imported_at) AS last FROM kfb_bills`).first();
+  const any = await db.prepare(`SELECT COUNT(*) AS n, MAX(imported_at) AS last FROM supplier_bills`).first();
   if (!any || !any.n) return null;
-  const { results } = await db.prepare(`SELECT currency, COUNT(*) AS n, SUM(amount) AS total, MIN(billed_at) AS oldest FROM kfb_bills WHERE status = 'unpaid' GROUP BY currency`).all();
+  const { results } = await db.prepare(`SELECT currency, COUNT(*) AS n, SUM(amount) AS total, MIN(billed_at) AS oldest FROM supplier_bills WHERE status = 'unpaid' GROUP BY currency`).all();
   const unpaid = (results || []).reduce((m, r) => m + r.n, 0);
   const oldest = (results || []).map((r) => r.oldest).sort()[0] || null;
   return {
@@ -44,7 +44,7 @@ export async function importBills(db, rows, { source = "manual", nowMs = Date.no
   for (const b of rows || []) {
     if (!b || !b.bill_id || !(Number(b.amount) > 0) || !b.billed_at) continue;
     const r = await db.prepare(
-      `INSERT INTO kfb_bills (bill_id, store, amount, currency, billed_at, paid_at, status, source, imported_at) VALUES (?,?,?,?,?,?,?,?,?)
+      `INSERT INTO supplier_bills (bill_id, store, amount, currency, billed_at, paid_at, status, source, imported_at) VALUES (?,?,?,?,?,?,?,?,?)
        ON CONFLICT(bill_id) DO UPDATE SET paid_at = excluded.paid_at, status = excluded.status, imported_at = excluded.imported_at`
     ).bind(String(b.bill_id), b.store ?? null, Number(b.amount), String(b.currency || "EUR").toUpperCase(), b.billed_at,
       b.paid_at ?? null, b.paid_at ? "paid" : "unpaid", source, nowIso(nowMs)).run();

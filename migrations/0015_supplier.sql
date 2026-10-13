@@ -180,7 +180,9 @@ CREATE TABLE IF NOT EXISTS kfb_credits (
 );
 
 -- INPUT: KFB bills (the KFB session reads them; Reilly pays them).
-CREATE TABLE IF NOT EXISTS kfb_bills (
+-- Bills to pay each morning (amount, paid or not). Named supplier_bills: kfb_bills (0016)
+-- holds the line-level bill detail the COGS Matcher uses.
+CREATE TABLE IF NOT EXISTS supplier_bills (
   bill_id        TEXT    PRIMARY KEY,
   store          TEXT,
   amount         REAL    NOT NULL,
