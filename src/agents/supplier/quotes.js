@@ -36,6 +36,8 @@ import { nowIso } from "../../lib/time.js";
 import { EUR_USD_ESTIMATE } from "../../lib/pnl.js";
 import { planVariantPrice, rulesFor } from "./pricing.js";
 import { DEPT, handleFrom, logOnce, money } from "./common.js";
+// Same outerwear test as Catalog's hold (plurals, topcoat, puffer, tags), so the two never disagree.
+import { isOuterwear } from "../catalog/common.js";
 
 const ACTOR = "sup.quote_desk";
 const DENIAL_ACTOR = "sup.denial_sync";
@@ -151,7 +153,7 @@ export const MAX_VARIANT_PAGES_PER_RUN = 6;
 
 export const PRODUCTS_BY_HANDLE_QUERY = `query SupplierQuoteProducts($q: String!) {
   products(first: ${PRODUCTS_PAGE}, query: $q) {
-    nodes { id handle title status productType
+    nodes { id handle title status productType tags
       variantsCount { count }
       variants(first: ${VARIANTS_PAGE}) { nodes { id title sku price compareAtPrice } pageInfo { hasNextPage endCursor } } }
   }
@@ -198,7 +200,6 @@ const sameId = (a, b) => !!a && !!b && (a === b || String(a).split("/").pop() ==
 /** H&C outerwear standing hold (Reilly 09-01): held at $114.95 under band. */
 const HC_OUTERWEAR_HOLD = 114.95;
 const HC_OUTERWEAR_WORDS = "H&C outerwear held at $114.95 under band (Reilly 09-01)";
-const OUTERWEAR_RE = /\b(outerwear|coat|overcoat|jacket|parka|peacoat|trench)\b/i;
 
 /** A batch nobody answered lapses after this long, so a store is never blocked forever. */
 export const BATCH_EXPIRE_DAYS = 3;
@@ -495,7 +496,7 @@ export function planProduct(store, handle, quotes, product, hold = null, fx = FX
       return { ...base, kind: "held", reason: `held at ${money(hold.held_price)}${hold.words ? ` ("${hold.words}")` : ""}; cost unchanged` };
     }
     base.notes.push(`was held at ${money(hold.held_price)}; cost moved ${money(hold.cost_at_hold)} → ${money(first.cost_usd)}, so it is proposed again`);
-  } else if (!hold && store === "hc" && atPrice(HC_OUTERWEAR_HOLD) && OUTERWEAR_RE.test(`${product.productType || ""} ${product.title || ""}`)) {
+  } else if (!hold && store === "hc" && atPrice(HC_OUTERWEAR_HOLD) && isOuterwear({ product_type: product.productType, tags: product.tags || [], title: product.title })) {
     return { ...base, kind: "held", seedHold: { held_price: HC_OUTERWEAR_HOLD, cost_at_hold: first.cost_usd, words: HC_OUTERWEAR_WORDS },
       reason: `${HC_OUTERWEAR_WORDS}: not re-proposed while the cost stays ${money(first.cost_usd)}` };
   }
