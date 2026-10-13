@@ -22,7 +22,7 @@
  * Pickup asks are per PARCEL: their kind is `pickup:<tracking number>`, so a second
  * parcel of the same order that gets stuck later is still asked about, once.
  */
-import { STORES, STORE_IDS, LIVE_STORE_IDS } from "../config/stores.js";
+import { STORES, STORE_IDS, LIVE_STORE_IDS, parcelTrackingOn } from "../config/stores.js";
 import { logEvent } from "./eventlog.js";
 import { evaluateFeeds } from "./freshness.js";
 import { sendPhone, phoneReady } from "./phone.js";
@@ -197,7 +197,8 @@ export async function runKfbComposer(env, { nowMs = Date.now(), fetchImpl = fetc
     // Pickup lines come from the tracking ledger. A fault there must not cost the express asks.
     let pickups = [];
     try {
-      pickups = await pickupCandidates(db, nowMs);
+      // Parcel tracking is off (Reilly, Oct 13): no carrier-pickup lines from old statuses.
+      pickups = parcelTrackingOn(env) ? await pickupCandidates(db, nowMs) : [];
     } catch (err) {
       await logEvent(db, {
         actor: ACTOR, kind: "error.kfb_pickup_lines", target: "sys.kfb",

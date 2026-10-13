@@ -796,14 +796,19 @@ export async function trackingOff(env, nowMs = Date.now()) {
   const open = await db.prepare(`UPDATE shipment_flags SET resolved_at = ? WHERE resolved_at IS NULL`).bind(at).run();
   const cleared = (open && open.meta && open.meta.changes) || 0;
   await db.prepare(`DELETE FROM feeds WHERE id = ?`).bind(FEED_ID).run();
-  if (!had || cleared) {
+  // Reship-or-refund questions from the switched-off Late-Shipment Watcher are withdrawn,
+  // not answered: 'expired' is not a decision and never runs anything.
+  const ap = await db.prepare(`UPDATE approvals SET status = 'expired', decided_at = ? WHERE status = 'pending' AND requested_by = ?`).bind(at, LATE_ACTOR).run();
+  const withdrawn = (ap && ap.meta && ap.meta.changes) || 0;
+  if (!had || cleared || withdrawn) {
     await logEvent(db, {
       actor: ACTOR, kind: "tracking.switched_off",
-      summary: `Parcel tracking is off (Reilly, Oct 13): 17TRACK and the day-15/day-20 parcel flags stopped` + (cleared ? `; ${cleared} open parcel flag${cleared === 1 ? "" : "s"} cleared` : ""),
-      data: { cleared }, at,
+      summary: `Parcel tracking is off (Reilly, Oct 13): 17TRACK and the day-15/day-20 parcel flags stopped` + (cleared ? `; ${cleared} open parcel flag${cleared === 1 ? "" : "s"} cleared` : "") +
+        (withdrawn ? `; ${withdrawn} reship-or-refund question${withdrawn === 1 ? "" : "s"} withdrawn (not answered)` : ""),
+      data: { cleared, withdrawn }, at,
     });
   }
-  return { off: true, cleared };
+  return { off: true, cleared, withdrawn };
 }
 
 export async function runTracking(env, { nowMs = Date.now(), fetchImpl = fetch, sleep = sleepDefault } = {}) {

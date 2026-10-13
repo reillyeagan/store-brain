@@ -270,7 +270,7 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
   function isAlarm(e){ return /alarm|error|failed|mismatch/i.test(e.kind||""); }
   function recentEvents(){ var now=Date.now(); return (state.events||[]).filter(function(e){return now-Date.parse(e.at)<WORKING_MS&&inStore(e)}); }
   function workingAgents(){ var set={}; recentEvents().forEach(function(e){ if(agentOf(e.actor)) set[e.actor]=1; }); return Object.keys(set); }
-  function builtCount(){ return (state.agents||[]).filter(function(a){return a.status!=="planned"}).length; }
+  function builtCount(){ return (state.agents||[]).filter(isOn).length; }
 
   /* Don't redraw under a text selection (e.g. copying part of a KFB message). */
   function selecting(){ var sel=window.getSelection&&window.getSelection(); return !!(sel&&!sel.isCollapsed&&$("#page")&&$("#page").contains(sel.anchorNode)); }
@@ -352,7 +352,7 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
       var y=st.yesterday||{}, rows=days?days.map(function(r){ var p=(r.per_store||[]).find(function(q){return q.store===st.id}); return {day:r.day,revenue:p?p.revenue:null,profit:p?p.profit:null}; }):null;
       var roas=y.roas, be=y.breakeven_roas, frac=roas!=null&&be?Math.min(1,roas/(be*2)):0, R=24, C=2*Math.PI*R, ok=roas!=null&&be!=null&&roas>=be;
       var ring='<svg class="ring" viewBox="0 0 58 58"><circle cx="29" cy="29" r="'+R+'" fill="none" stroke="#24242b" stroke-width="5"/>'+
-        (roas!=null?'<circle cx="29" cy="29" r="'+R+'" fill="none" stroke="'+(ok?"#6fe3b4":"#ff8fab")+'" stroke-width="5" stroke-linecap="round" stroke-dasharray="'+(C*frac).toFixed(1)+' '+C.toFixed(1)+'" transform="rotate(-90 29 29)"/>':'')+
+        (roas!=null&&be?'<circle cx="29" cy="29" r="'+R+'" fill="none" stroke="'+(ok?"#6fe3b4":"#ff8fab")+'" stroke-width="5" stroke-linecap="round" stroke-dasharray="'+(C*frac).toFixed(1)+' '+C.toFixed(1)+'" transform="rotate(-90 29 29)"/>':'')+
         (be?'<line x1="29" y1="'+(29-R-4)+'" x2="29" y2="'+(29-R+4)+'" stroke="#e8e8ea" stroke-width="1.5" transform="rotate(180 29 29)"/>':'')+
         '<text x="29" y="32" text-anchor="middle" style="font:600 11px Inter;fill:#e8e8ea">'+(roas==null?"—":roas.toFixed(1)+"x")+'</text></svg>';
       var c={hc:"#b9d3ff",aub:"#ffb38a",mar:"#b69cff"}[st.id]||"#b9d3ff";
@@ -370,7 +370,7 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
       kpi("Yesterday ROAS",x2(y.roas),be!=null?"dashed line = break-even "+x2(be):"",y.roas!=null&&be!=null?(y.roas>=be?"ok-t":"bad-t"):"",spark(days,"roas",{color:"#7cc4ff",ref:be}),"#7cc4ff")+
       kpi("Agents running",w.length+" working now",builtCount()+" of "+state.agents.length+" built",null,agentBar(),"#b69cff")+'</div>';
     var map='<div class="mapbox"><svg id="map" viewBox="0 0 1200 860" role="img" aria-label="Every agent and the systems they use; working agents pulse, moving dots are real hand-offs">'+mapSvg()+'</svg>'+
-      '<div class="legend"><span><i style="border:1px solid var(--good);box-shadow:0 0 0 3px rgba(111,227,180,.2)"></i>working now</span><span><i style="background:var(--accent)"></i>built</span><span><i style="border:1px solid var(--faint)"></i>planned</span><span><i style="border:1px solid var(--accent);background:none;outline:1px solid rgba(185,211,255,.35);outline-offset:2px"></i>uses Claude</span><span>solid line = live wire · dashed = not built yet</span><span>ring around a department = how much is built</span><span>moving dots = real hand-offs</span></div></div>';
+      '<div class="legend"><span><i style="border:1px solid var(--good);box-shadow:0 0 0 3px rgba(111,227,180,.2)"></i>working now</span><span><i style="background:var(--accent)"></i>built</span><span><i style="border:1px solid var(--faint)"></i>planned</span><span><i style="border:1px solid var(--accent);background:none;outline:1px solid rgba(185,211,255,.35);outline-offset:2px"></i>uses Claude</span><span>solid line = built · dashed = not built yet</span><span>ring around a department = how much is built</span><span>moving dots = real hand-offs</span></div></div>';
     var n=needs();
     var wait='<div class="lab" style="display:flex;justify-content:space-between;margin-bottom:12px"><span>Waiting on you · '+n.length+'</span><a href="#/brief" style="text-transform:none;letter-spacing:0;color:var(--muted)">open Brief →</a></div><div class="col" style="gap:10px">'+
       (n.length?n.slice(0,5).map(function(x){ return '<a href="'+(x.href||"#/brief")+'" style="text-decoration:none"><div class="card" style="border-left-color:'+x.color+'"><div class="t">'+esc(x.title)+'<span>'+esc(x.who)+'</span></div><div class="d">'+esc(x.detail)+'</div></div></a>'; }).join(""):'<div class="card" style="border-left-color:var(--good)"><div class="d">Nothing is waiting on you.</div></div>')+'</div>';
@@ -462,7 +462,7 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
     nodes+='<circle cx="'+CORE.x+'" cy="'+CORE.y+'" r="56" fill="none" stroke="#b9d3ff" stroke-opacity=".35" stroke-dasharray="2 7" class="spin"/>'+
       '<circle cx="'+CORE.x+'" cy="'+CORE.y+'" r="48" fill="none" stroke="#b9d3ff" stroke-opacity=".18"/>'+
       '<circle cx="'+CORE.x+'" cy="'+CORE.y+'" r="40" fill="url(#coreG)" stroke="#b9d3ff" stroke-width="1.4" filter="url(#glow)"/>';
-    labels+='<text x="'+CORE.x+'" y="'+(CORE.y-1)+'" text-anchor="middle" class="hub" style="font-size:13px">Core</text><text x="'+CORE.x+'" y="'+(CORE.y+13)+'" text-anchor="middle" class="sub">'+state.events.length+' events</text>';
+    labels+='<text x="'+CORE.x+'" y="'+(CORE.y-1)+'" text-anchor="middle" class="hub" style="font-size:13px">Core</text><text x="'+CORE.x+'" y="'+(CORE.y+13)+'" text-anchor="middle" class="sub">event log</text>';
     // systems (outer ring)
     Object.keys(SYS_POS).forEach(function(id){ var p=g.pos[id], s=(state.systems||[]).find(function(x){return x.id===id}); if(!s) return;
       var w=s.name.length*6.8+28, hot=recent.some(function(e){return e.target===id});

@@ -773,3 +773,23 @@ test("switched off (Reilly, Oct 13): no 17TRACK calls, open flags cleared, decis
   const push = await handleTrackingPush(new Request("https://b/webhooks/17track", { method: "POST", body: "{}" }), env);
   assert.equal(push.status, 200);
 });
+
+test("switched off: pending reship-or-refund questions are withdrawn (expired, never decided); tonight's KFB message has no pickup lines", async () => {
+  const { runTracking } = await import("../src/lib/tracking.js");
+  const { createApproval } = await import("../src/lib/approvals.js");
+  const DB = makeD1();
+  const a = await createApproval(DB, { dept: "ful", requestedBy: "ful.late", title: "#1 day 20", options: [{ id: "reship", label: "Reship" }], store: "aub" });
+  await runTracking({ DB });
+  const row = await DB.prepare(`SELECT status, choice FROM approvals WHERE id = ?`).bind(a.id || a).first();
+  assert.equal(row.status, "expired");
+  assert.equal(row.choice, null, "not recorded as Reilly's answer");
+  assert.equal((await listPending(DB)).length, 0);
+  // A parcel 17TRACK called "awaiting pickup" this morning (fresh status): with tracking on
+  // it becomes a pickup line; with tracking off it must not reach tonight's message.
+  const now = Date.parse("2026-10-13T23:00:00Z");
+  const seed = async (db) => db.prepare(`INSERT INTO shipments (store, order_id, order_name, order_created_at, tracking_number, shipped_at, registered_at, state, last_status, polled_at, updated_at)
+    VALUES ('hc', 'o9', '#9', '2026-10-05T12:00:00Z', 'UL123456789YP', '2026-10-06T12:00:00Z', '2026-10-06T13:00:00Z', 'awaiting_pickup', 'InfoReceived', '2026-10-13T12:00:00Z', '2026-10-13T12:00:00Z')`).run();
+  const body = async (env) => { await seed(env.DB); await runKfbComposer(env, { nowMs: now }); const m = await env.DB.prepare(`SELECT body FROM kfb_messages ORDER BY id DESC LIMIT 1`).first(); return m ? m.body : ""; };
+  assert.match(await body({ DB: makeD1(), PARCEL_TRACKING: "1" }), /UL123456789YP/, "control: with tracking on the parcel is a pickup line");
+  assert.doesNotMatch(await body({ DB: makeD1() }), /UL123456789YP/, "tracking off: no pickup line");
+});
