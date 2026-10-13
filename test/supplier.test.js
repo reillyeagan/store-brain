@@ -376,6 +376,16 @@ test("planProduct: a hold is not re-proposed unless the cost changed", () => {
   assert.equal(seeded.seedHold.cost_at_hold, 50, "the cost at hold time is recorded");
 });
 
+test("planProduct: outerwear hold uses Catalog's test (plurals, topcoat, tags)", () => {
+  const q = [{ id: 1, variant_id: "", status: "quoted", cost: 50, currency: "USD", similar: 0 }];
+  const topcoat = asRead(product("navy-topcoat", { price: "114.95", title: "Navy Topcoat", productType: "Coats & Jackets" }));
+  assert.equal(planProduct("hc", "navy-topcoat", q, topcoat).kind, "held");
+  const tagged = asRead({ ...product("quilted", { price: "114.95", title: "Quilted Layer", productType: "Layers" }), tags: ["Puffers"] });
+  assert.equal(planProduct("hc", "quilted", q, tagged).kind, "held");
+  const sweater = asRead(product("knit", { price: "114.95", title: "Heavy Knit", productType: "Sweaters" }));
+  assert.equal(planProduct("hc", "knit", q, sweater).kind, "reprice");
+});
+
 test("Quote Desk: H&C outerwear hold records its cost and is proposed again when the cost changes", async () => {
   const DB = makeD1();
   const coat = { "jmzjx1-it.myshopify.com": [product("wool-coat", { price: "114.95", title: "Wool Overcoat", productType: "Outerwear" })] };
