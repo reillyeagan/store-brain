@@ -179,7 +179,7 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
   </form>
 </div>
 
-<div class="gate" id="loading"><div style="display:grid;gap:10px;justify-items:center;color:var(--muted)"><div style="font:600 18px var(--font);color:var(--text)">Eagano LLC</div><div><span class="dot live" style="background:var(--good);margin-right:8px"></span>Waking the brain…</div></div></div>
+<div class="gate" id="loading"><div style="display:grid;gap:10px;justify-items:center;color:var(--muted)"><div style="font:600 18px var(--font);color:var(--text)">Eagano LLC</div><div id="loadMsg"><span class="dot live" style="background:var(--good);margin-right:8px"></span>Waking the brain…</div></div></div>
 <div class="shell" id="app" hidden>
   <aside class="side">
     <div class="brand">Eagano LLC</div>
@@ -244,7 +244,7 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
       if(Date.now()>busyUntil&&!selecting()) render();
     }catch(err){
       $("#status").innerHTML='<span class="bad">Can\'t reach the brain: '+esc(err.message)+'</span>';
-      if(!$("#loading").hidden) $("#loading").querySelector("div div:last-child").innerHTML='<span class="bad-t">Can\'t reach the brain ('+esc(err.message)+'). Retrying…</span>';
+      if(!$("#loading").hidden) $("#loadMsg").innerHTML='<span class="bad-t">Can\'t reach the brain ('+esc(err.message)+'). Retrying…</span>';
     }
     clearTimeout(timer); timer=setTimeout(load,document.hidden?60000:10000);
   }
@@ -434,7 +434,7 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
   /* A gentle curve between two points, bowed towards the Core so wires read as one system. */
   function arc(a,b,bend){ var mx=(a.x+b.x)/2, my=(a.y+b.y)/2, k=bend==null?.28:bend; var cx=mx+(CORE.x-mx)*k, cy=my+(CORE.y-my)*k; return "M"+a.x+" "+a.y+" Q"+cx.toFixed(1)+" "+cy.toFixed(1)+" "+b.x+" "+b.y; }
   /* What the map depends on: who acted in the last 2 minutes (and with whom), the store filter. */
-  function mapKey(){ return store+"|"+recentEvents().slice(0,24).map(function(e){return e.id}).join(",")+"|"+builtCount(); }
+  function mapKey(){ return store+"|"+recentEvents().map(function(e){return e.id}).join(",")+"|"+builtCount(); }
   function mapSvg(){
     var g=geometry(), defs="", bg="", wires="", lines="", anim="", nodes="", labels="";
     var recent=recentEvents(), working={};
