@@ -7,6 +7,8 @@ import { runFulfillment, fulfillmentState } from "../src/agents/fulfillment/inde
 import { upsertOrder } from "../src/lib/shopifyWebhooks.js";
 import { ensureFeeds, markFeedOk } from "../src/lib/freshness.js";
 import { STORES } from "../src/config/stores.js";
+import { logEvent } from "../src/lib/eventlog.js";
+import { runIncidents } from "../src/agents/core/incidents.js";
 
 const iso = (ms) => new Date(ms).toISOString();
 const evs = async (DB, kind) => (await DB.prepare(`SELECT * FROM events WHERE kind = ? ORDER BY id`).bind(kind).all()).results;
@@ -110,4 +112,15 @@ test("runFulfillment: hourly, never throws, no network", async () => {
   assert.equal((await runFulfillment({ DB }, { nowMs: SWEEP + 60000, fetchImpl })).order_watch, "not due");
   const broken = await runFulfillment({ DB: { prepare() { throw new Error("D1 down"); } } }, { nowMs: SWEEP, fetchImpl });
   assert.ok(broken.order_watch.error);
+});
+
+test("nice 7: 'waiting on KFB session' is a healthy run, so an earlier order-watch failure resolves", async () => {
+  const DB = makeD1();
+  await logEvent(DB, { actor: "ful.order_watch", kind: "error.ful_order_watch", summary: "boom", at: iso(SWEEP - 3600000) });
+  await runIncidents({ DB }, { nowMs: SWEEP - 3000000 });
+  await runFulfillment({ DB }, { nowMs: SWEEP });
+  const jr = await DB.prepare(`SELECT last_result FROM job_runs WHERE job = 'ful.order_watch'`).first();
+  assert.match(jr.last_result, /^ok: waiting on KFB session/);
+  const r = await runIncidents({ DB }, { nowMs: SWEEP + 60000 });
+  assert.equal(r.resolved, 1);
 });

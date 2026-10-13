@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { makeD1 } from "./helpers/d1.js";
 
 import { computeStoreDay, runDayClose } from "../src/lib/pnl.js";
-import { matchBills, groupLines, billRate, cogsState, BILLS_PER_RUN } from "../src/agents/pnl/cogs.js";
+import { matchBills, groupLines, billRate, cogsState, BILLS_PER_RUN, billSignature } from "../src/agents/pnl/cogs.js";
 import { pullFunnel, funnelFor, parseFunnelRows, FUNNEL_SHOPIFYQL, conversionRate } from "../src/agents/pnl/funnel.js";
 import { decide } from "../src/lib/approvals.js";
 import { moneyLine, cogsSourceFromShare, SYSTEM_PROMPT } from "../src/lib/brief.js";
@@ -440,4 +440,17 @@ test("review fix 11: mixed COGS is labelled partly estimated (plain brief, promp
   await runDayClose({ DB }, { nowMs });
   const close = (await evs(DB, "day.close")).find((e) => e.store === "hc");
   assert.match(close.summary, /COGS partly estimated/);
+});
+
+test("nice 6: a bill's signature doesn't depend on row order, so an unchanged bill is never re-matched", async () => {
+  const lines = [{ line_no: 2, order_ref: "1", cost_eur: 0, shipping_eur: 5 }, { line_no: 1, order_ref: "1", cost_eur: 20 }];
+  assert.equal(billSignature({ usd_charged: 30 }, lines), billSignature({ usd_charged: 30 }, [...lines].reverse()));
+  assert.notEqual(billSignature({ usd_charged: 30 }, lines), billSignature({ usd_charged: 31 }, lines));
+  const DB = makeD1();
+  const nowMs = Date.parse("2026-10-13T15:00:00Z");
+  await allFresh(DB, nowMs);
+  await order(DB, "hc", { id: 1, created_at: "2026-10-12T15:00:00Z", total: 100 });
+  await bill(DB, { id: "B1", code: "jmzjx1-it", usd: 36, lines: [{ ref: "1", cost: 20 }, { ref: "#1", cost: 0, ship: 10 }, { ref: "1", cost: 0 }] });
+  assert.equal((await matchBills(DB, { nowMs })).bills, 1);
+  for (let i = 1; i <= 3; i++) assert.equal((await matchBills(DB, { nowMs: nowMs + i * 60000 })).bills, 0);
 });

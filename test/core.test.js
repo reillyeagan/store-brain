@@ -351,3 +351,48 @@ test("review fix 8: the router catches up past one page in a single run", async 
   const r2 = await runRouter({ DB }, { nowMs: T0 + 120000 });
   assert.equal(r2.routed, 0);
 });
+
+/* ---------------- nice-to-haves ---------------- */
+
+test("nice 1: the auditor's AI cap follows ai.js (a non-number or 0 means the $3 default, never silence)", async () => {
+  for (const setting of ["abc", "0", "-5"]) {
+    const DB = makeD1();
+    await logEvent(DB, { actor: "cs.triage", kind: "ai.call", summary: "x", costUsd: 3.5, at: iso(T0 - 60000) });
+    await runAuditor({ DB, AI_DAILY_BUDGET_USD: setting }, { nowMs: T0 });
+    assert.equal((await evs(DB, "audit.ai_over_budget")).length, 1, setting);
+  }
+});
+
+test("nice 3: recordDecision and currentDecision know the old topic names", async () => {
+  const DB = makeD1();
+  await DB.prepare(`INSERT INTO decisions (at, topic, words, scope, settled) VALUES (?, 'supplier.bills', 'old words', 'all', 1)`).bind(iso(T0)).run();
+  assert.equal((await currentDecision(DB, "sup.bills")).words, "old words");
+  assert.equal((await currentDecision(DB, "supplier.bills")).words, "old words");
+  const r = await recordDecision(DB, { topic: "supplier.bills", words: "new words" }, { nowMs: T0 });
+  assert.ok(r.supersedes);
+  const cur = await currentDecision(DB, "sup.bills");
+  assert.equal(cur.words, "new words");
+  assert.equal(cur.topic, "sup.bills");
+  assert.equal((await listDecisions(DB, { topic: "sup.bills" })).length, 2);
+});
+
+test("nice 4: a router catch-up burst is not a flood", async () => {
+  const DB = makeD1();
+  for (let i = 0; i < 300; i++) await logEvent(DB, { actor: "core.router", kind: "route.handoff", summary: "h", at: iso(T0 - 1000) });
+  await runAuditor({ DB }, { nowMs: T0 });
+  assert.equal((await evs(DB, "audit.flood")).length, 0);
+});
+
+test("nice 5: an open incident outside the 50 most recent groups is judged on its own errors, not resolved for being left out", async () => {
+  const DB = makeD1();
+  for (let h = 0; h <= 3; h++) await logEvent(DB, { actor: "pnl.pullers", kind: "error.money_job", summary: "x", at: iso(T0 + h * 3600000) });
+  await runIncidents({ DB }, { nowMs: T0 + 3 * 3600000 + 60000 });
+  // 60 newer error groups push it out of the list while it is still failing.
+  for (let i = 0; i < 60; i++) await logEvent(DB, { actor: "sup.relay", kind: `error.noise_${i}`, summary: "n", at: iso(T0 + 3 * 3600000 + 120000 + i) });
+  const r = await runIncidents({ DB }, { nowMs: T0 + 3 * 3600000 + 300000 });
+  assert.equal(await count(DB, `SELECT COUNT(*) AS n FROM incidents WHERE key = 'pnl.pullers|error.money_job' AND status = 'open'`), 1);
+  assert.ok(r.groups <= 50);
+  // Once it has been quiet past its rhythm it does resolve.
+  await runIncidents({ DB }, { nowMs: T0 + 6 * 3600000 });
+  assert.equal(await count(DB, `SELECT COUNT(*) AS n FROM incidents WHERE key = 'pnl.pullers|error.money_job' AND status = 'resolved'`), 1);
+});

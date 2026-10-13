@@ -16,6 +16,8 @@
  * (each distinct finding at most once every RELOG_HOURS while it persists), and
  * `audit_findings` rows for the page. It never fixes anything: it reports.
  * The Auditor's own events are excluded from the flood check: someone else audits the auditor.
+ * The Router's hand-offs are excluded too: after an outage it catches up in bursts by design
+ * (one hand-off per routed event, bounded per run), which is not a flood.
  */
 import { logEvent, costSince } from "../../lib/eventlog.js";
 import { nowIso } from "../../lib/time.js";
@@ -72,7 +74,8 @@ async function gather(db, nowMs, env) {
   const hourAgo = nowIso(nowMs - 3600000);
   const flood = Number(env.AUDIT_FLOOD_PER_HOUR) > 0 ? Number(env.AUDIT_FLOOD_PER_HOUR) : FLOOD_PER_HOUR;
   const { results: busy } = await db.prepare(
-    `SELECT actor, COUNT(*) AS n FROM events WHERE at >= ? AND actor != ? GROUP BY actor HAVING COUNT(*) > ? ORDER BY n DESC LIMIT 10`
+    `SELECT actor, COUNT(*) AS n FROM events WHERE at >= ? AND actor NOT IN (?, 'core.router') AND kind != 'route.handoff'
+      GROUP BY actor HAVING COUNT(*) > ? ORDER BY n DESC LIMIT 10`
   ).bind(hourAgo, ACTOR, flood).all();
   for (const b of busy || []) {
     findings.push({ kind: "audit.flood", subject: b.actor, key: b.actor,
@@ -80,7 +83,9 @@ async function gather(db, nowMs, env) {
   }
 
   // 4. AI spend vs budget (UTC day, as ai.js counts it)
-  const cap = Number(env.AI_DAILY_BUDGET_USD || DEFAULT_DAILY_BUDGET_USD);
+  // Same rule as ai.js aiBudgetLeft: a setting that isn't a positive number means the default cap.
+  const capRaw = Number(env.AI_DAILY_BUDGET_USD);
+  const cap = Number.isFinite(capRaw) && capRaw > 0 ? capRaw : DEFAULT_DAILY_BUDGET_USD;
   const dayStart = new Date(Math.floor(nowMs / 86400000) * 86400000).toISOString();
   const spent = await costSince(db, dayStart);
   if (cap > 0 && spent > cap) {

@@ -25,8 +25,10 @@ export async function runFulfillment(env, { nowMs = Date.now(), fetchImpl = fetc
   try {
     if (!(await claimJob(env.DB, "ful.order_watch", FUL_JOBS["ful.order_watch"], nowMs))) out.order_watch = "not due";
     else {
-      const r = await guarded(env.DB, "ful.order_watch", "order_watch", nowMs, () => runOrderWatch(env, { nowMs }));
-      await noteResult(env.DB, "ful.order_watch", r && r.error ? `error: ${r.error}` : r.status === "waiting" ? r.reason : `ok: ${JSON.stringify(r).slice(0, 250)}`);
+      // Waiting on the KFB session is a healthy run (nothing to check yet), so it is noted as
+      // "ok: …": the Incident Desk reads job_runs and must see an earlier failure as recovered.
+      const r = await guarded(env.DB, "ful.order_watch", "ful_order_watch", nowMs, () => runOrderWatch(env, { nowMs }));
+      await noteResult(env.DB, "ful.order_watch", r && r.error ? `error: ${r.error}` : r.status === "waiting" ? `ok: ${r.reason}` : `ok: ${JSON.stringify(r).slice(0, 250)}`);
       out.order_watch = r;
     }
   } catch (err) {

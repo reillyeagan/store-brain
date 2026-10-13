@@ -96,13 +96,26 @@ const LINE_SELECT = `SELECT l.*, COALESCE(l.kfb_shop_code, b.kfb_shop_code) AS c
 
 /** Every bill's current signature; the ones that differ from what was last matched. */
 async function changedBills(db) {
-  const { results } = await db.prepare(
-    `SELECT b.bill_id, b.matched_sig, COALESCE(b.usd_charged, '') || '|' || COALESCE(b.total_eur, '') || '|' || COALESCE(b.kfb_shop_code, '') || '|' ||
-            COUNT(l.line_no) || '|' || ROUND(COALESCE(SUM(COALESCE(l.cost_eur,0) + COALESCE(l.fees_eur,0) + COALESCE(l.shipping_eur,0)), 0), 4) || '|' ||
-            COALESCE(GROUP_CONCAT(COALESCE(l.kfb_shop_code,'') || ':' || COALESCE(l.order_ref,''), ','), '') AS sig
-       FROM kfb_bills b LEFT JOIN kfb_bill_lines l ON l.bill_id = b.bill_id GROUP BY b.bill_id ORDER BY b.bill_id`
+  // Built in code from rows in a fixed order (bill, line number), so the same bill always gives
+  // the same signature (SQL GROUP_CONCAT has no guaranteed order and caused spurious re-matching).
+  const { results: bills } = await db.prepare(`SELECT bill_id, matched_sig, usd_charged, total_eur, kfb_shop_code FROM kfb_bills ORDER BY bill_id`).all();
+  const { results: lines } = await db.prepare(
+    `SELECT bill_id, line_no, kfb_shop_code, order_ref, cost_eur, fees_eur, shipping_eur FROM kfb_bill_lines ORDER BY bill_id, line_no`
   ).all();
-  return (results || []).filter((b) => b.matched_sig !== b.sig);
+  const byBill = new Map();
+  for (const l of lines || []) {
+    if (!byBill.has(l.bill_id)) byBill.set(l.bill_id, []);
+    byBill.get(l.bill_id).push(l);
+  }
+  return (bills || []).map((b) => ({ ...b, sig: billSignature(b, byBill.get(b.bill_id) || []) })).filter((b) => b.matched_sig !== b.sig);
+}
+
+/** Pure: a bill's state as one string (header + every line, in line order). */
+export function billSignature(bill, lines) {
+  const v = (x) => (x == null ? "" : String(x));
+  const sorted = [...lines].sort((a, b) => Number(a.line_no) - Number(b.line_no));
+  return [v(bill.usd_charged), v(bill.total_eur), v(bill.kfb_shop_code),
+    ...sorted.map((l) => [l.line_no, v(l.kfb_shop_code), v(l.order_ref), v(l.cost_eur), v(l.fees_eur), v(l.shipping_eur)].join(":"))].join("|");
 }
 
 /**

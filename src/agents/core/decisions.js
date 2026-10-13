@@ -75,10 +75,12 @@ export const SEED_DECISIONS = Object.freeze([
 
 /** Latest (unsuperseded) decision on a topic, or null. */
 export async function currentDecision(db, topic) {
+  // Any of the topic's names (old "supplier.*" rows still count as the same topic).
+  const names = topicNames(topic);
   return db.prepare(
-    `SELECT * FROM decisions WHERE topic = ? AND id NOT IN (SELECT supersedes FROM decisions WHERE supersedes IS NOT NULL)
+    `SELECT * FROM decisions WHERE topic IN (${names.map(() => "?").join(", ")}) AND id NOT IN (SELECT supersedes FROM decisions WHERE supersedes IS NOT NULL)
      ORDER BY id DESC LIMIT 1`
-  ).bind(topic).first();
+  ).bind(...names).first();
 }
 
 /**
@@ -88,6 +90,7 @@ export async function currentDecision(db, topic) {
  */
 export async function recordDecision(db, { topic, words, scope = "all", at = null }, { nowMs = Date.now(), quiet = false, source = null } = {}) {
   if (!topic || typeof topic !== "string") throw new Error("recordDecision: topic is required");
+  topic = canonicalTopic(topic); // one name per topic; old aliases are recorded under the canonical name
   if (!words || typeof words !== "string" || !words.trim()) throw new Error("recordDecision: Reilly's words are required, verbatim");
   const prev = await currentDecision(db, topic);
   if (prev && prev.words === words) return { id: prev.id, created: false, supersedes: prev.supersedes ?? null };
@@ -171,10 +174,11 @@ export async function seedDecisions(db, { nowMs = Date.now() } = {}) {
 /** Decisions, newest first; `current` = not superseded. */
 export async function listDecisions(db, { topic = null, limit = 50, currentOnly = false } = {}) {
   const lim = Math.min(Math.max(parseInt(limit, 10) || 50, 1), 200);
+  const names = topic ? topicNames(topic) : null;
   const { results } = await db.prepare(
     `SELECT d.*, (SELECT n.id FROM decisions n WHERE n.supersedes = d.id LIMIT 1) AS superseded_by
-       FROM decisions d ${topic ? "WHERE d.topic = ?" : ""} ORDER BY d.at DESC, d.id DESC LIMIT ?`
-  ).bind(...(topic ? [topic, lim] : [lim])).all();
+       FROM decisions d ${names ? `WHERE d.topic IN (${names.map(() => "?").join(", ")})` : ""} ORDER BY d.at DESC, d.id DESC LIMIT ?`
+  ).bind(...(names ? [...names, lim] : [lim])).all();
   const rows = (results || []).map((r) => ({ ...r, current: r.superseded_by == null, settled: !!r.settled }));
   return currentOnly ? rows.filter((r) => r.current) : rows;
 }
