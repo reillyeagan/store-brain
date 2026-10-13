@@ -79,16 +79,22 @@ export async function errorGroups(db, nowMs = Date.now(), windowH = WINDOW_H) {
     `SELECT actor, kind, COUNT(*) AS n FROM events WHERE kind LIKE 'error.%' AND kind != ? AND at >= ? GROUP BY actor, kind ORDER BY MAX(at) DESC LIMIT 50`
   ).bind(OWN_KIND, since).all();
   const out = [];
-  const back = nowIso(nowMs - LOOKBACK_H * 3600000);
   for (const g of results || []) {
-    const { results: times } = await db.prepare(`SELECT at, summary FROM events WHERE actor = ? AND kind = ? AND at >= ? ORDER BY at DESC LIMIT 200`)
-      .bind(g.actor, g.kind, back).all();
-    const chain = chainOf((times || []).map((t) => Date.parse(t.at)));
-    if (!chain) continue;
-    const job = await jobFor(db, g.kind);
-    out.push({ actor: g.actor, kind: g.kind, ...chain, last_summary: times[0].summary, job: job ? job.job : null, status: classify(chain, job, nowMs) });
+    const t = await traceGroup(db, g.actor, g.kind, nowMs);
+    if (t) out.push(t);
   }
   return out;
+}
+
+/** One actor+kind traced into an incident and classified (null: no error in the lookback). */
+export async function traceGroup(db, actor, kind, nowMs) {
+  const back = nowIso(nowMs - LOOKBACK_H * 3600000);
+  const { results: times } = await db.prepare(`SELECT at, summary FROM events WHERE actor = ? AND kind = ? AND at >= ? ORDER BY at DESC LIMIT 200`)
+    .bind(actor, kind, back).all();
+  const chain = chainOf((times || []).map((t) => Date.parse(t.at)));
+  if (!chain) return null;
+  const job = await jobFor(db, kind);
+  return { actor, kind, ...chain, last_summary: times[0].summary, job: job ? job.job : null, status: classify(chain, job, nowMs) };
 }
 
 export async function runIncidents(env, { nowMs = Date.now() } = {}) {
@@ -143,11 +149,18 @@ export async function runIncidents(env, { nowMs = Date.now() } = {}) {
       resolved++;
     }
   }
-  // Open incidents with no error left in the lookback are quiet by definition.
+  // Open incidents the list above didn't reach (it keeps the 50 most recent groups) are judged
+  // on their OWN errors by the same rules, never resolved just for being left out. One with no
+  // error at all in the 8-day lookback is quiet by definition.
   const { results: open } = await db.prepare(`SELECT * FROM incidents WHERE status = 'open'`).all();
   for (const inc of open || []) {
     if (groups.some((g) => `${g.actor}|${g.kind}` === inc.key)) continue;
-    await resolve(db, inc, "quiet", at);
+    const t = await traceGroup(db, inc.actor, inc.kind, nowMs);
+    if (t && t.status === "ongoing") {
+      await db.prepare(`UPDATE incidents SET first_seen = ?, last_seen = ?, count = ? WHERE key = ?`).bind(t.first_seen, t.last_seen, t.count, inc.key).run();
+      continue;
+    }
+    await resolve(db, inc, t ? t.status : "quiet", at);
     resolved++;
   }
   return { groups: groups.length, opened, resolved, asked };
