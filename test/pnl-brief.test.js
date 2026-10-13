@@ -922,3 +922,65 @@ test("brief: with parcel tracking off (Reilly, Oct 13) the brief carries no parc
   assert.equal(d.orders.new_flags_24h.length, 0);
   assert.match(plainBrief(d), /Parcel tracking: off/);
 });
+
+/* ---------------- brief rewrite ---------------- */
+
+test("rewrite: same row (id, created_at, phone kept), never re-sent to the phone; the cron won't compose again", async () => {
+  const { rewriteBrief } = await import("../src/lib/brief.js");
+  const DB = makeD1();
+  const env = briefEnv(DB, { BRIEF_PHONE_LIVE: "1" });
+  const nowMs = Date.parse("2026-10-13T12:05:00Z"); // 08:05 EDT
+  await allFresh(DB, nowMs);
+  const { fetchImpl, calls } = fakeApis();
+  const first = await runBrief(env, { nowMs, fetchImpl });
+  const before = await DB.prepare(`SELECT id, created_at, phone FROM briefs WHERE day = '2026-10-13'`).first();
+  const pushes = () => calls.filter((c) => c.url.includes("pushover")).length;
+  const p0 = pushes();
+  const later = nowMs + 60 * 60000;
+  const r = await rewriteBrief(env, { nowMs: later, fetchImpl });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  const after = await DB.prepare(`SELECT id, created_at, phone, status FROM briefs WHERE day = '2026-10-13'`).first();
+  assert.equal(after.id, before.id);
+  assert.equal(after.created_at, before.created_at, "the 8:00 phone link stays valid");
+  assert.equal(after.phone, before.phone);
+  assert.equal(after.status, "ready");
+  assert.equal(pushes(), p0, "a rewrite never notifies the phone");
+  assert.equal((await runBrief(env, { nowMs: later + 15 * 60000, fetchImpl })).ran, false, "the cron doesn't compose again");
+  assert.equal((await rewriteBrief(env, { nowMs: later + 60000, fetchImpl })).ok, false, "at most every 10 minutes");
+  assert.ok(first.ran);
+});
+
+test("rewrite: a failure puts the earlier brief back (nothing deleted, no second notification)", async () => {
+  const { rewriteBrief, latestBrief } = await import("../src/lib/brief.js");
+  const DB = makeD1();
+  const env = briefEnv(DB);
+  const nowMs = Date.parse("2026-10-13T12:05:00Z");
+  await allFresh(DB, nowMs);
+  await runBrief(env, { nowMs, fetchImpl: fakeApis().fetchImpl });
+  const old = await latestBrief(DB);
+  const boom = async () => { throw new Error("boom"); };
+  // Make the fresh-numbers step throw: break the P&L table for this run only.
+  const realPrepare = DB.prepare.bind(DB);
+  DB.prepare = (sql) => { if (/FROM pnl_days/.test(sql) && /SELECT/.test(sql)) throw new Error("D1 down"); return realPrepare(sql); };
+  const r = await rewriteBrief(env, { nowMs: nowMs + 3600000, fetchImpl: boom });
+  DB.prepare = realPrepare;
+  assert.equal(r.ok, false);
+  const now = await latestBrief(DB);
+  assert.equal(now.id, old.id);
+  assert.equal(now.body_md, old.body_md, "the earlier brief is still there");
+  const row = await DB.prepare(`SELECT status FROM briefs WHERE id = ?`).bind(old.id).first();
+  assert.equal(row.status, "ready");
+});
+
+test("brief: a restated closed day reaches the brief only when money moved by $5+", async () => {
+  const DB = makeD1();
+  const nowMs = Date.parse("2026-10-12T12:05:00Z");
+  await allFresh(DB, nowMs);
+  const { logEvent } = await import("../src/lib/eventlog.js");
+  await logEvent(DB, { actor: "pnl.ledger", kind: "pnl.restated", store: "hc", summary: "penny", data: { day: "2026-10-10", changed: ["ads"], before: { ads: 42.47 }, after: { ads: 42.94 } }, at: iso(nowMs - 3600000) });
+  await logEvent(DB, { actor: "pnl.ledger", kind: "pnl.restated", store: "hc", summary: "big one", data: { day: "2026-10-09", changed: ["revenue"], before: { revenue: 900 }, after: { revenue: 400 } }, at: iso(nowMs - 3600000) });
+  const d = await gatherBriefData({ DB }, { nowMs });
+  const txt = JSON.stringify(d);
+  assert.ok(txt.includes("big one"));
+  assert.ok(!txt.includes("penny"));
+});

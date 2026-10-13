@@ -450,7 +450,7 @@ export async function writePnlRow(db, row, at = nowIso()) {
       actor: ACTOR, kind: "pnl.restated", store: row.store,
       summary: `${STORES[row.store].name} P&L for ${row.day} restated: ` +
         changed.map((k) => `${k} ${fmt(before[k])} → ${fmt(row[k])}`).join(", "),
-      data: { day: row.day, changed, before: Object.fromEntries(changed.map((k) => [k, before[k]])) }, at,
+      data: { day: row.day, changed, before: Object.fromEntries(changed.map((k) => [k, before[k]])), after: Object.fromEntries(changed.map((k) => [k, row[k]])) }, at,
     });
   }
   return { status, restated, changed };

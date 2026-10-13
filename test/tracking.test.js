@@ -793,3 +793,31 @@ test("switched off: pending reship-or-refund questions are withdrawn (expired, n
   assert.match(await body({ DB: makeD1(), PARCEL_TRACKING: "1" }), /UL123456789YP/, "control: with tracking on the parcel is a pickup line");
   assert.doesNotMatch(await body({ DB: makeD1() }), /UL123456789YP/, "tracking off: no pickup line");
 });
+
+test("switched off: unsent KFB messages lose their pickup lines; a message with nothing else is cleared and can't be sent", async () => {
+  const { runTracking } = await import("../src/lib/tracking.js");
+  const { markKfbSent, CLEARED_NOTE } = await import("../src/lib/kfbMessage.js");
+  const DB = makeD1();
+  const ins = async (body, items) => {
+    const r = await DB.prepare(`INSERT INTO kfb_messages (created_at, local_day, mode, body, items, status) VALUES ('2026-10-12T23:00:00Z', '2026-10-12', 'shadow', ?, ?, 'draft')`).bind(body, JSON.stringify(items)).run();
+    const id = r.meta.last_row_id;
+    for (const i of items) await DB.prepare(`INSERT INTO kfb_message_items (message_id, store, order_id, order_name, kind) VALUES (?, ?, ?, ?, ?)`).bind(id, i.store, i.order_id, i.order_name, i.kind).run();
+    return id;
+  };
+  const mixed = await ins("Please add express…\n\nPlease check Holt & Crane #1198 …", [
+    { store: "hc", order_id: "o1", order_name: "#1221", kind: "express" },
+    { store: "hc", order_id: "o2", order_name: "#1198", kind: "pickup:YT1" }]);
+  const onlyPickup = await ins("Please check Auberlane #1055 …", [{ store: "aub", order_id: "o3", order_name: "#1055", kind: "pickup:UL1" }]);
+  await runTracking({ DB });
+  const m1 = await DB.prepare(`SELECT body, status FROM kfb_messages WHERE id = ?`).bind(mixed).first();
+  assert.match(m1.body, /Holt & Crane #1221/);
+  assert.doesNotMatch(m1.body, /#1198|Please check/);
+  assert.notEqual(m1.status, "cleared");
+  const m2 = await DB.prepare(`SELECT body, status, items FROM kfb_messages WHERE id = ?`).bind(onlyPickup).first();
+  assert.equal(m2.status, "cleared");
+  assert.equal(m2.body, CLEARED_NOTE);
+  assert.equal(m2.items, "[]");
+  assert.equal((await markKfbSent(DB, onlyPickup)).ok, false, "a cleared message can't be marked sent");
+  await runTracking({ DB }); // idempotent
+  assert.equal((await DB.prepare(`SELECT COUNT(*) AS n FROM kfb_message_items WHERE message_id = ?`).bind(mixed).first()).n, 1);
+});

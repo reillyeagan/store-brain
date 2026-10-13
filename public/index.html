@@ -839,7 +839,7 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
     h+='<div class="lab" style="margin-top:10px">KFB messages · '+(sup.mode==="live"?"live (to your phone)":"shadow (drafts only)")+'</div>';
     h+=sup.kfbMessages.length?sup.kfbMessages.map(function(m){
       return '<div class="rowx"><div class="msg">'+esc(m.body)+'</div><span class="meta"><span>'+esc(m.local_day)+'</span><span>'+esc(m.mode)+'</span><span>'+esc(m.status==="sent"?"sent "+ago(m.sent_at):m.status)+'</span></span>'+
-        '<div class="btns"><button class="btn" data-copy="'+esc(m.id)+'">Copy</button>'+(m.status!=="sent"?'<button class="btn" data-sent="'+esc(m.id)+'">Mark sent</button>':"")+'</div></div>';
+        (m.status==="cleared"?'':'<div class="btns"><button class="btn" data-copy="'+esc(m.id)+'">Copy</button>'+(m.status!=="sent"?'<button class="btn" data-sent="'+esc(m.id)+'">Mark sent</button>':"")+'</div>')+'</div>';
     }).join(""):'<div class="empty">No KFB messages yet. Relay checks once a day after 6:45 pm Eastern.</div>';
     return h;
   }

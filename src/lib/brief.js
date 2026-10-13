@@ -174,12 +174,20 @@ export async function gatherBriefData(env, { nowMs = Date.now() } = {}) {
   ).bind(...LIVE_STORE_IDS).all();
 
   // Risk: alarms and errors in the last 24 hours.
-  const { results: alarms } = await db.prepare(
-    `SELECT kind, store, summary FROM events
-      WHERE at >= ? AND (kind IN ('payout.mismatch', 'feed.alarm') OR kind LIKE 'error.%')
+  const { results: alarmRows } = await db.prepare(
+    `SELECT kind, store, summary, data FROM events
+      WHERE at >= ? AND (kind IN ('payout.mismatch', 'feed.alarm', 'pnl.restated') OR kind LIKE 'error.%')
         AND (? = 1 OR kind NOT LIKE 'error.tracking%')
-      ORDER BY id DESC LIMIT 8`
+      ORDER BY id DESC LIMIT 40`
   ).bind(nowIso(nowMs - 86400000), tracking ? 1 : 0).all();
+  // A restated closed day matters when money moved by $5 or more; penny re-reads of ad
+  // spend are noise. Older events without "after" values are kept (can't tell, so show).
+  const bigRestatement = (e) => {
+    let d = null; try { d = e.data ? JSON.parse(e.data) : null; } catch { d = null; }
+    if (!d || !d.after || !d.before) return true;
+    return (d.changed || []).some((k) => d.before[k] == null || d.after[k] == null || Math.abs(Number(d.after[k]) - Number(d.before[k])) >= 5);
+  };
+  const alarms = (alarmRows || []).filter((e) => e.kind !== "pnl.restated" || bigRestatement(e)).slice(0, 8);
 
   const data = {
     brief_day: day,
@@ -503,13 +511,13 @@ async function claimBrief(db, day, mode, nowMs) {
  * The cron step. Safe every 15 minutes: nothing before 08:00 Eastern, and only the first
  * run after it (per Eastern day) composes, unless that run died (see claimBrief).
  */
-export async function runBrief(env, { nowMs = Date.now(), fetchImpl = fetch, rewrite = false } = {}) {
+export async function runBrief(env, { nowMs = Date.now(), fetchImpl = fetch, rewrite = false, claimed: preClaimed = null } = {}) {
   const db = env.DB;
   const { day, minutes } = easternClock(nowMs);
   if (minutes < BRIEF_AFTER_MIN) return { ran: false, reason: "before 08:00 Eastern" };
   const at = nowIso(nowMs);
   const mode = briefMode(env);
-  const claimed = await claimBrief(db, day, mode, nowMs);
+  const claimed = preClaimed || await claimBrief(db, day, mode, nowMs);
   if (!claimed) return { ran: false, reason: "already composed today" };
   const row = claimed.row;
   // Every later write is tied to THIS claim, so a run that was reclaimed can't overwrite it.
@@ -581,6 +589,12 @@ export async function runBrief(env, { nowMs = Date.now(), fetchImpl = fetch, rew
     return { ran: true, day, id: row.id, mode, composer, model, body, unverified, checked: !!checked, aiError, phone, cost, reclaimed: claimed.reclaimed };
   } catch (err) {
     if (notified) throw err; // already on the phone: keep it, don't send a second one
+    if (rewrite) {
+      // Put the earlier brief back exactly as it was (its text was never overwritten).
+      await db.prepare(`UPDATE briefs SET status = 'ready' WHERE ${mine} AND status = 'rewriting'`).bind(row.id, row.created_at).run().catch(() => {});
+      await logEvent(db, { actor: ACTOR, kind: "error.brief_rewrite", summary: `Brief rewrite failed; the earlier brief is still shown (${String(err && err.message).slice(0, 150)})`, at }).catch(() => {});
+      throw err;
+    }
     await db.prepare(`DELETE FROM briefs WHERE ${mine} AND status = 'composing'`).bind(row.id, row.created_at).run().catch(() => {});
     throw err;
   }
@@ -588,21 +602,42 @@ export async function runBrief(env, { nowMs = Date.now(), fetchImpl = fetch, rew
 
 /** Minimum gap between rewrites: each one is a paid Claude call. */
 export const REWRITE_MIN_GAP_MIN = 10;
+/** A rewrite that hasn't finished in this long died; the old brief is put back. */
+export const REWRITE_STALE_MIN = 5;
 
 /**
- * "Rewrite now" on the Brief page: compose today's brief again from fresh numbers. Only
- * after 08:00 ET (today's brief exists), at most every 10 minutes, never re-sent to the phone.
+ * "Rewrite now" on the Brief page: compose today's brief again from fresh numbers.
+ *  - In place: the same row keeps its id, created_at (so the 8:00 phone link still works)
+ *    and phone result. Its status goes ready → rewriting, which the cron never claims or
+ *    reclaims, so a rewrite can never trigger a second phone notification.
+ *  - The old text stays on the page until the new one is written; on any failure it is
+ *    put back (status ready again, nothing deleted).
+ *  - Only after 08:00 ET (today's brief exists), at most every 10 minutes.
  */
 export async function rewriteBrief(env, { nowMs = Date.now(), fetchImpl = fetch } = {}) {
   const db = env.DB;
+  const at = nowIso(nowMs);
   const { day, minutes } = easternClock(nowMs);
   if (minutes < BRIEF_AFTER_MIN) return { ok: false, error: "Today's brief isn't written until 8:00 am Eastern" };
   const cur = await db.prepare(`SELECT id, created_at, status FROM briefs WHERE day = ?`).bind(day).first();
-  if (cur && cur.status !== "ready") return { ok: false, error: "The brief is being written right now; try again in a minute" };
-  if (cur && Date.parse(cur.created_at) > nowMs - REWRITE_MIN_GAP_MIN * 60000) return { ok: false, error: `It was written less than ${REWRITE_MIN_GAP_MIN} minutes ago` };
-  if (cur) await db.prepare(`DELETE FROM briefs WHERE id = ? AND created_at = ? AND status = 'ready'`).bind(cur.id, cur.created_at).run();
-  const r = await runBrief(env, { nowMs, fetchImpl, rewrite: true });
-  return r.ran ? { ok: true, id: r.id, composer: r.composer, checked: r.checked } : { ok: false, error: r.reason };
+  if (!cur) return { ok: false, error: "Today's brief hasn't been written yet; it comes a few minutes after 8:00" };
+  const lastStart = await db.prepare(`SELECT at FROM events WHERE kind = 'brief.rewrite_started' AND at >= ? ORDER BY id DESC LIMIT 1`)
+    .bind(nowIso(nowMs - REWRITE_MIN_GAP_MIN * 60000)).first();
+  if (cur.status === "composing") return { ok: false, error: "The brief is being written right now; try again in a minute" };
+  if (cur.status === "rewriting" && lastStart && Date.parse(lastStart.at) > nowMs - REWRITE_STALE_MIN * 60000) {
+    return { ok: false, error: "A rewrite is already running" };
+  }
+  if (lastStart && cur.status === "ready") return { ok: false, error: `It was rewritten less than ${REWRITE_MIN_GAP_MIN} minutes ago` };
+  const claim = await db.prepare(`UPDATE briefs SET status = 'rewriting' WHERE id = ? AND created_at = ? AND status IN ('ready', 'rewriting')`)
+    .bind(cur.id, cur.created_at).run();
+  if (!claim.meta || claim.meta.changes !== 1) return { ok: false, error: "The brief changed meanwhile; try again" };
+  await logEvent(db, { actor: ACTOR, kind: "brief.rewrite_started", summary: `Morning brief ${day}: rewriting on Reilly's request`, data: { briefId: cur.id }, at });
+  try {
+    const r = await runBrief(env, { nowMs, fetchImpl, rewrite: true, claimed: { row: { id: cur.id, created_at: cur.created_at }, reclaimed: null } });
+    return r.ran ? { ok: true, id: r.id, composer: r.composer, checked: r.checked } : { ok: false, error: r.reason };
+  } catch (err) {
+    return { ok: false, error: `The rewrite failed, so the earlier brief is still shown (${String(err && err.message).slice(0, 120)})` };
+  }
 }
 
 /* ---------------- signed page + phone ---------------- */
@@ -663,7 +698,7 @@ export async function getBrief(db, id) {
 
 /** Latest finished brief for Mission Control. */
 export async function latestBrief(db) {
-  const r = await db.prepare(`SELECT id, day, created_at, mode, body_md, model, composer, input_tokens, output_tokens, cost_usd, ai_error, unverified, checked, phone FROM briefs WHERE status = 'ready' ORDER BY day DESC LIMIT 1`).first();
+  const r = await db.prepare(`SELECT id, day, created_at, mode, body_md, model, composer, input_tokens, output_tokens, cost_usd, ai_error, unverified, checked, phone FROM briefs WHERE status IN ('ready', 'rewriting') ORDER BY day DESC LIMIT 1`).first();
   if (!r) return null;
   const j = (s) => { try { return s ? JSON.parse(s) : null; } catch { return null; } };
   return { ...r, unverified: j(r.unverified) || [], checked: r.checked == null ? null : !!r.checked, phone: j(r.phone) };
@@ -677,7 +712,7 @@ ul{margin:0;padding-left:18px}li{margin:3px 0;font-size:14px}p{margin:6px 0;font
 export async function handleBriefPage(request, env, id, nowMs = Date.now()) {
   const url = new URL(request.url);
   const b = await getBrief(env.DB, id);
-  if (!b || b.status !== "ready" || !(await verifyBriefSig(env.APPROVAL_SIGNING_KEY, b, url.searchParams.get("sig"), url.searchParams.get("exp"), nowMs))) {
+  if (!b || (b.status !== "ready" && b.status !== "rewriting") || !(await verifyBriefSig(env.APPROVAL_SIGNING_KEY, b, url.searchParams.get("sig"), url.searchParams.get("exp"), nowMs))) {
     return page("Link not valid", `<h1>This link isn't valid</h1><div class="meta">It may have expired (brief links last 48 hours). Open Mission Control → Brief instead.</div>`, 403);
   }
   const inner = `<h1>Morning brief · ${esc(b.day)}</h1>

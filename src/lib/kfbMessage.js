@@ -95,6 +95,7 @@ export function composePickupBody(items) {
  * KFB message he hasn't sent yet, rebuilding the text from what's left (the express asks).
  * A message with nothing left is marked 'cleared' so it stops waiting on him.
  */
+export const CLEARED_NOTE = "Nothing to send: this message only had carrier-pickup checks, and parcel tracking was switched off (Oct 13).";
 export async function stripPickupLines(db, at = nowIso()) {
   const { results: msgs } = await db.prepare(`SELECT id, body FROM kfb_messages WHERE status != 'sent' AND status != 'cleared'`).all();
   let changed = 0, cleared = 0, removed = 0;
@@ -107,7 +108,11 @@ export async function stripPickupLines(db, at = nowIso()) {
     const left = (items || []).filter((i) => !isPickupKind(i.kind));
     const body = composeKfbBody(left);
     if (body) await db.prepare(`UPDATE kfb_messages SET body = ?, items = ? WHERE id = ?`).bind(body, JSON.stringify(left), m.id).run();
-    else { await db.prepare(`UPDATE kfb_messages SET status = 'cleared' WHERE id = ?`).bind(m.id).run(); cleared++; }
+    else {
+      // Nothing left: replace the text too, so the old pickup lines can't be copied and sent.
+      await db.prepare(`UPDATE kfb_messages SET status = 'cleared', body = ?, items = '[]' WHERE id = ?`).bind(CLEARED_NOTE, m.id).run();
+      cleared++;
+    }
     changed++;
   }
   if (changed) {
@@ -355,8 +360,9 @@ export async function markKfbSent(db, id, nowMs = Date.now()) {
   const msg = await getKfbMessage(db, id);
   if (!msg) return { ok: false, error: "not_found" };
   if (msg.status === "sent") return { ok: false, error: "already_sent", sent_at: msg.sent_at };
+  if (msg.status === "cleared") return { ok: false, error: "nothing_to_send" };
   const at = nowIso(nowMs);
-  const res = await db.prepare(`UPDATE kfb_messages SET status = 'sent', sent_at = ? WHERE id = ? AND status != 'sent'`)
+  const res = await db.prepare(`UPDATE kfb_messages SET status = 'sent', sent_at = ? WHERE id = ? AND status NOT IN ('sent', 'cleared')`)
     .bind(at, id).run();
   if (!res.meta || res.meta.changes !== 1) return { ok: false, error: "already_sent" };
   const n = msg.items.length;
@@ -412,6 +418,9 @@ export async function handleKfbPage(request, env, id) {
   const sentSig = await signKfb(env.APPROVAL_SIGNING_KEY, msg, "sent", Number(exp));
   const action = `/api/kfb/${msg.id}/sent?exp=${encodeURIComponent(exp)}&sig=${sentSig}`;
   const n = msg.items.length;
+  if (msg.status === "cleared") {
+    return page("Nothing to send", `<h1>Nothing to send</h1><div class="meta">${esc(msg.local_day)}</div><p>${esc(CLEARED_NOTE)}</p>`);
+  }
   const status = msg.status === "sent"
     ? `<div class="done good">Marked sent ${esc(String(msg.sent_at || "").slice(0, 16).replace("T", " "))} UTC</div>`
     : `<button id="sent" data-a="${esc(action)}">Mark sent</button>`;
