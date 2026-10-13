@@ -628,3 +628,11 @@ test("worker: /api/agents/:id/events needs the key, knows only real agents, retu
   assert.equal(j.events.length, 1);
   assert.equal(j.week.events, 1);
 });
+
+test("dashboard page: its script parses (a stray quote would leave Reilly with a blank page)", async () => {
+  const { readFileSync } = await import("node:fs");
+  const html = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const m = html.match(/<script>([\s\S]*)<\/script>/);
+  assert.ok(m, "inline script present");
+  assert.doesNotThrow(() => new Function(m[1]));
+});

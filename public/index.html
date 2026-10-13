@@ -62,8 +62,12 @@ a{color:inherit}
 .mapbox{border:1px solid var(--border);border-radius:12px;background:radial-gradient(ellipse at 50% 48%,#15171f 0%,#0d0d10 62%);position:relative;overflow-x:auto;display:flex;flex-direction:column}
 /* The map keeps its own height; the side column scrolls instead of stretching it
    (a tall activity list once pushed the drawing out of view). */
-.homeside{max-height:calc(100vh - 40px);position:sticky;top:20px}
-.homeside .feedbox{overflow:auto;min-height:0;flex:1}
+.home{align-items:stretch!important}
+.mapbox{display:flex;flex-direction:column}
+.mapbox .legend{margin-top:auto}
+.homeside{min-height:0}
+.homeside .feedbox{position:relative;flex:1 1 0;min-height:240px;padding:0;overflow:hidden}
+.homeside .feedbox .inner{position:absolute;inset:0;overflow:auto;padding:16px}
 #map{display:block;width:100%;min-width:760px;height:auto}
 #map .lb{font:400 11px var(--font);fill:#80808b}
 #map .lb.off{fill:#54545c;text-decoration:line-through}
@@ -76,7 +80,7 @@ a{color:inherit}
 #map .sub{font:400 9px var(--font);fill:var(--faint)}
 #map .node{cursor:pointer}
 #map .node:hover .lb{fill:var(--text)}
-.legend{display:flex;gap:14px;flex-wrap:wrap;font-size:11px;color:var(--faint);padding:10px 14px;border-top:1px solid var(--border)}
+.legend{display:flex;gap:6px 14px;flex-wrap:wrap;font-size:11px;color:var(--faint);padding:12px 16px;border-top:1px solid var(--border)}
 .legend i{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px;vertical-align:0}
 .col{display:flex;flex-direction:column;gap:var(--gap);min-width:0}
 .card{border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:10px;padding:12px 14px;background:var(--panel2)}
@@ -92,12 +96,13 @@ a{color:inherit}
 .av{width:26px;height:26px;border-radius:50%;border:1px solid;display:grid;place-items:center;font:600 9.5px var(--font);letter-spacing:.02em}
 .av.on{box-shadow:0 0 0 3px rgba(111,227,180,.18),0 0 12px rgba(111,227,180,.35)}
 .spk{display:block;width:100%;height:42px;margin-top:auto;padding-top:12px}
+.bars{display:block;width:100%;height:70px;margin-top:auto;padding-top:14px}
 .glow{position:absolute;right:-60px;bottom:-80px;width:220px;height:220px;border-radius:50%;opacity:.16;pointer-events:none;-webkit-mask:radial-gradient(closest-side,#000,transparent);mask:radial-gradient(closest-side,#000,transparent)}
 .stores{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:var(--gap)}
 @media (max-width:900px){.stores{grid-template-columns:minmax(0,1fr)}}
 .sc{border:1px solid var(--border);border-radius:12px;background:var(--panel);padding:14px 16px;display:grid;grid-template-columns:1fr auto;gap:4px 12px;position:relative;overflow:hidden}
 .sc .n{font:600 13.5px var(--font)}.sc .m{font-size:11.5px;color:var(--muted)}
-.ring{width:58px;height:58px;grid-row:span 3}
+.ring{width:58px;height:58px}
 .chart{width:100%;height:auto;display:block}
 .chart text{font:400 10px var(--font);fill:#6f6f78}
 @keyframes blink{50%{opacity:.25}}
@@ -320,6 +325,27 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
     if(!pnlData||pnlStore!==store){ loadPnl(); return null; }
     return (pnlData.days||[]).filter(function(r){return r.day<pnlData.today}).slice(0,n||14).reverse();
   }
+  /* A bar per day (oldest → yesterday), same size everywhere, so up and down days read at
+     a glance. colorFn(v,row) picks each bar's colour; unknown days are a grey stub, never 0. */
+  function dayBars(rows,key,opt){
+    opt=opt||{}; var W=280,H=70,T=4,B=14, ih=H-T-B;
+    if(!rows||!rows.length) return '<svg class="bars" viewBox="0 0 '+W+' '+H+'"></svg>';
+    var vals=rows.map(function(r){return r[key]}), known=vals.filter(function(v){return v!=null&&isFinite(v)});
+    var hi=Math.max.apply(null,known.concat([0,opt.ref||0])), lo=Math.min.apply(null,known.concat([0]));
+    if(hi===lo) hi=lo+1;
+    var n=rows.length, slot=W/n, bw=Math.max(6,slot*.62), y=function(v){return T+(hi-v)/(hi-lo)*ih}, z=y(0), out='';
+    if(opt.ref!=null) out+='<line x1="0" x2="'+W+'" y1="'+y(opt.ref).toFixed(1)+'" y2="'+y(opt.ref).toFixed(1)+'" stroke="#a3a3ae" stroke-opacity=".55" stroke-dasharray="3 3"/>';
+    rows.forEach(function(r,i){
+      var cx=slot*i+slot/2, v=vals[i], last=i===n-1, wd=new Date(r.day+"T12:00:00Z").toLocaleDateString(undefined,{weekday:"narrow",timeZone:"UTC"});
+      out+='<text x="'+cx.toFixed(1)+'" y="'+(H-2)+'" text-anchor="middle" style="font:'+(last?"600":"400")+' 9px Inter;fill:'+(last?"#e8e8ea":"#5c5c66")+'">'+esc(wd)+'</text>';
+      if(v==null||!isFinite(v)){ out+='<rect x="'+(cx-bw/2).toFixed(1)+'" y="'+(z-1.5).toFixed(1)+'" width="'+bw.toFixed(1)+'" height="3" rx="1" fill="#33333c"><title>'+esc(fmtDay(r.day,true))+': unknown</title></rect>'; return; }
+      var top=Math.min(y(v),z), h=Math.max(2,Math.abs(y(v)-z)), c=opt.color(v,r);
+      out+='<rect x="'+(cx-bw/2).toFixed(1)+'" y="'+top.toFixed(1)+'" width="'+bw.toFixed(1)+'" height="'+h.toFixed(1)+'" rx="2" fill="'+c+'" opacity="'+(last?1:.62)+'"><title>'+esc(fmtDay(r.day,true))+': '+esc(opt.fmt(v))+'</title></rect>';
+    });
+    if(lo<0) out+='<line x1="0" x2="'+W+'" y1="'+z.toFixed(1)+'" y2="'+z.toFixed(1)+'" stroke="#3a3a44"/>';
+    return '<svg class="bars" viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none" aria-hidden="true">'+out+'</svg>';
+  }
+  var PROFIT_C=function(v){return v<0?"#ff8fab":"#6fe3b4"};
   function spark(rows,key,opt){
     opt=opt||{}; var W=240,H=44;
     var vals=(rows||[]).map(function(r){return typeof key==="function"?key(r):r[key]}), known=vals.filter(function(v){return v!=null&&isFinite(v)});
@@ -366,16 +392,16 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
       var c={hc:"#b9d3ff",aub:"#ffb38a",mar:"#b69cff"}[st.id]||"#b9d3ff";
       return '<div class="sc"><div class="glow" style="background:'+c+'"></div><div><div class="n"><span class="dot" style="background:'+c+';margin-right:7px"></span>'+esc(storeName(st.id))+'</div>'+
         '<div class="m">Yesterday '+esc(money(y.revenue))+' · <span class="'+(y.profit==null?"":y.profit<0?"bad-t":"ok-t")+'">'+esc(y.profit==null?"profit —":money(y.profit,true))+'</span></div></div>'+ring+
-        '<div style="grid-column:1">'+spark(rows,"revenue",{color:c,zero:true})+'</div><div class="m" style="grid-column:1">14 days · ring: ROAS, tick = break-even</div></div>';
+        '<div style="grid-column:1 / -1">'+dayBars(rows,"profit",{color:PROFIT_C,fmt:function(v){return money(v,true)}})+'</div><div class="m" style="grid-column:1 / -1">Daily profit, 14 days · ring = yesterday ROAS</div></div>';
     }).join("")+'</div>';
   }
   function homePage(){
     var y=yesterdayRow()||{}, w=workingAgents(), days=lastDays(14);
     var prof=y.profit, be=y.breakeven_roas;
     var kpis='<div class="kpis">'+
-      kpi("Yesterday revenue",money(y.revenue),y.orders!=null?y.orders+" orders · last 14 days below":"",null,spark(days,"revenue",{color:"#b9d3ff",zero:true}),"#b9d3ff")+
-      kpi("Yesterday profit",prof==null?"—":money(prof,true),prof==null?(y.revenue!=null?"not final yet":""):(!y.complete?"not final yet":(y.cogs_estimated_share>0?"COGS estimated":"final")),prof==null?"":prof<0?"bad-t":"ok-t",spark(days,"profit",{bars:true,zero:true}),prof!=null&&prof<0?"#ff8fab":"#6fe3b4")+
-      kpi("Yesterday ROAS",x2(y.roas),be!=null?"dashed line = break-even "+x2(be):"",y.roas!=null&&be!=null?(y.roas>=be?"ok-t":"bad-t"):"",spark(days,"roas",{color:"#7cc4ff",ref:be}),"#7cc4ff")+
+      kpi("Yesterday revenue",money(y.revenue),y.orders!=null?y.orders+" orders · bars = last 14 days":"",null,dayBars(days,"revenue",{color:function(){return "#b9d3ff"},fmt:function(v){return money(v)}}),"#b9d3ff")+
+      kpi("Yesterday profit",prof==null?"—":money(prof,true),prof==null?(y.revenue!=null?"not final yet":""):(!y.complete?"not final yet":(y.cogs_estimated_share>0?"COGS estimated":"final")),prof==null?"":prof<0?"bad-t":"ok-t",dayBars(days,"profit",{color:PROFIT_C,fmt:function(v){return money(v,true)}}),prof!=null&&prof<0?"#ff8fab":"#6fe3b4")+
+      kpi("Yesterday ROAS",x2(y.roas),be!=null?"green = above break-even "+x2(be)+" (dashed)":"",y.roas!=null&&be!=null?(y.roas>=be?"ok-t":"bad-t"):"",dayBars(days,"roas",{ref:be,color:function(v,r){var b=r.breakeven_roas!=null?r.breakeven_roas:be; return b==null?"#7cc4ff":v>=b?"#6fe3b4":"#ff8fab"},fmt:function(v){return x2(v)}}),"#7cc4ff")+
       kpi("Agents running",w.length+" working now",builtCount()+" of "+state.agents.length+" built",null,agentBar(),"#b69cff")+'</div>';
     var map='<div class="mapbox"><svg id="map" data-k="'+esc(mapKey())+'" viewBox="0 0 1200 860" role="img" aria-label="Every agent and the systems they use; working agents pulse, moving dots are real hand-offs">'+mapSvg()+'</svg>'+
       '<div class="legend"><span><i style="border:1px solid var(--good);box-shadow:0 0 0 3px rgba(111,227,180,.2)"></i>working now</span><span><i style="background:var(--accent)"></i>built</span><span><i style="border:1px solid var(--faint)"></i>planned</span><span><i style="border:1px solid var(--accent);background:none;outline:1px solid rgba(185,211,255,.35);outline-offset:2px"></i>uses Claude</span><span>solid line = built · dashed = not built yet</span><span>ring around a department = how much is built</span><span>moving dots = real hand-offs</span></div></div>';
@@ -383,7 +409,7 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
     var wait='<div class="lab" style="display:flex;justify-content:space-between;margin-bottom:12px"><span>Waiting on you · '+n.length+'</span><a href="#/brief" style="text-transform:none;letter-spacing:0;color:var(--muted)">open Brief →</a></div><div class="col" style="gap:10px">'+
       (n.length?n.slice(0,5).map(function(x){ return '<a href="'+(x.href||"#/brief")+'" style="text-decoration:none"><div class="card" style="border-left-color:'+x.color+'"><div class="t">'+esc(x.title)+'<span>'+esc(x.who)+'</span></div><div class="d">'+esc(x.detail)+'</div></div></a>'; }).join(""):'<div class="card" style="border-left-color:var(--good)"><div class="d">Nothing is waiting on you.</div></div>')+'</div>';
     var feed='<div class="lab" style="display:flex;justify-content:space-between"><span>Activity · live</span><span style="color:var(--good);text-transform:none;letter-spacing:0"><span class="dot live" style="background:var(--good);margin-right:5px"></span>'+w.length+' agent'+(w.length===1?"":"s")+' working</span></div>'+feedHtml(25);
-    return kpis+storeCards()+'<div class="home">'+map+'<div class="col homeside"><div class="box">'+wait+'</div><div class="box feedbox">'+feed+'</div></div></div>';
+    return kpis+storeCards()+'<div class="home">'+map+'<div class="col homeside"><div class="box">'+wait+'</div><div class="box feedbox"><div class="inner">'+feed+'</div></div></div></div>';
   }
   function kpi(l,v,s,cls,extra,glow){ return '<div class="kpi">'+(glow?'<div class="glow" style="background:'+glow+'"></div>':'')+'<div class="l">'+esc(l)+'</div><div class="v '+(cls||"")+'">'+esc(v)+'</div>'+(s?'<div class="s">'+esc(s)+'</div>':"")+(extra||"")+'</div>'; }
   function avatar(id,live){ var n=actorName(id).replace(/[^A-Za-z ]/g,"").split(" ").filter(Boolean), c=colorOf(id);
@@ -507,7 +533,7 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
       out.push({kind:"approval",id:a.id,title:a.title,who:actorName(a.requested_by),detail:(a.store?storeName(a.store)+" · ":"")+ago(a.created_at),color:colorOf(a.requested_by),a:a}); });
     var sup=state.supplier||{kfbMessages:[]};
     /* Only today's or yesterday's unsent message: an old shadow draft isn't waiting on you. */
-    (sup.kfbMessages||[]).forEach(function(m){ if(m.status==="sent"||m.local_day<since) return;
+    (sup.kfbMessages||[]).forEach(function(m){ if(m.status==="sent"||m.status==="cleared"||m.local_day<since) return;
       out.push({kind:"kfb",id:m.id,title:"KFB message ready",who:"Relay",detail:m.item_count+" item"+(m.item_count===1?"":"s")+" · "+m.local_day+(m.mode==="shadow"?" · shadow":""),color:PAL.sup,m:m}); });
     var hot={day20:1,day20_verify:1,failed_delivery:1,pickup_ready:1}, groups={};
     ((state.shipping||{}).flags||[]).forEach(function(f){ if(!hot[f.kind]||f.approval_id) return; if(st!=="all"&&f.store&&f.store!==st) return;
@@ -541,7 +567,7 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
   function briefPage(){
     var b=state.brief||{}, l=b.latest;
     var mode=b.mode!=="live"?"shadow · not sent to your phone yet":!l?"goes to your phone at 8:00":l.phone&&l.phone.sent?"sent to your phone":"phone: not sent"+(l.phone&&l.phone.reason?" ("+l.phone.reason+")":"");
-    var top='<div class="box"><div class="lab" style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap"><span>This morning'+(l?" · "+esc(l.day):"")+'</span><span style="text-transform:none;letter-spacing:0">'+esc(mode)+'</span></div>'+
+    var top='<div class="box"><div class="lab" style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap"><span>This morning'+(l?" · "+esc(l.day):"")+'</span><span style="text-transform:none;letter-spacing:0;display:flex;gap:10px;align-items:center">'+esc(mode)+(l?'<button class="btn" id="rewrite" title="Write today\'s brief again from the latest numbers (a few cents of Claude)">Rewrite now</button>':'')+'</span></div><div id="rewriteOut"></div>'+
       (l?('<div class="brief-body">'+(l.ai_error?'<div class="warnbox">AI unavailable, plain brief: '+esc(l.ai_error)+'</div>':'')+mdHtml(l.body_md)+'</div><div class="note">'+esc(l.composer==="ai"?"Claude "+(l.model||""):"plain (no AI)")+(l.checked===false?' · <span class="bad-t">numbers NOT checked</span>':l.checked?" · every number checked against the ledger":"")+' · '+esc(ago(l.created_at))+'</div>')
         :'<div class="empty">No brief yet. The brain writes it once a day at 8:00 am Eastern.</div>')+'</div>';
     var live='<div class="box"><div class="lab" style="display:flex;justify-content:space-between"><span>What has happened · live</span><span style="color:var(--good);text-transform:none;letter-spacing:0"><span class="dot live" style="background:var(--good);margin-right:5px"></span>updating</span></div>'+feedHtml(60,true)+'</div>';
@@ -869,6 +895,10 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
       busyUntil=Date.now()+15000;
     }) });
     document.querySelectorAll("button[data-sent]").forEach(function(b){ b.addEventListener("click",function(){ markSent(b.dataset.sent,b) }) });
+    if($("#rewrite")) $("#rewrite").addEventListener("click",async function(){ var b=$("#rewrite"); b.disabled=true; b.textContent="Writing…"; busyUntil=Date.now()+90000;
+      try{ var r=await api("/api/brief/rewrite",{method:"POST"}); var j=await r.json();
+        if(j.ok){ busyUntil=0; load(); } else { $("#rewriteOut").innerHTML='<div class="note bad-t">'+esc(j.error||"failed")+'</div>'; b.disabled=false; b.textContent="Rewrite now"; busyUntil=Date.now()+12000; }
+      }catch(e){ $("#rewriteOut").innerHTML='<div class="note bad-t">Couldn\'t reach the brain.</div>'; b.disabled=false; b.textContent="Rewrite now"; busyUntil=Date.now()+12000; } });
     document.querySelectorAll("button[data-setup]").forEach(function(b){ b.addEventListener("click",function(){ runSetup(b) }) });
     document.querySelectorAll("button[data-google]").forEach(function(b){ b.addEventListener("click",function(){ google(b.dataset.google,b) }) });
     if($("#outConn")) loadConnections();

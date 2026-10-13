@@ -90,6 +90,37 @@ export function composePickupBody(items) {
   ).join("\n");
 }
 
+/**
+ * Parcel tracking switched off (Reilly, Oct 13): take the carrier-pickup lines out of every
+ * KFB message he hasn't sent yet, rebuilding the text from what's left (the express asks).
+ * A message with nothing left is marked 'cleared' so it stops waiting on him.
+ */
+export async function stripPickupLines(db, at = nowIso()) {
+  const { results: msgs } = await db.prepare(`SELECT id, body FROM kfb_messages WHERE status != 'sent' AND status != 'cleared'`).all();
+  let changed = 0, cleared = 0, removed = 0;
+  for (const m of msgs || []) {
+    const { results: items } = await db.prepare(`SELECT store, order_id, order_name, kind, detail FROM kfb_message_items WHERE message_id = ?`).bind(m.id).all();
+    const pick = (items || []).filter((i) => isPickupKind(i.kind));
+    if (!pick.length) continue;
+    await db.prepare(`DELETE FROM kfb_message_items WHERE message_id = ? AND (kind = 'pickup' OR kind LIKE 'pickup:%')`).bind(m.id).run();
+    removed += pick.length;
+    const left = (items || []).filter((i) => !isPickupKind(i.kind));
+    const body = composeKfbBody(left);
+    if (body) await db.prepare(`UPDATE kfb_messages SET body = ?, items = ? WHERE id = ?`).bind(body, JSON.stringify(left), m.id).run();
+    else { await db.prepare(`UPDATE kfb_messages SET status = 'cleared' WHERE id = ?`).bind(m.id).run(); cleared++; }
+    changed++;
+  }
+  if (changed) {
+    await logEvent(db, {
+      actor: ACTOR, kind: "kfb.pickup_lines_removed", target: "sys.kfb",
+      summary: `Parcel tracking is off: removed ${removed} carrier-pickup line${removed === 1 ? "" : "s"} from ${changed} unsent KFB message${changed === 1 ? "" : "s"}` +
+        (cleared ? ` (${cleared} had nothing else and no longer wait on Reilly)` : ""),
+      data: { changed, cleared, removed }, at,
+    }).catch(() => {});
+  }
+  return { changed, cleared, removed };
+}
+
 /** The whole message: one section per kind, express first (it's time-critical). */
 export const isPickupKind = (kind) => kind === "pickup" || String(kind || "").startsWith("pickup:");
 

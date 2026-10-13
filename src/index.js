@@ -6,6 +6,7 @@
  *   GET  /api/state                      Mission Control data (key required)
  *   GET  /api/pnl?store=all|hc|aub|mar    every stored P&L day for the P&L page (key required)
  *   GET  /api/agents/:id/events          one agent's latest events, for its page (key required)
+ *   POST /api/brief/rewrite              compose today's brief again from fresh numbers (key required)
  *   POST /api/approvals/:id/decide       Reilly's decision (key OR a signed phone link)
  *   POST /webhooks/shopify               Shopify webhooks (HMAC-verified per store)
  *   POST /webhooks/17track               17TRACK pushes (`sign` header verified; known numbers re-read from the API)
@@ -67,7 +68,7 @@ import {
 } from "./lib/kfbMessage.js";
 import { runTracking, handleTrackingPush, shippingState } from "./lib/tracking.js";
 import { runPnlCron, runDayClose, pnlState, pnlHistory } from "./lib/pnl.js";
-import { runBrief, latestBrief, handleBriefPage, briefMode } from "./lib/brief.js";
+import { runBrief, latestBrief, handleBriefPage, briefMode, rewriteBrief } from "./lib/brief.js";
 
 export const VERSION = "0.2.0-eagano-llc";
 
@@ -189,6 +190,11 @@ export default {
         if (!hasKey(request, env)) return json({ ok: false, error: "unauthorized" }, 401);
         if (!isKnownActor(ae[1])) return json({ ok: false, error: "unknown agent" }, 404);
         return json({ ok: true, id: ae[1], ...(await agentEvents(env.DB, ae[1])) });
+      }
+      if (path === "/api/brief/rewrite" && request.method === "POST") {
+        if (!hasKey(request, env)) return json({ ok: false, error: "unauthorized" }, 401);
+        const r = await rewriteBrief(env);
+        return json(r, r.ok ? 200 : 409);
       }
       if (path === "/api/admin/check-stores" && request.method === "POST") {
         if (!hasKey(request, env)) return json({ ok: false, error: "unauthorized" }, 401);

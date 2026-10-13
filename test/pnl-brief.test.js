@@ -436,7 +436,7 @@ test("brief: the data given to the model carries the order-name/date references 
   const nowMs = Date.parse("2026-10-12T12:05:00Z");
   await allFresh(DB, nowMs);
   await DB.prepare(`INSERT INTO shipment_flags (store, order_id, order_name, kind, detail, raised_at) VALUES ('hc', 'gid://shopify/Order/1231', '#1231', 'day15', 'Day 15', ?)`).bind(iso(nowMs - 3600000)).run();
-  const d = await gatherBriefData({ DB }, { nowMs });
+  const d = await gatherBriefData({ DB, PARCEL_TRACKING: "1" }, { nowMs }); // parcel flags exist only with tracking on
   assert.ok(d.references.order_names.includes("#1231"));
   assert.ok(d.references.dates.includes("2026-10-11"));
   assert.match((await import("../src/lib/brief.js")).SYSTEM_PROMPT, /DATA\.references/);
@@ -910,4 +910,15 @@ test("history fill: skips a store whose orders feed is stale; revisits incomplet
   for (let i = 0; i < 5; i++) await fillMissingDays({ DB }, { nowMs });
   const r = await DB.prepare(`SELECT computed_at FROM pnl_days WHERE store = 'aub' AND day = '2026-10-01'`).first();
   assert.notEqual(r.computed_at, "2026-01-01T00:00:00Z");
+});
+
+test("brief: with parcel tracking off (Reilly, Oct 13) the brief carries no parcel flags and says tracking is off", async () => {
+  const DB = makeD1();
+  const nowMs = Date.parse("2026-10-12T12:05:00Z");
+  await allFresh(DB, nowMs);
+  await DB.prepare(`INSERT INTO shipment_flags (store, order_id, order_name, kind, detail, raised_at) VALUES ('hc', 'o1', '#1231', 'day15', 'Day 15', ?)`).bind(iso(nowMs - 3600000)).run();
+  const d = await gatherBriefData({ DB }, { nowMs });
+  assert.deepEqual(d.orders.open_shipping_flags, {});
+  assert.equal(d.orders.new_flags_24h.length, 0);
+  assert.match(plainBrief(d), /Parcel tracking: off/);
 });

@@ -800,6 +800,10 @@ export async function trackingOff(env, nowMs = Date.now()) {
   // not answered: 'expired' is not a decision and never runs anything.
   const ap = await db.prepare(`UPDATE approvals SET status = 'expired', decided_at = ? WHERE status = 'pending' AND requested_by = ?`).bind(at, LATE_ACTOR).run();
   const withdrawn = (ap && ap.meta && ap.meta.changes) || 0;
+  // Unsent KFB messages lose their carrier-pickup lines (they came from tracking).
+  // Imported here, not at the top: kfbMessage.js already imports this module.
+  const { stripPickupLines } = await import("./kfbMessage.js");
+  await stripPickupLines(db, at).catch(() => null);
   if (!had || cleared || withdrawn) {
     await logEvent(db, {
       actor: ACTOR, kind: "tracking.switched_off",

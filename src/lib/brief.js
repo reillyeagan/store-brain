@@ -28,7 +28,7 @@
  * link to /brief/:id. The notification text itself carries no money figures (it passes
  * through Pushover's servers); the numbers are only on the signed page.
  */
-import { LIVE_STORE_IDS, STORES } from "../config/stores.js";
+import { LIVE_STORE_IDS, STORES, parcelTrackingOn } from "../config/stores.js";
 import { logEvent } from "./eventlog.js";
 import { evaluateFeeds } from "./freshness.js";
 import { listPending, hmacHex, sameText } from "./approvals.js";
@@ -150,11 +150,12 @@ export async function gatherBriefData(env, { nowMs = Date.now() } = {}) {
   const pending = await listPending(db);
   const kfb = (await listKfbMessages(db, 1))[0] || null;
 
-  // Orders + shipping.
-  const { results: flagRows } = await db.prepare(
+  // Orders + shipping. Parcel tracking is off (Reilly, Oct 13): no parcel flags at all.
+  const tracking = parcelTrackingOn(env);
+  const { results: flagRows } = !tracking ? { results: [] } : await db.prepare(
     `SELECT kind, COUNT(*) AS n FROM shipment_flags WHERE resolved_at IS NULL AND store IN (${marks}) GROUP BY kind`
   ).bind(...LIVE_STORE_IDS).all();
-  const { results: newFlags } = await db.prepare(
+  const { results: newFlags } = !tracking ? { results: [] } : await db.prepare(
     `SELECT store, order_name, kind, detail FROM shipment_flags WHERE resolved_at IS NULL AND raised_at >= ? AND store IN (${marks}) ORDER BY raised_at DESC LIMIT 6`
   ).bind(nowIso(nowMs - 86400000), ...LIVE_STORE_IDS).all();
   const express = await db.prepare(
@@ -175,9 +176,10 @@ export async function gatherBriefData(env, { nowMs = Date.now() } = {}) {
   // Risk: alarms and errors in the last 24 hours.
   const { results: alarms } = await db.prepare(
     `SELECT kind, store, summary FROM events
-      WHERE at >= ? AND (kind IN ('payout.mismatch', 'pnl.restated', 'feed.alarm') OR kind LIKE 'error.%')
+      WHERE at >= ? AND (kind IN ('payout.mismatch', 'feed.alarm') OR kind LIKE 'error.%')
+        AND (? = 1 OR kind NOT LIKE 'error.tracking%')
       ORDER BY id DESC LIMIT 8`
-  ).bind(nowIso(nowMs - 86400000)).all();
+  ).bind(nowIso(nowMs - 86400000), tracking ? 1 : 0).all();
 
   const data = {
     brief_day: day,
@@ -190,6 +192,7 @@ export async function gatherBriefData(env, { nowMs = Date.now() } = {}) {
     },
     orders: {
       express_yesterday: express ? Number(express.n) : 0,
+      parcel_tracking: tracking ? "on" : "off (Reilly's call, Oct 13)",
       open_shipping_flags: Object.fromEntries((flagRows || []).map((r) => [r.kind, Number(r.n)])),
       new_flags_24h: (newFlags || []).map((f) => ({ store: STORES[f.store] ? STORES[f.store].name : f.store, order: f.order_name, kind: f.kind, detail: f.detail })),
     },
@@ -251,7 +254,8 @@ export function plainBrief(d) {
   L.push("## Orders");
   L.push(`- Express orders yesterday: ${d.orders.express_yesterday}`);
   const fl = Object.entries(d.orders.open_shipping_flags);
-  L.push(`- Open shipping flags: ${fl.length ? fl.map(([k, n]) => `${k} ${n}`).join(", ") : "none"}`);
+  if (d.orders.parcel_tracking && d.orders.parcel_tracking !== "on") L.push(`- Parcel tracking: ${d.orders.parcel_tracking}`);
+  else L.push(`- Open shipping flags: ${fl.length ? fl.map(([k, n]) => `${k} ${n}`).join(", ") : "none"}`);
   for (const f of d.orders.new_flags_24h) L.push(`- New: ${f.store} ${f.order} · ${f.kind} — ${f.detail}`);
   L.push("");
   L.push("## Money");
@@ -499,7 +503,7 @@ async function claimBrief(db, day, mode, nowMs) {
  * The cron step. Safe every 15 minutes: nothing before 08:00 Eastern, and only the first
  * run after it (per Eastern day) composes, unless that run died (see claimBrief).
  */
-export async function runBrief(env, { nowMs = Date.now(), fetchImpl = fetch } = {}) {
+export async function runBrief(env, { nowMs = Date.now(), fetchImpl = fetch, rewrite = false } = {}) {
   const db = env.DB;
   const { day, minutes } = easternClock(nowMs);
   if (minutes < BRIEF_AFTER_MIN) return { ran: false, reason: "before 08:00 Eastern" };
@@ -560,18 +564,18 @@ export async function runBrief(env, { nowMs = Date.now(), fetchImpl = fetch } = 
       cost, aiError, JSON.stringify(unverified), checked, row.id, row.created_at).run();
 
     let phone = null;
-    if (mode === "live") {
+    if (mode === "live" && !rewrite) {
       phone = await notifyBrief(env, { id: row.id, created_at: row.created_at, day }, data, { nowMs, fetchImpl });
       notified = !!phone.sent;
       await db.prepare(`UPDATE briefs SET phone = ? WHERE ${mine}`).bind(JSON.stringify(phone), row.id, row.created_at).run();
     }
     await logEvent(db, {
       actor: ACTOR,
-      kind: mode === "shadow" ? "brief.composed" : phone.sent ? "brief.notified" : "brief.notify_failed",
-      target: mode === "live" ? "sys.phone" : null,
+      kind: rewrite ? "brief.rewritten" : mode === "shadow" ? "brief.composed" : phone.sent ? "brief.notified" : "brief.notify_failed",
+      target: mode === "live" && !rewrite ? "sys.phone" : null,
       summary: `Morning brief ${day} ready (${composer === "ai" ? `Claude ${model}` : "plain, no AI"}` +
         `${unverified.length ? `, ${unverified.length} unverified number${unverified.length === 1 ? "" : "s"}` : ""})` +
-        (mode === "shadow" ? " — shadow: Mission Control only" : phone.sent ? " — sent to Reilly's phone" : ` — phone notification failed: ${phone.reason}`),
+        (rewrite ? " — rewritten on Reilly's request (not re-sent to the phone)" : mode === "shadow" ? " — shadow: Mission Control only" : phone.sent ? " — sent to Reilly's phone" : ` — phone notification failed: ${phone.reason}`),
       data: { briefId: row.id, day, mode, composer, model, unverified, checked: !!checked, reclaimed: claimed.reclaimed }, at,
     });
     return { ran: true, day, id: row.id, mode, composer, model, body, unverified, checked: !!checked, aiError, phone, cost, reclaimed: claimed.reclaimed };
@@ -580,6 +584,25 @@ export async function runBrief(env, { nowMs = Date.now(), fetchImpl = fetch } = 
     await db.prepare(`DELETE FROM briefs WHERE ${mine} AND status = 'composing'`).bind(row.id, row.created_at).run().catch(() => {});
     throw err;
   }
+}
+
+/** Minimum gap between rewrites: each one is a paid Claude call. */
+export const REWRITE_MIN_GAP_MIN = 10;
+
+/**
+ * "Rewrite now" on the Brief page: compose today's brief again from fresh numbers. Only
+ * after 08:00 ET (today's brief exists), at most every 10 minutes, never re-sent to the phone.
+ */
+export async function rewriteBrief(env, { nowMs = Date.now(), fetchImpl = fetch } = {}) {
+  const db = env.DB;
+  const { day, minutes } = easternClock(nowMs);
+  if (minutes < BRIEF_AFTER_MIN) return { ok: false, error: "Today's brief isn't written until 8:00 am Eastern" };
+  const cur = await db.prepare(`SELECT id, created_at, status FROM briefs WHERE day = ?`).bind(day).first();
+  if (cur && cur.status !== "ready") return { ok: false, error: "The brief is being written right now; try again in a minute" };
+  if (cur && Date.parse(cur.created_at) > nowMs - REWRITE_MIN_GAP_MIN * 60000) return { ok: false, error: `It was written less than ${REWRITE_MIN_GAP_MIN} minutes ago` };
+  if (cur) await db.prepare(`DELETE FROM briefs WHERE id = ? AND created_at = ? AND status = 'ready'`).bind(cur.id, cur.created_at).run();
+  const r = await runBrief(env, { nowMs, fetchImpl, rewrite: true });
+  return r.ran ? { ok: true, id: r.id, composer: r.composer, checked: r.checked } : { ok: false, error: r.reason };
 }
 
 /* ---------------- signed page + phone ---------------- */
