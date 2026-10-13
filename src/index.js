@@ -31,7 +31,7 @@
  *                 15 min, payouts hourly; throttled in job_runs) → tracking (collect hourly, 17TRACK polls as due, checks)
  *                 → P&L recompute (last 3 days + a few missing history days, every tick) → morning brief (once per day after 08:00 ET)
  *                 → KFB composer (once per day after 18:45 ET) → Freshness Sentinel
- *   every 5 min   (minutes 1, 6, 11, ...) one department agent run, in rotation (src/agents/index.js)
+ *   every 5 min   (minutes 1, 6, 11, ... 56) one department agent run, in rotation (src/agents/index.js)
  *   daily 05:00Z  P&L day close (01:00 EDT / 00:00 EST: "yesterday" is always the day that just ended)
  *
  * Secrets (Reilly adds these in Cloudflare; never in this repo):
@@ -74,7 +74,7 @@ import {
 import { runTracking, handleTrackingPush, shippingState } from "./lib/tracking.js";
 import { runPnlCron, runDayClose, pnlState, pnlHistory } from "./lib/pnl.js";
 import { runBrief, latestBrief, handleBriefPage, briefMode, rewriteBrief } from "./lib/brief.js";
-import { runDepartmentSlot, departmentState, DEPARTMENTS_RUN } from "./agents/index.js";
+import { runDepartmentSlot, departmentState, DEPARTMENTS_RUN, DEPT_CRON } from "./agents/index.js";
 import { funnelFor } from "./agents/pnl/index.js";
 import { vaultOutbox, markVaultCopied } from "./agents/core/librarian.js";
 
@@ -296,8 +296,14 @@ export default {
   async scheduled(event, env, ctx) {
     ctx.waitUntil(
       (async () => {
-        if (event.cron === "1-59/5 * * * *") {
-          await runDepartmentSlot(env); // never throws
+        if (event.cron === DEPT_CRON) {
+          await runDepartmentSlot(env, { nowMs: Number(event.scheduledTime) || Date.now() }); // never throws
+          return;
+        }
+        // Only the exact ledger cron runs the ledger steps: an unknown string (a wrangler.toml
+        // edit that didn't reach this code) must not run the 15-minute job every 5 minutes.
+        if (event.cron !== "*/15 * * * *" && event.cron !== "0 5 * * *") {
+          await logEvent(env.DB, { actor: "core.incidents", kind: "error.unknown_cron", summary: `A schedule fired that the brain doesn't know ("${String(event.cron).slice(0, 60)}"); nothing ran` }).catch(() => {});
           return;
         }
         if (event.cron === "0 5 * * *") {

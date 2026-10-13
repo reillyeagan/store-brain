@@ -669,7 +669,7 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
       blk("Ad spend",money(s.ads),s.guy_fee?guyLbl+money(s.guy_fee):s.ads!=null?"no media-buyer fee these days":"")+
       blk("COGS"+cogsTag+(s.cogs_assumed?'<span class="tag bad">33% ASSUMED</span>':''),money(s.cogs),s.cogs_assumed?"no measured rate for some orders":s.cogs_est_share>0?"KFB rate estimate until real costs land":s.cogs!=null?"real KFB costs":"")+
       blk("Orders",s.orders==null?"—":String(s.orders),s.aov!=null?"AOV "+money(s.aov):"")+
-      blk("CVR",fun&&fun.totals&&fun.totals.conversion_rate!=null?pct(fun.totals.conversion_rate,2):"—",fun&&fun.totals&&fun.totals.sessions!=null?fun.totals.sessions.toLocaleString()+" sessions":"funnel not wired yet")+
+      blk("CVR",fun&&fun.ok&&fun.totals&&fun.totals.conversion_rate!=null&&fun.totals.converted_sessions!=null?pct(fun.totals.conversion_rate,2):"—",fun&&fun.ok&&fun.totals&&fun.totals.sessions!=null?fun.totals.sessions.toLocaleString()+" sessions"+(pr.to===d.today?" · today so far":""):"funnel not wired yet")+
       blk("Fees &amp; refunds",money(fr),"fees "+money(s.fees)+" · refunds "+money(s.refunds)+(s.refunds_pending?" ("+money(s.refunds_pending)+" pending)":""))+
     '</div>';
     var funnel=funnelBox(pr);
@@ -716,22 +716,24 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
   var funCache={};
   function funnelData(pr){
     var from=pr.clipped||pr.from, k=store+"|"+from+"|"+pr.to, c=funCache[k];
-    if(!c){ funCache[k]={loading:true}; (async function(){ try{ var r=await api("/api/funnel?store="+encodeURIComponent(store)+"&from="+from+"&to="+pr.to); funCache[k]=await r.json(); }catch(e){ funCache[k]={ok:false,error:"couldn't load"}; }
+    if(c&&!c.loading&&Date.now()-(c._at||0)>120000) c=null; /* refresh every 2 min */
+    if(!c){ funCache[k]={loading:true}; (async function(){ try{ var r=await api("/api/funnel?store="+encodeURIComponent(store)+"&from="+from+"&to="+pr.to); funCache[k]=await r.json(); funCache[k]._at=Date.now(); }catch(e){ funCache[k]={ok:false,error:"couldn't load",_at:Date.now()}; }
       if(route.p==="pnl"&&$("#pnl")&&Date.now()>busyUntil){ var t=$(".tblwrap")?$(".tblwrap").scrollTop:0; $("#pnl").innerHTML=pnlBody(); wirePnl(); if($(".tblwrap")) $(".tblwrap").scrollTop=t; } })(); return null; }
-    return c.ok?c:null;
+    return c.ok||c.error?c:null;
   }
   function funnelBox(pr){
-    var f=funnelData(pr), t=f&&f.totals;
+    var f=funnelData(pr), t=f&&f.ok?f.totals:null;
+    if(f&&!f.ok) return '<div class="box"><div class="lab">Funnel</div><div class="funnel"><div class="bad-t">Couldn\'t load the funnel ('+esc(f.error||"error")+'). Retrying shortly.</div></div></div>';
     if(!f||!t||t.sessions==null){
       var why=f&&f.status?Object.keys(f.status).map(function(k){return storeName(k)+": "+(f.status[k].reason||f.status[k].state)}).join(" · "):"";
       return '<div class="box"><div class="lab">Funnel</div><div class="funnel"><div><b style="color:var(--text);font-weight:500">Not wired yet</b><br>Sessions, add to cart and checkout come from Shopify\'s analytics (read_reports).<br>'+(why?esc(why)+'<br>':'')+'Until then the funnel and CVR stay blank, never guessed.</div></div></div>';
     }
     var steps=[["Sessions",t.sessions,"of all traffic",null],["Added to cart",t.cart_sessions,"of sessions",t.sessions],["Reached checkout",t.checkout_sessions,"of added to cart",t.cart_sessions],["Orders",t.converted_sessions,"of reached checkout",t.checkout_sessions]];
     var W=[300,96,64,44], h='';
-    steps.forEach(function(st,i){ var w=t.sessions?Math.max(14,Math.round(300*st[1]/t.sessions)):14;
-      h+='<div style="display:grid;grid-template-columns:1fr 300px 1fr;align-items:center;gap:12px;height:62px"><div style="text-align:right"><div style="font:500 13px var(--font)">'+st[0]+'</div><div class="note" style="margin:0">'+(t.sessions?pct(st[1]/t.sessions,2)+" of sessions":"")+'</div></div>'+
-        '<div style="display:grid;place-items:center"><div style="height:46px;width:'+w+'px;border-radius:6px;background:'+(i===3?"#6fe3b4":"#5f6b78")+';opacity:'+(i===3?.9:.6)+'"></div></div>'+
-        '<div><div style="font:600 17px var(--font)">'+esc(st[1].toLocaleString())+'</div><div class="note" style="margin:0">'+(st[3]?pct(st[1]/st[3],0)+" "+st[2]:st[2])+'</div></div></div>'; });
+    steps.forEach(function(st,i){ var known=st[1]!=null, w=known&&t.sessions?Math.max(14,Math.round(300*st[1]/t.sessions)):14;
+      h+='<div style="display:grid;grid-template-columns:1fr 300px 1fr;align-items:center;gap:12px;height:62px"><div style="text-align:right"><div style="font:500 13px var(--font)">'+st[0]+'</div><div class="note" style="margin:0">'+(known&&t.sessions?pct(st[1]/t.sessions,2)+" of sessions":"")+'</div></div>'+
+        '<div style="display:grid;place-items:center"><div style="height:46px;width:'+w+'px;border-radius:6px;background:'+(!known?"#2a2a33":i===3?"#6fe3b4":"#5f6b78")+';opacity:'+(i===3?.9:.6)+'"></div></div>'+
+        '<div><div style="font:600 17px var(--font)">'+(known?esc(st[1].toLocaleString()):"—")+'</div><div class="note" style="margin:0">'+(known&&st[3]?pct(st[1]/st[3],0)+" "+st[2]:known?st[2]:"not known")+'</div></div></div>'; });
     return '<div class="box"><div class="lab">Funnel'+(f.wired?'':' · some stores not wired')+'</div><div style="margin-top:8px">'+h+'</div></div>';
   }
   function blk(lHtml,v,s,cls){ return '<div class="blk"><div class="l">'+lHtml+'</div><div class="v '+(cls||"")+'">'+esc(v)+'</div><div class="s">'+esc(s||"")+'</div></div>'; }

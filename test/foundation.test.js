@@ -654,6 +654,6 @@ test("departments: the 5-minute cron runs one department per slot, every departm
   }
   // The cron slot never throws, even with no network and nothing wired.
   let p; const ctx = { waitUntil: (x) => { p = x; } };
-  await worker.scheduled({ cron: "1-59/5 * * * *" }, { DB }, ctx);
+  await worker.scheduled({ cron: (await import("../src/agents/index.js")).DEPT_CRON, scheduledTime: Date.now() }, { DB }, ctx);
   await p;
 });

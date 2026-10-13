@@ -29,7 +29,9 @@ function dayStartIso(nowMs) {
 }
 
 export async function aiBudgetLeft(env, nowMs = Date.now()) {
-  const cap = Number(env.AI_DAILY_BUDGET_USD || DEFAULT_DAILY_BUDGET_USD);
+  // A setting that isn't a positive number falls back to the default (NaN would mean "no cap").
+  const raw = Number(env.AI_DAILY_BUDGET_USD);
+  const cap = Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_DAILY_BUDGET_USD;
   const spent = await costSince(env.DB, dayStartIso(nowMs));
   return cap - Number(spent || 0);
 }
@@ -45,7 +47,7 @@ export async function askClaude(env, req, { fetchImpl = fetch, nowMs = Date.now(
     const since = dayStartIso(nowMs);
     const told = await env.DB.prepare(`SELECT id FROM events WHERE kind = 'ai.budget_reached' AND at >= ? LIMIT 1`).bind(since).first().catch(() => null);
     if (!told) {
-      await logEvent(env.DB, { actor: req.actor, kind: "ai.budget_reached", summary: `AI spend reached today's cap ($${Number(env.AI_DAILY_BUDGET_USD || DEFAULT_DAILY_BUDGET_USD).toFixed(2)}); agents skip AI work until tomorrow`, at: nowIso(nowMs) }).catch(() => {});
+      await logEvent(env.DB, { actor: req.actor, kind: "ai.budget_reached", summary: `AI spend reached today's cap; agents skip AI work until tomorrow (UTC)`, at: nowIso(nowMs) }).catch(() => {});
     }
     return { skipped: "daily AI budget reached" };
   }

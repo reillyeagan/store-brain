@@ -4,7 +4,7 @@
  *
  * Why a rotation: the 15-minute cron already does the ledger work (orders, money, P&L,
  * brief, KFB message). Each Cloudflare run has its own limits on outside calls and time, so
- * the departments get their own cron ("1-59/5 * * * *": minutes 1, 6, 11, ...) and each run
+ * the departments get their own cron (minutes 1, 6, 11, ... 56; see DEPT_CRON) and each run
  * does ONE department. Inside, every department throttles its agents with job_runs, so a
  * department that comes round more often than it needs simply finds nothing due.
  *
@@ -32,7 +32,9 @@ export const DEPARTMENTS_RUN = Object.freeze({
 });
 
 /** Which department runs in each 5-minute slot of the hour (slot = floor(minute / 5)). */
-export const ROTATION = Object.freeze(["cs", "media", "catalog", "core", "cs", "risk", "supplier", "pnl", "cs", "media", "catalog", "fulfillment"]);
+export const ROTATION = Object.freeze(["cs", "media", "catalog", "core", "cs", "risk", "supplier", "pnl", "cs", "core", "catalog", "fulfillment"]);
+/** The cron string in wrangler.toml for the department runs (explicit minutes: no range/step mix). */
+export const DEPT_CRON = "1,6,11,16,21,26,31,36,41,46,51,56 * * * *";
 
 export function departmentForMinute(minute) {
   return ROTATION[Math.floor((((minute % 60) + 60) % 60) / 5) % ROTATION.length];
@@ -41,6 +43,7 @@ export function departmentForMinute(minute) {
 /** Off switch for every department at once (env AGENTS_OFF = "1"); each also has its own. */
 export async function runDepartmentSlot(env, { nowMs = Date.now(), fetchImpl = fetch } = {}) {
   if (env.AGENTS_OFF === "1") return { ran: false, reason: "AGENTS_OFF" };
+  // nowMs should be the cron's scheduledTime, so a run that starts late keeps its own slot.
   const dept = departmentForMinute(new Date(nowMs).getUTCMinutes());
   const d = DEPARTMENTS_RUN[dept];
   try {
