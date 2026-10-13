@@ -324,10 +324,10 @@ export class BriefAiError extends Error {}
  * response reports token usage, BEFORE the content is checked: an empty or malformed answer
  * is still paid for, and its cost must reach the ledger.
  */
-export async function callClaude(env, prompt, { fetchImpl = fetch, onUsage = null } = {}) {
+export async function callClaude(env, prompt, { fetchImpl = fetch, onUsage = null, maxTokens = null } = {}) {
   const model = String(env.BRIEF_MODEL || DEFAULT_BRIEF_MODEL).trim();
   const base = {
-    model, max_tokens: BRIEF_MAX_TOKENS, system: prompt.system,
+    model, max_tokens: Math.min(Number(maxTokens) || BRIEF_MAX_TOKENS, 4000), system: prompt.system,
     messages: [{ role: "user", content: prompt.user }],
   };
   // No up-front thinking (plain writing task, keeps tokens down) and low effort.
