@@ -57,10 +57,13 @@ a{color:inherit}
 .kpi .v{font:600 24px var(--font);margin-top:2px;letter-spacing:-.01em;font-variant-numeric:tabular-nums}
 .kpi .s{font-size:11.5px;color:var(--muted);margin-top:1px}
 @media (max-width:700px){.kpis{grid-template-columns:repeat(2,minmax(0,1fr))}}
-.home{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:var(--gap);align-items:stretch}
+.home{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:var(--gap);align-items:start}
 @media (max-width:1100px){.home{grid-template-columns:minmax(0,1fr)}}
 .mapbox{border:1px solid var(--border);border-radius:12px;background:radial-gradient(ellipse at 50% 48%,#15171f 0%,#0d0d10 62%);position:relative;overflow-x:auto;display:flex;flex-direction:column}
-.mapbox svg{flex:1}
+/* The map keeps its own height; the side column scrolls instead of stretching it
+   (a tall activity list once pushed the drawing out of view). */
+.homeside{max-height:calc(100vh - 40px);position:sticky;top:20px}
+.homeside .feedbox{overflow:auto;min-height:0;flex:1}
 #map{display:block;width:100%;min-width:760px;height:auto}
 #map .lb{font:400 11px var(--font);fill:#80808b}
 #map .lb.off{fill:#54545c;text-decoration:line-through}
@@ -176,6 +179,7 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
   </form>
 </div>
 
+<div class="gate" id="loading"><div style="display:grid;gap:10px;justify-items:center;color:var(--muted)"><div style="font:600 18px var(--font);color:var(--text)">Eagano LLC</div><div><span class="dot live" style="background:var(--good);margin-right:8px"></span>Waking the brain…</div></div></div>
 <div class="shell" id="app" hidden>
   <aside class="side">
     <div class="brand">Eagano LLC</div>
@@ -219,7 +223,7 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
     try{ return sessionStorage.getItem(KEY_STORE) }catch(e){ return null }
   }
   function showGate(msg){
-    $("#app").hidden=true; $("#gate").hidden=false;
+    $("#app").hidden=true; $("#loading").hidden=true; $("#gate").hidden=false;
     if(msg){ $("#keyIn").setCustomValidity(msg); $("#keyIn").reportValidity(); }
   }
   $("#gateForm").addEventListener("submit",function(e){
@@ -236,10 +240,11 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
       if(r.status===401){ try{sessionStorage.removeItem(KEY_STORE)}catch(e){} key=null; showGate("That key didn't work."); return; }
       if(!r.ok) throw new Error("HTTP "+r.status);
       state=await r.json();
-      $("#gate").hidden=true; $("#app").hidden=false;
+      $("#gate").hidden=true; $("#loading").hidden=true; $("#app").hidden=false;
       if(Date.now()>busyUntil&&!selecting()) render();
     }catch(err){
       $("#status").innerHTML='<span class="bad">Can\'t reach the brain: '+esc(err.message)+'</span>';
+      if(!$("#loading").hidden) $("#loading").querySelector("div div:last-child").innerHTML='<span class="bad-t">Can\'t reach the brain ('+esc(err.message)+'). Retrying…</span>';
     }
     clearTimeout(timer); timer=setTimeout(load,document.hidden?60000:10000);
   }
@@ -375,7 +380,7 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
     var wait='<div class="lab" style="display:flex;justify-content:space-between;margin-bottom:12px"><span>Waiting on you · '+n.length+'</span><a href="#/brief" style="text-transform:none;letter-spacing:0;color:var(--muted)">open Brief →</a></div><div class="col" style="gap:10px">'+
       (n.length?n.slice(0,5).map(function(x){ return '<a href="'+(x.href||"#/brief")+'" style="text-decoration:none"><div class="card" style="border-left-color:'+x.color+'"><div class="t">'+esc(x.title)+'<span>'+esc(x.who)+'</span></div><div class="d">'+esc(x.detail)+'</div></div></a>'; }).join(""):'<div class="card" style="border-left-color:var(--good)"><div class="d">Nothing is waiting on you.</div></div>')+'</div>';
     var feed='<div class="lab" style="display:flex;justify-content:space-between"><span>Activity · live</span><span style="color:var(--good);text-transform:none;letter-spacing:0"><span class="dot live" style="background:var(--good);margin-right:5px"></span>'+w.length+' agent'+(w.length===1?"":"s")+' working</span></div>'+feedHtml(25);
-    return kpis+storeCards()+'<div class="home">'+map+'<div class="col"><div class="box">'+wait+'</div><div class="box" style="flex:1">'+feed+'</div></div></div>';
+    return kpis+storeCards()+'<div class="home">'+map+'<div class="col homeside"><div class="box">'+wait+'</div><div class="box feedbox">'+feed+'</div></div></div>';
   }
   function kpi(l,v,s,cls,extra,glow){ return '<div class="kpi">'+(glow?'<div class="glow" style="background:'+glow+'"></div>':'')+'<div class="l">'+esc(l)+'</div><div class="v '+(cls||"")+'">'+esc(v)+'</div>'+(s?'<div class="s">'+esc(s)+'</div>':"")+(extra||"")+'</div>'; }
   function avatar(id,live){ var n=actorName(id).replace(/[^A-Za-z ]/g,"").split(" ").filter(Boolean), c=colorOf(id);
