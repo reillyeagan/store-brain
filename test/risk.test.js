@@ -3,9 +3,9 @@ import assert from "node:assert/strict";
 import { makeD1 } from "./helpers/d1.js";
 
 import { runRisk, riskState, RISK_JOBS } from "../src/agents/risk/index.js";
-import { runChargebacks, reminderDue, approvalTitle, missingEvidence, gatherFacts } from "../src/agents/risk/chargebacks.js";
+import { runChargebacks, reminderDue, approvalTitle, countdownAsOf, missingEvidence, gatherFacts, redactPii } from "../src/agents/risk/chargebacks.js";
 import { runFraud, screenOrder, shopifyLevel } from "../src/agents/risk/fraud.js";
-import { runAccountHealth, judgeHealth } from "../src/agents/risk/accountHealth.js";
+import { runAccountHealth, judgeHealth, mergeHealth } from "../src/agents/risk/accountHealth.js";
 import { collectStore, classifyPending, claimSnippets, themeStrings } from "../src/agents/risk/claimsAudit.js";
 import { daysLeft } from "../src/agents/risk/shared.js";
 import { _resetTokenCacheForTests } from "../src/lib/storeGuard.js";
@@ -109,7 +109,9 @@ test("chargebacks: stores the dispute, ONE approval with order, amount and due d
   assert.match(pend[0].title, /#1053/);
   assert.match(pend[0].title, /\$89\.95/);
   assert.match(pend[0].title, /Oct 31/);
-  assert.match(pend[0].title, /18 days left/);
+  // No frozen countdown in the stored title; the dated countdown sits in the option detail.
+  assert.doesNotMatch(pend[0].title, /days? left|TODAY|OVERDUE/);
+  assert.match(pend[0].options[0].detail, /As of Oct 13: 18 days left/);
   assert.equal(pend[0].dept, "risk");
   const row = await DB.prepare(`SELECT * FROM risk_disputes`).first();
   assert.equal(row.status, "NEEDS_RESPONSE");
@@ -204,10 +206,12 @@ test("chargebacks: a store that isn't wired is skipped and noted once a day, nev
   assert.equal((await evs(DB, "risk.not_wired")).length, 2); // aub + mar, once each
 });
 
-test("chargebacks: approval title says OVERDUE / TODAY plainly", () => {
+test("chargebacks: title has the due date only; the dated countdown says OVERDUE / TODAY plainly", () => {
   const d = { order_name: "#1", amount: 10, currency: "USD", evidence_due_by: "2026-10-13", type: "CHARGEBACK" };
-  assert.match(approvalTitle("hc", d, NOW), /due TODAY/);
-  assert.match(approvalTitle("hc", { ...d, evidence_due_by: "2026-10-10" }, NOW), /3 days OVERDUE/);
+  assert.equal(approvalTitle("hc", d), "Chargeback #1 · $10.00 · evidence due Oct 13 · Holt & Crane");
+  assert.equal(countdownAsOf(d, NOW), "As of Oct 13: due TODAY");
+  assert.equal(countdownAsOf({ ...d, evidence_due_by: "2026-10-10" }, NOW), "As of Oct 13: 3 days OVERDUE");
+  assert.equal(countdownAsOf({ ...d, evidence_due_by: null }, NOW), "Shopify gave no due date");
 });
 
 test("chargebacks: missing evidence notes a billing/shipping ZIP mismatch on fraud disputes", async () => {
@@ -407,4 +411,108 @@ test("runRisk: RISK_OFF=1 does nothing", async () => {
   const net = fakeNet();
   assert.deepEqual(await runRisk({ DB, ...CREDS, RISK_OFF: "1" }, { nowMs: NOW, fetchImpl: net.fetchImpl }), { skipped: "RISK_OFF" });
   assert.equal(net.calls.length, 0);
+});
+
+/* ---------------- review fixes (2026-10-13) ---------------- */
+
+test("fix: customer PII from a real cs_tickets row never reaches Claude; only date, subject and redacted body are used", async () => {
+  const DB = makeD1();
+  await DB.prepare(
+    `INSERT INTO cs_tickets (opened_at, updated_at, slot, gmail_id, received_at, store, from_email, from_name, to_addr, subject, body,
+       order_ref, order_id, order_name, draft_body, context, triage)
+     VALUES (?, ?, 'google:hc', 'g1', '2026-10-01T15:00:00Z', 'hc', 'pat.buyer@example.com', 'Pat Buyer', 'info@holtandcrane.com',
+       'Where is my order #1053? - Pat Buyer', ?, '1053', 'gid://shopify/Order/1053', '#1053',
+       'Hi Pat Buyer, your parcel to 12 Elm Street is on its way', '{"address":"12 Elm Street, Austin TX 78701"}', '{"from":"pat.buyer@example.com"}')`
+  ).bind(iso(NOW), iso(NOW),
+    "Hi, this is Pat Buyer. My blazer hasn't arrived at 12 Elm Street Apt 4, Austin TX 78701. Call me on (512) 555-0199 or email pat.buyer@example.com").run();
+  const net = fakeNet({
+    shopify: only("hc", () => ({ disputes: { nodes: [disputeNode()] } }), emptyFor),
+    claude: "Draft. [ADD: proof of delivery]",
+  });
+  await runChargebacks({ DB, ...CREDS, ANTHROPIC_API_KEY: KEY }, { nowMs: NOW, fetchImpl: net.fetchImpl });
+  const ai = net.calls.filter((c) => c.kind === "claude");
+  assert.equal(ai.length, 1);
+  const prompt = JSON.stringify(ai[0].body);
+  for (const pii of ["pat.buyer@example.com", "buyer@example.com", "Pat", "Buyer", "Elm Street", "12 Elm", "Austin", "78701", "555-0199", "512", "info@holtandcrane.com"]) {
+    assert.ok(!prompt.includes(pii), `the prompt must not contain "${pii}"`);
+  }
+  // The message itself did make it in (redacted), so the rebuttal can cite it.
+  assert.match(prompt, /blazer hasn't arrived/);
+  assert.match(prompt, /2026-10-01T15:00:00Z/);
+  // CS drafts, context and triage are never read.
+  assert.ok(!prompt.includes("your parcel to"));
+  // The stored pack holds only date, subject and redacted body.
+  const facts = JSON.parse((await DB.prepare(`SELECT facts FROM risk_evidence_packs`).first()).facts);
+  assert.equal(facts.customer_messages.length, 1);
+  assert.deepEqual(Object.keys(facts.customer_messages[0]).sort(), ["body", "received_at", "subject"]);
+  assert.ok(!JSON.stringify(facts.customer_messages).includes("example.com"));
+  assert.ok(!JSON.parse((await DB.prepare(`SELECT missing FROM risk_evidence_packs`).first()).missing).some((m) => /Customer emails/.test(m)));
+});
+
+test("fix: redactPii removes emails, phones, street addresses and known names", () => {
+  const s = redactPii("Jo Smith, 221 Baker Street, call +1 415-555-0100, jo@x.co, Springfield", ["Jo Smith", "Springfield"]);
+  assert.ok(!/Smith|Baker|415|jo@x\.co|Springfield/.test(s), s);
+});
+
+test("fix: a HIGH order whose approval fails is NOT marked final; the next run raises it once", async () => {
+  const base = makeD1();
+  let failApprovals = true;
+  const DB = {
+    prepare(sql) {
+      if (failApprovals && /INSERT INTO approvals/.test(sql)) throw new Error("approvals table busy");
+      return base.prepare(sql);
+    },
+  };
+  const high = orderNode(30, { risk: { recommendation: "CANCEL", assessments: [{ riskLevel: "HIGH", facts: [] }] } });
+  const net = fakeNet({ shopify: only("hc", () => ({ orders: { nodes: [high] } }), emptyFor) });
+  const env = { DB, ...CREDS };
+  await runFraud(env, { nowMs: NOW, fetchImpl: net.fetchImpl });
+  const row = await base.prepare(`SELECT * FROM risk_order_screens`).first();
+  assert.ok(!row || row.final === 0, "must not be final without its approval");
+  assert.equal((await evs(base, "risk.order_high")).length, 0);
+  failApprovals = false;
+  await runFraud(env, { nowMs: NOW + 3600000, fetchImpl: net.fetchImpl });
+  await runFraud(env, { nowMs: NOW + 7200000, fetchImpl: net.fetchImpl });
+  assert.equal((await listPending(base)).length, 1);
+  assert.equal((await evs(base, "risk.order_high")).length, 1);
+  const done = await base.prepare(`SELECT * FROM risk_order_screens`).first();
+  assert.equal(done.final, 1);
+  assert.ok(done.approval_id > 0);
+});
+
+test("fix: a partial health read keeps the last values and never lowers 'bad'; no false 'worse' alert after", async () => {
+  // Pure merge: rates failed, account read fine → previous dispute rate and "bad" kept.
+  const prev = { state: "bad", dispute_rate: 0.01, orders_90d: 400, disputes_90d: 4, disputes_at_least: 0, orders_precision: "EXACT", refund_rate: null,
+    payments_activated: 1, payout_interval: "DAILY", failed_payouts: 0 };
+  const read = { h: { payments_activated: 1, payout_interval: "DAILY", failed_payouts: 0, orders_90d: null, orders_precision: null,
+    disputes_90d: null, disputes_at_least: 0, dispute_rate: null, refund_rate: null }, ratesOk: false, accountOk: true };
+  const m = mergeHealth(read, prev);
+  assert.equal(m.state, "bad");
+  assert.equal(m.h.dispute_rate, 0.01);
+  assert.equal(m.partial, true);
+
+  // End to end: bad → (dispute read fails) → bad kept → (full read, still bad) → no second alert.
+  const DB = makeD1();
+  let ratesFail = false;
+  const net = fakeNet({
+    shopify: only("mar", (s, op) => {
+      if (op === "RiskRates") {
+        if (ratesFail) return { errors: [{ message: "Internal error. Looks like something went wrong on our end." }] };
+        return { ordersCount: { count: 400, precision: "EXACT" }, disputes: { nodes: [1, 2, 3, 4].map((i) => ({ id: `d${i}`, status: "LOST" })), pageInfo: { hasNextPage: false } } };
+      }
+      return emptyFor(op);
+    }, emptyFor),
+  });
+  const env = { DB, ...CREDS };
+  await runAccountHealth(env, { nowMs: NOW, fetchImpl: net.fetchImpl });
+  assert.equal((await DB.prepare(`SELECT state FROM risk_account_health WHERE store = 'mar'`).first()).state, "bad");
+  ratesFail = true;
+  await runAccountHealth(env, { nowMs: NOW + DAY, fetchImpl: net.fetchImpl });
+  const mid = await DB.prepare(`SELECT * FROM risk_account_health WHERE store = 'mar'`).first();
+  assert.equal(mid.state, "bad");
+  assert.equal(mid.dispute_rate, 4 / 400);
+  assert.equal(JSON.parse(mid.detail).partial, true);
+  ratesFail = false;
+  await runAccountHealth(env, { nowMs: NOW + 2 * DAY, fetchImpl: net.fetchImpl });
+  assert.equal((await evs(DB, "risk.health_worse")).length, 1); // only the first time it went bad
 });

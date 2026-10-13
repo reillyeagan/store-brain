@@ -23,7 +23,7 @@ import { shopifyGraphQL } from "../../lib/storeGuard.js";
 import { createApproval } from "../../lib/approvals.js";
 import { logEvent } from "../../lib/eventlog.js";
 import { askClaude } from "../../lib/ai.js";
-import { nowIso } from "../../lib/time.js";
+import { nowIso, localDay } from "../../lib/time.js";
 import {
   DEPT, moneyOf, currencyOf, fmtMoney, fmtDay, daysLeft, logProblem, logOnce, safeJson, tableExists,
 } from "./shared.js";
@@ -103,12 +103,24 @@ async function upsertDispute(db, storeId, d, at) {
 const label = (d) => d.order_name || `dispute ${d.legacy_id || d.dispute_id}`;
 const reasonText = (r) => (r ? String(r).toLowerCase().replace(/_/g, " ") : "reason not given");
 
-/** The approval title: order, amount and due date, as the spec and brief ask. */
-export function approvalTitle(storeId, d, nowMs) {
-  const dl = daysLeft(d.evidence_due_by, nowMs);
-  const left = dl == null ? "" : dl < 0 ? ` (${-dl} days OVERDUE)` : dl === 0 ? " (due TODAY)" : ` (${dl} day${dl === 1 ? "" : "s"} left)`;
+/**
+ * The approval title: order, amount and due date, as the spec and brief ask. No countdown:
+ * the title is stored once and would go stale ("18 days left" read a week later is wrong).
+ * The countdown lives in the option detail, dated (see countdownAsOf).
+ */
+export function approvalTitle(storeId, d) {
   const kind = d.type === "INQUIRY" ? "Inquiry" : "Chargeback";
-  return `${kind} ${label(d)} · ${fmtMoney(d.amount, d.currency)} · evidence due ${fmtDay(d.evidence_due_by)}${left} · ${STORES[storeId].name}`;
+  return `${kind} ${label(d)} · ${fmtMoney(d.amount, d.currency)} · evidence due ${fmtDay(d.evidence_due_by)} · ${STORES[storeId].name}`;
+}
+
+/** "As of Oct 13: 18 days left" (or due today / N days overdue). Dated, so it can't mislead later. */
+export function countdownAsOf(d, nowMs) {
+  const dl = daysLeft(d.evidence_due_by, nowMs);
+  if (dl == null) return "Shopify gave no due date";
+  const asOf = `As of ${fmtDay(localDay(nowMs, "America/New_York"))}`;
+  if (dl < 0) return `${asOf}: ${-dl} day${dl === -1 ? "" : "s"} OVERDUE`;
+  if (dl === 0) return `${asOf}: due TODAY`;
+  return `${asOf}: ${dl} day${dl === 1 ? "" : "s"} left`;
 }
 
 /**
@@ -123,9 +135,9 @@ async function ensureApproval(db, storeId, d, nowMs) {
   try {
     const id = await createApproval(db, {
       dept: DEPT, requestedBy: ACTOR, store: storeId,
-      title: approvalTitle(storeId, d, nowMs),
+      title: approvalTitle(storeId, d),
       options: [
-        { id: "will_submit", label: "I'll submit the evidence in Shopify", detail: `Reason: ${reasonText(d.reason)}. The evidence draft is on the Risk page; the brain never submits.` },
+        { id: "will_submit", label: "I'll submit the evidence in Shopify", detail: `${countdownAsOf(d, nowMs)}. Reason: ${reasonText(d.reason)}. The evidence draft is on the Risk page; the brain never submits.` },
         { id: "accept_loss", label: "Don't fight it (I'll accept it in Shopify)", detail: `${fmtMoney(d.amount, d.currency)} is lost if accepted.` },
       ],
     });
@@ -179,29 +191,57 @@ async function remindIfDue(db, storeId, d, nowMs) {
 
 /* ---------------- evidence pack (code part) ---------------- */
 
-/** Customer messages about this order, if a CS department table exists. Optional input. */
-async function customerMessages(db, d) {
-  const out = [];
-  // We don't depend on CS's schema: try a few plausible tables and columns, quietly.
-  for (const t of ["cs_messages", "cs_emails", "cs_tickets", "cs_threads"]) {
-    if (!(await tableExists(db, t))) continue;
-    for (const col of ["order_id", "order_name", "order_ref"]) {
-      const key = col === "order_id" ? d.order_id : d.order_name;
-      if (!key) continue;
-      try {
-        const { results } = await db.prepare(`SELECT * FROM ${t} WHERE ${col} = ? LIMIT 10`).bind(key).all();
-        for (const r of results || []) out.push({ table: t, row: trimRow(r) });
-        break;
-      } catch { /* column not there: try the next one */ }
+/**
+ * Remove personal details from free text before it is stored in a pack or sent to Claude:
+ * email addresses, phone numbers, street addresses, and the customer's own name, city and
+ * ZIP (passed in as `known`). Errs towards removing too much: a redacted word costs nothing,
+ * a leaked address can't be taken back.
+ */
+export function redactPii(text, known = []) {
+  let s = String(text || "");
+  s = s.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[email]");
+  s = s.replace(/\+?\d[\d\s().-]{7,}\d/g, "[phone]");
+  s = s.replace(/\b\d{1,6}\s+(?:[A-Za-z0-9.'-]+\s+){0,4}(?:street|st|avenue|ave|road|rd|boulevard|blvd|lane|ln|drive|dr|way|court|ct|place|pl|terrace|circle|cir|highway|hwy|parkway|pkwy)\b\.?(?:\s*(?:apt|apartment|suite|ste|unit|#)\s*[\w-]+)?/gi, "[address]");
+  for (const k of known) {
+    for (const w of String(k || "").split(/\s+/)) {
+      if (w.length < 3) continue;
+      s = s.replace(new RegExp(`\\b${w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "gi"), "[redacted]");
     }
   }
-  return out.slice(0, 10);
+  return s;
 }
 
-function trimRow(r) {
-  const o = {};
-  for (const [k, v] of Object.entries(r)) o[k] = typeof v === "string" ? v.slice(0, 600) : v;
-  return o;
+/** The customer's own identifying words (name, city, ZIP) from the order, for redaction. */
+function knownPii(o) {
+  if (!o) return [];
+  const a = o.shippingAddress || {}, b = o.billingAddress || {};
+  return [o.customer && o.customer.displayName, a.name, a.city, a.zip, b.zip].filter(Boolean);
+}
+
+/**
+ * Customer emails about this order, from the CS department's cs_tickets table when it exists
+ * (optional input). Only the date, subject and a clipped, redacted body are taken: never the
+ * sender's address or name, CS's drafts, triage or order context.
+ */
+async function customerMessages(db, storeId, d, o) {
+  if (!(await tableExists(db, "cs_tickets"))) return [];
+  const ref = d.order_name ? String(d.order_name).replace(/[^0-9]/g, "") : null;
+  try {
+    const { results } = await db.prepare(
+      `SELECT received_at, subject, body FROM cs_tickets
+        WHERE (store = ? OR store IS NULL)
+          AND ((? IS NOT NULL AND order_id = ?) OR (? IS NOT NULL AND order_name = ?) OR (? IS NOT NULL AND order_ref = ?))
+        ORDER BY received_at LIMIT 10`
+    ).bind(storeId, d.order_id, d.order_id, d.order_name, d.order_name, ref || null, ref || null).all();
+    const known = knownPii(o);
+    return (results || []).map((r) => ({
+      received_at: r.received_at || null,
+      subject: redactPii(String(r.subject || "").slice(0, 200), known),
+      body: redactPii(String(r.body || "").slice(0, 600), known),
+    }));
+  } catch {
+    return []; // CS schema changed: the pack still builds; "emails" shows as missing evidence
+  }
 }
 
 /** Everything code can gather for one dispute. Pure facts; no judgement. */
@@ -223,7 +263,7 @@ export async function gatherFacts(db, storeId, d) {
   const { results: policies } = await db.prepare(
     `SELECT key, value, source, observed_at FROM core_facts WHERE live = 1 AND area = 'policy' AND (store = ? OR store IS NULL) ORDER BY id DESC LIMIT 10`
   ).bind(storeId).all();
-  const messages = await customerMessages(db, d);
+  const messages = await customerMessages(db, storeId, d, o);
   const ship = o && o.shippingAddress, bill = o && o.billingAddress;
   return {
     store: STORES[storeId].name,
@@ -287,10 +327,29 @@ Rules:
 - Where a piece of evidence is missing, write [ADD: what is needed] so he knows to attach it.
 - Answer the specific dispute reason. Factual, calm, under 300 words. No greeting, no sign-off.`;
 
-/** Strip what Claude doesn't need (email address) before the facts leave the ledger. */
-function factsForAi(facts, missing) {
+/**
+ * What Claude sees: no email, no name, no street/city/ZIP, no carrier scan locations. A
+ * rebuttal doesn't need them (Shopify attaches the order details itself), so personal
+ * data never leaves the ledger. Message text is redacted a second time, belt and braces.
+ */
+export function factsForAi(facts, missing) {
   const f = JSON.parse(JSON.stringify(facts));
-  if (f.customer) delete f.customer.email;
+  const ship = f.shipping_address || {}, bill = f.billing_address || {};
+  const known = [f.customer && f.customer.name, ship.name, ship.city, ship.zip, bill.zip].filter(Boolean);
+  if (f.customer) f.customer = { orders_with_store: f.customer.orders_with_store ?? null };
+  if (f.shipping_address) {
+    f.shipping_address = { province: ship.province || null, country: ship.country || null };
+  }
+  if (f.billing_address) {
+    f.billing_address = {
+      country: bill.country || null,
+      zip_matches_shipping: bill.zip && ship.zip ? bill.zip === ship.zip : null,
+    };
+  }
+  f.ledger_shipments = (f.ledger_shipments || []).map(({ last_event_location, ...s }) => s);
+  f.customer_messages = (f.customer_messages || []).map((m) => ({
+    received_at: m.received_at || null, subject: redactPii(m.subject, known), body: redactPii(m.body, known),
+  }));
   return { ...f, evidence_we_could_not_find: missing };
 }
 

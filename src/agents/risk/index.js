@@ -1,16 +1,17 @@
 /**
  * Risk & Disputes department — one cron entry point and one dashboard data function.
  *
- * runRisk(env) is called on every 15-minute cron tick. Each agent throttles itself through
- * job_runs (claimJob), runs inside its own try (one failing agent never stops the others)
- * and never throws. Everything is SHADOW: Shopify is only read; the brain stores, flags,
- * drafts and asks Reilly. Reilly submits dispute evidence and cancels orders himself.
+ * runRisk(env) is called once an hour: Risk's slot in the department rotation
+ * (src/agents/index.js). Each agent throttles itself through job_runs (claimJob), runs inside
+ * its own try (one failing agent never stops the others) and never throws. Everything is
+ * SHADOW: Shopify is only read; the brain stores, flags, drafts and asks Reilly. Reilly
+ * submits dispute evidence and cancels orders himself.
  *
  * Cadences (why):
  *   risk.chargebacks      hourly   evidence deadlines are days away; hourly is plenty
- *   risk.fraud            30 min   a HIGH order should reach Reilly before KFB is paid
+ *   risk.fraud            hourly   a HIGH order should reach Reilly before KFB is paid
  *   risk.account_health   daily    spec: "Account health (daily)"; weekly summary on top
- *   risk.claims_audit     weekly per store (one store per tick), classification hourly
+ *   risk.claims_audit     weekly per store (one store per hourly run), classification hourly
  *
  * Kill switch: env RISK_OFF = "1" skips the whole department (default: runs, in shadow).
  */
@@ -24,7 +25,7 @@ import { daysLeft, logOnce, safeJson } from "./shared.js";
 
 export const RISK_JOBS = Object.freeze({
   chargebacks: { job: "risk.chargebacks", everyMin: 60, actor: "risk.chargebacks" },
-  fraud: { job: "risk.fraud", everyMin: 30, actor: "risk.fraud" },
+  fraud: { job: "risk.fraud", everyMin: 60, actor: "risk.fraud" },
   health: { job: "risk.account_health", everyMin: 24 * 60, actor: "risk.account_health" },
   healthWeekly: { job: "risk.account_health.weekly", everyMin: 7 * 24 * 60, actor: "risk.account_health" },
   claimsCollect: { job: "risk.claims.collect", everyMin: 7 * 24 * 60, actor: "risk.claims_audit" }, // + ".<store>"
@@ -45,7 +46,7 @@ async function step(env, spec, fn, nowMs, jobName = spec.job) {
   } catch (err) {
     await retrySoon(env.DB, jobName, spec.everyMin, Math.min(30, spec.everyMin), nowMs).catch(() => {});
     await logOnce(env.DB, { actor: spec.actor, kind: "error.risk",
-      summary: `${spec.actor} run failed; it will retry within 30 minutes (${String(err && err.message).slice(0, 200)})` }, { nowMs }).catch(() => {});
+      summary: `${spec.actor} run failed; it will retry on Risk's next run (${String(err && err.message).slice(0, 200)})` }, { nowMs }).catch(() => {});
     return { error: String(err && err.message) };
   }
 }
