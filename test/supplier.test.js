@@ -2,9 +2,9 @@ import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { makeD1 } from "./helpers/d1.js";
 
-import { up95, down95, targetPrice, planVariantPrice, compareAtFor, tierOf, badgePct } from "../src/agents/supplier/pricing.js";
-import { importQuotes, runQuoteDesk, validateQuoteRow, planProduct, PRODUCTS_BY_HANDLE_QUERY } from "../src/agents/supplier/quotes.js";
-import { recommendSize, runSizeChecker, complaintShift, chartFromRows, garmentOf } from "../src/agents/supplier/sizeChecker.js";
+import { up95, down95, planVariantPrice, compareAtFor, tierOf, badgePct } from "../src/agents/supplier/pricing.js";
+import { importQuotes, runQuoteDesk, validateQuoteRow, planProduct, PRODUCTS_BY_HANDLE_QUERY, VARIANT_PAGE_QUERY, settleBatches, writeQuoteCost } from "../src/agents/supplier/quotes.js";
+import { recommendSize, runSizeChecker, complaintShift, chartFromRows, garmentOf, listedSizes } from "../src/agents/supplier/sizeChecker.js";
 import { runSimilarQc, recordSimilarOffer, judgeSimilar } from "../src/agents/supplier/similarQc.js";
 import { runPreflight, preflightProduct } from "../src/agents/supplier/preflight.js";
 import { addCredit, runClaims, creditAging, markCredited } from "../src/agents/supplier/claims.js";
@@ -12,7 +12,7 @@ import { runDigest, digestData, digestBody, importBills } from "../src/agents/su
 import { runScout } from "../src/agents/supplier/scout.js";
 import { ensureSupplierDecisions, SUPPLIER_DECISIONS } from "../src/agents/supplier/decisions.js";
 import { runSupplier, supplierState } from "../src/agents/supplier/index.js";
-import { listPending } from "../src/lib/approvals.js";
+import { listPending, decide } from "../src/lib/approvals.js";
 import { _resetTokenCacheForTests } from "../src/lib/storeGuard.js";
 
 beforeEach(() => _resetTokenCacheForTests());
@@ -32,60 +32,114 @@ function fakeShopify(productsByDomain) {
     const body = JSON.parse(init.body);
     calls.push({ url: String(url), body });
     const domain = new URL(url).host;
+    const all = productsByDomain[domain] || [];
+    const page = (vs, from, n) => ({ nodes: vs.slice(from, from + n), pageInfo: { hasNextPage: from + n < vs.length, endCursor: String(from + n) } });
+    if (body.variables.id) { // variant page
+      const p = all.find((x) => x.id === body.variables.id);
+      return Response.json({ data: { product: { variants: page(p.allVariants, Number(body.variables.after || 0), 100) } } });
+    }
     const handles = [...body.variables.q.matchAll(/handle:([a-z0-9-]+)/g)].map((m) => m[1]);
-    const nodes = (productsByDomain[domain] || []).filter((p) => handles.includes(p.handle));
+    const first = Number(/variants\(first: (\d+)\)/.exec(body.query)[1]);
+    const nodes = all.filter((p) => handles.includes(p.handle)).map(({ allVariants, ...p }) => ({
+      ...p, variantsCount: { count: allVariants.length }, variants: page(allVariants, 0, first),
+    }));
     return Response.json({ data: { products: { nodes } } });
   };
   return { fetchImpl, calls };
 }
 
-const product = (handle, { price = "49.95", compareAt = null, status = "ACTIVE", title = handle, productType = "Sweaters", variants = null } = {}) => ({
+const product = (handle, { price = "49.95", compareAt = null, status = "ACTIVE", title = handle, productType = "Sweaters", variants = null, sku = null } = {}) => ({
   id: `gid://shopify/Product/${handle}`, handle, title, status, productType,
-  variants: { nodes: variants || [{ id: `gid://shopify/ProductVariant/${handle}-1`, title: "M", price, compareAtPrice: compareAt }] },
+  allVariants: variants || [{ id: `gid://shopify/ProductVariant/${handle}-1`, title: "M", sku, price, compareAtPrice: compareAt }],
 });
 
-/* ------------------------------------------------------------ pricing */
+/**
+ * Shopify's requested query cost (the published rules, enough to check our queries): a scalar
+ * costs 0, an object 1, and a connection with first:N costs 2 + N × (1 + its node's fields),
+ * plus anything else on the connection (pageInfo = 1) once.
+ */
+function requestedCost(query) {
+  const src = query.slice(query.indexOf("{"));
+  let i = 0;
+  const parseSel = () => { // at "{": returns [{name, args, children}]
+    i++;
+    const fields = [];
+    while (i < src.length) {
+      const rest = src.slice(i);
+      if (/^\s*}/.test(rest)) { i += rest.indexOf("}") + 1; return fields; }
+      const m = /^\s*([A-Za-z_]\w*)\s*(\(([^)]*)\))?\s*/.exec(rest);
+      if (!m) { i++; continue; }
+      i += m[0].length;
+      const f = { name: m[1], args: m[3] || "", children: null };
+      if (src[i] === "{") f.children = parseSel();
+      fields.push(f);
+    }
+    return fields;
+  };
+  const cost = (f) => {
+    if (!f.children) return 0;
+    const first = /first:\s*(\d+)/.exec(f.args);
+    if (first) {
+      return 2 + f.children.reduce((t, c) => t + (c.name === "nodes" || c.name === "edges"
+        ? Number(first[1]) * (1 + c.children.reduce((u, g) => u + cost(g), 0))
+        : cost(c)), 0);
+    }
+    return 1 + f.children.reduce((t, c) => t + cost(c), 0);
+  };
+  return parseSel().reduce((t, f) => t + cost(f), 0);
+}
 
-test("pricing: .95 rounding helpers", () => {
+/* ------------------------------------------------------------ pricing (shared Catalog rulebook) */
+
+const plan = (store, costUsd, price, compareAt = null) => planVariantPrice(store, { costUsd, price, compareAt });
+
+test("pricing: Quote Desk uses the shared catalog/pricingRules.js (Marlowe target, floors, ceiling waiver)", () => {
   assert.equal(up95(40), 40.95);
-  assert.equal(up95(44.95), 44.95);
-  assert.equal(up95(45), 45.95);
   assert.equal(down95(45), 44.95);
-  assert.equal(down95(44.94), 43.95);
-});
-
-test("pricing: Marlowe target = min(max(up95(cost/0.29), 49.95), 144.95)", () => {
-  assert.equal(targetPrice("mar", 20).price, 69.95); // 20/0.29 = 68.97 → 69.95
-  assert.equal(targetPrice("mar", 10).price, 49.95); // floor
-  const c = targetPrice("mar", 50);
-  assert.equal(c.price, 144.95);
+  assert.equal(plan("mar", 20, 59.95).newPrice, 69.95); // 20/0.29 = 68.97 → 69.95
+  assert.equal(plan("mar", 10, 59.95).newPrice, 49.95); // floor
+  const c = plan("mar", 50, 99.95);
+  assert.equal(c.newPrice, 144.95);
   assert.equal(c.limitedBy, "ceiling");
   assert.equal(c.waiverPrice, 172.95, "the proposal says what band needs; never waives itself");
 });
 
-test("pricing: H&C directional (raise above 33%, cut below 29%, leave in band) with the $44.95 floor", () => {
-  assert.equal(targetPrice("hc", 20, 49.95).price, 60.95); // 40% → cheapest .95 at ≤33%
-  assert.equal(targetPrice("hc", 20, 79.95).price, 68.95); // 25% → dearest .95 at ≥29%
-  assert.equal(targetPrice("hc", 20, 64.95).price, 64.95); // 30.8% in band
-  assert.equal(targetPrice("hc", 10, 39.95).price, 44.95); // band wants less, floor wins
-  assert.equal(targetPrice("aub", 10).price, 44.95);
+test("pricing: no false ceiling waiver when $144.95 keeps COGS in band", () => {
+  // 47.80 / 144.95 = 32.98% ≤ 33%: in band at the ceiling, so no waiver is offered.
+  const p = plan("hc", 47.8, 129.95);
+  assert.equal(p.newPrice, 144.95);
+  assert.equal(p.waiverPrice, null);
+  assert.equal(p.limitedBy, null);
+  const m = plan("mar", 42.03, 120.95); // 42.03 / 144.95 = 28.997%: in band at the ceiling
+  assert.equal(m.newPrice, 144.95);
+  assert.equal(m.waiverPrice, null);
+  assert.equal(plan("mar", 42.05, 120.95).waiverPrice, 145.95, "just over band: the waiver is real");
 });
 
-test("pricing: compare-at keeps the product's tier and prints the exact badge on H&C", () => {
-  assert.equal(tierOf(49.95, null), 0);
-  assert.equal(tierOf(49.95, 62.95), 20);
-  const p = planVariantPrice("hc", { costUsd: 20, price: 49.95, compareAt: 62.95 });
+test("pricing: H&C directional (raise above 33%, cut below 29%, leave in band), $44.95 floor, in-band non-.95 cleaned", () => {
+  assert.equal(plan("hc", 20, 49.95).newPrice, 60.95); // 40% → cheapest .95 at ≤33%
+  assert.equal(plan("hc", 20, 79.95).newPrice, 68.95); // 25% → dearest .95 at ≥29%
+  const keep = plan("hc", 20, 64.95);
+  assert.equal(keep.newPrice, 64.95);
+  assert.equal(keep.change, false);
+  assert.equal(plan("hc", 10, 39.95).newPrice, 44.95); // band wants less, floor wins
+  assert.equal(plan("aub", 10, 49.95).newPrice, 44.95);
+  assert.equal(plan("hc", 20, 65).newPrice, 64.95, "in band but not .95: cleaned to .95");
+});
+
+test("pricing: compare-at keeps the tier, prefers .95 over .50, badge prints the exact tier", () => {
+  assert.equal(tierOf("hc", 49.95, null), 0);
+  assert.equal(tierOf("hc", 49.95, 62.95), 20);
+  const p = plan("hc", 20, 49.95, 62.95);
   assert.equal(p.newPrice, 60.95);
   assert.equal(p.tier, 20);
   assert.equal(badgePct("hc", p.newPrice, p.newCompareAt), 20);
-  assert.match(String(p.newCompareAt), /\.(95|5)$/);
-  const none = planVariantPrice("hc", { costUsd: 20, price: 49.95, compareAt: null });
-  assert.equal(none.newCompareAt, null, "tier 0 stays without a compare-at");
-  const unchanged = planVariantPrice("hc", { costUsd: 20, price: 64.95, compareAt: 80.95 });
-  assert.equal(unchanged.change, false);
+  assert.match(p.newCompareAt.toFixed(2), /\.95$/, ".95 preferred");
+  assert.equal(plan("hc", 20, 49.95, null).newCompareAt, null, "tier 0 stays without a compare-at");
   for (const tier of [10, 20, 30, 40]) {
     const c = compareAtFor("hc", 59.95, tier);
-    assert.equal(c.printed, tier, `tier ${tier}`);
+    assert.equal(badgePct("hc", 59.95, c), tier, `tier ${tier}`);
+    assert.match(c.toFixed(2), /\.95$/);
   }
 });
 
@@ -191,17 +245,101 @@ test("Quote Desk: one batched approval per store (reprice + draft), plans stored
   assert.ok(ev.results.some((e) => e.actor === "sup.denial_sync" && e.kind === "denials.planned"));
 });
 
-test("Quote Desk: new quotes wait while the store's batch is still pending (no second approval)", async () => {
+test("Quote Desk: new quotes wait while the batch is pending; newer quotes for its products supersede it", async () => {
   const DB = makeD1();
   await seedQuotes(DB);
   const { fetchImpl, calls } = fakeShopify(HC_PRODUCTS);
   const env = { DB, ...HC_CREDS };
   await runQuoteDesk(env, { nowMs: NOW, fetchImpl });
-  await importQuotes(DB, [{ store: "hc", handle: "grey-crew", status: 30, cost: 25, currency: "USD", quoted_at: "2026-10-13T10:00:00Z" }], { nowMs: NOW });
+  // A quote for a product that is not in the waiting batch: waits, no second approval.
+  await importQuotes(DB, [{ store: "hc", handle: "in-band", status: 30, cost: 25, currency: "USD", quoted_at: "2026-10-13T10:00:00Z" }], { nowMs: NOW });
   const r2 = await runQuoteDesk(env, { nowMs: NOW + 3600000, fetchImpl });
   assert.match(r2.find((r) => r.store === "hc").waiting, /waiting on Reilly/);
   assert.equal((await listPending(DB)).length, 1);
   assert.equal(calls.length, 1, "no Shopify read while waiting");
+  // A newer quote for a product IN the batch: the batch is superseded and re-planned with everything.
+  await importQuotes(DB, [{ store: "hc", handle: "grey-crew", status: 30, cost: 25, currency: "USD", quoted_at: "2026-10-13T11:00:00Z" }], { nowMs: NOW });
+  await runQuoteDesk(env, { nowMs: NOW + 2 * 3600000, fetchImpl });
+  const pending = await listPending(DB);
+  assert.equal(pending.length, 1, "still exactly one pending approval");
+  const old = await DB.prepare(`SELECT b.status, a.status AS ap FROM supplier_batches b JOIN approvals a ON a.id = b.approval_id WHERE b.id = 1`).first();
+  assert.deepEqual([old.status, old.ap], ["superseded", "expired"]);
+  const nb = await DB.prepare(`SELECT id FROM supplier_batches WHERE approval_id = ?`).bind(pending[0].id).first();
+  const { results: plans } = await DB.prepare(`SELECT product_handle, kind, new_price FROM supplier_plans WHERE batch_id = ? ORDER BY id`).bind(nb.id).all();
+  const by = Object.fromEntries(plans.map((p) => [p.product_handle, p]));
+  assert.equal(by["navy-cardigan"].kind, "reprice", "the old batch's other items are carried into the new one");
+  assert.equal(by["dead-shirt"].kind, "draft");
+  assert.equal(by["grey-crew"].new_price, 75.95, "with the newer cost (25/0.33 → 75.95)");
+});
+
+test("Quote Desk: batch status follows its approval; an unanswered batch expires after 3 days", async () => {
+  const DB = makeD1();
+  await seedQuotes(DB);
+  await runQuoteDesk({ DB, ...HC_CREDS }, { nowMs: NOW, fetchImpl: fakeShopify(HC_PRODUCTS).fetchImpl });
+  const [ap] = await listPending(DB);
+  await decide(DB, ap.id, { choice: "approve_all" });
+  await settleBatches(DB, "hc", NOW + 60000);
+  assert.equal((await DB.prepare(`SELECT status FROM supplier_batches WHERE id = 1`).first()).status, "approved");
+
+  const DB2 = makeD1();
+  await seedQuotes(DB2);
+  await runQuoteDesk({ DB: DB2, ...HC_CREDS }, { nowMs: NOW, fetchImpl: fakeShopify(HC_PRODUCTS).fetchImpl });
+  assert.equal(await settleBatches(DB2, "hc", NOW + 2 * DAY), 1, "still waiting at 2 days");
+  assert.equal(await settleBatches(DB2, "hc", NOW + 3 * DAY + 60000), null);
+  const b = await DB2.prepare(`SELECT b.status, a.status AS ap FROM supplier_batches b JOIN approvals a ON a.id = b.approval_id`).first();
+  assert.deepEqual([b.status, b.ap], ["expired", "expired"]);
+});
+
+test("Quote Desk: the approval says plainly that nothing is applied, and lists every variant old → new", async () => {
+  const DB = makeD1();
+  await importQuotes(DB, [{ store: "hc", handle: "two-sizes", status: 30, cost: 20, currency: "USD", quoted_at: "2026-10-12" }], { nowMs: NOW });
+  const variants = [
+    { id: "gid://shopify/ProductVariant/a", title: "S", sku: "TS-S", price: "49.95", compareAtPrice: "62.95" },
+    { id: "gid://shopify/ProductVariant/b", title: "M", sku: "TS-M", price: "52.95", compareAtPrice: null },
+  ];
+  await runQuoteDesk({ DB, ...HC_CREDS }, { nowMs: NOW, fetchImpl: fakeShopify({ "jmzjx1-it.myshopify.com": [product("two-sizes", { title: "Two Sizes", variants })] }).fetchImpl });
+  const [ap] = await listPending(DB);
+  const d = ap.options[0].detail;
+  assert.doesNotMatch(d, /Catalog applies|R2 backup/);
+  assert.match(d, /nothing is written to Shopify/);
+  assert.match(d, /S: \$49\.95 → \$60\.95, compare-at \$62\.95 → \$75\.95/);
+  assert.match(d, /M: \$52\.95 → \$60\.95, compare-at n\/a → n\/a/);
+});
+
+test("Quote Desk: Shopify query stays under the 1000-point cost limit; long variant lists are paged", async () => {
+  for (const q of [PRODUCTS_BY_HANDLE_QUERY, VARIANT_PAGE_QUERY]) assert.ok(requestedCost(q) < 1000, `cost ${requestedCost(q)}`);
+  assert.equal(requestedCost(PRODUCTS_BY_HANDLE_QUERY), 877);
+  assert.equal(requestedCost(`{ products(first: 50) { nodes { id variants(first: 100) { nodes { id } } } } }`), 5152, "the estimator catches the old query");
+
+  const DB = makeD1();
+  await importQuotes(DB, [{ store: "hc", handle: "many", status: 30, cost: 20, currency: "USD", quoted_at: "2026-10-12" }], { nowMs: NOW });
+  const variants = Array.from({ length: 45 }, (_, i) => ({ id: `gid://shopify/ProductVariant/m${i}`, title: `V${i}`, price: "49.95", compareAtPrice: null }));
+  const { fetchImpl, calls } = fakeShopify({ "jmzjx1-it.myshopify.com": [product("many", { variants })] });
+  await runQuoteDesk({ DB, ...HC_CREDS }, { nowMs: NOW, fetchImpl });
+  assert.equal(calls.length, 2, "one product page + one variant page");
+  const p = await DB.prepare(`SELECT kind, variants FROM supplier_plans`).first();
+  assert.equal(p.kind, "reprice");
+  assert.equal(JSON.parse(p.variants).length, 45, "every variant priced, none dropped");
+});
+
+test("Quote Desk: quote costs go to the Core for Margin Guard; Reilly's own cost is never overwritten", async () => {
+  const DB = makeD1();
+  await DB.prepare(`INSERT INTO core_facts (store, area, key, value, kind, source, observed_at) VALUES ('hc','product','cost:sku:GC-M','12','observation','Reilly 2026-10-01', ?)`).bind(iso(NOW)).run();
+  await seedQuotes(DB);
+  const prods = { "jmzjx1-it.myshopify.com": HC_PRODUCTS["jmzjx1-it.myshopify.com"].map((p) => (p.handle === "grey-crew" ? product("grey-crew", { sku: "GC-M" }) : p)) };
+  await runQuoteDesk({ DB, ...HC_CREDS }, { nowMs: NOW, fetchImpl: fakeShopify(prods).fetchImpl });
+  const f = await DB.prepare(`SELECT value, source FROM core_facts WHERE key = 'cost:product:gid://shopify/Product/navy-cardigan'`).first();
+  assert.deepEqual(JSON.parse(f.value), { amount: 17.09, currency: "EUR" }, "EUR kept as EUR so each reader applies its own FX rule");
+  assert.match(f.source, /^kfb_quote/);
+  const usd = await DB.prepare(`SELECT value FROM core_facts WHERE key = 'cost:product:gid://shopify/Product/grey-crew'`).first();
+  assert.deepEqual(JSON.parse(usd.value), { usd: 20 });
+  const { results: sku } = await DB.prepare(`SELECT value, source FROM core_facts WHERE key = 'cost:sku:GC-M'`).all();
+  assert.equal(sku.length, 1);
+  assert.equal(sku[0].value, "12", "Reilly's fact kept");
+  assert.equal(await writeQuoteCost(DB, "hc", "cost:sku:GC-M", { id: 9, cost: 30, currency: "USD" }, NOW), "kept");
+  // A newer quote updates the brain's own fact in place (no pile of rows).
+  assert.equal(await writeQuoteCost(DB, "hc", "cost:product:gid://shopify/Product/grey-crew", { id: 9, cost: 22, currency: "USD", quoted_at: iso(NOW) }, NOW), "updated");
+  assert.equal((await DB.prepare(`SELECT COUNT(*) AS n FROM core_facts WHERE key = 'cost:product:gid://shopify/Product/grey-crew'`).first()).n, 1);
 });
 
 test("Quote Desk: store not wired → skipped, quotes stay open, no approval", async () => {
@@ -226,11 +364,36 @@ test("Quote Desk: ceiling-limited products offer the waiver as a separate option
   assert.match(ap.options[1].detail, /\$172\.95/);
 });
 
+const asRead = (p) => ({ ...p, variants: { nodes: p.allVariants } });
+
 test("planProduct: a hold is not re-proposed unless the cost changed", () => {
   const q = [{ id: 1, variant_id: "", status: "quoted", cost: 50, currency: "USD", similar: 0 }];
-  const p = product("blazer", { price: "99.95" });
+  const p = asRead(product("blazer", { price: "99.95" }));
   assert.equal(planProduct("hc", "blazer", q, p, { held_price: 99.95, cost_at_hold: 50 }).kind, "held");
   assert.equal(planProduct("hc", "blazer", q, p, { held_price: 99.95, cost_at_hold: 40 }).kind, "reprice");
+  const seeded = planProduct("hc", "blazer", q, p, { held_price: 99.95, cost_at_hold: null });
+  assert.equal(seeded.kind, "held");
+  assert.equal(seeded.seedHold.cost_at_hold, 50, "the cost at hold time is recorded");
+});
+
+test("Quote Desk: H&C outerwear hold records its cost and is proposed again when the cost changes", async () => {
+  const DB = makeD1();
+  const coat = { "jmzjx1-it.myshopify.com": [product("wool-coat", { price: "114.95", title: "Wool Overcoat", productType: "Outerwear" })] };
+  await importQuotes(DB, [{ store: "hc", handle: "wool-coat", status: 30, cost: 50, currency: "USD", quoted_at: "2026-10-12" }], { nowMs: NOW });
+  await runQuoteDesk({ DB, ...HC_CREDS }, { nowMs: NOW, fetchImpl: fakeShopify(coat).fetchImpl });
+  const hold = await DB.prepare(`SELECT * FROM supplier_price_holds WHERE product_handle = 'wool-coat'`).first();
+  assert.equal(hold.cost_at_hold, 50);
+  assert.equal((await listPending(DB)).length, 0);
+  // Same cost again → still held.
+  await importQuotes(DB, [{ store: "hc", handle: "wool-coat", status: 30, cost: 50, currency: "USD", quoted_at: "2026-10-13" }], { nowMs: NOW });
+  await runQuoteDesk({ DB, ...HC_CREDS }, { nowMs: NOW + 3600000, fetchImpl: fakeShopify(coat).fetchImpl });
+  assert.equal((await listPending(DB)).length, 0);
+  // Cost moves → proposed again.
+  await importQuotes(DB, [{ store: "hc", handle: "wool-coat", status: 30, cost: 44, currency: "USD", quoted_at: "2026-10-14" }], { nowMs: NOW });
+  await runQuoteDesk({ DB, ...HC_CREDS }, { nowMs: NOW + 2 * 3600000, fetchImpl: fakeShopify(coat).fetchImpl });
+  const [ap] = await listPending(DB);
+  assert.ok(ap, "re-proposed after the cost changed");
+  assert.match(ap.options[0].detail, /Wool Overcoat/);
 });
 
 /* ------------------------------------------------------------ Size Checker */
@@ -269,17 +432,42 @@ test("Size Checker: never above the factory's largest; no chart means no guess",
   assert.equal(recommendSize({ title: "Women's Cardigan", orderedSize: "M", chartRows: SMALL_CHART }).verdict, "no_reference");
 });
 
-test("Size Checker: complaints size up even when the chart looks fine; complaints alone are labelled", () => {
+test("Size Checker: complaints size up even when the chart looks fine; complaints alone stay within the listed sizes", () => {
   const fine = [{ size_label: "M", measurements: { chest: 112, length: 72 } }, { size_label: "L", measurements: { chest: 122, length: 74 } }, { size_label: "XL", measurements: { chest: 132, length: 76 } }];
   const complaints = [{ size_ordered: "M", size_that_fits: "L" }, { said: "way too small" }];
   assert.equal(complaintShift(complaints), 1);
   const r = recommendSize({ title: "Cardigan", orderedSize: "M", chartRows: fine, complaints });
   assert.equal(r.send_size, "L");
   assert.match(r.reason, /complaint/);
-  const only = recommendSize({ title: "Cardigan", orderedSize: "M", chartRows: [], complaints });
+  const only = recommendSize({ title: "Cardigan", orderedSize: "M", chartRows: [], complaints, productSizes: ["S", "M", "L", "XL"] });
   assert.equal(only.verdict, "complaints_only");
   assert.equal(only.send_size, "L");
-  assert.match(only.reason, /largest size unknown/);
+  const unknown = recommendSize({ title: "Cardigan", orderedSize: "M", chartRows: [], complaints });
+  assert.equal(unknown.send_size, null, "largest size unknown: no ask");
+  const beyond = recommendSize({ title: "Cardigan", orderedSize: "XL", chartRows: [], complaints, productSizes: ["S", "M", "L", "XL"] });
+  assert.equal(beyond.send_size, null, "never asks for a size the product doesn't come in");
+  assert.match(beyond.reason, /above the largest size it comes in \(XL\)/);
+  assert.deepEqual(listedSizes(JSON.stringify([{ title: "Navy / Medium" }, { title: "Navy / XXL" }])).sort(), ["2XL", "M"]);
+});
+
+test("Size Checker: mixed complaints (as many 'too large' as 'too small') never size up", () => {
+  assert.equal(complaintShift([{ size_ordered: "M", size_that_fits: "L" }, { size_ordered: "L", size_that_fits: "M" }]), 0);
+  assert.equal(complaintShift([{ said: "too small" }, { said: "way too big" }, { said: "too loose" }]), 0);
+  assert.equal(complaintShift([{ said: "too small" }, { said: "tight" }, { said: "too big" }]), 1);
+});
+
+test("Size Checker: never sends smaller than ordered (a chart that runs large is noted, no KFB ask)", () => {
+  const big = [ // Chinese S is really a US M
+    { size_label: "S", measurements: { chest: 112, length: 72 } },
+    { size_label: "M", measurements: { chest: 122, length: 74 } },
+    { size_label: "L", measurements: { chest: 132, length: 76 } },
+  ];
+  const r = recommendSize({ title: "Merino Sweater", orderedSize: "M", chartRows: big });
+  assert.equal(r.verdict, "runs_large");
+  assert.equal(r.send_size, "M");
+  const top = recommendSize({ title: "Merino Sweater", orderedSize: "XL", chartRows: big });
+  assert.equal(top.send_size, null, "factory tops out at L: no smaller size is sent");
+  assert.equal(top.verdict, "no_fit");
 });
 
 test("Size Checker: flat chest measurements are doubled; garment types", () => {
@@ -355,14 +543,18 @@ test("Pre-flight: denied products and size complaints flagged once; 'no quote' o
   const DB = makeD1();
   await seedOrder(DB, { n: 1301, handle: "dead-shirt", title: "Dead Shirt", product: "d1" });
   await seedOrder(DB, { n: 1302, handle: "other", title: "Other", product: "o1" });
+  await seedOrder(DB, { n: 1303, handle: "other", title: "Other", product: "o1", size: "Medium" });
+  await seedOrder(DB, { n: 1304, handle: "other", title: "Other", product: "o1", size: "L" });
   let r = await runPreflight({ DB }, { nowMs: NOW });
   assert.equal(r.added, 0, "no quotes wired: no 'no quote' noise");
 
   await importQuotes(DB, [{ store: "hc", handle: "dead-shirt", status: 26, quoted_at: "2026-10-12", remark: "factory closed" }], { nowMs: NOW });
-  await DB.prepare(`INSERT INTO size_complaints (store, product_id, size_ordered, size_that_fits, at) VALUES ('hc','gid://shopify/Product/o1','M','L',?)`).bind(iso(NOW)).run();
+  await DB.prepare(`INSERT INTO size_complaints (store, product_id, size_ordered, size_that_fits, at) VALUES ('hc','gid://shopify/Product/o1','m','L',?)`).bind(iso(NOW)).run();
   r = await runPreflight({ DB }, { nowMs: NOW });
-  const { results } = await DB.prepare(`SELECT order_name, kind FROM supply_flags ORDER BY order_name, kind`).all();
-  assert.deepEqual(results.map((x) => `${x.order_name}:${x.kind}`), ["#1301:denied", "#1301:no_quote", "#1302:no_quote", "#1302:size_complaints"]);
+  const { results } = await DB.prepare(`SELECT order_name, kind FROM supply_flags WHERE kind != 'no_quote' ORDER BY order_name, kind`).all();
+  assert.deepEqual(results.map((x) => `${x.order_name}:${x.kind}`), ["#1301:denied", "#1302:size_complaints", "#1303:size_complaints"],
+    "'Medium' and 'm' both count as M; L has no complaints");
+  assert.equal((await DB.prepare(`SELECT COUNT(*) AS n FROM supply_flags WHERE kind = 'no_quote'`).first()).n, 4);
   r = await runPreflight({ DB }, { nowMs: NOW + 3600000 });
   assert.equal(r.added, 0, "never repeated");
 
@@ -405,6 +597,21 @@ test("Digest: says 'waiting on KFB session' (never zero) and is written once per
   await importBills(DB, [{ bill_id: "b1", amount: 120.5, currency: "EUR", billed_at: iso(NOW - 2 * DAY) }, { bill_id: "b2", amount: 10, billed_at: iso(NOW - DAY), paid_at: iso(NOW) }], { nowMs: NOW });
   const body = digestBody(await digestData(DB, NOW));
   assert.match(body, /1 unpaid bill, EUR 120\.50, oldest 2 days/);
+});
+
+test("Digest: an old KFB read is not used (never 'none unpaid' from a stale import)", async () => {
+  const DB = makeD1();
+  const old = NOW - 5 * DAY;
+  await importBills(DB, [{ bill_id: "b1", amount: 10, currency: "EUR", billed_at: iso(old - DAY), paid_at: iso(old) }], { nowMs: old });
+  await importQuotes(DB, [{ store: "hc", handle: "a", status: 25, quoted_at: iso(old) }], { nowMs: old });
+  const body = digestBody(await digestData(DB, NOW));
+  assert.doesNotMatch(body, /none unpaid/);
+  assert.match(body, /Bills: KFB last read 5 days ago: too old/);
+  assert.match(body, /Quotes: KFB last read 5 days ago: too old/);
+  // Fresh (within 36 h) → numbers are used.
+  const fresh = digestBody(await digestData(DB, old + 20 * 3600000));
+  assert.match(fresh, /Bills: none unpaid/);
+  assert.match(fresh, /1 waiting for your KFB confirmation/);
 });
 
 /* ------------------------------------------------------------ Scout */

@@ -116,13 +116,19 @@ function nearestUs(ref, m, v) {
 /** Learned size-up from complaints: what customers said fit vs what they ordered. */
 export function complaintShift(complaints) {
   const shifts = [];
-  let small = 0;
+  let small = 0, large = 0;
   for (const c of complaints || []) {
     const o = sizeIndex(c.size_ordered), f = sizeIndex(c.size_that_fits);
-    if (o >= 0 && f >= 0) { if (f > o) { shifts.push(f - o); small++; } continue; }
-    if (/small|tight|short|snug/i.test(String(c.said || ""))) { shifts.push(1); small++; }
+    if (o >= 0 && f >= 0) {
+      if (f > o) { shifts.push(f - o); small++; } else if (f < o) large++;
+      continue;
+    }
+    const said = String(c.said || "");
+    if (/too (big|large|loose|long)|baggy|oversized|runs (big|large)/i.test(said)) large++;
+    else if (/small|tight|short|snug/i.test(said)) { shifts.push(1); small++; }
   }
-  if (!small) return 0;
+  // Mixed signals never size up: only when "too small" clearly outnumbers "too large".
+  if (!small || large >= small) return 0;
   shifts.sort((a, b) => a - b);
   return Math.max(1, shifts[Math.floor((shifts.length - 1) / 2)]); // median, at least one size
 }
@@ -131,7 +137,7 @@ export function complaintShift(complaints) {
  * Decide the size to send for one line. Pure.
  * @returns {{verdict, send_size, reason, conflict:boolean}}
  */
-export function recommendSize({ title, orderedSize, chartRows, complaints = [], reference = US_REFERENCE_MEN, audience = null }) {
+export function recommendSize({ title, orderedSize, chartRows, complaints = [], reference = US_REFERENCE_MEN, audience = null, productSizes = null }) {
   const ordered = normSize(orderedSize);
   const garment = garmentOf(title);
   const nComplaints = (complaints || []).length;
@@ -145,9 +151,18 @@ export function recommendSize({ title, orderedSize, chartRows, complaints = [], 
   const sizes = sortedSizes(chart);
   if (!sizes.length) {
     if (shift > 0) {
-      const send = SIZE_ORDER[Math.min(sizeIndex(ordered) + shift, SIZE_ORDER.length - 1)];
-      return { verdict: "complaints_only", send_size: send, conflict: false,
-        reason: `no size chart; ${nComplaints} sizing complaint${nComplaints === 1 ? "" : "s"} say it runs small by ${shift} → ${send}. Factory's largest size unknown: check before asking KFB.` };
+      const want = SIZE_ORDER[Math.min(sizeIndex(ordered) + shift, SIZE_ORDER.length - 1)];
+      const base = `no size chart; ${nComplaints} sizing complaint${nComplaints === 1 ? "" : "s"} say it runs small by ${shift} → ${want}`;
+      // Never ask for a size the product doesn't come in: cap at the largest size it is listed in.
+      const listed = (productSizes || []).map(normSize).filter(Boolean);
+      if (!listed.length) {
+        return { verdict: "complaints_only", send_size: null, conflict: false, reason: `${base}, but the product's largest size is not known yet: no ask made` };
+      }
+      const largestListed = listed.sort((a, b) => sizeIndex(a) - sizeIndex(b))[listed.length - 1];
+      if (sizeIndex(want) > sizeIndex(largestListed)) {
+        return { verdict: "complaints_only", send_size: null, conflict: false, reason: `${base}, which is above the largest size it comes in (${largestListed}): customer message needed` };
+      }
+      return { verdict: "complaints_only", send_size: want, conflict: false, reason: `${base} (it comes in up to ${largestListed}; no chart to check the factory's sizes)` };
     }
     return { verdict: "no_chart", send_size: null, reason: "no size chart in the library yet: no guess", conflict: false };
   }
@@ -178,6 +193,9 @@ export function recommendSize({ title, orderedSize, chartRows, complaints = [], 
       reason: `nothing up to the factory's largest (${largest}) fits a US ${ordered}: ${said.join("; ")}. Customer message needed.` };
   }
   let sendIdx = Math.max(...measured.map((m) => sizeIndex(picks[m])));
+  // Never send smaller than ordered: a chart that runs large is noted, not acted on.
+  const chartBelowOrdered = sendIdx < sizeIndex(ordered);
+  if (chartBelowOrdered) sendIdx = sizeIndex(ordered);
   const distinct = new Set(measured.map((m) => picks[m]));
   const conflict = distinct.size > 1;
   let why = said.join("; ");
@@ -194,11 +212,16 @@ export function recommendSize({ title, orderedSize, chartRows, complaints = [], 
   }
   if (sendIdx > sizeIndex(largest)) {
     return { verdict: "no_fit", send_size: null, conflict,
-      reason: `${why}. That's above the factory's largest size (${largest}): customer message needed.` };
+      reason: chartBelowOrdered
+        ? `${why}. The chart says a smaller Chinese size would fit, but the factory's largest is ${largest} and the brain never sends smaller than ordered: customer message needed.`
+        : `${why}. That's above the factory's largest size (${largest}): customer message needed.` };
   }
   if (notes.length) why += `. Note: ${notes.join("; ")}`;
   const send = SIZE_ORDER[sendIdx];
   if (send === ordered) {
+    if (chartBelowOrdered) {
+      return { verdict: "runs_large", send_size: ordered, conflict, reason: `${why}. Runs large: shipped as ordered (the brain never sends smaller than ordered)${garmentNote}` };
+    }
     // Would one size smaller also match? Then it runs large: noted, still shipped as ordered.
     const smaller = sizes.filter((s) => sizeIndex(s) < sizeIndex(ordered)).pop();
     const runsLarge = smaller && measured.every((m) => chart[smaller][m] != null && chart[smaller][m] >= reference[ordered][m] - TOLERANCE[m]);
@@ -206,6 +229,17 @@ export function recommendSize({ title, orderedSize, chartRows, complaints = [], 
     return { verdict: "as_ordered", send_size: ordered, conflict, reason: `${why}. True to size: ship as ordered${garmentNote}` };
   }
   return { verdict: "size_up", send_size: send, conflict, reason: `${why}${garmentNote}` };
+}
+
+/** Letter sizes a product is listed in, from cat_products.variants JSON ([{title:"Navy / M"}, ...]). */
+export function listedSizes(variantsJson) {
+  let vs = variantsJson;
+  if (typeof vs === "string") { try { vs = JSON.parse(vs); } catch { return []; } }
+  const out = new Set();
+  for (const v of Array.isArray(vs) ? vs : []) {
+    for (const part of String((v && v.title) || "").split("/")) { const s = normSize(part); if (s) out.add(s); }
+  }
+  return [...out];
 }
 
 /** Optional Core overrides: audience per store and the US reference per garment. */
@@ -256,7 +290,12 @@ export async function runSizeChecker(env, { nowMs = Date.now() } = {}) {
     ).bind(l.store, l.product_id || "").all();
     const garment = garmentOf(l.title);
     const reference = (garment && core[l.store].references[garment]) || US_REFERENCE_MEN;
-    const rec = recommendSize({ title: l.title, orderedSize: l.size, chartRows, complaints, reference, audience: core[l.store].audience });
+    // The sizes the product is listed in (Catalog's copy), so complaints alone never ask beyond them.
+    const listing = (complaints || []).length && !(chartRows || []).length
+      ? await db.prepare(`SELECT variants FROM cat_products WHERE store = ? AND product_id = ?`).bind(l.store, l.product_id || "").first().catch(() => null)
+      : null;
+    const productSizes = listedSizes(listing && listing.variants);
+    const rec = recommendSize({ title: l.title, orderedSize: l.size, chartRows, complaints, reference, audience: core[l.store].audience, productSizes });
     let reason = rec.reason;
     if (rec.verdict !== "no_chart" && rec.verdict !== "no_reference" && !core[l.store].audience) reason += " (audience assumed men's: not in the Core yet)";
     const verified = chartRows && chartRows.length ? (chartRows.every((r) => r.verified) ? 1 : 0) : null;

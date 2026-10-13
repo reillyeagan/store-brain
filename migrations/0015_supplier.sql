@@ -43,7 +43,7 @@ CREATE TABLE IF NOT EXISTS supplier_batches (
   waiver_count   INTEGER NOT NULL DEFAULT 0,
   fx_rate        REAL,                          -- EUR→USD used for the costs
   fx_source      TEXT,
-  status         TEXT    NOT NULL               -- awaiting_approval | nothing_to_approve
+  status         TEXT    NOT NULL               -- awaiting_approval | nothing_to_approve | approved | rejected | expired | superseded | failed
 );
 CREATE INDEX IF NOT EXISTS idx_supplier_batches_store ON supplier_batches(store, status);
 

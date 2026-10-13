@@ -24,6 +24,16 @@ import { money } from "./common.js";
 const ACTOR = "sup.digest";
 /** Composed on the first tick at/after 07:00 Eastern, so it's ready for the 8:00 brief. */
 export const DIGEST_AFTER_MIN = 7 * 60;
+/**
+ * Rule 4 (freshness before numbers): a KFB read older than this is not used. Without it, one
+ * bill import weeks ago would make the brief say "Bills: none unpaid" forever (flattering).
+ * 36 h = a missed morning session still counts, two missed ones don't.
+ */
+export const KFB_READ_MAX_AGE_H = 36;
+
+/** Hours since an ISO time, or null. */
+const ageHours = (iso, nowMs) => (iso ? (nowMs - Date.parse(iso)) / 3600000 : null);
+const agoText = (h) => (h < 48 ? `${Math.round(h)} hours ago` : `${Math.floor(h / 24)} days ago`);
 
 /** Bills summary, or null when no bill has ever been imported (not wired ≠ zero). */
 export async function billsSummary(db, nowMs = Date.now()) {
@@ -35,6 +45,7 @@ export async function billsSummary(db, nowMs = Date.now()) {
   return {
     unpaid, totals: Object.fromEntries((results || []).map((r) => [r.currency, Math.round(r.total * 100) / 100])),
     oldest, oldestDays: oldest ? Math.floor((nowMs - Date.parse(oldest)) / 86400000) : null, lastImport: any.last,
+    ageHours: ageHours(any.last, nowMs), stale: ageHours(any.last, nowMs) > KFB_READ_MAX_AGE_H,
   };
 }
 
@@ -62,7 +73,8 @@ export async function digestData(db, nowMs = Date.now()) {
     const latest = await db.prepare(`SELECT status, COUNT(*) AS n FROM (${LATEST_QUOTE_SQL}) GROUP BY status`).all();
     const m = (rs) => Object.fromEntries((rs.results || []).map((r) => [r.status, r.n]));
     const lt = m(latest);
-    quotes = { open: m(open), awaitingReilly: lt.awaiting_reilly || 0, unknown: lt.unknown || 0, pending: lt.pending || 0, lastImport: quotesAny.last };
+    quotes = { open: m(open), awaitingReilly: lt.awaiting_reilly || 0, unknown: lt.unknown || 0, pending: lt.pending || 0, lastImport: quotesAny.last,
+      ageHours: ageHours(quotesAny.last, nowMs), stale: ageHours(quotesAny.last, nowMs) > KFB_READ_MAX_AGE_H };
   }
   const { results: batches } = await db.prepare(
     `SELECT b.id, b.store, b.reprice_count, b.draft_count, b.waiver_count, b.approval_id, b.created_at FROM supplier_batches b
@@ -98,7 +110,9 @@ const totalsText = (t) => Object.entries(t || {}).map(([c, v]) => money(v, `${c}
 export function digestBody(d) {
   const out = [];
   if (!d.quotes) out.push("• KFB: waiting on KFB session (quotes, bills and similar offers can't be read yet: no API, CAPTCHA login).");
-  else {
+  else if (d.quotes.stale) {
+    out.push(`• Quotes: KFB last read ${agoText(d.quotes.ageHours)}: too old to report what's waiting.`);
+  } else {
     const o = d.quotes.open;
     out.push(`• Quotes: ${(o.quoted || 0) + (o.denied || 0)} not yet planned (${o.quoted || 0} quoted, ${o.denied || 0} denied)` +
       (d.quotes.awaitingReilly ? ` · ${d.quotes.awaitingReilly} waiting for your KFB confirmation (status 25)` : "") +
@@ -116,6 +130,7 @@ export function digestBody(d) {
   if (sizeBits.length) out.push(`• Sizes: ${sizeBits.join("; ")}.`);
   if (d.kfbMessage) out.push(`• Last KFB message (${d.kfbMessage.local_day}): ${d.kfbMessage.status}${d.kfbMessage.mode === "shadow" ? " (shadow)" : ""}.`);
   if (!d.bills) out.push("• Bills: waiting on KFB session.");
+  else if (d.bills.stale) out.push(`• Bills: KFB last read ${agoText(d.bills.ageHours)}: too old to say what's unpaid.`);
   else if (!d.bills.unpaid) out.push("• Bills: none unpaid.");
   else out.push(`• Bills: ${plural(d.bills.unpaid, "unpaid bill")}, ${totalsText(d.bills.totals)}, oldest ${d.bills.oldestDays} day${d.bills.oldestDays === 1 ? "" : "s"}.`);
   if (d.credits.count) {
