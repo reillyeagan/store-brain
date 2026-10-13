@@ -109,8 +109,8 @@ CREATE TABLE IF NOT EXISTS media_findings (
 );
 
 -- What the brain WOULD do (shadow): negatives, budget moves. Never applied.
--- Budget proposals carry their day in the key so each day is a separate call that can be
--- scored later (the track record Reilly needs before replacing Guy).
+-- Budget calls: ONE open call per campaign and direction (key = kind:campaign:day it opened);
+-- each call is scored once, 7 days later (early, crude track record before replacing Guy).
 CREATE TABLE IF NOT EXISTS media_proposals (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   store         TEXT    NOT NULL,
@@ -119,7 +119,7 @@ CREATE TABLE IF NOT EXISTS media_proposals (
   kind          TEXT    NOT NULL,            -- negative_keyword | budget_cut | budget_raise
   title         TEXT    NOT NULL,
   detail        TEXT,                        -- JSON: numbers and reasons (computed by code)
-  status        TEXT    NOT NULL DEFAULT 'open', -- open | stale (condition no longer holds) | scored (budget call judged)
+  status        TEXT    NOT NULL DEFAULT 'open', -- open | stale (search term no longer qualifies) | closed (budget call's condition changed); scoring is in outcome/scored_at
   created_at    TEXT    NOT NULL,
   updated_at    TEXT    NOT NULL,
   outcome       TEXT,                        -- right | wrong | unclear (scored later)

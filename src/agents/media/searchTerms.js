@@ -15,7 +15,7 @@
  */
 import { logEvent } from "../../lib/eventlog.js";
 import { nowIso } from "../../lib/time.js";
-import { accountTz, windowFor, micros, int, real, r2, upsertProposal, staleUnseenProposals, storeName, money } from "./common.js";
+import { accountTz, windowFor, micros, int, real, r2, upsertProposal, staleUnseenProposals, storeName, money, runBatched, MAX_STORED_ROWS } from "./common.js";
 import { dailyRead } from "./reads.js";
 
 export const AGENT = "media.search_terms";
@@ -61,16 +61,19 @@ export async function runSearchTerms(env, { storeId, session, nowMs = Date.now()
     `SELECT search_term_view.search_term, search_term_view.status, campaign.id, campaign.name,
        metrics.cost_micros, metrics.clicks, metrics.impressions, metrics.conversions, metrics.conversions_value
      FROM search_term_view WHERE segments.date BETWEEN '${from}' AND '${to}' AND metrics.cost_micros > 0`);
-  const terms = parseTermRows(rows);
+  const terms = parseTermRows(rows).sort((a, b) => b.cost - a.cost);
   const at = nowIso(nowMs);
-  // The table holds the latest window only: replace it (the query succeeded, so this is the truth).
-  await db.prepare(`DELETE FROM media_search_terms WHERE store = ?`).bind(storeId).run();
-  for (const t of terms) {
-    await db.prepare(
-      `INSERT INTO media_search_terms (store, term, campaign_id, campaign_name, term_status, window_from, window_to, cost, clicks, impressions, conversions, conv_value, fetched_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).bind(storeId, t.term, t.campaign_id, t.campaign_name, t.term_status, from, to, t.cost, t.clicks, t.impressions, t.conversions, t.conv_value, at).run();
-  }
+  // The table holds the latest window only. New rows are written FIRST (batched, capped at the
+  // costliest MAX_STORED_ROWS), and only then are the previous window's rows removed, so a
+  // failure part-way never leaves the table empty.
+  await runBatched(db, terms.slice(0, MAX_STORED_ROWS).map((t) => db.prepare(
+    `INSERT INTO media_search_terms (store, term, campaign_id, campaign_name, term_status, window_from, window_to, cost, clicks, impressions, conversions, conv_value, fetched_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(store, term, campaign_id) DO UPDATE SET campaign_name = excluded.campaign_name, term_status = excluded.term_status,
+       window_from = excluded.window_from, window_to = excluded.window_to, cost = excluded.cost, clicks = excluded.clicks,
+       impressions = excluded.impressions, conversions = excluded.conversions, conv_value = excluded.conv_value, fetched_at = excluded.fetched_at`
+  ).bind(storeId, t.term, t.campaign_id, t.campaign_name, t.term_status, from, to, t.cost, t.clicks, t.impressions, t.conversions, t.conv_value, at)));
+  await db.prepare(`DELETE FROM media_search_terms WHERE store = ? AND fetched_at <> ?`).bind(storeId, at).run();
 
   const minUsd = Number(env.MEDIA_WASTE_MIN_USD || WASTE_MIN_USD_DEFAULT);
   const wasted = wastedTerms(terms, minUsd);

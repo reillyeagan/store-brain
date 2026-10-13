@@ -11,8 +11,10 @@
  *  - an AdsSession: one Google token per tick, a hard cap on Ads calls per tick, and
  *    "not wired" as its own answer (never zero),
  *  - the store's break-even ROAS from the P&L ledger (pnl_days), never invented,
- *  - the "reality factor": Shopify revenue / Google's claimed conversion value, capped at 1
- *    so Google's numbers can be marked DOWN but never up (rule 5),
+ *  - the "revenue cap": Google's claimed conversion value can never exceed the store's TOTAL
+ *    Shopify revenue (all channels). It is a sanity cap, not a correction to "reality": it only
+ *    bites when Google claims more than the whole store took, so most days it changes nothing.
+ *    Labelled "Google ROAS, capped at total store revenue" everywhere (rule 5: never flatter),
  *  - findings (flags that stay open while true) and rate-limited error events.
  */
 import { LIVE_STORE_IDS, STORES } from "../../config/stores.js";
@@ -148,18 +150,43 @@ export async function storeBreakeven(db, storeId, from, to) {
 }
 
 /**
- * Shopify reality vs Google's claim over a window: real revenue / Google conv value.
- * Capped at 1: Google's number may be marked DOWN to reality, never UP (Google only sees
- * ad-driven sales, so a ratio above 1 is other channels, not a reason to flatter ads).
+ * The revenue cap over a window: min(1, total Shopify revenue / Google conv value).
+ * Honest meaning: Google can't have earned more than the whole store took. It does NOT turn
+ * Google's numbers into real ad-driven sales (Shopify revenue includes every channel), so it
+ * rarely lowers anything; when it does, Google is over-claiming badly. Never raises (capped at 1).
  * Null when either side is unknown or Google claims nothing.
  */
-export async function realityFactor(db, storeId, from, to) {
+export const CAP_LABEL = "Google ROAS, capped at total store revenue";
+export async function revenueCap(db, storeId, from, to) {
   const g = await db.prepare(`SELECT COALESCE(SUM(conv_value), 0) AS v, COUNT(*) AS n FROM media_campaign_days WHERE store = ? AND day >= ? AND day <= ?`)
     .bind(storeId, from, to).first();
   const p = await db.prepare(`SELECT COALESCE(SUM(revenue), 0) AS v, COUNT(*) AS n FROM pnl_days WHERE store = ? AND day >= ? AND day <= ? AND revenue IS NOT NULL`)
     .bind(storeId, from, to).first();
   if (!g || !Number(g.n) || !p || !Number(p.n) || !(Number(g.v) > 0)) return null;
   return Math.min(1, Math.round((Number(p.v) / Number(g.v)) * 10000) / 10000);
+}
+
+/** "break-even 2.02x" or "break-even 2.02x (estimated: COGS estimated)" — shown in every title. */
+export function breakevenLabel(be) {
+  if (!be || be.breakeven == null) return "break-even unknown";
+  return `break-even ${Number(be.breakeven).toFixed(2)}x${be.estimated ? " (estimated: COGS estimated)" : ""}`;
+}
+
+/* ---------------- batched writes ---------------- */
+
+export const BATCH_CHUNK = 50;
+export const MAX_STORED_ROWS = 500;
+
+/**
+ * Run prepared+bound statements in chunks with db.batch (one round trip per chunk, D1 runs
+ * each batch as a transaction). Falls back to one-by-one when the binding has no batch.
+ */
+export async function runBatched(db, stmts, chunk = BATCH_CHUNK) {
+  for (let i = 0; i < stmts.length; i += chunk) {
+    const part = stmts.slice(i, i + chunk);
+    if (typeof db.batch === "function") await db.batch(part);
+    else for (const st of part) await st.run();
+  }
 }
 
 /* ---------------- findings ---------------- */

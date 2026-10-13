@@ -5,14 +5,16 @@ import { encryptToken, _resetGoogleCacheForTests } from "../src/lib/google.js";
 import { minusDays } from "../src/lib/adsSpend.js";
 
 import { runMedia, mediaState, STORE_AGENTS } from "../src/agents/media/index.js";
-import { AdsSession, storeBreakeven, realityFactor, mediaStoreIds } from "../src/agents/media/common.js";
+import { AdsSession, storeBreakeven, revenueCap, mediaStoreIds, runBatched, breakevenLabel } from "../src/agents/media/common.js";
 import { parseCampaignRows, underStreak } from "../src/agents/media/performance.js";
 import { parseTermRows, wastedTerms } from "../src/agents/media/searchTerms.js";
 import { productIdFromItem, judgeProduct, parseProductRows } from "../src/agents/media/products.js";
 import { mondayOf, weekTrends, parseKeywordRows } from "../src/agents/media/season.js";
 import { describeChange } from "../src/agents/media/guyMonitor.js";
 import { compareDays, runConversions } from "../src/agents/media/conversions.js";
-import { budgetCalls, scoreCall, scoreOldCalls } from "../src/agents/media/budget.js";
+import { budgetCalls, scoreCall, runBudget, trackRecord } from "../src/agents/media/budget.js";
+import { runPerformance } from "../src/agents/media/performance.js";
+import { runSearchTerms } from "../src/agents/media/searchTerms.js";
 
 /* ---------------- fixtures ---------------- */
 
@@ -123,14 +125,14 @@ test("media: break-even comes from the P&L and ignores days with unknown COGS (n
   assert.equal(none.breakeven, null);
 });
 
-test("media: reality factor marks Google DOWN to Shopify, never up", async () => {
+test("media: revenue cap marks Google DOWN to total store revenue, never up", async () => {
   const { DB } = await setup();
   await seedPnl(DB, "hc", { days: 2, revenue: 100 });
   const ins = (day, v) => DB.prepare(`INSERT INTO media_campaign_days (store, day, campaign_id, cost, clicks, impressions, conversions, conv_value, fetched_at) VALUES ('hc', ?, '1', 10, 1, 1, 1, ?, 'x')`).bind(day, v).run();
   await ins(YDAY, 400); await ins("2026-10-11", 400);
-  assert.equal(await realityFactor(DB, "hc", "2026-10-11", YDAY), 0.25);
+  assert.equal(await revenueCap(DB, "hc", "2026-10-11", YDAY), 0.25);
   await DB.prepare(`UPDATE media_campaign_days SET conv_value = 10`).run();
-  assert.equal(await realityFactor(DB, "hc", "2026-10-11", YDAY), 1); // Shopify 200 > Google 20: capped at 1
+  assert.equal(await revenueCap(DB, "hc", "2026-10-11", YDAY), 1); // Shopify 200 > Google 20: capped at 1
 });
 
 test("media: wasted terms need spend over the threshold, zero conversions, and not already excluded", () => {
@@ -192,18 +194,70 @@ test("media: conversion check — overclaim and broken tracking", () => {
   assert.equal(fine.flags.length, 0);
 });
 
-test("media: budget calls — cut under 0.8× break-even, raise over 1.3×, a move when both; scored later", () => {
-  const calls = budgetCalls([
-    { campaign_id: "1", name: "Bad", status: "ENABLED", cost: 140, value: 140, days: 7 },  // 1.0x
-    { campaign_id: "2", name: "Good", status: "ENABLED", cost: 140, value: 560, days: 7 }, // 4.0x
+test("media: budget calls — enabled campaigns only, cut/raise/hold, a move when both, none without the revenue cap", () => {
+  const camps = [
+    { campaign_id: "1", name: "Bad", status: "ENABLED", cost: 140, value: 140, days: 7 },     // 1.0x
+    { campaign_id: "2", name: "Good", status: "ENABLED", cost: 140, value: 560, days: 7 },    // 4.0x
     { campaign_id: "3", name: "Small", status: "ENABLED", cost: 10, value: 0, days: 7 },
-  ], { breakeven: 2, factor: 1 });
-  assert.deepEqual(calls.map((c) => c.kind), ["budget_cut", "budget_raise", "budget_move"]);
+    { campaign_id: "4", name: "Paused bad", status: "PAUSED", cost: 140, value: 0, days: 7 },
+    { campaign_id: "5", name: "Removed", status: "REMOVED", cost: 140, value: 0, days: 7 },
+    { campaign_id: "6", name: "Okay", status: "ENABLED", cost: 140, value: 280, days: 7 },    // 2.0x: hold
+  ];
+  const calls = budgetCalls(camps, { breakeven: 2, cap: 1 });
+  assert.deepEqual(calls.map((c) => c.kind), ["budget_cut", "budget_raise", "budget_hold", "budget_move"]);
   assert.equal(calls[0].amount, 4); // 20% of $20/day
-  assert.deepEqual(budgetCalls([], { breakeven: null }), []);
-  assert.equal(scoreCall("budget_cut", { roas: 1.2 }, 2), "right");
-  assert.equal(scoreCall("budget_raise", { roas: 1.2 }, 2), "wrong");
-  assert.equal(scoreCall("budget_cut", null, 2), "unclear");
+  assert.ok(!calls.some((c) => c.campaign_id === "4" || c.campaign_id === "5"));
+  assert.deepEqual(budgetCalls(camps, { breakeven: null, cap: 1 }), []);
+  assert.deepEqual(budgetCalls(camps, { breakeven: 2, cap: null }), []); // never fall back to raw Google numbers
+});
+
+test("media: budget scoring is against a no-change baseline; Guy doing the same isn't counted; moves aren't scored", () => {
+  const before = { daily: 20, roas: 1.0 };
+  assert.equal(scoreCall("budget_cut", before, { daily: 20, roas: 1.1 }, 2).outcome, "right");    // left alone, still losing
+  assert.equal(scoreCall("budget_cut", before, { daily: 21, roas: 2.5 }, 2).outcome, "wrong");    // left alone, recovered
+  assert.equal(scoreCall("budget_cut", before, { daily: 10, roas: 1.5 }, 2).outcome, "guy_did_same");
+  assert.equal(scoreCall("budget_raise", { daily: 20, roas: 3 }, { daily: 20, roas: 1.2 }, 2).outcome, "wrong");
+  assert.equal(scoreCall("budget_hold", { daily: 20, roas: 2 }, { daily: 20, roas: 1.8 }, 2).outcome, "right");
+  assert.equal(scoreCall("budget_hold", { daily: 20, roas: 2 }, { daily: 40, roas: 1.8 }, 2).outcome, "unclear");
+  assert.equal(scoreCall("budget_cut", before, null, 2).outcome, "unclear");
+  assert.equal(scoreCall("budget_move", before, { daily: 20, roas: 1 }, 2).outcome, "not_scored");
+});
+
+test("media: one open budget call per campaign across days, scored once, track record counts distinct campaigns", async () => {
+  const { DB, env } = await setup();
+  await seedPnl(DB, "hc", { days: 30 });
+  // 30 days of a steady 1.0x campaign (break-even 2.02): a standing "cut".
+  for (let i = 1; i <= 30; i++) {
+    await DB.prepare(`INSERT INTO media_campaign_days (store, day, campaign_id, campaign_name, status, cost, clicks, impressions, conversions, conv_value, fetched_at) VALUES ('hc', ?, '9', 'Steady', 'ENABLED', 20, 1, 1, 1, 20, 'x')`)
+      .bind(minusDays(TODAY, i)).run();
+  }
+  const noNet = async () => { throw new Error("no network"); };
+  const fresh = (t) => DB.prepare(`UPDATE media_campaign_days SET fetched_at = ?`).bind(new Date(t - 3600000).toISOString()).run();
+  for (let d = 0; d < 10; d++) {
+    const t = NOW - (9 - d) * 86400000;
+    await fresh(t);
+    await runBudget(env, { nowMs: t, fetchImpl: noNet });
+  }
+  const calls = (await DB.prepare(`SELECT kind, status, outcome FROM media_proposals WHERE agent = 'media.budget' AND store = 'hc'`).all()).results;
+  assert.equal(calls.length, 1); // ten daily runs, still one call
+  assert.equal(calls[0].kind, "budget_cut");
+  assert.equal(calls[0].status, "open");
+  assert.equal(calls[0].outcome, "right"); // scored once (opened 9 days ago): spend unchanged, still under
+  const tr = await trackRecord(DB);
+  assert.equal(tr.scored, 1);
+  assert.equal(tr.campaigns, 1);
+  assert.equal(tr.label, "early / crude");
+  assert.match(tr.note, /persistence/);
+  // Titles say what the ROAS is and that the break-even rests on estimated COGS.
+  const t = await DB.prepare(`SELECT title FROM media_proposals WHERE agent = 'media.budget'`).first();
+  assert.match(t.title, /capped at total store revenue/);
+  assert.match(t.title, /estimated: COGS estimated/);
+  // The campaign is paused: the call closes and no new one opens.
+  await DB.prepare(`INSERT INTO media_campaign_days (store, day, campaign_id, campaign_name, status, cost, clicks, impressions, conversions, conv_value, fetched_at) VALUES ('hc', ?, '9', 'Steady', 'PAUSED', 0, 0, 0, 0, 0, 'x')`).bind(TODAY).run();
+  await fresh(NOW + 86400000);
+  await runBudget(env, { nowMs: NOW + 86400000, fetchImpl: noNet });
+  const after = (await DB.prepare(`SELECT status FROM media_proposals WHERE agent = 'media.budget'`).all()).results;
+  assert.deepEqual(after.map((r) => r.status), ["closed"]);
 });
 
 /* ---------------- the cron: wiring, safety, throttling ---------------- */
@@ -248,14 +302,15 @@ test("media: a full day of ticks — every agent runs, ≤ 6 Ads calls per tick,
       oldResource: { campaign: { status: "ENABLED" } }, newResource: { campaign: { status: "PAUSED" } } } }] }]),
   });
   let maxPerTick = 0;
-  for (let t = 0; t < 8; t++) {
+  for (let t = 0; t < 6; t++) {
     const before = g.adsCalls().length;
-    await runMedia(env, { nowMs: NOW + t * 15 * 60000, fetchImpl: g.fetchImpl });
+    await runMedia(env, { nowMs: NOW + t * 60 * 60000, fetchImpl: g.fetchImpl }); // Media gets one rotation slot an hour
     maxPerTick = Math.max(maxPerTick, g.adsCalls().length - before);
   }
   assert.ok(maxPerTick <= 6, `max Ads calls per tick ${maxPerTick}`);
-  // 3 stores × 5 Ads agents = 15 calls, each once.
-  assert.equal(g.adsCalls().length, 15);
+  // 3 stores × 5 Ads agents = 15 calls in the first hours, then performance comes due again
+  // at 4 hours (+3): every job ran within 6 hourly runs.
+  assert.equal(g.adsCalls().length, 18);
   for (const c of g.adsCalls()) {
     assert.match(c.url, /googleAds:searchStream$/);
     assert.match(JSON.parse(c.init.body).query, /^\s*SELECT\s/);
@@ -407,16 +462,75 @@ test("media: AI reads are capped at one per store per day, and invented search t
   assert.equal((await evs(DB, "ai.call")).length, 2);
 });
 
-test("media: budget calls are scored 7+ days later against what happened", async () => {
-  const { DB } = await setup();
-  await DB.prepare(`INSERT INTO media_proposals (store, agent, key, kind, title, detail, created_at, updated_at) VALUES ('hc', 'media.budget', '2026-10-01:budget_cut:9', 'budget_cut', 't', ?, 'x', 'x')`)
-    .bind(JSON.stringify({ campaign_id: "9", breakeven: 2 })).run();
-  for (let i = 2; i <= 8; i++) {
-    await DB.prepare(`INSERT INTO media_campaign_days (store, day, campaign_id, cost, clicks, impressions, conversions, conv_value, fetched_at) VALUES ('hc', ?, '9', 10, 1, 1, 0, 10, 'x')`)
-      .bind(`2026-10-0${i}`).run();
-  }
-  assert.equal(await scoreOldCalls(DB, "hc", TODAY, "2026-10-13T00:00:00Z"), 1);
-  const p = await DB.prepare(`SELECT outcome, status FROM media_proposals`).first();
-  assert.equal(p.outcome, "right");
-  assert.equal(p.status, "scored");
+test("media: performance — an empty Google reply never zeroes stored days (rule 6), logged once", async () => {
+  const { DB, env } = await setup();
+  await connectGoogle(env);
+  await seedTz(DB);
+  await seedPnl(DB, "hc");
+  let empty = false;
+  const g = fakeGoogle({ campaign: () => j([{ results: empty ? [] : [campRow(YDAY, "1", "A", 30, 60), campRow("2026-10-11", "1", "A", 25, 50)] }]) });
+  const session = new AdsSession(env, { fetchImpl: g.fetchImpl, nowMs: NOW, maxCalls: 10 });
+  await runPerformance(env, { storeId: "hc", session, nowMs: NOW, fetchImpl: g.fetchImpl });
+  empty = true;
+  const r = await runPerformance(env, { storeId: "hc", session, nowMs: NOW + 3600000, fetchImpl: g.fetchImpl });
+  assert.match(r, /^no data/);
+  await runPerformance(env, { storeId: "hc", session, nowMs: NOW + 2 * 3600000, fetchImpl: g.fetchImpl });
+  const sum = await DB.prepare(`SELECT SUM(cost) AS c FROM media_campaign_days WHERE store = 'hc'`).first();
+  assert.equal(sum.c, 55);
+  assert.equal((await evs(DB, "media.check")).length, 1);
+});
+
+test("media: performance flag titles say what the ROAS is and that break-even rests on estimated COGS", async () => {
+  const { DB, env } = await setup();
+  await connectGoogle(env);
+  await seedTz(DB);
+  await seedPnl(DB, "hc");
+  const days = Array.from({ length: 5 }, (_, i) => minusDays(YDAY, i));
+  const g = fakeGoogle({ campaign: () => j([{ results: days.map((d) => campRow(d, "1", "Bleeder", 20, 20)) }]) });
+  const session = new AdsSession(env, { fetchImpl: g.fetchImpl, nowMs: NOW });
+  await runPerformance(env, { storeId: "hc", session, nowMs: NOW, fetchImpl: g.fetchImpl });
+  const f = await DB.prepare(`SELECT summary FROM media_findings WHERE agent = 'media.performance'`).first();
+  assert.match(f.summary, /Google ROAS, capped at total store revenue/);
+  assert.match(f.summary, /break-even 2\.02x \(estimated: COGS estimated\)/);
+  assert.equal(breakevenLabel({ breakeven: 2, estimated: false }), "break-even 2.00x");
+  const st = await mediaState(env, { nowMs: NOW });
+  const hc = st.stores.find((x) => x.store === "hc");
+  assert.equal(hc.roas_capped_label, "Google ROAS, capped at total store revenue");
+  assert.equal("roas_adjusted" in hc, false);
+  assert.equal(st.budget.track_record.label, "early / crude");
+});
+
+test("media: writes are batched when D1 offers batch, capped at 500 rows, and a failure part-way never empties the table", async () => {
+  const { DB, env } = await setup();
+  await connectGoogle(env);
+  await seedTz(DB);
+  const term = (t, usd) => ({ searchTermView: { searchTerm: t, status: "NONE" }, campaign: { id: "1", name: "S" }, metrics: { costMicros: String(Math.round(usd * 1e6)), conversions: 1 } });
+  let rows = [term("old one", 5), term("old two", 4)];
+  const g = fakeGoogle({ search_term_view: () => j([{ results: rows }]) });
+  let batches = 0;
+  DB.batch = async (stmts) => { batches += 1; for (const st of stmts) await st.run(); };
+  const session = new AdsSession(env, { fetchImpl: g.fetchImpl, nowMs: NOW, maxCalls: 10 });
+  await runSearchTerms(env, { storeId: "hc", session, nowMs: NOW, fetchImpl: g.fetchImpl });
+  assert.equal(batches, 1);
+  assert.equal((await DB.prepare(`SELECT COUNT(*) AS n FROM media_search_terms`).first()).n, 2);
+  // 600 terms: the costliest 500 stored, in 10 batches of 50; last window's rows gone.
+  rows = Array.from({ length: 600 }, (_, i) => term(`t${i}`, 1 + i / 100));
+  batches = 0;
+  await runSearchTerms(env, { storeId: "hc", session, nowMs: NOW + 86400000, fetchImpl: g.fetchImpl });
+  assert.equal(batches, 10);
+  assert.equal((await DB.prepare(`SELECT COUNT(*) AS n FROM media_search_terms`).first()).n, 500);
+  assert.equal((await DB.prepare(`SELECT COUNT(*) AS n FROM media_search_terms WHERE term = 't599'`).first()).n, 1);
+  assert.equal((await DB.prepare(`SELECT COUNT(*) AS n FROM media_search_terms WHERE term = 'old one'`).first()).n, 0);
+  // D1 fails on the second chunk: the previous window's rows are still there.
+  let calls = 0;
+  DB.batch = async (stmts) => { calls += 1; if (calls === 2) throw new Error("D1 limit"); for (const st of stmts) await st.run(); };
+  rows = Array.from({ length: 120 }, (_, i) => term(`new${i}`, 2));
+  await assert.rejects(() => runSearchTerms(env, { storeId: "hc", session, nowMs: NOW + 2 * 86400000, fetchImpl: g.fetchImpl }), /D1 limit/);
+  assert.ok((await DB.prepare(`SELECT COUNT(*) AS n FROM media_search_terms`).first()).n >= 500);
+  // No batch on the binding: falls back to one statement at a time.
+  delete DB.batch;
+  let ran = 0;
+  const fake = { run: async () => { ran += 1; } };
+  await runBatched(DB, [fake, fake, fake]);
+  assert.equal(ran, 3);
 });

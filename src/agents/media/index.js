@@ -5,8 +5,9 @@
  * for now, the media section is just watching more than anything ... eventually I want to
  * drop him as the mediabuyer and just use the store brain, but we need more data".
  *
- * runMedia(env) rides on the 15-minute cron. Every agent/store pair has its own job name in
- * job_runs (claimJob), so work is spread over ticks:
+ * runMedia(env) is called by the department rotation (src/agents/index.js): Media gets ONE
+ * of the 12 five-minute slots per hour, so it runs about once an hour. Every agent/store pair
+ * has its own job name in job_runs (claimJob); a job not due simply waits for a later hour:
  *   media.performance.<store>   every 4h   (1 Ads call)
  *   media.guy_monitor.<store>   every 6h   (1 Ads call)
  *   media.search_terms.<store>  daily      (1 Ads call + at most 1 Claude call)
@@ -14,12 +15,13 @@
  *   media.season.<store>        daily      (1 Ads call)
  *   media.conversions.<store>   every 6h   (D1 only)
  *   media.budget                daily      (D1 only + at most 1 Claude call)
- * At most MEDIA_MAX_ADS_CALLS (default 6) Google Ads requests per tick; what doesn't fit
- * runs on the next tick. A job is claimed only when it can run whole.
+ * At most MEDIA_MAX_ADS_CALLS (default 6) Google Ads requests per run; what doesn't fit runs
+ * in the next hourly run. A job is claimed only when it can run whole. Capacity: 6 calls an
+ * hour = 144 a day, against about 39 needed (3 stores × (6 performance + 4 guy + 3 daily)).
  *
  * Never throws. Google not connected → nothing claimed, one "not wired" event a day.
- * An Ads error → error event (at most hourly per agent+store), the job retries in 30 minutes,
- * and NO numbers are written (never zero for a failure).
+ * An Ads error → error event (at most hourly per agent+store), the job is retried at the next
+ * hourly run, and NO numbers are written (never zero for a failure).
  * Kill switch: env MEDIA_PAUSED = "1" stops the whole department.
  */
 import { claimJob, retrySoon, noteJobResult } from "../../lib/jobRuns.js";
@@ -27,7 +29,7 @@ import { STORE_IDS } from "../../config/stores.js";
 import { localDay, nowIso } from "../../lib/time.js";
 import {
   AdsSession, MediaNotWired, MediaCallBudget, mediaStoreIds, notWiredReason, logMediaError, logNotWiredOnce,
-  minusDays, r2, storeBreakeven, realityFactor, storeName,
+  minusDays, r2, storeBreakeven, revenueCap, breakevenLabel, CAP_LABEL, storeName,
 } from "./common.js";
 import { runPerformance } from "./performance.js";
 import { runGuyMonitor } from "./guyMonitor.js";
@@ -35,7 +37,7 @@ import { runSearchTerms } from "./searchTerms.js";
 import { runProducts } from "./products.js";
 import { runSeason } from "./season.js";
 import { runConversions } from "./conversions.js";
-import { runBudget } from "./budget.js";
+import { runBudget, trackRecord } from "./budget.js";
 import { latestRead } from "./reads.js";
 
 export const DEFAULT_MAX_ADS_CALLS = 6;
@@ -63,7 +65,7 @@ async function handleFailure(env, { agent, store, job, everyMin, err, nowMs }) {
   }
   if (err instanceof MediaCallBudget) {
     await retrySoon(db, job, everyMin, 15, nowMs).catch(() => {});
-    await noteJobResult(db, job, "deferred: Ads call budget for the tick used up").catch(() => {});
+    await noteJobResult(db, job, "deferred: Ads call budget for this run used up").catch(() => {});
     return "deferred";
   }
   const msg = String((err && err.message) || err).slice(0, 250);
@@ -96,7 +98,7 @@ export async function runMedia(env, { nowMs = Date.now(), fetchImpl = fetch } = 
           if (session.notWired) { out[job] = `not wired: ${session.notWired}`; continue; }
           if (session.tokenError) { out[job] = "skipped: Google sign-in failed this tick"; continue; }
           // Two calls of headroom: one for the report, one in case the account timezone is unknown.
-          if (!session.canCall(2)) { out[job] = "waiting for a later tick"; continue; }
+          if (!session.canCall(2)) { out[job] = "waiting for the next media run (about an hour)"; continue; }
         }
         try {
           if (!(await claimJob(db, job, a.everyMin, nowMs))) { out[job] = "not due"; continue; }
@@ -161,7 +163,7 @@ export async function mediaState(env, { nowMs = Date.now() } = {}) {
     ).bind(id, from, to).first();
     const days = Number((spend && spend.days) || 0);
     const be = await storeBreakeven(db, id, from, to);
-    const factor = days ? await realityFactor(db, id, from, to) : null;
+    const cap = days ? await revenueCap(db, id, from, to) : null;
     const pnl = await db.prepare(`SELECT COALESCE(SUM(revenue), 0) AS rev, COUNT(*) AS n FROM pnl_days WHERE store = ? AND day >= ? AND day <= ? AND revenue IS NOT NULL`).bind(id, from, to).first();
     const cost = days ? r2(spend.cost) : null; // null = no data, never zero
     const { results: wasted } = await db.prepare(
@@ -172,7 +174,8 @@ export async function mediaState(env, { nowMs = Date.now() } = {}) {
       `SELECT changed_at, user_email, client_type, resource_type, operation, summary, effect FROM media_changes WHERE store = ? ORDER BY changed_at DESC LIMIT 15`
     ).bind(id).all();
     const { results: budget } = await db.prepare(
-      `SELECT key, kind, title, status, outcome, created_at FROM media_proposals WHERE store = ? AND agent = 'media.budget' ORDER BY created_at DESC, id DESC LIMIT 8`
+      `SELECT key, kind, title, status, outcome, created_at, updated_at FROM media_proposals WHERE store = ? AND agent = 'media.budget'
+       ORDER BY CASE status WHEN 'open' THEN 0 ELSE 1 END, CASE kind WHEN 'budget_hold' THEN 1 ELSE 0 END, updated_at DESC, id DESC LIMIT 10`
     ).bind(id).all();
     const conv = await openFindings(db, id, "media.conversions", 5);
     const check = conv.find((f) => f.key === "check") || null;
@@ -181,9 +184,10 @@ export async function mediaState(env, { nowMs = Date.now() } = {}) {
       window: { from, to, days_with_data: days, fetched_at: spend && spend.fetched_at },
       spend: cost,
       google_roas: cost ? r2(Number(spend.value) / cost) : null,
-      roas_adjusted: cost && factor != null ? r2((Number(spend.value) * factor) / cost) : null,
+      roas_capped: cost && cap != null ? r2((Number(spend.value) * cap) / cost) : null,
+      roas_capped_label: CAP_LABEL,
       pnl_roas: cost && pnl && Number(pnl.n) ? r2(Number(pnl.rev) / cost) : null, // Shopify revenue (all channels) / ad spend
-      breakeven: be.breakeven, breakeven_estimated: be.estimated, breakeven_note: be.reason, reality_factor: factor,
+      breakeven: be.breakeven, breakeven_estimated: be.estimated, breakeven_label: breakevenLabel(be), breakeven_note: be.reason, revenue_cap: cap,
       flagged_campaigns: await openFindings(db, id, "media.performance", 10),
       wasted_terms: (wasted || []).map((w) => ({ title: w.title, ...(parse(w.detail) || {}) })),
       product_burners: await openFindings(db, id, "media.products", 10),
@@ -195,10 +199,6 @@ export async function mediaState(env, { nowMs = Date.now() } = {}) {
       jobs: jobs.filter((j) => j.job.endsWith(`.${id}`)),
     });
   }
-  const track = await db.prepare(
-    `SELECT COUNT(*) AS n, SUM(outcome = 'right') AS right_n, SUM(outcome = 'wrong') AS wrong_n, SUM(outcome = 'unclear') AS unclear_n
-     FROM media_proposals WHERE agent = 'media.budget' AND outcome IS NOT NULL`
-  ).first();
   return {
     mode: "watch only",
     decision: "guy is still the mediabuyer, dont worry about the spend cieling, and for now, the media section is just watching more than anything",
@@ -207,7 +207,7 @@ export async function mediaState(env, { nowMs = Date.now() } = {}) {
     stores,
     budget: {
       rationale: await latestRead(db, "all", "media.budget"),
-      track_record: { scored: Number((track && track.n) || 0), right: Number((track && track.right_n) || 0), wrong: Number((track && track.wrong_n) || 0), unclear: Number((track && track.unclear_n) || 0) },
+      track_record: await trackRecord(db),
       job: jobs.find((j) => j.job === "media.budget") || null,
     },
     at: nowIso(nowMs),
