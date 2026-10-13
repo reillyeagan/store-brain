@@ -5,7 +5,8 @@
  * one of these ids. `kind` says whether a worker is plain code or uses Claude.
  * `level`: L0 proposes (Reilly approves) · L1 acts within limits, reports after ·
  * L2 runs quietly, shows in the digest.
- * `status`: planned → built → shadow → live. Only Reilly moves a worker to live.
+ * `status`: planned → built → shadow → live, or "off" (built, switched off by Reilly). Only
+ * Reilly moves a worker to live or off.
  */
 
 export const DEPARTMENTS = Object.freeze([
@@ -64,13 +65,14 @@ export const AGENTS = Object.freeze([
   a("sup.claims", "sup", "Claims & Credits", "code", "L0"),
 
   // P&L
-  a("pnl.pullers", "pnl", "Data Pullers", "code", "L2"),
+  // Built and running (orders, ads spend, backfill): marked built 2026-10-13.
+  a("pnl.pullers", "pnl", "Data Pullers", "code", "L2", "built"),
   a("pnl.cogs", "pnl", "COGS Matcher", "code", "L2"),
-  a("pnl.refunds", "pnl", "Refund Reconciler", "code", "L2"),
+  a("pnl.refunds", "pnl", "Refund Reconciler", "code", "L2", "built"),
   // Daily P&L rows in the ledger (pnl_days). Sheets writing comes later, after the shadow gate.
   a("pnl.ledger", "pnl", "Ledger Keeper", "code", "L2", "built"),
   a("pnl.analyst", "pnl", "Analyst", "ai", "L2"),
-  a("pnl.money_map", "pnl", "Money Map", "code", "L2"),
+  a("pnl.money_map", "pnl", "Money Map", "code", "L2", "built"),
   a("pnl.calendar", "pnl", "Tax, Admin & Triggers", "code", "L1"),
 
   // Risk
@@ -83,10 +85,10 @@ export const AGENTS = Object.freeze([
   a("ful.order_watch", "ful", "Order-to-Supplier Watcher", "code", "L1"),
   // Tracking Sync: Shopify tracking numbers → 17TRACK, stuck-pickup / failed-delivery flags,
   // proof of delivery to R2. Shadow-safe (nothing reaches a customer).
-  a("ful.tracking", "ful", "Tracking Sync", "code", "L1", "built"),
+  a("ful.tracking", "ful", "Tracking Sync", "code", "L1", "off"), // switched off by Reilly 2026-10-13
   // Day-15 / day-20 flags and the reship-or-refund approval are plain code today; the
   // customer emails it will draft later need AI, hence kind "ai".
-  a("ful.late", "ful", "Late-Shipment Watcher", "ai", "L0", "built"),
+  a("ful.late", "ful", "Late-Shipment Watcher", "ai", "L0", "off"), // switched off with parcel tracking
   a("ful.exceptions", "ful", "Exception Fixer", "ai", "L0"),
 
   // Catalog

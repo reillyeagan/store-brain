@@ -118,7 +118,7 @@ const orderNode = (n, fulfillments, createdAt = iso(NOW - 5 * DAY)) => ({ id: `g
 
 test("collect: fulfillments with tracking → shipments (cancelled ignored, numbers normalised, once per number)", async () => {
   const DB = makeD1();
-  const env = { DB, ...HC_CREDS };
+  const env = { PARCEL_TRACKING: "1", DB, ...HC_CREDS };
   const gqlLog = [];
   const orders = [
     orderNode(1231, [{ id: "gid://shopify/Fulfillment/1", createdAt: iso(NOW - 4 * DAY), status: "SUCCESS",
@@ -159,7 +159,7 @@ test("register: each number once, never past the quota, never orders older than 
   const DB = makeD1();
   const log = [];
   const t17 = fake17({ remain: 2, total: 200, log });
-  const env = { DB, TRACKING_API_KEY: KEY };
+  const env = { PARCEL_TRACKING: "1", DB, TRACKING_API_KEY: KEY };
   await seed(DB, { order: 1, tracking_number: "UL000000001YP", shipped_at: iso(NOW - 3 * DAY) });
   await seed(DB, { order: 2, tracking_number: "UL000000002YP", shipped_at: iso(NOW - 2 * DAY) });
   await seed(DB, { order: 3, tracking_number: "UL000000003YP", shipped_at: iso(NOW - 1 * DAY) });
@@ -196,7 +196,7 @@ test("register: 'already registered' counts as registered; other rejections are 
   const log = [];
   const t17 = fake17({ reject: { GFUS000000001: -18019903 }, log });
   t17.registered.add("YT0000000000000001"); // registered before (e.g. a crash after the API call)
-  const env = { DB, TRACKING_API_KEY: KEY };
+  const env = { PARCEL_TRACKING: "1", DB, TRACKING_API_KEY: KEY };
   await seed(DB, { order: 1, tracking_number: "YT0000000000000001" });
   await seed(DB, { order: 2, tracking_number: "GFUS000000001" });
   const r = await registerNew(env, { nowMs: NOW, fetchImpl: t17, sleep: noSleep });
@@ -216,7 +216,7 @@ test("register: unknown quota spends nothing", async () => {
     return Response.json({ code: 0, data: {} }); // no quota fields
   };
   await seed(DB, { order: 1, tracking_number: "UL000000001YP" });
-  const r = await registerNew({ DB, TRACKING_API_KEY: KEY }, { nowMs: NOW, fetchImpl: handler, sleep: noSleep });
+  const r = await registerNew({ PARCEL_TRACKING: "1", DB, TRACKING_API_KEY: KEY }, { nowMs: NOW, fetchImpl: handler, sleep: noSleep });
   assert.equal(r.registered, 0);
   assert.ok(!log.some((u) => u.endsWith("/register")));
 });
@@ -248,8 +248,8 @@ test("webhook: refused without a key, without a signature, or with a forged one"
   const DB = makeD1();
   await seed(DB, { order: 1, tracking_number: "UL000000001YP", registered_at: iso(NOW) });
   const raw = JSON.stringify({ event: "TRACKING_UPDATED", data: { number: "UL000000001YP", track_info: { latest_status: { status: "Delivered" } } } });
-  assert.equal((await worker.fetch(push(raw, sign(raw)), { DB })).status, 503, "not wired");
-  const env = { DB, TRACKING_API_KEY: KEY };
+  assert.equal((await worker.fetch(push(raw, sign(raw)), { PARCEL_TRACKING: "1", DB })).status, 503, "not wired");
+  const env = { PARCEL_TRACKING: "1", DB, TRACKING_API_KEY: KEY };
   assert.equal((await worker.fetch(push(raw, null), env)).status, 401);
   assert.equal((await worker.fetch(push(raw, sign(raw, "WRONGKEY")), env)).status, 401);
   assert.equal((await worker.fetch(push(raw + " ", sign(raw)), env)).status, 401, "body tampered");
@@ -262,7 +262,7 @@ test("webhook: refused without a key, without a signature, or with a forged one"
 
 test("webhook: a verified push never writes its own status; known numbers are queued for an API re-read, unknown ignored", async () => {
   const DB = makeD1();
-  const env = { DB, TRACKING_API_KEY: KEY };
+  const env = { PARCEL_TRACKING: "1", DB, TRACKING_API_KEY: KEY };
   await seed(DB, { order: 1, tracking_number: "UL000000001YP", registered_at: iso(NOW - DAY), polled_at: iso(NOW - 3600000), state: "in_transit", last_status: "InTransit" });
   const raw = JSON.stringify({ event: "TRACKING_UPDATED", data: { number: "UL000000001YP", track_info: { latest_status: { status: "Delivered" } } } });
   const res = await worker.fetch(push(raw, sign(raw)), env);
@@ -288,7 +288,7 @@ test("webhook: a verified push never writes its own status; known numbers are qu
 
 test("composer: a stuck parcel gets one pickup line (store named), once per order", async () => {
   const DB = makeD1();
-  const env = { DB };
+  const env = { PARCEL_TRACKING: "1", DB };
   const now = ET("18:45");
   await seed(DB, {
     order: 1231, tracking_number: "UL123456789YP", shipped_at: "2026-10-07T15:00:00Z", order_created_at: "2026-10-05T15:00:00Z",
@@ -336,7 +336,7 @@ test("day math: whole Eastern calendar days, not UTC", () => {
 
 test("checks: day 15 flag, day 20 flag + one reship/refund approval, never duplicated", async () => {
   const DB = makeD1();
-  const env = { DB };
+  const env = { PARCEL_TRACKING: "1", DB };
   const order = "2026-09-20T15:00:00Z"; // Sep 20 Eastern
   await seed(DB, { order: 1100, tracking_number: "UL110000000YP", order_created_at: order, registered_at: order, state: "in_transit", last_status: "InTransit", polled_at: iso(Date.parse("2026-10-05T12:00:00Z")) });
   await runChecks(env, { nowMs: Date.parse("2026-10-05T14:00:00Z") }); // day 15
@@ -356,14 +356,14 @@ test("checks: day 15 flag, day 20 flag + one reship/refund approval, never dupli
   assert.deepEqual(pending[0].options, [{ id: "reship", label: "Reship" }, { id: "refund", label: "Refund" }]);
   assert.match(pending[0].title, /Holt & Crane #1100/);
   assert.equal(flags[1].approval_id, pending[0].id);
-  const st = await shippingState({ DB, TRACKING_API_KEY: KEY }, day20);
+  const st = await shippingState({ PARCEL_TRACKING: "1", DB, TRACKING_API_KEY: KEY }, day20);
   assert.equal(st.flags[0].kind, "day20");
   assert.equal(st.flags[0].label, "Escalate: reship or refund");
 });
 
 test("checks: a stale status raises nothing; delivered resolves open flags; failed delivery is flagged", async () => {
   const DB = makeD1();
-  const env = { DB };
+  const env = { PARCEL_TRACKING: "1", DB };
   const now = Date.parse("2026-10-10T14:00:00Z");
   await seed(DB, { order: 1, tracking_number: "UL1YP0000001", order_created_at: "2026-09-15T15:00:00Z", registered_at: "2026-09-17T15:00:00Z", state: "in_transit", last_status: "InTransit", polled_at: iso(now - 3 * DAY) });
   await seed(DB, { order: 2, tracking_number: "UL2YP0000002", state: "failed_attempt", last_status: "DeliveryFailure", polled_at: iso(now - 3600000) });
@@ -381,7 +381,7 @@ test("checks: a stale status raises nothing; delivered resolves open flags; fail
 test("poll: delivered → proof of delivery saved to R2, verified, pointer on the shipment", async () => {
   const DB = makeD1();
   const BACKUPS = makeR2();
-  const env = { DB, BACKUPS, TRACKING_API_KEY: KEY };
+  const env = { PARCEL_TRACKING: "1", DB, BACKUPS, TRACKING_API_KEY: KEY };
   await seed(DB, { order: 1053, tracking_number: "UL105300000YP", registered_at: iso(NOW - 4 * DAY), state: "out_for_delivery", last_status: "OutForDelivery" });
   const delivered = trackItem("UL105300000YP", "Delivered", {
     sub: "Delivered_Other", time: "2026-10-10T14:05:00-04:00", location: "CHARLOTTE, NC 28202",
@@ -409,7 +409,7 @@ test("poll: delivered → proof of delivery saved to R2, verified, pointer on th
 
 test("poll: no backup bucket → no pointer, an error event, and it retries later", async () => {
   const DB = makeD1();
-  const env = { DB, TRACKING_API_KEY: KEY };
+  const env = { PARCEL_TRACKING: "1", DB, TRACKING_API_KEY: KEY };
   await seed(DB, { order: 7, tracking_number: "UL700000000YP", registered_at: iso(NOW - DAY) });
   const t17 = fake17({ info: { UL700000000YP: trackItem("UL700000000YP", "Delivered") } });
   const r = await pollTracking(env, { nowMs: NOW, fetchImpl: t17, sleep: noSleep });
@@ -421,7 +421,7 @@ test("poll: no backup bucket → no pointer, an error event, and it retries late
 
 test("poll: a number polled less than 6 h ago is left alone", async () => {
   const DB = makeD1();
-  const env = { DB, TRACKING_API_KEY: KEY };
+  const env = { PARCEL_TRACKING: "1", DB, TRACKING_API_KEY: KEY };
   await seed(DB, { order: 8, tracking_number: "UL800000000YP", registered_at: iso(NOW - DAY), polled_at: iso(NOW - 5 * 3600000), state: "in_transit" });
   const log = [];
   const r = await pollTracking(env, { nowMs: NOW, fetchImpl: fake17({ log }), sleep: noSleep });
@@ -433,7 +433,7 @@ test("poll: a number polled less than 6 h ago is left alone", async () => {
 
 test("runTracking: a failing 17TRACK stage doesn't stop the others; feed shows failing", async () => {
   const DB = makeD1();
-  const env = { DB, ...HC_CREDS, TRACKING_API_KEY: KEY };
+  const env = { PARCEL_TRACKING: "1", DB, ...HC_CREDS, TRACKING_API_KEY: KEY };
   await ensureFeeds(DB);
   await seed(DB, { order: 9, tracking_number: "UL900000000YP", state: "failed_attempt", last_status: "DeliveryFailure", polled_at: iso(NOW - 3600000), registered_at: iso(NOW - DAY) });
   const broken = async (url, init) => {
@@ -456,7 +456,7 @@ test("feed: not wired without TRACKING_API_KEY, and 17TRACK is never called", as
   await ensureFeeds(DB);
   const log = [];
   const f = async (url, init) => { log.push(String(url)); return router({ orders: [] })(url, init); };
-  const out = await runTracking({ DB, ...HC_CREDS }, { nowMs: NOW, fetchImpl: f, sleep: noSleep });
+  const out = await runTracking({ PARCEL_TRACKING: "1", DB, ...HC_CREDS }, { nowMs: NOW, fetchImpl: f, sleep: noSleep });
   assert.equal(out.poll, undefined);
   assert.ok(!log.some((u) => u.startsWith(API_BASE)));
   assert.equal((await evaluateFeeds(DB, NOW)).find((x) => x.id === FEED_ID).current, "not_wired");
@@ -471,7 +471,7 @@ test("cron: tracking blowing up doesn't stop the KFB composer or the sentinel", 
       return DB.prepare(sql);
     },
   };
-  const env = { DB: brokenDB, TRACKING_API_KEY: KEY };
+  const env = { PARCEL_TRACKING: "1", DB: brokenDB, TRACKING_API_KEY: KEY };
   const realFetch = globalThis.fetch;
   globalThis.fetch = async () => { throw new Error("offline"); };
   try {
@@ -489,10 +489,10 @@ test("cron: tracking blowing up doesn't stop the KFB composer or the sentinel", 
 
 test("state: Mission Control gets shipping counts, flags, quota and last sync", async () => {
   const DB = makeD1();
-  const env = { DB, MC_KEY: "m".repeat(32), TRACKING_API_KEY: KEY };
+  const env = { PARCEL_TRACKING: "1", DB, MC_KEY: "m".repeat(32), TRACKING_API_KEY: KEY };
   await seed(DB, { order: 1, tracking_number: "UL1000000001", registered_at: iso(Date.now() - DAY), state: "in_transit", last_status: "InTransit", order_created_at: iso(Date.now() - 5 * DAY) });
   await seed(DB, { order: 2, tracking_number: "UL1000000002", order_created_at: iso(Date.now() - 5 * DAY), shipped_at: iso(Date.now() - DAY) });
-  await registerNew({ DB, TRACKING_API_KEY: KEY }, { nowMs: Date.now(), fetchImpl: fake17({ remain: 12 }), sleep: noSleep });
+  await registerNew({ PARCEL_TRACKING: "1", DB, TRACKING_API_KEY: KEY }, { nowMs: Date.now(), fetchImpl: fake17({ remain: 12 }), sleep: noSleep });
   const res = await worker.fetch(new Request("https://b.example/api/state", { headers: { "x-store-brain-key": "m".repeat(32) } }), env);
   const body = await res.json();
   assert.equal(body.shipping.wired, true);
@@ -510,7 +510,7 @@ const pad = (n) => String(n).padStart(9, "0");
 
 test("fix 1: first run spends the quota newest first, skips Shopify-delivered and 21+ day parcels, stops at the cap", async () => {
   const DB = makeD1();
-  const env = { DB, ...HC_CREDS, TRACKING_API_KEY: KEY };
+  const env = { PARCEL_TRACKING: "1", DB, ...HC_CREDS, TRACKING_API_KEY: KEY };
   const log = [];
   const t17 = fake17({ remain: 200, log });
   // Shopify says what it knows: DELIVERED fulfillments are recorded and never registered.
@@ -561,7 +561,7 @@ test("fix 1: first run spends the quota newest first, skips Shopify-delivered an
 
 test("fix 1: the backlog never spends the last 20 registrations; new parcels can", async () => {
   const DB = makeD1();
-  const env = { DB, TRACKING_API_KEY: KEY };
+  const env = { PARCEL_TRACKING: "1", DB, TRACKING_API_KEY: KEY };
   const t17 = fake17({ remain: 25 });
   for (let i = 0; i < 10; i++) {
     await seed(DB, { order: 8000 + i, tracking_number: `YT${pad(i)}BK`, order_created_at: iso(NOW - (6 + i) * DAY), shipped_at: iso(NOW - (5 + i) * DAY) });
@@ -580,7 +580,7 @@ test("fix 1: the backlog never spends the last 20 registrations; new parcels can
 
 test("fix 2: multi-parcel orders reach day 15 / day 20 — delivered parcels don't block, untracked parcels still count", async () => {
   const DB = makeD1();
-  const env = { DB };
+  const env = { PARCEL_TRACKING: "1", DB };
   const order = "2026-09-20T15:00:00Z";
   const now = Date.parse("2026-10-10T14:00:00Z"); // day 20
   const fresh = iso(now - 3600000);
@@ -618,7 +618,7 @@ test("fix 2: multi-parcel orders reach day 15 / day 20 — delivered parcels don
 
 test("day-20 approvals: never for orders older than 45 days, at most 5 new per run, the rest held and logged", async () => {
   const DB = makeD1();
-  const env = { DB };
+  const env = { PARCEL_TRACKING: "1", DB };
   const now = Date.parse("2026-10-10T14:00:00Z");
   const fresh = iso(now - 3600000);
   // 8 tracked, fresh, late orders at day 20-27.
@@ -668,14 +668,14 @@ test("fix 3: a day-20 approval half-written by a crashed run is re-linked, never
   const order = "2026-09-20T15:00:00Z";
   const now = Date.parse("2026-10-10T14:00:00Z");
   await seed(DB, { order: 3001, tracking_number: "UL300100000YP", order_created_at: order, registered_at: order, state: "in_transit", last_status: "InTransit", polled_at: iso(now - 3600000) });
-  await assert.rejects(runChecks({ DB: flaky }, { nowMs: now }), /log down/);
+  await assert.rejects(runChecks({ PARCEL_TRACKING: "1", DB: flaky }, { nowMs: now }), /log down/);
   assert.equal((await listPending(DB)).length, 1, "the approval row did get written");
   const flag = await DB.prepare(`SELECT approval_id FROM shipment_flags WHERE kind = 'day20'`).first();
   assert.equal(flag.approval_id, null, "flag kept (not deleted), not linked yet");
 
-  const r = await runChecks({ DB: flaky }, { nowMs: now + 15 * 60000 });
+  const r = await runChecks({ PARCEL_TRACKING: "1", DB: flaky }, { nowMs: now + 15 * 60000 });
   assert.deepEqual(r.raised, ["day20_relinked"]);
-  await runChecks({ DB: flaky }, { nowMs: now + 30 * 60000 });
+  await runChecks({ PARCEL_TRACKING: "1", DB: flaky }, { nowMs: now + 30 * 60000 });
   const pending = await listPending(DB);
   assert.equal(pending.length, 1, "still one approval");
   assert.equal((await DB.prepare(`SELECT approval_id FROM shipment_flags WHERE kind = 'day20'`).first()).approval_id, pending[0].id);
@@ -683,7 +683,7 @@ test("fix 3: a day-20 approval half-written by a crashed run is re-linked, never
 
 test("fix 4: stuck pickup is per parcel — a second parcel stuck later is raised and asked about; clearing one doesn't clear the other", async () => {
   const DB = makeD1();
-  const env = { DB };
+  const env = { PARCEL_TRACKING: "1", DB };
   const day1 = ET("18:45", "2026-10-11");
   await seed(DB, { order: 4001, tracking_number: "UL400100001YP", order_created_at: "2026-10-05T15:00:00Z", shipped_at: "2026-10-07T15:00:00Z",
     registered_at: iso(day1 - 4 * DAY), state: "awaiting_pickup", last_status: "InfoReceived", polled_at: iso(day1 - 3600000) });
@@ -727,13 +727,13 @@ test("fix 4: an old per-order pickup line still counts as asked for the numbers 
   await seed(DB, { order: 4100, tracking_number: "UL410000001YP", order_created_at: "2026-10-05T15:00:00Z", shipped_at: "2026-10-07T15:00:00Z",
     registered_at: iso(now - 4 * DAY), state: "awaiting_pickup", last_status: "InfoReceived", polled_at: iso(now - 3600000) });
   await DB.prepare(`INSERT INTO kfb_message_items (message_id, store, order_id, order_name, kind, detail) VALUES (1, 'hc', 'gid://shopify/Order/4100', '#4100', 'pickup', 'UL410000001YP; shipped 2026-10-07')`).run();
-  const r = await runKfbComposer({ DB }, { nowMs: now });
+  const r = await runKfbComposer({ PARCEL_TRACKING: "1", DB }, { nowMs: now });
   assert.equal(r.messageId, null);
 });
 
 test("fix 5: bad-signature pushes are counted, not logged one by one (at most one summary an hour)", async () => {
   const DB = makeD1();
-  const env = { DB, TRACKING_API_KEY: KEY };
+  const env = { PARCEL_TRACKING: "1", DB, TRACKING_API_KEY: KEY };
   const raw = JSON.stringify({ event: "TRACKING_UPDATED", data: { number: "UL000000001YP" } });
   for (let i = 0; i < 50; i++) {
     const res = await handleTrackingPush(push(raw, "forged"), env, NOW + i * 1000);
@@ -746,4 +746,30 @@ test("fix 5: bad-signature pushes are counted, not logged one by one (at most on
   ev = (await recentEvents(DB)).filter((e) => e.kind === "tracking.push_rejected");
   assert.equal(ev.length, 2);
   assert.ok(ev.some((e) => /Refused 50 tracking pushes/.test(e.summary)), "the summary carries the count");
+});
+
+test("switched off (Reilly, Oct 13): no 17TRACK calls, open flags cleared, decision recorded once, feed can't go stale", async () => {
+  const { runTracking, handleTrackingPush, shippingState } = await import("../src/lib/tracking.js");
+  const DB = makeD1();
+  await ensureFeeds(DB);
+  await DB.prepare(`UPDATE feeds SET wired = 1, last_ok_at = '2026-10-01T00:00:00Z' WHERE id = 'tracking.17track'`).run();
+  await DB.prepare(`INSERT INTO shipment_flags (store, order_id, order_name, kind, detail, raised_at) VALUES ('aub', 'o1', '#1014', 'day20_verify', 'x', '2026-10-10T00:00:00Z')`).run();
+  let called = 0;
+  const env = { DB, TRACKING_API_KEY: "k".repeat(20) }; // no PARCEL_TRACKING override: production setting
+  const r = await runTracking(env, { fetchImpl: async () => { called++; throw new Error("must not call"); } });
+  assert.equal(r.off, true);
+  assert.equal(called, 0);
+  assert.equal((await DB.prepare(`SELECT COUNT(*) AS n FROM shipment_flags WHERE resolved_at IS NULL`).first()).n, 0);
+  await runTracking(env);
+  const d = (await DB.prepare(`SELECT * FROM decisions WHERE topic = 'parcel_tracking'`).all()).results;
+  assert.equal(d.length, 1, "Reilly's words recorded once");
+  assert.match(d[0].words, /stop the parcel panel tracking/);
+  await ensureFeeds(DB);
+  const f = (await evaluateFeeds(DB)).find((x) => x.id === "tracking.17track");
+  assert.notEqual(f && f.current, "stale");
+  const st = await shippingState(env);
+  assert.equal(st.off, true);
+  assert.equal(st.flags.length, 0);
+  const push = await handleTrackingPush(new Request("https://b/webhooks/17track", { method: "POST", body: "{}" }), env);
+  assert.equal(push.status, 200);
 });

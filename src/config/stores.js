@@ -16,7 +16,21 @@
  * (2026-10-11); confirm it against Guy's first invoice before the P&L leaves shadow.
  * Per store on purpose: if one store's terms ever differ, change only that store.
  */
-const GUY_FEE = Object.freeze({ rate: 0.10, start: "2026-09-07" });
+/**
+ * Parcel tracking (17TRACK + day-15/day-20 parcel flags): OFF.
+ * Reilly, 2026-10-13: "we need to stop the parcel panel tracking its not worth it if its
+ * going to fill up this much bullshit". Flip to true only on his word.
+ */
+export const PARCEL_TRACKING = false;
+/** Tests switch it on with env.PARCEL_TRACKING = "1"; production follows the constant. */
+export function parcelTrackingOn(env) { return PARCEL_TRACKING || !!(env && env.PARCEL_TRACKING === "1"); }
+export const PARCEL_TRACKING_DECISION = Object.freeze({
+  at: "2026-10-13T17:11:00Z",
+  topic: "parcel_tracking",
+  words: "we need to stop the parcel panel tracking its not worth it if its going to fill up this much bullshit",
+});
+
+export const GUY_FEE = Object.freeze({ rate: 0.10, start: "2026-09-07" });
 
 export const STORES = Object.freeze({
   hc: {

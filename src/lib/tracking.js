@@ -27,7 +27,7 @@
  *     few days, so the backlog can never use up what new orders need.
  * A parcel that isn't tracked still gets day-15 / day-20 flags from its order date.
  */
-import { LIVE_STORE_IDS, STORES } from "../config/stores.js";
+import { LIVE_STORE_IDS, STORES, parcelTrackingOn, PARCEL_TRACKING_DECISION } from "../config/stores.js";
 import { shopifyGraphQL } from "./storeGuard.js";
 import { logEvent } from "./eventlog.js";
 import { markFeedOk, markFeedFailed } from "./freshness.js";
@@ -782,7 +782,32 @@ async function stage(env, name, fn, at) {
  * Called by the 15-minute cron. Each stage has its own try, so one failing never stops
  * the next (and never reaches the order pull, KFB composer or sentinel).
  */
+/**
+ * Parcel tracking switched off (stores.js PARCEL_TRACKING). Once: record Reilly's words in
+ * `decisions`, close every open parcel flag, and drop the 17TRACK feed so it can't show
+ * as stale. Nothing registers, polls or raises flags while it's off.
+ */
+export async function trackingOff(env, nowMs = Date.now()) {
+  const db = env.DB;
+  const at = nowIso(nowMs);
+  const d = PARCEL_TRACKING_DECISION;
+  const had = await db.prepare(`SELECT id FROM decisions WHERE topic = ? AND words = ?`).bind(d.topic, d.words).first();
+  if (!had) await db.prepare(`INSERT INTO decisions (at, topic, words, scope, settled) VALUES (?, ?, ?, 'all', 1)`).bind(d.at, d.topic, d.words).run();
+  const open = await db.prepare(`UPDATE shipment_flags SET resolved_at = ? WHERE resolved_at IS NULL`).bind(at).run();
+  const cleared = (open && open.meta && open.meta.changes) || 0;
+  await db.prepare(`DELETE FROM feeds WHERE id = ?`).bind(FEED_ID).run();
+  if (!had || cleared) {
+    await logEvent(db, {
+      actor: ACTOR, kind: "tracking.switched_off",
+      summary: `Parcel tracking is off (Reilly, Oct 13): 17TRACK and the day-15/day-20 parcel flags stopped` + (cleared ? `; ${cleared} open parcel flag${cleared === 1 ? "" : "s"} cleared` : ""),
+      data: { cleared }, at,
+    });
+  }
+  return { off: true, cleared };
+}
+
 export async function runTracking(env, { nowMs = Date.now(), fetchImpl = fetch, sleep = sleepDefault } = {}) {
+  if (!parcelTrackingOn(env)) return trackingOff(env, nowMs);
   const at = nowIso(nowMs);
   const out = {};
   const hourly = await claimStage(env.DB, "collect", nowMs, COLLECT_EVERY_MS);
@@ -834,6 +859,7 @@ export async function noteRejectedPush(db, nowMs = Date.now()) {
  */
 export async function handleTrackingPush(request, env, nowMs = Date.now()) {
   const json = (b, status = 200) => new Response(JSON.stringify(b), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" } });
+  if (!parcelTrackingOn(env)) return json({ ok: true, ignored: "parcel tracking is off" });
   if (!env.TRACKING_API_KEY) return json({ ok: false, error: "not wired" }, 503);
   const raw = await request.text();
   if (raw.length > MAX_PUSH_BYTES) return json({ ok: false, error: "too large" }, 413);
@@ -871,8 +897,8 @@ export async function handleTrackingPush(request, env, nowMs = Date.now()) {
 
 export async function shippingState(env, nowMs = Date.now()) {
   const db = env.DB;
-  const empty = { wired: !!env.TRACKING_API_KEY, counts: {}, total: 0, unregistered: 0, notTracked: { quota: 0, age: 0, shopifyDelivered: 0, rejected: 0 }, registerErrors: [], flags: [], quota: null, quotaLow: false, lastSync: null, lastCollect: null };
-  if (!LIVE_STORE_IDS.length) return empty;
+  const empty = { off: !parcelTrackingOn(env), wired: !!env.TRACKING_API_KEY, counts: {}, total: 0, unregistered: 0, notTracked: { quota: 0, age: 0, shopifyDelivered: 0, rejected: 0 }, registerErrors: [], flags: [], quota: null, quotaLow: false, lastSync: null, lastCollect: null };
+  if (!LIVE_STORE_IDS.length || !parcelTrackingOn(env)) return empty;
   const since = nowIso(nowMs - 60 * DAY);
   // Parcels 17TRACK isn't tracking are counted by why: Shopify says delivered, too old,
   // rejected, or waiting on quota/cap (decided from the last register run's reason).
