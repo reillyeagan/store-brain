@@ -58,6 +58,18 @@ CREATE TABLE IF NOT EXISTS cat_runs (
   PRIMARY KEY (agent, store)
 );
 
+-- Standing price holds (H&C outerwear at $114.95, Reilly 09-01) with the cost at hold time:
+-- "A held product is never re-proposed unless its cost changes."
+CREATE TABLE IF NOT EXISTS cat_holds (
+  store            TEXT    NOT NULL,
+  product_id       TEXT    NOT NULL,
+  price            REAL    NOT NULL,           -- the held price
+  cost_usd         REAL,                       -- cost when held (null = unknown then; first known cost fills it)
+  held_at          TEXT    NOT NULL,
+  cost_seen_at     TEXT,
+  PRIMARY KEY (store, product_id)
+);
+
 -- Once-a-day claims, so a daily check runs exactly once per store-local day even when two
 -- cron runs overlap (atomic: the row only moves forward to a later day).
 CREATE TABLE IF NOT EXISTS cat_daily (

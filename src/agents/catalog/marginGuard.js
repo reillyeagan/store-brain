@@ -8,7 +8,8 @@
  *   break-even ROAS for each flagged product. Products with no cost on file are listed as
  *   "cost unknown" — never assumed (rule 4).
  * Inputs: `cat_products` (fresh copy), Core costs (`cost:product:<GID>` / `cost:sku:<SKU>`,
- *   USD or EUR at the 1.17 estimate, flagged).
+ *   USD or EUR at the 1.17 estimate, flagged; any source, including the Supplier Quote Desk's
+ *   "kfb_quote" facts), `cat_holds`. Each variant is judged on its own cost.
  * Outputs: a `cat_runs` row and one digest event per store per day. Out-of-band products are
  *   carried into Pricing's approval (spec: "Out of band → added to the next pricing approval"),
  *   because Pricing reads the same costs. Never changes anything.
@@ -20,7 +21,7 @@ import { nowIso } from "../../lib/time.js";
 import { BREAKEVEN_REFUND_RATE, BREAKEVEN_FEE_RATE, breakevenRoas } from "../../lib/pnl.js";
 import { STORES } from "../../config/stores.js";
 import { rulesFor, cogsPct } from "./pricingRules.js";
-import { saveRun, readCosts, productCost, isHeld, pct, money } from "./common.js";
+import { saveRun, readCosts, productCost, variantCost, resolveHolds, pct, money } from "./common.js";
 
 export const AGENT = "cat.margin_guard";
 
@@ -30,27 +31,37 @@ export function contributionPerDollar(cogs) {
   return Math.round(((1 - cogs) * (1 - BREAKEVEN_REFUND_RATE) - BREAKEVEN_FEE_RATE) * 10000) / 10000;
 }
 
-/** Judge one product with a known cost. Returns a finding or null when it's in band and profitable. */
-export function judgeProduct(storeId, product, cost) {
+/**
+ * Judge one product. Each variant is judged on ITS OWN cost (variantCost); variants with no
+ * cost are skipped and counted, never given a sibling's cost. The worst variant (highest COGS)
+ * decides the margin flags. `hold` (from resolveHolds) suppresses the band flags, never the
+ * loss flag. Returns a finding, or null when it's in band and profitable (or no cost is known).
+ */
+export function judgeProduct(storeId, product, costs, hold = null) {
   const rules = rulesFor(storeId);
   const priced = (product.variants || []).filter((v) => v.price != null && v.price > 0);
   if (!rules || !priced.length) return null;
-  // The cheapest variant is the worst case for margin (errors run in the flattering direction).
-  const low = priced.reduce((a, v) => (v.price < a.price ? v : a));
-  const cogs = cogsPct(cost.usd, low.price);
+  const judged = priced.map((v) => ({ v, c: variantCost(costs, product, v) })).filter((x) => x.c)
+    .map((x) => ({ ...x, cogs: cogsPct(x.c.usd, x.v.price) }));
+  if (!judged.length) return null;
+  const worst = judged.reduce((a, x) => (x.cogs > a.cogs ? x : a));
+  const best = judged.reduce((a, x) => (x.cogs < a.cogs ? x : a));
+  const held = !!(hold && hold.held);
+  const cogs = worst.cogs;
   const contrib = contributionPerDollar(cogs);
-  const held = isHeld(storeId, product, low.price);
   const problems = [];
-  if (contrib != null && contrib <= 0) problems.push({ code: "loss_after_fees", severity: "high", message: `Loses money after refunds and fees at ${money(low.price)} (COGS ${pct(cogs)})` });
-  if (cogs > rules.band.hi + 1e-9 && !held) problems.push({ code: "cogs_above_band", severity: "high", message: `COGS ${pct(cogs)} is above the ${pct(rules.band.hi)} band top` });
-  if (cogs < rules.band.lo - 1e-9 && !held && low.price > rules.floor + 0.004) {
-    problems.push({ code: "cogs_below_band", severity: "low", message: `COGS ${pct(cogs)} is under the ${pct(rules.band.lo)} band bottom (priced above the rules)` });
+  if (contrib != null && contrib <= 0) problems.push({ code: "loss_after_fees", severity: "high", message: `Loses money after refunds and fees at ${money(worst.v.price)} (COGS ${pct(cogs)})` });
+  if (cogs > rules.band.hi + 1e-9 && !held) problems.push({ code: "cogs_above_band", severity: "high", message: `COGS ${pct(cogs)} is above the ${pct(rules.band.hi)} band top (${worst.v.title || "variant"} at ${money(worst.v.price)})` });
+  if (!problems.length && best.cogs < rules.band.lo - 1e-9 && !held && best.v.price > rules.floor + 0.004) {
+    problems.push({ code: "cogs_below_band", severity: "low", message: `COGS ${pct(best.cogs)} is under the ${pct(rules.band.lo)} band bottom (priced above the rules)` });
   }
   if (!problems.length) return null;
+  const shown = problems[0].code === "cogs_below_band" ? best : worst;
   return {
     product_id: product.product_id, handle: product.handle, title: product.title,
-    price: low.price, cost_usd: cost.usd, cost_fx_estimated: !!cost.fxEstimated, cost_partial: !!cost.partial, cost_key: cost.key,
-    cogs, contribution_per_dollar: contrib, breakeven_roas: breakevenRoas(cogs == null ? null : 1 - cogs), held,
+    price: shown.v.price, cost_usd: shown.c.usd, cost_fx_estimated: judged.some((x) => x.c.fxEstimated), cost_key: shown.c.key,
+    variants_judged: judged.length, variants_cost_unknown: priced.length - judged.length,
+    cogs: shown.cogs, contribution_per_dollar: contributionPerDollar(shown.cogs), breakeven_roas: breakevenRoas(1 - shown.cogs), held,
     severity: problems.some((p) => p.severity === "high") ? "high" : "low", issues: problems,
   };
 }
@@ -63,6 +74,7 @@ export async function runMarginGuardStore(env, storeId, products, { nowMs, day }
   }
   const costs = await readCosts(db, storeId);
   const active = products.filter((p) => p.status === "ACTIVE");
+  const holds = await resolveHolds(db, storeId, active, costs, nowMs);
   const findings = [], unknown = [];
   let known = 0, fxEstimated = 0;
   for (const p of active) {
@@ -70,7 +82,7 @@ export async function runMarginGuardStore(env, storeId, products, { nowMs, day }
     if (!cost) { unknown.push({ product_id: p.product_id, handle: p.handle, title: p.title }); continue; }
     known++;
     if (cost.fxEstimated) fxEstimated++;
-    const f = judgeProduct(storeId, p, cost);
+    const f = judgeProduct(storeId, p, costs, holds.get(p.product_id) || null);
     if (f) findings.push(f);
   }
   findings.sort((a, b) => (b.severity === "high") - (a.severity === "high") || b.cogs - a.cogs);

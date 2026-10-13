@@ -1,9 +1,11 @@
 /**
  * Catalog & Feed department (dept "cat") — cron entry point and dashboard data. SHADOW.
  *
- * Every 15-minute tick:
+ * Catalog gets 2 of the 12 five-minute department slots each hour (src/agents/index.js
+ * ROTATION), so it runs about twice an hour, 20 and 40 minutes apart. Each run:
  *   1. The catalog reader (sync.js) reads a few pages of each live store's products from
- *      Shopify (read-only) into `cat_products` (job "cat.sync", every 15 min).
+ *      Shopify (read-only) into `cat_products` (job "cat.sync": at most once per 15 min, so
+ *      every catalog run reads; the claim only stops overlapping runs reading twice).
  *   2. Once a day per store, after 06:00 store time, and only if that copy is fresh:
  *      Margin Guard, Pricing, Product Status, New-Product Check (in that order).
  *   3. Once a day per store: Merchant Center Health (doesn't need the product copy).
@@ -24,6 +26,7 @@ import { rulesFor, PRICE_CEILING } from "./pricingRules.js";
 import { dailyDue, claimDaily, releaseDaily, markWaiting, getRun, loadProducts, logEventOnce } from "./common.js";
 
 export const SYNC_JOB = "cat.sync";
+/** Catalog runs ~20/40 min apart; 15 min is only a guard against two overlapping runs both reading. */
 export const SYNC_EVERY_MIN = 15;
 export const STATE_LIST_CAP = 50;
 

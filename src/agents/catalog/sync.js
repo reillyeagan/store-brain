@@ -5,8 +5,10 @@
  * Store Guard with each store's own credentials), oldest-updated first. A FULL read happens
  * once a day (it also finds products deleted in Shopify); between full reads, a DELTA read
  * asks only for products whose updated_at moved since the last completed read
- * (`updated_at:>='<watermark>'`). Each tick reads at most PAGES_PER_TICK pages per store, so
- * a big catalog is spread over several ticks; the cursor is saved between ticks.
+ * (`updated_at:>='<watermark>'`). Each catalog run (about twice an hour: Catalog has 2 of the
+ * 12 department slots) reads at most PAGES_PER_TICK pages per store, so a big catalog is
+ * spread over several runs; the cursor is saved between runs. 4 pages × 10 = 40 products per
+ * store per run → ~80 an hour, so a 500-product store's daily full read takes ~6 hours.
  * Why delta + daily full: inventory changes don't always move a product's updated_at, and a
  * deleted product never shows up in a delta, so the daily full read keeps the copy honest.
  * Shadow: read only. Never calls a mutation.
@@ -15,7 +17,7 @@ import { shopifyGraphQL } from "../../lib/storeGuard.js";
 import { nowIso } from "../../lib/time.js";
 
 export const PAGE_SIZE = 10;          // 10 products × (30 variants + 3 collections) keeps query cost well under 1,000
-export const PAGES_PER_TICK = 3;      // per store per tick → ≤ 9 Shopify calls a tick for 3 stores
+export const PAGES_PER_TICK = 4;      // per store per run → ≤ 12 Shopify reads (+3 token mints) a run for 3 stores
 export const FULL_EVERY_HOURS = 24;
 /** The copy is only trusted when a full read finished this recently ... */
 export const FULL_MAX_AGE_HOURS = 48;
