@@ -16,8 +16,9 @@ import { nowIso } from "../../lib/time.js";
 import { safeJson } from "./shared.js";
 
 const ACTOR = "core.router";
-export const ROUTE_BATCH = 200; // events read per tick
-export const HANDOFFS_PER_TICK = 60;
+export const ROUTE_BATCH = 200;        // routable events read per page
+export const HANDOFFS_PER_RUN = 400;   // hand-offs logged per run at most
+export const ROUTE_TIME_BUDGET_MS = 8000;
 
 /**
  * Event kind → agents that act next, and why. Exact kinds first; a trailing ".*" matches a
@@ -76,39 +77,58 @@ async function setCursor(db, value, at) {
     ON CONFLICT(name) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`).bind(value, at).run();
 }
 
+/** SQL filter for the kinds the table routes, so unroutable events cost nothing to skip. */
+function routableFilter() {
+  const exact = ROUTES.filter((r) => !r.kind.endsWith(".*")).map((r) => r.kind);
+  const prefixes = ROUTES.filter((r) => r.kind.endsWith(".*")).map((r) => `${r.kind.slice(0, -1)}%`);
+  const sql = `(kind IN (${exact.map(() => "?").join(", ")})${prefixes.map(() => " OR kind LIKE ?").join("")})`;
+  return { sql, binds: [...exact, ...prefixes] };
+}
+
 /**
- * One tick: route events logged since the last tick. The first run starts at the newest
- * event (history isn't replayed as if it were new).
+ * One run: route every event logged since the last run. The Core comes round about twice an
+ * hour in the department rotation, so a run keeps reading pages until it has caught up, within
+ * a row / hand-off / time budget (then the cursor stops at the last event handled and the
+ * next run carries on). The first run starts at the newest event (history isn't replayed).
  */
-export async function runRouter(env, { nowMs = Date.now() } = {}) {
+export async function runRouter(env, { nowMs = Date.now(), clock = Date.now } = {}) {
   const db = env.DB;
   const at = nowIso(nowMs);
-  let from = await cursor(db);
+  const started = clock();
+  const from = await cursor(db);
+  const max = Number((await db.prepare(`SELECT COALESCE(MAX(id), 0) AS id FROM events`).first()).id);
   if (from == null) {
-    const max = await db.prepare(`SELECT COALESCE(MAX(id), 0) AS id FROM events`).first();
-    await setCursor(db, Number(max.id), at);
-    return { routed: 0, waiting: 0, started_at_event: Number(max.id) };
+    await setCursor(db, max, at);
+    return { routed: 0, waiting: 0, started_at_event: max };
   }
-  const { results } = await db.prepare(`SELECT id, actor, kind, store, target, summary, data FROM events WHERE id > ? ORDER BY id LIMIT ?`).bind(from, ROUTE_BATCH).all();
-  let routed = 0, waiting = 0, last = from;
-  for (const e of results || []) {
-    const routes = routeEvent(e);
-    const ready = routes.filter((r) => r.ready);
-    if (routed + ready.length > HANDOFFS_PER_TICK) break; // the rest next tick; cursor stops here
-    for (const r of ready) {
-      const d = safeJson(e.data, {}) || {};
-      await logEvent(db, {
-        actor: ACTOR, kind: "route.handoff", store: e.store, target: r.to,
-        summary: `${e.kind} from ${e.actor} → ${r.to}: ${r.why}`,
-        data: { event_id: e.id, from: e.actor, event_kind: e.kind, approvalId: d.approvalId ?? undefined }, at,
-      });
-      routed++;
+  const f = routableFilter();
+  let routed = 0, waiting = 0, read = 0, last = from, done = false, budget = false;
+  while (!done && !budget) {
+    const { results } = await db.prepare(
+      `SELECT id, actor, kind, store, target, summary, data FROM events WHERE id > ? AND id <= ? AND ${f.sql} ORDER BY id LIMIT ?`
+    ).bind(last, max, ...f.binds, ROUTE_BATCH).all();
+    const page = results || [];
+    for (const e of page) {
+      const routes = routeEvent(e);
+      const ready = routes.filter((r) => r.ready);
+      if (routed + ready.length > HANDOFFS_PER_RUN || clock() - started > ROUTE_TIME_BUDGET_MS) { budget = true; break; }
+      for (const r of ready) {
+        const d = safeJson(e.data, {}) || {};
+        await logEvent(db, {
+          actor: ACTOR, kind: "route.handoff", store: e.store, target: r.to,
+          summary: `${e.kind} from ${e.actor} → ${r.to}: ${r.why}`,
+          data: { event_id: e.id, from: e.actor, event_kind: e.kind, approvalId: d.approvalId ?? undefined }, at,
+        });
+        routed++;
+      }
+      waiting += routes.length - ready.length;
+      last = e.id;
+      read++;
     }
-    waiting += routes.length - ready.length;
-    last = e.id;
+    if (!budget && page.length < ROUTE_BATCH) { done = true; last = max; } // caught up to the newest event at the start
   }
   if (last !== from) await setCursor(db, last, at);
-  return { routed, waiting, read: (results || []).length, cursor: last };
+  return { routed, waiting, read, cursor: last, caught_up: done };
 }
 
 export async function routerState(db) {

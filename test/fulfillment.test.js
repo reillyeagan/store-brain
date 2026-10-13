@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { makeD1 } from "./helpers/d1.js";
 
-import { runOrderWatch, RECHECK_MIN } from "../src/agents/fulfillment/orderWatch.js";
+import { runOrderWatch, WRITES_PER_RUN } from "../src/agents/fulfillment/orderWatch.js";
 import { runFulfillment, fulfillmentState } from "../src/agents/fulfillment/index.js";
 import { upsertOrder } from "../src/lib/shopifyWebhooks.js";
 import { ensureFeeds, markFeedOk } from "../src/lib/freshness.js";
@@ -12,11 +12,11 @@ const iso = (ms) => new Date(ms).toISOString();
 const evs = async (DB, kind) => (await DB.prepare(`SELECT * FROM events WHERE kind = ? ORDER BY id`).bind(kind).all()).results;
 const SWEEP = Date.parse("2026-10-13T12:00:00Z");
 
-async function order(DB, store, { id, created_at, status = "paid", test = false }) {
+async function order(DB, store, { id, created_at, status = "paid", test = false, cancelled_at = null }) {
   await upsertOrder(DB, STORES[store], {
     order_id: `gid://shopify/Order/${store}-${id}`, name: `#${id}`, created_at, currency: "USD",
     subtotal: 50, discounts: 0, total: 50, financial_status: status, payload_updated_at: created_at,
-  }, JSON.stringify({ total_price: "50", test }), STORES[store].timezone, created_at);
+  }, JSON.stringify({ total_price: "50", test, cancelled_at }), STORES[store].timezone, created_at);
 }
 
 async function kfb(DB, store, ref, importedMs = SWEEP) {
@@ -42,7 +42,7 @@ test("order watch: no KFB session yet → waiting, nothing flagged", async () =>
   assert.equal(st.parcel_tracking.on, false);
 });
 
-test("order watch: missing once → suspect (silent); still missing on the re-check → one flag; found later → cleared", async () => {
+test("order watch: missed by one sweep → suspect (silent); re-reading the SAME sweep never flags; a NEWER sweep still missing it → one flag; found later → cleared", async () => {
   const DB = makeD1();
   await sweep(DB);
   await order(DB, "hc", { id: 1, created_at: "2026-10-12T10:00:00Z" }); // 26 h before the sweep
@@ -50,25 +50,44 @@ test("order watch: missing once → suspect (silent); still missing on the re-ch
   await order(DB, "hc", { id: 3, created_at: "2026-10-13T08:00:00Z" }); // too recent for this sweep
   await order(DB, "hc", { id: 4, created_at: "2026-10-12T09:00:00Z", status: "voided" });
   await order(DB, "hc", { id: 5, created_at: "2026-10-12T09:00:00Z", test: true });
+  await order(DB, "hc", { id: 6, created_at: "2026-10-12T09:00:00Z", cancelled_at: "2026-10-12T11:00:00Z" }); // paid, then cancelled
   await kfb(DB, "hc", "2");
   await kfb(DB, "aub", "1"); // the same number in another store doesn't count
   let r = await runOrderWatch({ DB }, { nowMs: SWEEP + 60000 });
   assert.equal(r.checked, 2);
   assert.equal(r.suspect, 1);
-  assert.equal((await evs(DB, "ful.not_in_kfb")).length, 0);
-  r = await runOrderWatch({ DB }, { nowMs: SWEEP + 60000 + (RECHECK_MIN - 5) * 60000 });
+  // Hours later, same sweep data: no re-check has happened, so no flag.
+  r = await runOrderWatch({ DB }, { nowMs: SWEEP + 5 * 3600000 });
   assert.equal(r.flagged, 0);
-  r = await runOrderWatch({ DB }, { nowMs: SWEEP + 60000 + (RECHECK_MIN + 1) * 60000 });
+  assert.equal((await evs(DB, "ful.not_in_kfb")).length, 0);
+  // The next morning's sweep still doesn't have #1.
+  const SWEEP2 = SWEEP + 24 * 3600000;
+  await sweep(DB, SWEEP2);
+  await kfb(DB, "hc", "3", SWEEP2);
+  r = await runOrderWatch({ DB }, { nowMs: SWEEP2 + 60000 });
   assert.equal(r.flagged, 1);
-  await runOrderWatch({ DB }, { nowMs: SWEEP + 3 * 3600000 });
+  await runOrderWatch({ DB }, { nowMs: SWEEP2 + 3 * 3600000 });
   const flags = await evs(DB, "ful.not_in_kfb");
   assert.equal(flags.length, 1);
   assert.equal(flags[0].target, "sup.relay");
-  assert.match(flags[0].summary, /#1/);
-  await kfb(DB, "hc", "#1", SWEEP + 3 * 3600000);
-  r = await runOrderWatch({ DB }, { nowMs: SWEEP + 4 * 3600000 });
+  assert.match(flags[0].summary, /#1 /);
+  assert.equal((await DB.prepare(`SELECT COUNT(*) AS n FROM order_watch WHERE order_id LIKE '%hc-6'`).first()).n, 0); // cancelled: never suspected
+  await kfb(DB, "hc", "#1", SWEEP2 + 3 * 3600000);
+  r = await runOrderWatch({ DB }, { nowMs: SWEEP2 + 4 * 3600000 });
   assert.equal(r.found, 1);
   assert.equal((await evs(DB, "ful.kfb_found")).length, 1);
+});
+
+test("order watch: the newest orders are never starved by older ones", async () => {
+  const DB = makeD1();
+  await sweep(DB);
+  await kfb(DB, "hc", "x");
+  const base = Date.parse("2026-10-01T00:00:00Z");
+  for (let i = 0; i < WRITES_PER_RUN + 20; i++) await order(DB, "hc", { id: 1000 + i, created_at: iso(base + i * 60000) });
+  await order(DB, "hc", { id: 9, created_at: "2026-10-12T20:00:00Z" }); // the newest
+  const r = await runOrderWatch({ DB }, { nowMs: SWEEP + 60000 });
+  assert.equal(r.suspect, WRITES_PER_RUN);
+  assert.ok(await DB.prepare(`SELECT 1 FROM order_watch WHERE order_id = 'gid://shopify/Order/hc-9'`).first());
 });
 
 test("order watch: a sweep that read nothing for a store, or a stale sweep, checks nothing (rule 6)", async () => {

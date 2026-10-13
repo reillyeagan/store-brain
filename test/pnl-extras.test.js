@@ -2,9 +2,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { makeD1 } from "./helpers/d1.js";
 
-import { computeStoreDay } from "../src/lib/pnl.js";
-import { matchBills, groupLines, billRate, cogsState } from "../src/agents/pnl/cogs.js";
-import { pullFunnel, funnelFor, parseFunnelRows, FUNNEL_SHOPIFYQL } from "../src/agents/pnl/funnel.js";
+import { computeStoreDay, runDayClose } from "../src/lib/pnl.js";
+import { matchBills, groupLines, billRate, cogsState, BILLS_PER_RUN } from "../src/agents/pnl/cogs.js";
+import { pullFunnel, funnelFor, parseFunnelRows, FUNNEL_SHOPIFYQL, conversionRate } from "../src/agents/pnl/funnel.js";
+import { decide } from "../src/lib/approvals.js";
+import { moneyLine, cogsSourceFromShare, SYSTEM_PROMPT } from "../src/lib/brief.js";
 import { explainChange, runAnalyst } from "../src/agents/pnl/analyst.js";
 import { rollForward, federalEstimatedTaxDates, reminderBucket, runCalendar, mtdResult, refundRate, calendarState } from "../src/agents/pnl/calendar.js";
 import { runPnlExtras, pnlExtrasState } from "../src/agents/pnl/index.js";
@@ -320,4 +322,122 @@ test("runPnlExtras: throttled, never throws, nothing but Shopify reads and (once
   const st = await pnlExtrasState({ DB }, { nowMs });
   assert.equal(st.mode, "shadow");
   assert.equal(st.cogs.status, "waiting on KFB bills");
+});
+
+/* ---------------- review fixes ---------------- */
+
+test("review fix 2: every bill is read eventually, and an order split across bills is costed from ALL its lines", async () => {
+  const DB = makeD1();
+  const nowMs = Date.parse("2026-10-13T15:00:00Z");
+  await allFresh(DB, nowMs);
+  await order(DB, "hc", { id: 1, created_at: "2026-10-12T15:00:00Z", total: 100 });
+  const n = BILLS_PER_RUN + 5;
+  for (let i = 0; i < n; i++) await bill(DB, { id: `B${String(i).padStart(3, "0")}`, code: "jmzjx1-it", usd: 1.2, lines: [{ ref: "1", cost: 1 }] });
+  const r1 = await matchBills(DB, { nowMs });
+  assert.equal(r1.bills, BILLS_PER_RUN);
+  const m = await DB.prepare(`SELECT * FROM cogs_matches WHERE store = 'hc'`).first();
+  assert.equal(m.cost_eur, n);           // all 55 lines, not just the 50 bills of this run
+  assert.equal(m.cost_usd, r2x(n * 1.2));
+  assert.equal(m.line_count, n);
+  const r2 = await matchBills(DB, { nowMs: nowMs + 60000 });
+  assert.equal(r2.bills, 5);
+  assert.equal((await DB.prepare(`SELECT COUNT(*) AS n FROM kfb_bills WHERE matched_sig IS NULL`).first()).n, 0);
+  assert.equal((await matchBills(DB, { nowMs: nowMs + 120000 })).bills, 0); // nothing new: nothing re-read
+  // A new bill line for the order later → the order is re-costed with everything.
+  await bill(DB, { id: "Z1", code: "jmzjx1-it", usd: 12, lines: [{ ref: "1", cost: 10 }] });
+  await matchBills(DB, { nowMs: nowMs + 180000 });
+  assert.equal((await DB.prepare(`SELECT cost_eur FROM cogs_matches WHERE store = 'hc'`).first()).cost_eur, n + 10);
+});
+const r2x = (x) => Math.round(x * 100) / 100;
+
+test("review fix 3: a cost under half the estimate is HELD (the P&L keeps the estimate) until Reilly confirms it or a later bill raises it", async () => {
+  const DB = makeD1();
+  const nowMs = Date.parse("2026-10-13T15:00:00Z");
+  await allFresh(DB, nowMs);
+  await order(DB, "mar", { id: 7, created_at: "2026-10-12T15:00:00Z", total: 100 });
+  await order(DB, "mar", { id: 8, created_at: "2026-10-12T16:00:00Z", total: 100 });
+  await bill(DB, { id: "B9", code: "806080-g8", usd: 5, lines: [{ ref: "7", cost: 4 }] });
+  await bill(DB, { id: "B10", code: "806080-g8", usd: 6, lines: [{ ref: "8", cost: 5 }] });
+  await matchBills(DB, { nowMs });
+  await matchBills(DB, { nowMs: nowMs + 60000 });
+  let day = await computeStoreDay(DB, "mar", "2026-10-12", { nowMs });
+  assert.equal(day.cogs_source, "estimate");
+  assert.equal(day.cogs_actual, null);
+  const aps = (await DB.prepare(`SELECT * FROM approvals WHERE requested_by = 'pnl.cogs' ORDER BY id`).all()).results;
+  assert.equal(aps.length, 2); // one per held order, not one per run
+  // Reilly confirms order 7's amount.
+  const a7 = aps.find((a) => a.title.includes("#7"));
+  await decide(DB, a7.id, { choice: "use_actual" });
+  // A later bill raises order 8 above half the estimate.
+  await bill(DB, { id: "B11", code: "806080-g8", usd: 18, lines: [{ ref: "8", cost: 15 }] });
+  await matchBills(DB, { nowMs: nowMs + 120000 });
+  const rows = (await DB.prepare(`SELECT order_name, status, cost_usd FROM cogs_matches ORDER BY order_name`).all()).results;
+  assert.deepEqual(rows.map((r) => [r.order_name, r.status]), [["#7", "matched"], ["#8", "matched"]]);
+  day = await computeStoreDay(DB, "mar", "2026-10-12", { nowMs });
+  assert.equal(day.cogs_source, "actual");
+  assert.equal(day.cogs_actual, 29);
+});
+
+test("review fix 12: matches for a store that isn't live are marked done and never block the queue", async () => {
+  const DB = makeD1();
+  const nowMs = Date.parse("2026-10-13T15:00:00Z");
+  await allFresh(DB, nowMs);
+  await order(DB, "tund", { id: 5, created_at: "2026-10-12T15:00:00Z", total: 100 });
+  await bill(DB, { id: "T1", code: "mek6yu-91", usd: 60, lines: [{ ref: "5", cost: 50 }] });
+  await matchBills(DB, { nowMs });
+  assert.equal((await DB.prepare(`SELECT COUNT(*) AS n FROM cogs_matches WHERE applied_at IS NULL`).first()).n, 0);
+  assert.equal((await DB.prepare(`SELECT COUNT(*) AS n FROM pnl_days WHERE store = 'tund'`).first()).n, 0);
+});
+
+test("review fix 4: conversion rate is null unless both numbers are known; a missing column is not 'wired'", async () => {
+  assert.equal(conversionRate(null, 100), null);
+  assert.equal(conversionRate(2, null), null);
+  assert.equal(conversionRate(2, 0), null);
+  assert.equal(conversionRate(2, 100), 0.02);
+  _resetTokenCacheForTests();
+  const DB = makeD1();
+  const nowMs = Date.parse("2026-10-13T15:00:00Z");
+  const { fetchImpl } = fakeShopify(() => j({ data: { shopifyqlQuery: { parseErrors: [], tableData: {
+    columns: [{ name: "day" }, { name: "sessions" }, { name: "sessions_with_cart_additions" }, { name: "sessions_that_reached_checkout" }],
+    rows: [{ day: "2026-10-12", sessions: 100, sessions_with_cart_additions: 10, sessions_that_reached_checkout: 5 }] } } } }));
+  const r = await pullFunnel({ DB, ...SECRETS }, { nowMs, fetchImpl });
+  assert.ok(r.every((x) => x.state === "error" && /sessions_that_completed_checkout/.test(x.reason)));
+  assert.equal((await DB.prepare(`SELECT COUNT(*) AS n FROM funnel_days`).first()).n, 0);
+  const f = await funnelFor(DB, "hc", "2026-10-12", "2026-10-12", { nowMs });
+  assert.equal(f.wired, false);
+  assert.equal(f.days[0].conversion_rate, null);
+});
+
+test("review fix 10: no month-to-date loss is claimed while a day's order history is incomplete", async () => {
+  assert.deepEqual(mtdResult([{ revenue: 100, profit: -5, profit_partial: -5, notes: { missing: ["order_history"] } }], 1).profit, null);
+  const DB = makeD1();
+  const nowMs = Date.parse("2026-10-13T14:00:00Z");
+  for (let d = 1; d <= 12; d++) {
+    const day = `2026-10-${String(d).padStart(2, "0")}`;
+    for (const id of LIVE_STORE_IDS) {
+      await pnlRow(DB, id, day, { revenue: 100, profit: null, profit_partial: -5 });
+      await DB.prepare(`UPDATE pnl_days SET notes = '{"missing":["order_history"]}' WHERE store = ? AND day = ?`).bind(id, day).run();
+    }
+  }
+  await runCalendar({ DB }, { nowMs });
+  assert.equal((await evs(DB, "trigger.mtd_loss")).length, 0);
+});
+
+test("review fix 11: mixed COGS is labelled partly estimated (plain brief, prompt, day close)", async () => {
+  assert.equal(cogsSourceFromShare(0.4), "mixed");
+  assert.equal(cogsSourceFromShare(1), "estimate");
+  assert.equal(cogsSourceFromShare(0), "actual");
+  assert.match(moneyLine("H&C", { cogs: 90, cogs_source: "mixed", profit: 10, missing: [], stale_inputs: [] }), /\$90\.00 \(partly estimated\)/);
+  assert.match(moneyLine("H&C", { cogs: 90, cogs_source: "estimate", profit: 10, missing: [], stale_inputs: [] }), /\(estimate\)/);
+  assert.match(SYSTEM_PROMPT, /"mixed", call them partly estimated/);
+  const DB = makeD1();
+  const nowMs = Date.parse("2026-10-13T05:00:00Z");
+  await allFresh(DB, nowMs);
+  await order(DB, "hc", { id: 1, created_at: "2026-10-12T15:00:00Z", total: 100 });
+  await order(DB, "hc", { id: 2, created_at: "2026-10-12T16:00:00Z", total: 100 });
+  await bill(DB, { id: "B1", code: "jmzjx1-it", usd: 36, lines: [{ ref: "1", cost: 30 }] });
+  await matchBills(DB, { nowMs });
+  await runDayClose({ DB }, { nowMs });
+  const close = (await evs(DB, "day.close")).find((e) => e.store === "hc");
+  assert.match(close.summary, /COGS partly estimated/);
 });

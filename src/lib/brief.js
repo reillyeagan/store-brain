@@ -85,13 +85,20 @@ const x2 = (n) => (n == null ? "—" : Number(n).toFixed(2));
 
 /* ---------------- 1. gather (code only) ---------------- */
 
+/** Sums (group, MTD) carry no cogs_source: derive it from the estimated share (1 = all estimate, 0 = all actual). */
+export function cogsSourceFromShare(share) {
+  if (share == null || !Number.isFinite(Number(share))) return null;
+  const x = Number(share);
+  return x >= 1 ? "estimate" : x <= 0 ? "actual" : "mixed";
+}
+
 /** One P&L row (or sum) → the compact numbers the brief is allowed to use. */
 function pnlFacts(r) {
   if (!r) return null;
   const basis = r.cogs_basis || {};
   return {
     revenue: r.revenue, orders: r.orders, refunds: r.refunds, refunds_pending: r.refunds_pending,
-    cogs: r.cogs, cogs_source: r.cogs_source || (r.cogs_estimated_share ? "estimate" : null),
+    cogs: r.cogs, cogs_source: r.cogs_source || cogsSourceFromShare(r.cogs_estimated_share),
     cogs_estimated_share: r.cogs_estimated_share,
     cogs_rate: basis.rate ?? null, cogs_rate_assumed: !!(basis.rate_assumed || r.cogs_assumed),
     ads: r.ads, guy_fee: r.guy_fee, shopify_fees: r.fees,
@@ -233,10 +240,11 @@ function verdict(roas, be) {
 
 /* ---------------- 2a. the plain (code-built) brief ---------------- */
 
-function moneyLine(name, f) {
+export function moneyLine(name, f) {
   if (!f) return `- **${name}:** no P&L row yet`;
-  const est = f.cogs_source === "estimate" || f.cogs_source === "mixed";
-  const cogs = f.cogs == null ? "not wired" : `${money(f.cogs)}${est ? ` (estimate${f.cogs_rate_assumed ? ", ASSUMED 33% rate" : ""})` : ""}`;
+  // A mixed day (some orders at the real KFB cost, the rest estimated) is labelled partly estimated.
+  const label = f.cogs_source === "estimate" ? "estimate" : f.cogs_source === "mixed" ? "partly estimated" : null;
+  const cogs = f.cogs == null ? "not wired" : `${money(f.cogs)}${label ? ` (${label}${f.cogs_rate_assumed ? ", ASSUMED 33% rate" : ""})` : ""}`;
   const profit = f.profit != null ? money(f.profit)
     : `unknown (missing: ${f.missing.join(", ") || "inputs"})${f.profit_excluding_unwired != null ? `; ${money(f.profit_excluding_unwired)} without those` : ""}`;
   return `- **${name}:** revenue ${money(f.revenue)} (${f.orders == null ? "orders not wired" : `${f.orders} order${f.orders === 1 ? "" : "s"}`}) · refunds ${money(f.refunds)}` +
@@ -301,7 +309,7 @@ Voice, in Reilly's words: "short and concise while getting the info across and g
 Hard rules:
 1. Use ONLY numbers that appear in DATA. Never invent, estimate, round into new figures, or extrapolate. Do not add up numbers yourself; the totals you need are in DATA (group, month_to_date, roas_minus_breakeven).
 2. null means "not wired / unknown". Say "not wired", never treat it as zero.
-3. Wherever cogs_source is "estimate", call COGS (and profit, margin, break-even) an estimate. If cogs_rate_assumed is true, say the 33% COGS rate is ASSUMED.
+3. Wherever cogs_source is "estimate", call COGS (and profit, margin, break-even) an estimate; where it is "mixed", call them partly estimated (some orders at the real KFB cost, the rest estimated). If cogs_rate_assumed is true, say the 33% COGS rate is ASSUMED.
 4. A day with complete=false or stale_inputs is not final; say which inputs. If a store's month_to_date has order_history_days_covered below days_in_period, say "month-to-date covers X of Y days" with those two numbers.
 5. Good news gets MORE scrutiny, not less: when a number looks good, say what could make it wrong (estimated COGS, stale feed, partial day, PENDING refunds).
 6. Media is watch only: describe ROAS against break-even and the reason; never recommend changing bids, budgets or campaigns.

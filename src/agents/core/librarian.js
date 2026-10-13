@@ -147,15 +147,25 @@ export async function queueVaultSync(db, { nowMs = Date.now() } = {}) {
   for (const d of dec.results || []) {
     if (await enqueue(db, { kind: "decision", ref: d.id, title: `Decision (${d.topic}): "${d.words.slice(0, 120)}"`, body: d, at })) counts.decision++;
   }
+  // Facts are walked by id with a cursor (agent_cursors 'librarian.facts'), so vault-seeded
+  // rows that are skipped are passed over once instead of being re-read every run (review fix:
+  // 1,200+ seeded vault facts used to fill every batch, and new facts were never reached).
+  const cur = await db.prepare(`SELECT value FROM agent_cursors WHERE name = 'librarian.facts'`).first();
+  let lastId = cur ? Number(cur.value) : 0;
   const facts = await db.prepare(
-    `SELECT * FROM core_facts WHERE CAST(id AS TEXT) NOT IN (SELECT ref_id FROM vault_outbox WHERE kind = 'fact') ORDER BY id LIMIT ?`
-  ).bind(OUTBOX_PER_RUN * 3).all();
+    `SELECT * FROM core_facts WHERE id > ? ORDER BY id LIMIT ?`
+  ).bind(lastId, OUTBOX_PER_RUN * 10).all();
   let factBudget = OUTBOX_PER_RUN;
   for (const f of facts.results || []) {
+    if (fromVault(f.source)) { lastId = f.id; continue; } // came from the vault: it's already there
     if (factBudget <= 0) break;
-    if (fromVault(f.source)) continue; // came from the vault: it's already there
     factBudget--;
     if (await enqueue(db, { kind: "fact", ref: f.id, title: `Fact ${f.store ? `[${f.store}] ` : ""}${f.key}`, body: f, at })) counts.fact++;
+    lastId = f.id;
+  }
+  if (!cur || lastId !== Number(cur.value)) {
+    await db.prepare(`INSERT INTO agent_cursors (name, value, updated_at) VALUES ('librarian.facts', ?, ?)
+      ON CONFLICT(name) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`).bind(lastId, at).run();
   }
   const briefs = await db.prepare(
     `SELECT id, day, created_at, mode, composer, body_md, checked FROM briefs

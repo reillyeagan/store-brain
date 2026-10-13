@@ -14,7 +14,8 @@
  *     - 7-day refund rate above CAL_REFUND_RATE_ABOVE (default 11.9%, the refund allowance in
  *       the break-even ROAS formula);
  *     - month-to-date loss: profit (or, when inputs are missing, even the costs we DO know)
- *       already below zero.
+ *       already below zero; never claimed while any day's order history is incomplete (its
+ *       revenue may be missing, which would make the loss false).
  * Inputs: the static list, core_facts (calendar:*), money_balances, pnl_days.
  * Outputs: `calendar.reminder` and `trigger.*` events (target core.briefer), calendar_reminders rows.
  */
@@ -133,6 +134,9 @@ export function refundRate(rows) {
  */
 export function mtdResult(rows, expectedDays) {
   if (!rows.length || rows.length < expectedDays) return { profit: null, upper_bound: null };
+  // A day whose order history isn't complete may be missing revenue: no loss can be claimed from it.
+  const missing = (r) => { const n = typeof r.notes === "string" ? safeJson(r.notes, {}) : r.notes || {}; return Array.isArray(n.missing) ? n.missing : []; };
+  if (rows.some((r) => missing(r).includes("order_history"))) return { profit: null, upper_bound: null, reason: "order history incomplete" };
   const profit = rows.every((r) => r.profit != null) ? r2(rows.reduce((s, r) => s + Number(r.profit), 0)) : null;
   const upper = rows.every((r) => r.revenue != null && r.profit_partial != null) ? r2(rows.reduce((s, r) => s + Number(r.profit_partial), 0)) : null;
   return { profit, upper_bound: upper };

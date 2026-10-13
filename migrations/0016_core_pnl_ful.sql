@@ -94,7 +94,8 @@ CREATE TABLE IF NOT EXISTS kfb_bills (
   usd_charged   REAL,                         -- exact USD the card was charged for this bill (decision 3); null = not known yet
   fx_source     TEXT,                         -- e.g. "wf_alert:<gmail id>"
   paid_at       TEXT,
-  imported_at   TEXT    NOT NULL
+  imported_at   TEXT    NOT NULL,
+  matched_sig   TEXT                          -- COGS Matcher: the bill's state (lines, EUR, card amount) last matched; differs = re-match
 );
 
 -- Every line on a KFB bill: parent orders AND all suborders (never filtered by price > 0).
@@ -124,11 +125,14 @@ CREATE TABLE IF NOT EXISTS cogs_matches (
   cost_eur     REAL    NOT NULL,              -- parent + all suborders, incl. fees and shipping
   cost_usd     REAL,                          -- at the exact card rate; null while waiting on FX
   fx_rate      REAL,
-  status       TEXT    NOT NULL,              -- matched | waiting_fx
+  status       TEXT    NOT NULL,              -- matched | waiting_fx | low_hold (under half the estimate: held as estimate until a later bill or Reilly confirms)
   bill_ids     TEXT,                          -- JSON array
   line_count   INTEGER NOT NULL,
   matched_at   TEXT    NOT NULL,
-  applied_at   TEXT,                          -- when the P&L day was last recomputed with it
+  applied_at   TEXT,                          -- when the P&L day was last recomputed with it (or skipped: store not live)
+  estimate_usd REAL,                          -- what the estimate would have been, for the low-cost check
+  hold_approval_id INTEGER,                   -- the approval asking Reilly about a low_hold cost
+  confirmed_cost_usd REAL,                    -- the low cost Reilly confirmed (only that exact amount counts as confirmed)
   PRIMARY KEY (store, order_id)
 );
 CREATE INDEX IF NOT EXISTS idx_cogs_matches_day ON cogs_matches(store, local_day);
@@ -176,8 +180,9 @@ CREATE TABLE IF NOT EXISTS order_watch (
   order_id      TEXT    NOT NULL,
   order_name    TEXT,
   created_at    TEXT    NOT NULL,             -- Shopify order time (UTC)
-  state         TEXT    NOT NULL,             -- suspect (missed once) | flagged (missed on re-check) | found
+  state         TEXT    NOT NULL,             -- suspect (missed by one sweep) | flagged (also missed by a newer sweep) | found | cancelled
   first_missing_at TEXT NOT NULL,
+  sweep_at      TEXT,                         -- the KFB sweep (feed last_ok_at) that first missed it
   checked_at    TEXT    NOT NULL,
   flagged_at    TEXT,
   found_at      TEXT,

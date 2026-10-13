@@ -589,7 +589,7 @@ export async function runDayClose(env, { nowMs = Date.now() } = {}) {
     await logEvent(env.DB, {
       actor: ACTOR, kind: "day.close", store: id,
       summary: `${STORES[id].name} ${y} closed: revenue ${fmt(r && r.revenue)}, profit ${r && r.profit != null ? fmt(r.profit) : `unknown (missing: ${(notes.missing || []).join(", ") || "inputs"})`}` +
-        (r && r.cogs_source === "estimate" ? " (COGS estimated)" : "") +
+        (r && r.cogs_source === "estimate" ? " (COGS estimated)" : r && r.cogs_source === "mixed" ? " (COGS partly estimated)" : "") +
         (r && r.complete ? "" : ` — not complete${[...(notes.stale_inputs || []), ...(notes.unsettled || [])].length ? `: ${[...(notes.stale_inputs || []), ...(notes.unsettled || [])].join(", ")}` : ""}`),
       data: { day: y, complete: !!(r && r.complete) }, at,
     });

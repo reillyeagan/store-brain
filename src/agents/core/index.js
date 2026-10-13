@@ -1,13 +1,15 @@
 /**
  * Core department cron entry point and page data.
  *
- *   runCore(env, {nowMs, fetchImpl})  — call on the 15-minute cron. Never throws. Each agent
+ *   runCore(env, {nowMs, fetchImpl})  — called by the department rotation. Never throws. Each agent
  *                                       runs in its own try and self-throttles via job_runs.
  *   coreState(env, {nowMs})          — small JSON for the Core department page.
  *
- * Cadence: Router every tick (15 min) · Incident Desk every 15 min · Auditor hourly ·
- * Librarian checks + vault outbox hourly, weekly report every 7 days · decision seed daily
- * (idempotent; inserts only what's missing).
+ * Cadence: the Core comes round about twice an hour in the department rotation
+ * (src/agents/index.js), so the Router and the Incident Desk run on every visit (their
+ * 15-minute throttle never holds them back; the Router reads until it has caught up) ·
+ * Auditor and Librarian (checks + vault outbox) hourly · Librarian weekly report every 7 days ·
+ * decision seed daily (idempotent; inserts only what's missing).
  * All shadow: nothing leaves the ledger. No AI is used by these agents today.
  */
 import { claimJob } from "../../lib/jobRuns.js";
