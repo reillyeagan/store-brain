@@ -34,7 +34,44 @@ test("rules: floors, the $144.95 ceiling on all 3 stores, bands and shapes match
   assert.equal(R.rulesFor("cc"), null, "no rules agreed: never borrow another store's");
   assert.equal(R.rulesFor("nope"), null);
   assert.equal(R.rulesFor("hc").badge.verified, true);
-  assert.equal(R.rulesFor("aub").badge.verified, false, "Auberlane's badge snippet hasn't been read: never assumed verified");
+  assert.equal(R.rulesFor("aub").badge.model, "round5", "Auberlane's live snippet rounds to the nearest 5");
+  assert.equal(R.rulesFor("mar").badge.model, "round1", "Marlowe's live snippet rounds to the nearest whole percent");
+  assert.equal(R.rulesFor("aub").badge.verified, true);
+  assert.equal(R.rulesFor("mar").badge.verified, true);
+});
+
+test("rules: each store's badge prints what its own theme snippet prints", () => {
+  // Auberlane: pct / 5, round, × 5.
+  assert.equal(R.badgePct("aub", 82, 100), 20);   // 18% → 20
+  assert.equal(R.badgePct("aub", 83, 100), 15);   // 17% → 15
+  assert.equal(R.badgePct("aub", 77.5, 100), 25); // 22.5% → 25 (half rounds up, as Liquid does)
+  // Marlowe: nearest whole percent, so 19% is NOT the 20 tier.
+  assert.equal(R.badgePct("mar", 81, 100), 19);
+  assert.equal(R.tierOf("mar", 81, 100), null, "19% badge is a wrong tier on Marlowe");
+  assert.equal(R.badgePct("mar", 80.4, 100), 20);
+  // Exact halves are computed in cents like the theme, so they round UP (float dollars said 22.4999…).
+  assert.equal(R.badgePct("aub", 44.95, 58.00), 25, "exactly 22.5% off prints -25% live");
+  assert.equal(R.tierOf("aub", 44.95, 58.00), null, "so it is a wrong tier, not tier 20");
+  assert.equal(R.badgePct("aub", 47.95, 54.80), 15);
+  assert.equal(R.badgePct("mar", 114.95, 190.00), 40);
+  // A discount that rounds to 0 shows no badge: wrong tier, and said that way.
+  assert.equal(R.badgePct("aub", 99.95, 101.95), 0);
+  assert.equal(R.tierOf("aub", 99.95, 101.95), null);
+  const zero = R.validatePrice("aub", { price: 99.95, compareAt: 101.95, cost: 27 });
+  assert.ok(zero.issues.some((i) => i.code === "compare_at_tier_wrong" && /No badge would show/.test(i.detail || i.message || JSON.stringify(i))));
+  // compareAtFor finds a pair that prints the tier exactly on every store.
+  let hits = 0;
+  for (const id of ["aub", "mar"]) for (const p of [49.95, 79.95, 129.95]) for (const t of [10, 20, 30, 40]) {
+    const c = R.compareAtFor(id, p, t);
+    assert.ok(c != null, `${id} ${p} tier ${t} has a compare-at`);
+    assert.equal(R.badgePct(id, p, c), t, `${id} ${p} tier ${t} → ${c}`);
+    assert.equal(R.tierOf(id, p, c), t);
+    hits++;
+  }
+  assert.equal(hits, 24);
+  // Marlowe wrong tier is a real finding now its snippet is read.
+  const m = R.validatePrice("mar", { price: 81, compareAt: 100, cost: 21 });
+  assert.ok(m.issues.some((i) => i.code === "compare_at_tier_wrong" && i.severity === "medium"));
 });
 
 test("rules: .95 helpers work in whole cents", () => {
@@ -144,7 +181,7 @@ test("rules: validatePrice flags floor, ceiling, ending, COGS and compare-at, an
   assert.ok(off.issues.some((i) => i.code === "off_target" && i.severity === "low"));
   assert.equal(off.proposed.price, 51.95);
   assert.equal(off.proposed.tier, 20);
-  assert.ok(off.issues.some((i) => i.code === "badge_unverified"), "unverified badge is said, not hidden");
+  assert.ok(!off.issues.some((i) => i.code === "badge_unverified"), "Auberlane's badge is now read from its theme");
 
   // Ceiling blocks the band: reported with the waiver note, no price proposal past the ceiling.
   const blocked = R.validatePrice("hc", { price: 144.95, cost: 60 });

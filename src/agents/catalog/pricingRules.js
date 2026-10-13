@@ -15,8 +15,8 @@
  *   - Compare-at tiers: 20% of products each at none / ~10% / ~20% / ~30% / ~40%; the badge must
  *     print the exact tier. H&C's snippets/price.liquid floors to a whole percent, then rounds to
  *     the nearest 10, so ±5 points prints clean. "Read each store's own badge snippet before
- *     computing — never assume": Auberlane's and Marlowe's snippets have NOT been read yet, so
- *     their badge model is marked unverified and tier findings there are informational only.
+ *     computing — never assume". Auberlane's and Marlowe's live themes were read on 2026-10-13
+ *     and they do NOT match H&C (see BADGE_MODELS).
  *   - When the ceiling stops a product reaching band, say so and offer the waiver; never waive.
  *
  * Money is handled in whole cents internally so .95 endings never drift with float maths.
@@ -32,11 +32,19 @@ export const TIER_SHARE = 0.2;
 
 /**
  * Badge models: how a store's theme turns (price, compare-at) into the "−N%" badge.
- *  - floor_round10: floor to a whole percent, then round to the nearest 10 (H&C, read from its snippet).
- *  - For stores whose snippet has not been read we use the same maths but say it is unverified.
+ *  - floor_round10: floor to a whole percent, then round to the nearest 10 (H&C, per the supplier spec).
+ *  - round5: round to the nearest 5 (Auberlane live theme, snippets/product-card.liquid and
+ *    snippets/pdp-sale-pct.liquid: `pct_raw | divided_by: 5.0 | round | times: 5`). So ±2.5 points
+ *    prints clean: 18% shows "-20%", 17% shows "-15%".
+ *  - round1: round to the nearest whole percent (Marlowe live theme, snippets/price.liquid
+ *    `... divided_by: cap | round`, and the JS in marlowe-sale-pdp / marlowe-cart-sale /
+ *    recently-viewed uses Math.round the same way). Only ±0.5 points prints the exact tier.
+ * Liquid's `round` and JS Math.round agree for positive numbers (half rounds up).
  */
 export const BADGE_MODELS = Object.freeze({
   floor_round10: (pct) => Math.round(Math.floor(pct + 1e-9) / 10) * 10,
+  round5: (pct) => Math.round(pct / 5) * 5,
+  round1: (pct) => Math.round(pct),
 });
 
 export const STORE_PRICING = Object.freeze({
@@ -48,12 +56,12 @@ export const STORE_PRICING = Object.freeze({
   aub: Object.freeze({
     store: "aub", band: Object.freeze({ lo: 0.25, hi: 0.29 }), shape: "single",
     floor: 44.95, ceiling: PRICE_CEILING,
-    badge: Object.freeze({ model: "floor_round10", verified: false, source: "NOT READ: Auberlane badge snippet (assumed like H&C)" }),
+    badge: Object.freeze({ model: "round5", verified: true, source: "Auberlane live theme snippets/product-card.liquid + pdp-sale-pct.liquid (read 2026-10-13)" }),
   }),
   mar: Object.freeze({
     store: "mar", band: Object.freeze({ lo: 0.25, hi: 0.29 }), shape: "single",
     floor: 49.95, ceiling: PRICE_CEILING,
-    badge: Object.freeze({ model: "floor_round10", verified: false, source: "NOT READ: Marlowe badge snippet (assumed like H&C)" }),
+    badge: Object.freeze({ model: "round1", verified: true, source: "Marlowe live theme snippets/price.liquid (read 2026-10-13)" }),
   }),
 });
 
@@ -222,9 +230,12 @@ export function discountPct(price, compareAt) {
 /** What the store's badge prints for this price/compare-at, in percent (null = no badge). */
 export function badgePct(storeId, price, compareAt) {
   const rules = rulesFor(storeId);
-  const d = discountPct(price, compareAt);
-  if (!rules || d == null) return null;
-  return BADGE_MODELS[rules.badge.model](d);
+  const pc = toCents(price), cc = toCents(compareAt);
+  if (!rules || pc == null || cc == null || pc <= 0 || cc <= pc) return null;
+  // Same sum, same order, in whole cents, exactly as the themes do it
+  // ((cap - price) * 100.0 / cap). In float dollars an exact 22.5% comes out as 22.4999…
+  // and rounds down where the live badge rounds up.
+  return BADGE_MODELS[rules.badge.model](((cc - pc) * 100) / cc);
 }
 
 /**
@@ -341,7 +352,7 @@ export function validatePrice(storeId, { price, compareAt = null, cost = null } 
       if (tier == null) {
         const b = badgePct(storeId, p, ca);
         add("compare_at_tier_wrong", rules.badge.verified ? "medium" : "info",
-          `Badge would print ${b}%, not a 10/20/30/40 tier${rules.badge.verified ? "" : " (badge snippet not read yet)"}`);
+          `${b > 0 ? `Badge would print ${b}%, not a 10/20/30/40 tier` : "No badge would show (the discount rounds to 0%), but the price is struck through"}${rules.badge.verified ? "" : " (badge snippet not read yet)"}`);
       }
     }
   }
