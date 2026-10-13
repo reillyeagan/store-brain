@@ -54,7 +54,7 @@
  *   SB_<STORE>_CLIENT_ID / SB_<STORE>_CLIENT_SECRET   per-store Shopify app credentials
  */
 import { STORES, LIVE_STORE_IDS } from "./config/stores.js";
-import { DEPARTMENTS, AGENTS, SERVICES, SYSTEMS, AGENT_DOES, isKnownActor } from "./config/agents.js";
+import { DEPARTMENTS, AGENTS, SERVICES, SYSTEMS, AGENT_DOES, isKnownActor, RETIRED_AGENTS } from "./config/agents.js";
 import { recentEvents, costSince, logEvent, agentEvents } from "./lib/eventlog.js";
 import { evaluateFeeds, runSentinel, ensureFeeds } from "./lib/freshness.js";
 import { listPending, decide, verifyDecisionSig, getApproval } from "./lib/approvals.js";
@@ -130,6 +130,7 @@ async function handleState(env) {
     stores: Object.values(STORES).map(({ id, name, live }) => ({ id, name, live })),
     departments: DEPARTMENTS,
     agents: AGENTS.map((a) => ({ ...a, does: AGENT_DOES[a.id] || null })),
+    retired: RETIRED_AGENTS,
     services: SERVICES,
     systems: SYSTEMS,
     events,

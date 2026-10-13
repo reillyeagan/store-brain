@@ -268,7 +268,7 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
   function liveStores(){ return (state.stores||[]).filter(function(s){return s.live}); }
   function storeName(id){ var s=(state.stores||[]).find(function(x){return x.id===id}); return SHORT[id]||(s?s.name:id); }
   function agentOf(id){ return (state.agents||[]).find(function(x){return x.id===id}); }
-  function actorName(id){ var a=agentOf(id)||(state.services||[]).find(function(x){return x.id===id})||(state.systems||[]).find(function(x){return x.id===id}); return a?a.name:id; }
+  function actorName(id){ var a=agentOf(id)||(state.retired||[]).find(function(x){return x.id===id})||(state.services||[]).find(function(x){return x.id===id})||(state.systems||[]).find(function(x){return x.id===id}); return a?a.name:id; }
   function deptOf(id){ var a=agentOf(id); return a?a.dept:(String(id).indexOf("svc.")===0||String(id).indexOf("sys.")===0?"core":String(id).split(".")[0]); }
   function colorOf(id){ return PAL[deptOf(id)]||"#8a8a93"; }
   function ago(iso){ var m=Math.round((Date.now()-Date.parse(iso))/60000); if(m<1)return "just now"; if(m<60)return m+" min ago"; var h=Math.round(m/60); return h<48?h+" h ago":Math.round(h/24)+" d ago"; }

@@ -5,8 +5,9 @@
  * one of these ids. `kind` says whether a worker is plain code or uses Claude.
  * `level`: L0 proposes (Reilly approves) · L1 acts within limits, reports after ·
  * L2 runs quietly, shows in the digest.
- * `status`: planned → built → shadow → live, or "off" (built, switched off by Reilly). Only
- * Reilly moves a worker to live or off.
+ * `status`: planned → built → shadow → live. Only Reilly moves a worker to live.
+ * Agents Reilly switched off are removed from AGENTS (and the dashboard) and kept in
+ * RETIRED_AGENTS, so their old events still show who wrote them.
  */
 
 export const DEPARTMENTS = Object.freeze([
@@ -83,12 +84,6 @@ export const AGENTS = Object.freeze([
 
   // Fulfillment
   a("ful.order_watch", "ful", "Order-to-Supplier Watcher", "code", "L1", "built"),
-  // Tracking Sync: Shopify tracking numbers → 17TRACK, stuck-pickup / failed-delivery flags,
-  // proof of delivery to R2. Shadow-safe (nothing reaches a customer).
-  a("ful.tracking", "ful", "Tracking Sync", "code", "L1", "off"), // switched off by Reilly 2026-10-13
-  // Day-15 / day-20 flags and the reship-or-refund approval are plain code today; the
-  // customer emails it will draft later need AI, hence kind "ai".
-  a("ful.late", "ful", "Late-Shipment Watcher", "ai", "L0", "off"), // switched off with parcel tracking
   a("ful.exceptions", "ful", "Exception Fixer", "ai", "L0"),
 
   // Catalog
@@ -98,6 +93,16 @@ export const AGENTS = Object.freeze([
   a("cat.prepublish", "cat", "New-Product Check", "code", "L2", "built"),
   a("cat.feed_health", "cat", "Merchant Center Health", "code", "L0"),
   // Dropped 2026-10-11 (Reilly): content & size notes, import builder, theme desk.
+]);
+
+/**
+ * Retired agents: switched off by Reilly and taken off the map and the counts (his words,
+ * 2026-10-13: "if theyve been deleted, just remove them. dont leave them crossed off").
+ * Their code stays dormant behind PARCEL_TRACKING; the ids stay known so history reads right.
+ */
+export const RETIRED_AGENTS = Object.freeze([
+  { id: "ful.tracking", dept: "ful", name: "Tracking Sync", retired: "2026-10-13: parcel tracking switched off" },
+  { id: "ful.late", dept: "ful", name: "Late-Shipment Watcher", retired: "2026-10-13: parcel tracking switched off" },
 ]);
 
 /** Shared safety services — plain code every agent runs through. */
@@ -125,7 +130,7 @@ export const SYSTEMS = Object.freeze([
   { id: "sys.claude", name: "Claude API" },
 ]);
 
-const KNOWN = new Set([...AGENTS.map((x) => x.id), ...SERVICES.map((x) => x.id), ...SYSTEMS.map((x) => x.id)]);
+const KNOWN = new Set([...AGENTS.map((x) => x.id), ...RETIRED_AGENTS.map((x) => x.id), ...SERVICES.map((x) => x.id), ...SYSTEMS.map((x) => x.id)]);
 
 export function isKnownActor(id) {
   return KNOWN.has(id);
