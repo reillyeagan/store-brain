@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS cs_inboxes (
   slot          TEXT    PRIMARY KEY,
   account       TEXT,                        -- the Gmail account behind the slot
   cursor_ms     INTEGER,                     -- newest internalDate read (null = never read)
+  scan_before_ms INTEGER,                    -- working back through a backlog: list only mail older than this
   last_read_at  TEXT,                        -- last time a read was attempted
   last_ok_at    TEXT,                        -- last time a read finished without a fault
   last_error    TEXT,                        -- plain-English reason of the last failure ("not wired", HTTP ...)
@@ -79,6 +80,9 @@ CREATE TABLE IF NOT EXISTS cs_tickets (
   draft_status    TEXT,                      -- stored | gmail_draft | blocked | escalated
   draft_note      TEXT,
   gmail_draft_id  TEXT,
+  gmail_draft_state TEXT,                    -- null = made (may still be in Gmail) | gone (Gmail says 404: sent or deleted)
+  gmail_push      TEXT,                      -- null | refused (a Gmail draft won't be made for this ticket; never retried)
+  gmail_push_note TEXT,                      -- why it was refused
   -- cs.escalation
   escalated_at    TEXT,
   approval_id     INTEGER,

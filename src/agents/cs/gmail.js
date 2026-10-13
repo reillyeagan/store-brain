@@ -25,8 +25,8 @@ async function gget(token, path, { fetchImpl }) {
  * (contact forms); the code filter (filters.js) still decides.
  * @param {string[]|null} domains null = a store's own inbox (no narrowing)
  */
-export function inboxQuery(afterMs, domains = null) {
-  const base = `-from:me -in:sent -in:drafts -in:chats -category:promotions -category:social -category:forums after:${Math.floor(afterMs / 1000)}`;
+export function inboxQuery(afterMs, domains = null, beforeMs = null) {
+  const base = `-from:me -in:sent -in:drafts -in:chats -category:promotions -category:social -category:forums after:${Math.floor(afterMs / 1000)}${beforeMs != null ? ` before:${Math.ceil(beforeMs / 1000)}` : ""}`;
   if (!domains) return base;
   const who = [...domains.flatMap((d) => [`to:${d}`, `deliveredto:${d}`]), "from:shopify.com"];
   return `${base} {${who.join(" ")}}`;

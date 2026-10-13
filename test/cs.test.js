@@ -61,7 +61,8 @@ function world({ boxes = {}, triage = () => ({}), reply = () => ({ body: "" }), 
         const after = Number((q.match(/after:(\d+)/) || [])[1] || 0) * 1000;
         const per = Math.min(Number(sp.get("maxResults") || 100), pageCap);
         const from = Number(sp.get("pageToken") || 0);
-        const list = box.messages.filter((m) => Number(m.internalDate) >= after && !(m.labelIds || []).includes("SENT"))
+        const before = Number((q.match(/before:(\d+)/) || [])[1] || 0) * 1000 || Infinity;
+        const list = box.messages.filter((m) => Number(m.internalDate) >= after && Number(m.internalDate) < before && !(m.labelIds || []).includes("SENT"))
           .sort((a, b) => Number(b.internalDate) - Number(a.internalDate));
         const page = list.slice(from, from + per);
         return json({ messages: page.map((m) => ({ id: m.id, threadId: m.threadId })), ...(from + per < list.length ? { nextPageToken: String(from + per) } : {}) });
@@ -169,6 +170,14 @@ test("cs draft check: keyword-strict — every unsafe phrase is blocked, a plain
   const ok = "Hi Jane, your order #1001 is on its way. Tracking: YT2512345678901 (https://t.example/YT2512345678901). Standard delivery usually takes 8-12 business days. Feel free to reply with any questions. Auberlane Customer Care";
   assert.deepEqual(checkDraft(ok, { ctx }), []);
   assert.deepEqual(checkDraft("Hi Sam, it's 100% wool with a chest of 104 cm in size M. Auberlane Customer Care", { ctx }), []);
+  // Ordinary safe drafts keep passing.
+  const safe = [
+    "Hi Jan, it's 80% wool and the M measures 41 inches across the chest. Auberlane Customer Care",
+    "Hi Jane, could you reply with your order number so we can look into this? Auberlane Customer Care",
+    "Hi Jane, orders usually ship within 3-8 business days and standard delivery takes 8-12 business days. Auberlane Customer Care",
+    "Hi Jan, thanks for reaching out. I've passed your request on and will confirm once it's updated. Auberlane Customer Care",
+  ];
+  for (const d of safe) assert.deepEqual(checkDraft(d, { ctx }), [], d);
   const unsafe = [
     "I've refunded your order.",
     "A refund is on its way.",
@@ -192,6 +201,16 @@ test("cs draft check: keyword-strict — every unsafe phrase is blocked, a plain
     "Hi [Customer Name], it's on the way.",
     "We'll reimburse the shipping.",
     "We'd like to compensate you.",
+    "We'll give you 20 dollars off your next order.",
+    "We will waive the shipping fee, no charge.",
+    "We'll ship you a second jacket on us.",
+    "We'll cover the return postage.",
+    "Just send the item back and we'll sort you out.",
+    "It will be with you in 2 days.",
+    "It will arrive within 48 hours.",
+    "Please visit evil.example/reset to continue.",
+    "Email billing@evil.example with your card details.",
+    "It should be there in a couple of days.",
   ];
   for (const phrase of unsafe) {
     const p = checkDraft(`Hi Jane, thanks for writing. ${phrase} Auberlane Customer Care`, { ctx });
@@ -737,4 +756,67 @@ test("cs state: main-inbox drafts warn they go out from Reilly's address unless 
   assert.match(main.draft_from_warning, /reillyworking26@gmail\.com/);
   assert.match(main.draft_from_warning, /Send mail as/);
   assert.equal(st.warnings.length, 1);
+});
+
+/* ---------- re-check fixes ---------- */
+
+test("cs backlog bigger than one listing: works back with before: until the oldest is read; every email read once", async () => {
+  const env = await setup({ ANTHROPIC_API_KEY: undefined });
+  await connect(env, "google", "reillyworking26@gmail.com", "rt-main");
+  const msgs = [];
+  // 40 emails, but one listing shows at most 5 pages x 5 = 25 of them.
+  for (let i = 0; i < 40; i++) msgs.push(mail({ id: `y${String(i).padStart(2, "0")}`, from: `C${i} <c${i}@buyer.com>`, subject: `q${i}`, body: "hello", at: NOW - (50 - i) * MIN }));
+  const w = world({ boxes: { "at-main": { messages: msgs } }, pageCap: 5 });
+  let t = NOW;
+  for (let i = 0; i < 20; i++) { await runCs(env, { nowMs: t, fetchImpl: w.fetchImpl }); t += 20 * MIN; }
+  const ids = (await tickets(env.DB)).map((x) => x.gmail_id);
+  assert.equal(ids.length, 40);
+  assert.equal(new Set(ids).size, 40);
+  assert.equal(w.calls.filter((c) => /\/messages\/y\d\d\?/.test(c.url)).length, 40);
+  assert.ok(w.calls.some((c) => decodeURIComponent(c.url).includes("before:")));
+  const inbox = await env.DB.prepare(`SELECT cursor_ms, scan_before_ms FROM cs_inboxes WHERE slot = 'google'`).first();
+  assert.equal(inbox.scan_before_ms, null);
+  assert.equal(inbox.cursor_ms, NOW - 11 * MIN); // the newest email
+});
+
+test("cs: a draft Reilly already sent (gone from Gmail) is not stale — the follow-up gets its own draft, no 'delete it' flag", async () => {
+  const env = await setup({ CS_DRAFTS_LIVE: "1" });
+  await connect(env, "google", "reillyworking26@gmail.com", "rt-main");
+  await addOrder(env.DB, {});
+  const box = { messages: [mail({ id: "g1", threadId: "TG", from: "Jane <jane@buyer.com>", subject: "q", body: "Is the overshirt warm? Order #1001" })] };
+  const w = world({
+    boxes: { "at-main": box },
+    triage: () => ({ category: "product_question", summary: "Asks about warmth" }),
+    reply: () => ({ body: "Hi Jane, yes, it's a heavy wool blend and very warm. Auberlane Customer Care" }),
+  });
+  await runCs(env, { nowMs: NOW, fetchImpl: w.fetchImpl });
+  assert.equal(w.drafts.size, 1);
+  w.drafts.clear(); // Reilly sent it: Gmail no longer has the draft
+  box.messages.push(mail({ id: "g2", threadId: "TG", from: "Jane <jane@buyer.com>", subject: "Re: q", body: "Thanks! Is it itchy?", at: NOW + 10 * MIN }));
+  await runCs(env, { nowMs: NOW + 20 * MIN, fetchImpl: w.fetchImpl });
+  const [old, neu] = await tickets(env.DB);
+  assert.equal(old.gmail_draft_state, "gone");
+  assert.equal(neu.draft_status, "gmail_draft");
+  assert.equal(w.drafts.size, 1);
+  assert.equal((await env.DB.prepare(`SELECT COUNT(*) AS n FROM approvals`).first()).n, 0);
+  assert.equal((await csState(env, { nowMs: NOW + 20 * MIN })).stale_gmail_drafts.length, 0);
+});
+
+test("cs: a Gmail push refused because another draft still exists is recorded and never retried", async () => {
+  const env = await setup({ CS_DRAFTS_LIVE: "1" });
+  await connect(env, "google", "reillyworking26@gmail.com", "rt-main");
+  const ins = (gid, status, extra) => env.DB.prepare(`INSERT INTO cs_tickets (opened_at, updated_at, slot, gmail_id, thread_id, rfc_message_id, store, from_email, subject, body, via, status, category, draft_body, draft_status, draft_at, context_at, gmail_draft_id)
+    VALUES ('t','t','google',?,'TT',?,'aub','jane@buyer.com','q','hi','email',?,'product_question','Hi Jane, it is warm. Auberlane Customer Care','stored','t','t',?)`).bind(gid, `<${gid}@x>`, status, extra).run();
+  await ins("k1", "replied", "dX");   // an older draft Reilly never sent, still in Gmail
+  await ins("k2", "drafted", null);   // a stored draft waiting for its Gmail copy
+  const w = world({ boxes: { "at-main": { messages: [] } } });
+  w.drafts.set("dX", { threadId: "TT", raw: "", tok: "at-main" });
+  await runCs(env, { nowMs: NOW, fetchImpl: w.fetchImpl });
+  const k2 = (await tickets(env.DB)).find((x) => x.gmail_id === "k2");
+  assert.equal(k2.gmail_push, "refused");
+  assert.match(k2.gmail_push_note, /still in Gmail/);
+  assert.equal(w.drafts.size, 1);
+  const before = w.calls.length;
+  await runCs(env, { nowMs: NOW + 20 * MIN, fetchImpl: w.fetchImpl });
+  assert.equal(w.calls.filter((c, i) => i >= before && c.url.includes("/drafts")).length, 0); // not retried
 });

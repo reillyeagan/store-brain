@@ -84,12 +84,14 @@ async function readOneInbox(env, inbox, account, { nowMs, fetchImpl, budget }) {
   const domains = inbox.own ? null : inbox.stores.map((s) => STORE_MAIL_DOMAINS[s]).filter(Boolean);
   // One list page was reserved above; more pages only while the run's allowance lasts.
   const maxPages = Math.max(1, Math.min(CAPS.listMaxPages, budget.left + 1));
-  const listing = await listIds(token, { q: inboxQuery(cursor, domains), perPage: CAPS.listPage, maxPages, fetchImpl });
+  // Working back through a backlog bigger than one listing: only mail older than scan_before.
+  const scanBefore = row && row.scan_before_ms != null ? Number(row.scan_before_ms) : null;
+  const listing = await listIds(token, { q: inboxQuery(cursor, domains, scanBefore), perPage: CAPS.listPage, maxPages, fetchImpl });
   budget.spend(listing.pages - 1);
   if (!listing.complete) {
     // Gmail lists newest first only. Mail older than what was listed is still unread: the
     // cursor stays put (below), and this is said out loud instead of pretending.
-    await logOnce(db, { actor: ACTOR, kind: "cs.read_backlog", target: "sys.gmail", summary: `${label}: more than ${listing.ids.length} emails since the last read; the oldest are not reachable this run. The cursor stays put until they are read.` }, { key: inbox.slot, windowMin: 6 * 60, nowMs });
+    await logOnce(db, { actor: ACTOR, kind: "cs.read_backlog", target: "sys.gmail", summary: `${label}: more than ${listing.ids.length} emails since the last read; working back to the oldest over the next runs. The cursor stays put until they are read.` }, { key: inbox.slot, windowMin: 6 * 60, nowMs });
   }
 
   // Already-looked-at ids, in one query (Gmail's after: is per second, so lists overlap).
@@ -135,13 +137,27 @@ async function readOneInbox(env, inbox, account, { nowMs, fetchImpl, budget }) {
   }
   // The cursor moves only when everything Gmail listed after it has been looked at, and only to
   // the newest message actually looked at: no mail is ever stepped over.
-  let newCursor = cursor;
+  let newCursor = cursor, newScan = scanBefore;
   if (listing.complete && read + givenUp === fresh.length) {
-    const mx = await db.prepare(`SELECT MAX(internal_ms) AS m FROM cs_mail_seen WHERE slot = ?`).bind(inbox.slot).first();
-    if (mx && mx.m != null && Number(mx.m) > cursor) newCursor = Number(mx.m);
+    if (scanBefore != null) {
+      // Everything older than scan_before is now read, and everything from there up to the top
+      // of the listing that started the scan was already seen: the cursor can move to it.
+      newCursor = Math.max(cursor, scanBefore - 1000);
+      newScan = null;
+    } else {
+      const mx = await db.prepare(`SELECT MAX(internal_ms) AS m FROM cs_mail_seen WHERE slot = ?`).bind(inbox.slot).first();
+      if (mx && mx.m != null && Number(mx.m) > cursor) newCursor = Number(mx.m);
+    }
+  } else if (!listing.complete && fresh.length === 0) {
+    // Every listed email is already seen but older ones exist beyond the listing: next run
+    // lists before the oldest listed one, working back to the oldest unread.
+    for (const m of listing.ids.slice().reverse()) {
+      const r = await db.prepare(`SELECT internal_ms FROM cs_mail_seen WHERE slot = ? AND gmail_id = ?`).bind(inbox.slot, m.id).first();
+      if (r && r.internal_ms != null) { newScan = Number(r.internal_ms) + 1000; break; }
+    }
   }
   await noteInbox(db, inbox.slot, {
-    account, cursor_ms: newCursor, last_read_at: at, last_ok_at: at, last_error: null,
+    account, cursor_ms: newCursor, scan_before_ms: newScan, last_read_at: at, last_ok_at: at, last_error: null,
     read_count: Number((row && row.read_count) || 0) + read,
   });
   const waiting = fresh.length - read - givenUp;

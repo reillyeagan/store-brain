@@ -66,7 +66,7 @@ export const CADENCE = Object.freeze({ read: 15, work: 15, obligations: 60 });
  * delivered on time" → can be called the faster option, never a guaranteed date.
  */
 export const DELIVERY_FACTS = Object.freeze([
-  "Orders usually ship within about 3 business days (sometimes up to 8).",
+  "Orders usually ship within 3-8 business days.",
   "Standard delivery usually takes about 8-12 business days from the order date.",
   "Express shipping is the faster option; never give a guaranteed delivery date.",
 ]);
