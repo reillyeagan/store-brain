@@ -28,7 +28,16 @@ export function newDays(env) {
   return Number.isFinite(n) && n > 0 && n <= 30 ? n : DEFAULT_NEW_DAYS;
 }
 
-/** The checklist for one new product. `ctx`: {cost, hasSizeChart, handles:Set, tierCounts}. */
+/** A new product has this long to get a KFB quote before "no quote" counts as a problem. */
+export const QUOTE_GRACE_DAYS = 2;
+
+/** Days since the product was published (or created), or null when neither date is known. */
+export function productAgeDays(p, nowMs = Date.now()) {
+  const t = Date.parse(p.published_at || p.created_at || "");
+  return Number.isFinite(t) ? (nowMs - t) / 86400000 : null;
+}
+
+/** The checklist for one new product. `ctx`: {cost, costs, hasSizeChart, handles:Set, tierCounts, supply, nowMs}. */
 export function checkNewProduct(storeId, p, ctx) {
   const problems = [];
   const add = (code, severity, message) => problems.push({ code, severity, message });
@@ -43,7 +52,19 @@ export function checkNewProduct(storeId, p, ctx) {
   else if (ctx.cost.partial) add("cost_partial", "low", "Cost on file for only some variants (the others aren't judged on COGS)");
   // The Supplier's pre-publish gate: a confirmed supply line (quoted, not denied).
   if (ctx.supply && ctx.supply.error) add("supply_preflight_unavailable", "info", `Supply pre-flight couldn't run: ${ctx.supply.error}`);
-  else if (ctx.supply && !ctx.supply.ok) add("supply_preflight", "medium", `Supply pre-flight: ${(ctx.supply.reasons || []).join("; ")}`);
+  else if (ctx.supply && !ctx.supply.ok) {
+    // "No quote yet" is expected while KFB quotes aren't wired for this store, and for a product
+    // younger than QUOTE_GRACE_DAYS (Reilly clicks "get products" in KFB after publishing): info
+    // then, so it doesn't drown real problems. Denied / not-quoted / ceiling stay medium.
+    const age = productAgeDays(p, ctx.nowMs);
+    const expected = ctx.supply.no_quote && (!ctx.supply.quotes_wired || (age != null && age < QUOTE_GRACE_DAYS));
+    const why = !ctx.supply.quotes_wired ? "KFB quotes not wired for this store yet" : `published ${age == null ? "?" : age.toFixed(1)} days ago, inside the ${QUOTE_GRACE_DAYS}-day grace for "get products"`;
+    const noQuote = (ctx.supply.reasons || []).filter((r) => /no KFB quote/i.test(r));
+    const other = (ctx.supply.reasons || []).filter((r) => !/no KFB quote/i.test(r));
+    if (expected && noQuote.length) add("supply_no_quote_yet", "info", `Supply pre-flight: ${noQuote.join("; ")} (expected: ${why})`);
+    const rest = expected ? other : ctx.supply.reasons || [];
+    if (rest.length) add("supply_preflight", "medium", `Supply pre-flight: ${rest.join("; ")}`);
+  }
   if (!p.seo_title || !p.seo_description) add("seo_basics", "info", "SEO title/description not set (Shopify falls back to title/description)");
   const m = /^(.*)-(\d+)$/.exec(p.handle || "");
   if (m && ctx.handles.has(m[1])) add("possible_duplicate", "medium", `Handle looks like a copy of "${m[1]}"`);
@@ -83,7 +104,9 @@ export async function supplyCheck(db, storeId, p) {
   try {
     const prices = (p.variants || []).map((v) => v.price).filter((x) => x != null);
     const r = await preflightProduct(db, storeId, p.handle, { price: prices.length ? Math.max(...prices) : null });
-    return { ok: !!r.ok, reasons: r.reasons || [], quote_status: r.quote ? r.quote.status : null };
+    // Are KFB quotes wired for this store at all? (any row = the Quote Desk has imported quotes)
+    const w = await db.prepare(`SELECT 1 AS x FROM kfb_quotes WHERE store = ? LIMIT 1`).bind(storeId).first();
+    return { ok: !!r.ok, reasons: r.reasons || [], quote_status: r.quote ? r.quote.status : null, no_quote: !r.quote, quotes_wired: !!w };
   } catch (err) {
     return { error: String(err && err.message).slice(0, 160) };
   }
@@ -115,7 +138,7 @@ export async function runPrepublishStore(env, storeId, products, { nowMs, day })
   for (const p of fresh) {
     results.push(checkNewProduct(storeId, p, {
       cost: productCost(costs, p), costs, hasSizeChart: charted.has(p.product_id), handles, tierCounts,
-      supply: await supplyCheck(db, storeId, p),
+      supply: await supplyCheck(db, storeId, p), nowMs,
     }));
   }
   const rank = { high: 3, medium: 2, low: 1, info: 0 };

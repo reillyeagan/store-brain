@@ -633,3 +633,36 @@ test("new-product check: calls the Supplier's preflightProduct gate and shows it
   const r2 = checkNewProduct("hc", p, { cost: null, handles: new Set(), tierCounts: null, supply: err });
   assert.ok(r2.issues.some((i) => i.code === "supply_preflight_unavailable" && i.severity === "info"));
 });
+
+test("new-product check: 'no KFB quote' is info while quotes aren't wired or the product is under 2 days old, medium otherwise", async () => {
+  const DB = makeD1();
+  const now = NOW;
+  const old = { ...cached(1, { price: 64.95, publishedAt: "2026-10-10T12:00:00Z" }), handle: "old-shirt", published_at: "2026-10-10T12:00:00Z" }; // ~3 days
+  const young = { ...cached(2, { price: 64.95 }), handle: "new-shirt", published_at: "2026-10-12T20:00:00Z" };             // ~0.75 days
+  const ctx = async (p) => ({ cost: null, handles: new Set(), tierCounts: null, supply: await supplyCheck(DB, "hc", p), nowMs: now });
+  const sev = (r, code) => (r.issues.find((i) => i.code === code) || {}).severity;
+
+  // Not wired: kfb_quotes has no rows for H&C → info even for the 3-day-old product.
+  let s = await supplyCheck(DB, "hc", old);
+  assert.equal(s.quotes_wired, false);
+  let r = checkNewProduct("hc", old, await ctx(old));
+  assert.equal(sev(r, "supply_no_quote_yet"), "info");
+  assert.equal(sev(r, "supply_preflight"), undefined);
+
+  // Wired (a quote exists for another product in this store; another store's quotes don't count).
+  await DB.prepare(`INSERT INTO kfb_quotes (store, product_handle, status, cost, currency, quoted_at, source, imported_at) VALUES ('aub','x','quoted',10,'EUR','2026-10-01T00:00:00Z','manual','2026-10-01T00:00:00Z')`).run();
+  assert.equal((await supplyCheck(DB, "hc", old)).quotes_wired, false, "only this store's quotes count");
+  await DB.prepare(`INSERT INTO kfb_quotes (store, product_handle, status, cost, currency, quoted_at, source, imported_at) VALUES ('hc','other','quoted',10,'EUR','2026-10-01T00:00:00Z','manual','2026-10-01T00:00:00Z')`).run();
+  r = checkNewProduct("hc", old, await ctx(old));
+  assert.equal(sev(r, "supply_preflight"), "medium", "wired and older than 2 days → medium");
+  assert.equal(r.passed, false);
+  r = checkNewProduct("hc", young, await ctx(young));
+  assert.equal(sev(r, "supply_no_quote_yet"), "info", "younger than 2 days → info");
+  assert.equal(sev(r, "supply_preflight"), undefined);
+
+  // A denial is never softened, however young the product.
+  await DB.prepare(`INSERT INTO kfb_quotes (store, product_handle, status, quoted_at, remark, source, imported_at) VALUES ('hc','new-shirt','denied','2026-10-13T00:00:00Z','no stock','manual','2026-10-13T00:00:00Z')`).run();
+  r = checkNewProduct("hc", young, await ctx(young));
+  assert.equal(sev(r, "supply_preflight"), "medium");
+  assert.match(r.issues.find((i) => i.code === "supply_preflight").message, /denied/);
+});
