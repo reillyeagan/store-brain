@@ -83,6 +83,7 @@ async function checkStore(env, storeId, { nowMs, fetchImpl }) {
     disputes_90d: null, disputes_at_least: 0, dispute_rate: null, refund_rate: null };
   const notes = [];
   const problems = [];
+  let ratesOk = false, accountOk = false;
 
   try {
     const d = await shopifyGraphQL(env, storeId, RATES_QUERY,
@@ -96,6 +97,8 @@ async function checkStore(env, storeId, { nowMs, fetchImpl }) {
     // Orders "AT_LEAST" means the true count is higher, so the rate shown can only be too high:
     // the safe direction. No orders → no rate (never 0%).
     if (h.orders_90d && h.disputes_90d != null) h.dispute_rate = h.disputes_90d / h.orders_90d;
+    ratesOk = !!oc && !!conn;
+    if (!ratesOk) notes.push("dispute rate: Shopify's answer was incomplete");
   } catch (err) {
     problems.push(await logProblem(env.DB, ACTOR, storeId, err, `${STORES[storeId].name} dispute rate`, nowMs));
     notes.push(`dispute rate not read: ${String(err && err.message).slice(0, 120)}`);
@@ -109,6 +112,7 @@ async function checkStore(env, storeId, { nowMs, fetchImpl }) {
       h.payout_interval = (a.payoutSchedule && a.payoutSchedule.interval) || null;
       const payouts = (a.payouts && a.payouts.nodes) || [];
       h.failed_payouts = payouts.filter((p) => p.status === "FAILED").length;
+      accountOk = true;
     } else {
       notes.push("Shopify returned no Payments account");
     }
@@ -121,8 +125,34 @@ async function checkStore(env, storeId, { nowMs, fetchImpl }) {
   h.refund_rate = rr.rate;
   if (rr.note) notes.push(`refund rate: ${rr.note}`);
 
+  return { h, notes, problems, ratesOk, accountOk };
+}
+
+const RATE_FIELDS = ["orders_90d", "orders_precision", "disputes_90d", "disputes_at_least", "dispute_rate", "refund_rate"];
+const ACCOUNT_FIELDS = ["payments_activated", "payout_interval", "failed_payouts"];
+
+/**
+ * Pure: combine a (possibly partial) read with the last stored row. A probe that failed
+ * says nothing about the store (rule 6), so its fields keep their last known values, and a
+ * partial read may raise the state but never lower it (rule 5: a failed read must not make
+ * a "bad" store look "ok", and must not set up a false "worse" alert on the next full read).
+ */
+export function mergeHealth(read, prevRow) {
+  const h = { ...read.h };
+  if (prevRow) {
+    if (!read.ratesOk) for (const k of RATE_FIELDS) h[k] = prevRow[k];
+    if (!read.accountOk) for (const k of ACCOUNT_FIELDS) h[k] = prevRow[k];
+  }
   const verdict = judgeHealth(h);
-  return { h, verdict, notes, problems };
+  const partial = !read.ratesOk || !read.accountOk;
+  let state = verdict.state;
+  const reasons = [...verdict.reasons];
+  const prevState = prevRow && prevRow.state;
+  if (partial && prevState && (state == null || RANK[state] < RANK[prevState])) {
+    state = prevState;
+    reasons.push(`kept "${prevState}" from the last full check (this check could not read everything)`);
+  }
+  return { h, state, reasons, partial };
 }
 
 export async function runAccountHealth(env, { nowMs = Date.now(), fetchImpl = fetch } = {}) {
@@ -132,10 +162,14 @@ export async function runAccountHealth(env, { nowMs = Date.now(), fetchImpl = fe
   const lines = [];
   for (const storeId of LIVE_STORE_IDS) {
     const name = STORES[storeId].name;
-    const prev = await db.prepare(`SELECT state FROM risk_account_health WHERE store = ?`).bind(storeId).first();
-    const { h, verdict, notes, problems } = await checkStore(env, storeId, { nowMs, fetchImpl });
-    // A store we couldn't read at all keeps its last row: a failed probe says nothing about the store (rule 6).
-    if (verdict.state == null && problems.length) { out[storeId] = { state: null, problems }; lines.push(`${name}: not read`); continue; }
+    const prev = await db.prepare(`SELECT * FROM risk_account_health WHERE store = ?`).bind(storeId).first();
+    const read = await checkStore(env, storeId, { nowMs, fetchImpl });
+    const { notes, problems } = read;
+    // A store we couldn't read at all keeps its last row untouched: a failed probe says nothing
+    // about the store (rule 6).
+    if (!read.ratesOk && !read.accountOk) { out[storeId] = { state: prev ? prev.state : null, problems, notRead: true }; lines.push(`${name}: not read`); continue; }
+    const { h, state, reasons, partial } = mergeHealth(read, prev);
+    const verdict = { state, reasons };
     await db.prepare(
       `INSERT INTO risk_account_health (store, checked_at, state, payments_activated, payout_interval, failed_payouts, orders_90d,
          orders_precision, disputes_90d, disputes_at_least, dispute_rate, refund_rate, detail)
@@ -146,7 +180,7 @@ export async function runAccountHealth(env, { nowMs = Date.now(), fetchImpl = fe
          disputes_90d = excluded.disputes_90d, disputes_at_least = excluded.disputes_at_least, dispute_rate = excluded.dispute_rate,
          refund_rate = excluded.refund_rate, detail = excluded.detail`
     ).bind(storeId, at, verdict.state, h.payments_activated, h.payout_interval, h.failed_payouts, h.orders_90d, h.orders_precision,
-      h.disputes_90d, h.disputes_at_least, h.dispute_rate, h.refund_rate, JSON.stringify({ reasons: verdict.reasons, notes })).run();
+      h.disputes_90d, h.disputes_at_least, h.dispute_rate, h.refund_rate, JSON.stringify({ reasons: verdict.reasons, notes, partial })).run();
     out[storeId] = { state: verdict.state, reasons: verdict.reasons };
     lines.push(`${name}: ${verdict.state || "unknown"}, disputes ${pct(h.dispute_rate)}`);
     const before = prev && prev.state ? RANK[prev.state] : 0;

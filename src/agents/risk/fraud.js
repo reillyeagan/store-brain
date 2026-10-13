@@ -4,7 +4,7 @@
  * Reilly, 2026-10-11: "fraud screen for shopify orders is still good, just know that it is
  * VERY rare i will need to do anything, i have not cancelled any so far." So: low noise.
  *
- * What it does: every 30 minutes, reads each live store's orders from the last 3 days
+ * What it does: every hour (Risk's slot in the department rotation), reads each live store's orders from the last 3 days
  * (read-only) and screens each one ONCE:
  *   - Shopify's own verdict: the highest riskLevel among the order's risk assessments and
  *     the overall recommendation (ACCEPT / INVESTIGATE / CANCEL);
@@ -122,7 +122,19 @@ async function raiseHigh(db, storeId, order, verdict, nowMs) {
   });
 }
 
-export async function runFraud(env, { nowMs = Date.now(), fetchImpl = fetch } = {}) {
+/** Write (or update) one order's screen. An approval id once saved is never cleared. */
+async function saveScreen(db, storeId, order, v, { level, final, approvalId, at }) {
+  await db.prepare(
+    `INSERT INTO risk_order_screens (store, order_id, order_name, order_created_at, shopify_level, recommendation, level, reasons, final, approval_id, screened_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(store, order_id) DO UPDATE SET shopify_level = excluded.shopify_level, recommendation = excluded.recommendation,
+       level = excluded.level, reasons = excluded.reasons, final = excluded.final,
+       approval_id = COALESCE(excluded.approval_id, risk_order_screens.approval_id), screened_at = excluded.screened_at`
+  ).bind(storeId, order.id, order.name, order.createdAt, v.shopify, v.recommendation, level,
+    JSON.stringify(v.reasons), final, approvalId, at).run();
+}
+
+export async function runFraud(env,{ nowMs = Date.now(), fetchImpl = fetch } = {}) {
   const db = env.DB;
   const at = nowIso(nowMs);
   const since = new Date(nowMs - LOOKBACK_DAYS * DAY_MS).toISOString();
@@ -139,34 +151,38 @@ export async function runFraud(env, { nowMs = Date.now(), fetchImpl = fetch } = 
     const orders = ((data && data.orders && data.orders.nodes) || []).filter((o) => o && !o.test && !o.cancelledAt);
     let screened = 0, flagged = 0;
     for (const order of orders) {
-      const prev = await db.prepare(`SELECT final, level FROM risk_order_screens WHERE store = ? AND order_id = ?`).bind(storeId, order.id).first();
-      if (prev && prev.final) continue;
-      const v = screenOrder(order, orders);
-      // Wait for Shopify's own analysis, but not forever: after 24h judge on what we have.
-      const waiting = v.pending && nowMs - Date.parse(order.createdAt) < PENDING_RECHECK_MS;
-      const final = waiting ? 0 : 1;
-      await db.prepare(
-        `INSERT INTO risk_order_screens (store, order_id, order_name, order_created_at, shopify_level, recommendation, level, reasons, final, screened_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(store, order_id) DO UPDATE SET shopify_level = excluded.shopify_level, recommendation = excluded.recommendation,
-           level = excluded.level, reasons = excluded.reasons, final = excluded.final, screened_at = excluded.screened_at`
-      ).bind(storeId, order.id, order.name, order.createdAt, v.shopify, v.recommendation, waiting ? null : v.level,
-        JSON.stringify(v.reasons), final, at).run();
-      screened++;
-      if (waiting || !v.level) continue;
-      flagged++; flaggedNow++;
-      let approvalId = null;
-      if (v.level === "HIGH") {
-        approvalId = await raiseHigh(db, storeId, order, v, nowMs);
-        await db.prepare(`UPDATE risk_order_screens SET approval_id = ? WHERE store = ? AND order_id = ?`).bind(approvalId, storeId, order.id).run();
+      try {
+        const prev = await db.prepare(`SELECT final, level, approval_id FROM risk_order_screens WHERE store = ? AND order_id = ?`).bind(storeId, order.id).first();
+        if (prev && prev.final) continue;
+        const v = screenOrder(order, orders);
+        // Wait for Shopify's own analysis, but not forever: after 24h judge on what we have.
+        const waiting = v.pending && nowMs - Date.parse(order.createdAt) < PENDING_RECHECK_MS;
+        const flaggedOrder = !waiting && !!v.level;
+        let approvalId = (prev && prev.approval_id) || null;
+        if (flaggedOrder && v.level === "HIGH" && !approvalId) {
+          // Approval FIRST, its id saved at once on a NOT-final row: if anything after this
+          // fails, the next run finds the id (no second approval) and finishes the job. If the
+          // approval itself fails, nothing is final and the next run tries again.
+          approvalId = await raiseHigh(db, storeId, order, v, nowMs);
+          await saveScreen(db, storeId, order, v, { level: v.level, final: 0, approvalId, at });
+        }
+        if (flaggedOrder) {
+          await logEvent(db, {
+            actor: ACTOR, kind: v.level === "HIGH" ? "risk.order_high" : "risk.order_flagged", store: storeId,
+            target: v.level === "HIGH" ? "core.approvals" : undefined,
+            summary: `${v.level === "HIGH" ? "HIGH-risk" : "Worth a look"}: ${order.name} (${fmtMoney(moneyOf(order.totalPriceSet), currencyOf(order.totalPriceSet))}): ${v.reasons.join("; ")}`.slice(0, 480),
+            data: { orderId: order.id, level: v.level, shopify: v.shopify, recommendation: v.recommendation, reasons: v.reasons, approvalId },
+            at,
+          });
+          flagged++; flaggedNow++;
+        }
+        // Marked final only now, after the approval and the event exist.
+        await saveScreen(db, storeId, order, v, { level: waiting ? null : v.level, final: waiting ? 0 : 1, approvalId, at });
+        screened++;
+      } catch (err) {
+        // One order failing never stops the rest; it stays not-final, so the next run retries it.
+        await logProblem(db, ACTOR, storeId, err, `${STORES[storeId].name} fraud screen of ${order.name}`, nowMs);
       }
-      await logEvent(db, {
-        actor: ACTOR, kind: v.level === "HIGH" ? "risk.order_high" : "risk.order_flagged", store: storeId,
-        target: v.level === "HIGH" ? "core.approvals" : undefined,
-        summary: `${v.level === "HIGH" ? "HIGH-risk" : "Worth a look"}: ${order.name} (${fmtMoney(moneyOf(order.totalPriceSet), currencyOf(order.totalPriceSet))}): ${v.reasons.join("; ")}`.slice(0, 480),
-        data: { orderId: order.id, level: v.level, shopify: v.shopify, recommendation: v.recommendation, reasons: v.reasons, approvalId },
-        at,
-      });
     }
     stores[storeId] = { orders: orders.length, screened, flagged };
   }
