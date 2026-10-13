@@ -14,7 +14,7 @@
  */
 import { logEvent } from "../../lib/eventlog.js";
 import { nowIso } from "../../lib/time.js";
-import { accountTz, windowFor, minusDays, micros, int, r2, upsertFinding, clearUnseen, storeName } from "./common.js";
+import { accountTz, windowFor, minusDays, micros, int, r2, upsertFinding, clearUnseen, storeName, runBatched, MAX_STORED_ROWS } from "./common.js";
 
 export const AGENT = "media.season";
 export const TOP_KEYWORDS = 25;
@@ -80,12 +80,12 @@ export async function runSeason(env, { storeId, session, nowMs = Date.now() }) {
      FROM keyword_view WHERE segments.date BETWEEN '${from}' AND '${to}' AND metrics.impressions > 0`);
   const weeks = parseKeywordRows(rows);
   const at = nowIso(nowMs);
-  for (const w of weeks) {
-    await db.prepare(
-      `INSERT INTO media_keyword_weeks (store, week, keyword, impressions, clicks, cost, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(store, week, keyword) DO UPDATE SET impressions = excluded.impressions, clicks = excluded.clicks, cost = excluded.cost, fetched_at = excluded.fetched_at`
-    ).bind(storeId, w.week, w.keyword, w.impressions, w.clicks, w.cost, at).run();
-  }
+  // Batched and capped (the busiest keyword-weeks), so a big account can't blow the per-run query limit.
+  const keep = [...weeks].sort((a, b) => b.impressions - a.impressions).slice(0, MAX_STORED_ROWS);
+  await runBatched(db, keep.map((w) => db.prepare(
+    `INSERT INTO media_keyword_weeks (store, week, keyword, impressions, clicks, cost, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(store, week, keyword) DO UPDATE SET impressions = excluded.impressions, clicks = excluded.clicks, cost = excluded.cost, fetched_at = excluded.fetched_at`
+  ).bind(storeId, w.week, w.keyword, w.impressions, w.clicks, w.cost, at)));
   const trends = weekTrends(weeks, lastWeek, prevWeek);
   // Did anyone change budgets, bids or statuses in those two weeks? Then impressions aren't pure demand.
   const ch = await db.prepare(
