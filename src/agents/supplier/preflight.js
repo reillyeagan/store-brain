@@ -19,6 +19,7 @@ import { LIVE_STORE_IDS } from "../../config/stores.js";
 import { logEvent } from "../../lib/eventlog.js";
 import { nowIso } from "../../lib/time.js";
 import { PRICE_CEILING } from "./pricing.js";
+import { normSize } from "./common.js";
 
 const ACTOR = "sup.preflight";
 export const LOOKBACK_DAYS = 3;
@@ -51,11 +52,6 @@ export async function runPreflight(env, { nowMs = Date.now() } = {}) {
         FROM (${recent}) r JOIN supplier_plans p ON p.store = r.store AND p.product_handle = r.product_handle AND p.kind = 'draft'
         JOIN supplier_batches b ON b.id = p.batch_id LEFT JOIN approvals a ON a.id = b.approval_id
        WHERE COALESCE(a.status, 'pending') IN ('pending', 'approved', 'executed')`).bind(at, ...args),
-    // Complaints for this size.
-    db.prepare(`${ins} SELECT r.store, r.order_id, r.order_name, r.line_id, r.product_handle, r.title, 'size_complaints',
-        COUNT(c.id) || ' sizing complaint(s) on this product in size ' || r.size, ?
-        FROM (${recent}) r JOIN size_complaints c ON c.store = r.store AND c.product_id = r.product_id AND UPPER(c.size_ordered) = UPPER(r.size)
-       GROUP BY r.store, r.line_id`).bind(at, ...args),
     // Nothing fits.
     db.prepare(`${ins} SELECT r.store, r.order_id, r.order_name, r.line_id, r.product_handle, r.title, 'no_fit', s.reason, ?
         FROM (${recent}) r JOIN size_recommendations s ON s.store = r.store AND s.line_id = r.line_id WHERE s.verdict = 'no_fit'`).bind(at, ...args),
@@ -69,6 +65,27 @@ export async function runPreflight(env, { nowMs = Date.now() } = {}) {
   ];
   let added = 0;
   for (const c of checks) { const r = await c.run(); added += (r.meta && r.meta.changes) || 0; }
+
+  // Complaints for the size ordered. Done in code so "Medium", "m" and "M" (or "XXL"/"2XL") match.
+  const { results: pairs } = await db.prepare(
+    `SELECT r.store, r.order_id, r.order_name, r.line_id, r.product_handle, r.title, r.size, c.size_ordered
+       FROM (${recent}) r JOIN size_complaints c ON c.store = r.store AND c.product_id = r.product_id
+      WHERE r.size IS NOT NULL AND c.size_ordered IS NOT NULL`
+  ).bind(...args).all();
+  const byLine = new Map();
+  for (const p of pairs || []) {
+    const a = normSize(p.size) || String(p.size).trim().toUpperCase();
+    const b = normSize(p.size_ordered) || String(p.size_ordered).trim().toUpperCase();
+    if (a !== b) continue;
+    const k = `${p.store}|${p.line_id}`;
+    byLine.set(k, { ...p, n: ((byLine.get(k) || {}).n || 0) + 1, norm: a });
+  }
+  for (const p of byLine.values()) {
+    const r = await db.prepare(`${ins} VALUES (?,?,?,?,?,?,'size_complaints',?,?)`).bind(
+      p.store, p.order_id, p.order_name, p.line_id, p.product_handle, p.title,
+      `${p.n} sizing complaint${p.n === 1 ? "" : "s"} on this product in size ${p.norm}`, at).run();
+    added += (r.meta && r.meta.changes) || 0;
+  }
   if (added) {
     const { results } = await db.prepare(`SELECT kind, COUNT(*) AS n FROM supply_flags WHERE created_at = ? GROUP BY kind`).bind(at).all();
     await logEvent(db, {

@@ -13,16 +13,20 @@
  *
  * Inputs:  kfb_quotes (filled by the KFB Morning Session, planned, or importQuotes() below),
  *          Shopify products (read_products), supplier_price_holds.
- * Outputs: supplier_batches + supplier_plans rows, one approval per store batch, events.
- * Never:   writes to Shopify (no write scope; Catalog's Product Status applies an approved
- *          batch later with backup, Store Guard and verification). Never touches KFB.
+ * Outputs: supplier_batches + supplier_plans rows, one approval per store batch, each matched
+ *          quote's cost in core_facts (cost:product:<GID> / cost:sku:<SKU>, source kfb_quote), events.
+ * Never:   writes to Shopify (no write scope, and no worker applies an approved batch: approving
+ *          records Reilly's yes and he makes the change himself). Never touches KFB.
  *
- * Rules kept here:
+ * Rules kept here (prices themselves come from the shared src/agents/catalog/pricingRules.js):
  *  - Match by store link HANDLE, never title or KFB SKU (spec).
  *  - Store prices come from Shopify, never KFB's stale un_good_price (spec).
  *  - "Similar" quotes are priced like exact matches (Reilly: "q4 always fine").
  *  - While a store's previous batch is still waiting on Reilly, new quotes wait too: no
- *    second approval for the same store (no flood, no conflicting price lists).
+ *    second approval for the same store. Newer quotes for products in that batch supersede it;
+ *    a batch nobody answers expires after 3 days. Batch status follows its approval.
+ *  - Holds (supplier_price_holds, H&C outerwear at $114.95) keep the cost at hold time and are
+ *    proposed again once the cost changes.
  */
 import { LIVE_STORE_IDS, STORES, getStore } from "../../config/stores.js";
 import { shopifyGraphQL } from "../../lib/storeGuard.js";
@@ -44,8 +48,8 @@ const STATUS_WORDS = Object.freeze({
   denied: "denied", quoted: "quoted", unknown: "unknown",
 });
 
-/** How many products one store's batch covers per run (one Shopify query of ≤ 25 handles). */
-export const MAX_HANDLES_PER_RUN = 25;
+/** How many products one store's batch covers per run: one Shopify page of 25, with room for fuzzy extras. */
+export const MAX_HANDLES_PER_RUN = 20;
 
 /**
  * FX for EUR quotes. Spec: "EUR billed → USD at the actual card rate". The card-rate feed is
@@ -134,23 +138,58 @@ export function validateQuoteRow(r) {
 
 /* ---------------------------------------------------------------- Quote Desk run */
 
+/**
+ * Query size is bounded by Shopify's 1000-point requested-cost limit:
+ * 2 + PRODUCTS_PAGE × (1 product + 1 variantsCount + (2 + VARIANTS_PAGE + 1 pageInfo)) = 877.
+ * (The first version asked for 50 × 100 variants ≈ 5150 points and would have been refused.)
+ * Products with more variants than VARIANTS_PAGE are paged with VARIANT_PAGE_QUERY.
+ */
+export const PRODUCTS_PAGE = 25;
+export const VARIANTS_PAGE = 30;
+/** Extra variant pages allowed per run (keeps the Worker's subrequests bounded). */
+export const MAX_VARIANT_PAGES_PER_RUN = 6;
+
 export const PRODUCTS_BY_HANDLE_QUERY = `query SupplierQuoteProducts($q: String!) {
-  products(first: 50, query: $q) {
+  products(first: ${PRODUCTS_PAGE}, query: $q) {
     nodes { id handle title status productType
-      variants(first: 100) { nodes { id title price compareAtPrice } } }
+      variantsCount { count }
+      variants(first: ${VARIANTS_PAGE}) { nodes { id title sku price compareAtPrice } pageInfo { hasNextPage endCursor } } }
   }
 }`;
 
-/** One Shopify read for a list of handles (read_products). Returns Map handle → product. */
+export const VARIANT_PAGE_QUERY = `query SupplierQuoteVariants($id: ID!, $after: String) {
+  product(id: $id) { variants(first: 100, after: $after) { nodes { id title sku price compareAtPrice } pageInfo { hasNextPage endCursor } } }
+}`;
+
+/**
+ * One Shopify read for a list of handles (read_products), plus variant pages when a product has
+ * more than VARIANTS_PAGE variants. Returns {map: handle → product, full: page was full,
+ * truncated: Set of handles whose variants could not all be read this run}.
+ */
 async function readProducts(env, store, handles, fetchImpl, nowMs) {
   const q = handles.map((h) => `handle:${h}`).join(" OR ");
   const data = await shopifyGraphQL(env, store, PRODUCTS_BY_HANDLE_QUERY, { q }, { fetchImpl, nowMs });
+  const nodes = (data && data.products && data.products.nodes) || [];
   const map = new Map();
-  for (const n of (data && data.products && data.products.nodes) || []) {
+  const truncated = new Set();
+  let pagesLeft = MAX_VARIANT_PAGES_PER_RUN;
+  for (const n of nodes) {
     // Shopify's search is fuzzy; only an exact handle counts as a match.
-    if (handles.includes(n.handle)) map.set(n.handle, n);
+    if (!handles.includes(n.handle)) continue;
+    const variants = [...((n.variants && n.variants.nodes) || [])];
+    let page = n.variants && n.variants.pageInfo;
+    while (page && page.hasNextPage) {
+      if (pagesLeft-- <= 0) { truncated.add(n.handle); break; }
+      const more = await shopifyGraphQL(env, store, VARIANT_PAGE_QUERY, { id: n.id, after: page.endCursor }, { fetchImpl, nowMs });
+      const v = more && more.product && more.product.variants;
+      variants.push(...((v && v.nodes) || []));
+      page = v && v.pageInfo;
+    }
+    const count = n.variantsCount && Number(n.variantsCount.count);
+    if (Number.isFinite(count) && count > variants.length) truncated.add(n.handle);
+    map.set(n.handle, { ...n, variants: { nodes: variants } });
   }
-  return map;
+  return { map, full: nodes.length >= PRODUCTS_PAGE, truncated };
 }
 
 const num = (x) => (x == null || x === "" ? null : Number(x));
@@ -158,7 +197,86 @@ const sameId = (a, b) => !!a && !!b && (a === b || String(a).split("/").pop() ==
 
 /** H&C outerwear standing hold (Reilly 09-01): held at $114.95 under band. */
 const HC_OUTERWEAR_HOLD = 114.95;
+const HC_OUTERWEAR_WORDS = "H&C outerwear held at $114.95 under band (Reilly 09-01)";
 const OUTERWEAR_RE = /\b(outerwear|coat|overcoat|jacket|parka|peacoat|trench)\b/i;
+
+/** A batch nobody answered lapses after this long, so a store is never blocked forever. */
+export const BATCH_EXPIRE_DAYS = 3;
+
+/**
+ * Keep each store's batches in step with their approvals: approved / rejected / executed /
+ * expired are copied onto the batch; a batch still pending after BATCH_EXPIRE_DAYS expires
+ * (its approval too). Returns the id of the batch still waiting on Reilly, or null.
+ */
+export async function settleBatches(db, store, nowMs = Date.now()) {
+  const at = nowIso(nowMs);
+  const { results } = await db.prepare(
+    `SELECT b.id, b.created_at, b.approval_id, a.status AS ap FROM supplier_batches b JOIN approvals a ON a.id = b.approval_id
+      WHERE b.store = ? AND b.status = 'awaiting_approval'`
+  ).bind(store).all();
+  let waiting = null;
+  for (const b of results || []) {
+    if (b.ap === "pending") {
+      if (Date.parse(b.created_at) <= nowMs - BATCH_EXPIRE_DAYS * 86400000) {
+        await expireBatch(db, b, "expired", `not answered in ${BATCH_EXPIRE_DAYS} days`, at);
+      } else waiting = b.id;
+      continue;
+    }
+    const status = b.ap === "executed" ? "approved" : b.ap; // approved | rejected | expired | failed
+    await db.prepare(`UPDATE supplier_batches SET status = ? WHERE id = ?`).bind(status, b.id).run();
+  }
+  return waiting;
+}
+
+async function expireBatch(db, b, status, why, at) {
+  await db.prepare(`UPDATE approvals SET status = 'expired', decided_at = ?, note = ? WHERE id = ? AND status = 'pending'`)
+    .bind(at, `Expired by the brain: ${why}`, b.approval_id).run();
+  await db.prepare(`UPDATE supplier_batches SET status = ? WHERE id = ?`).bind(status, b.id).run();
+  await logEvent(db, {
+    actor: ACTOR, kind: `quotes.batch_${status}`, target: "core.approvals", at,
+    summary: `Supplier batch ${b.id} ${status} (${why}); nothing was changed in the store`, data: { batchId: b.id, approvalId: b.approval_id },
+  });
+}
+
+/**
+ * Newer quotes for products already in the waiting batch make that batch out of date: it is
+ * superseded (approval expired) and its quotes re-opened, so the next batch carries everything
+ * with the latest costs. Returns true when it superseded.
+ */
+async function supersedeIfStale(db, store, batchId, openHandles, nowMs) {
+  const { results } = await db.prepare(`SELECT DISTINCT product_handle FROM supplier_plans WHERE batch_id = ? AND kind IN ('reprice','draft')`).bind(batchId).all();
+  const overlap = (results || []).map((r) => r.product_handle).filter((h) => openHandles.has(h));
+  if (!overlap.length) return false;
+  const b = await db.prepare(`SELECT id, approval_id FROM supplier_batches WHERE id = ?`).bind(batchId).first();
+  await expireBatch(db, b, "superseded", `newer KFB quotes for ${overlap.length} of its products`, nowIso(nowMs));
+  await db.prepare(`UPDATE kfb_quotes SET processed_at = NULL, batch_id = NULL, outcome = NULL WHERE batch_id = ? AND outcome IN ('reprice','draft')`).bind(batchId).run();
+  return true;
+}
+
+/**
+ * Write a quote's cost into the Core as cost:product:<GID> (and cost:sku:<SKU>) so Catalog's
+ * Margin Guard and the P&L can use it. EUR stays EUR in the fact ({"amount","currency"}) so
+ * every reader applies its own FX rule (the P&L waits for the card rate; Catalog uses the
+ * flagged 1.17 estimate). A fact from Reilly or the vault is never overwritten or outranked.
+ */
+export async function writeQuoteCost(db, store, key, q, nowMs = Date.now()) {
+  const at = nowIso(nowMs);
+  const value = String(q.currency).toUpperCase() === "USD"
+    ? JSON.stringify({ usd: q.cost })
+    : JSON.stringify({ amount: q.cost, currency: String(q.currency).toUpperCase() });
+  const { results } = await db.prepare(`SELECT id, source FROM core_facts WHERE live = 1 AND (store = ? OR store IS NULL) AND key = ?`).bind(store, key).all();
+  if ((results || []).some((f) => /reilly|vault/i.test(f.source || ""))) return "kept";
+  const mine = (results || []).find((f) => /^kfb_quote/i.test(f.source || ""));
+  if (mine) {
+    await db.prepare(`UPDATE core_facts SET value = ?, observed_at = ?, source = ? WHERE id = ?`)
+      .bind(value, q.quoted_at || at, `kfb_quote:${q.id}`, mine.id).run();
+    return "updated";
+  }
+  await db.prepare(
+    `INSERT INTO core_facts (store, area, key, value, kind, source, observed_at, live) VALUES (?, 'supplier', ?, ?, 'observation', ?, ?, 1)`
+  ).bind(store, key, value, `kfb_quote:${q.id}`, q.quoted_at || at).run();
+  return "inserted";
+}
 
 /**
  * Run the Quote Desk for every live store. Never throws for one store's problem.
@@ -184,23 +302,25 @@ export async function runQuoteDesk(env, { nowMs = Date.now(), fetchImpl = fetch 
   return results;
 }
 
+const OPEN_SQL = `SELECT * FROM kfb_quotes WHERE store = ? AND processed_at IS NULL AND status IN ('quoted','denied') ORDER BY quoted_at, id LIMIT 500`;
+
 async function quoteDeskForStore(env, store, { nowMs, fetchImpl }) {
   const db = env.DB;
   const at = nowIso(nowMs);
   const name = STORES[store].name;
 
-  // One approval at a time per store: wait while the last batch is undecided.
-  const waiting = await db.prepare(
-    `SELECT b.id FROM supplier_batches b JOIN approvals a ON a.id = b.approval_id
-      WHERE b.store = ? AND b.status = 'awaiting_approval' AND a.status = 'pending' LIMIT 1`
-  ).bind(store).first();
+  const waiting = await settleBatches(db, store, nowMs);
 
-  const { results: open } = await db.prepare(
-    `SELECT * FROM kfb_quotes WHERE store = ? AND processed_at IS NULL AND status IN ('quoted','denied')
-      ORDER BY quoted_at, id LIMIT 500`
-  ).bind(store).all();
+  let { results: open } = await db.prepare(OPEN_SQL).bind(store).all();
   if (!open || !open.length) return { store, open: 0 };
-  if (waiting) return { store, open: open.length, waiting: `batch ${waiting.id} still waiting on Reilly` };
+  // One approval at a time per store: wait while the last batch is undecided, unless newer
+  // quotes for its products have made it out of date.
+  if (waiting) {
+    if (!(await supersedeIfStale(db, store, waiting, new Set(open.map((q) => q.product_handle)), nowMs))) {
+      return { store, open: open.length, waiting: `batch ${waiting} still waiting on Reilly` };
+    }
+    ({ results: open } = await db.prepare(OPEN_SQL).bind(store).all());
+  }
 
   // Latest quote per (handle, variant) wins; older ones are superseded.
   const latest = new Map();
@@ -217,12 +337,20 @@ async function quoteDeskForStore(env, store, { nowMs, fetchImpl }) {
   }
   const handles = [...byHandle.keys()].slice(0, MAX_HANDLES_PER_RUN);
 
-  const products = await readProducts(env, store, handles, fetchImpl, nowMs);
+  const read = await readProducts(env, store, handles, fetchImpl, nowMs);
   const readAt = nowIso(nowMs);
   const { results: holdRows } = await db.prepare(`SELECT * FROM supplier_price_holds WHERE store = ?`).bind(store).all();
   const holds = new Map((holdRows || []).map((h) => [h.product_handle, h]));
 
-  const plans = handles.map((h) => planProduct(store, h, byHandle.get(h), products.get(h), holds.get(h)));
+  // A full page with a handle missing might just be crowded out: leave it open for next run.
+  // A product whose variants couldn't all be read is not priced from part of them.
+  const planned = handles.filter((h) => read.map.has(h) || !read.full);
+  const plans = planned.map((h) => {
+    const p = planProduct(store, h, byHandle.get(h), read.map.get(h), holds.get(h));
+    return read.truncated.has(h) && ["reprice", "no_change", "held"].includes(p.kind)
+      ? { ...p, kind: "cannot_price", reason: "more variants than could be read this run: not priced from part of them", seedHold: null }
+      : p;
+  });
 
   const reprices = plans.filter((p) => p.kind === "reprice");
   const drafts = plans.filter((p) => p.kind === "draft");
@@ -235,6 +363,7 @@ async function quoteDeskForStore(env, store, { nowMs, fetchImpl }) {
     reprices.length + drafts.length ? "awaiting_approval" : "nothing_to_approve").run();
   const batchId = batch.meta.last_row_id;
 
+  let costFacts = 0;
   for (const p of plans) {
     await db.prepare(
       `INSERT INTO supplier_plans (batch_id, store, kind, quote_id, product_id, product_handle, title, product_type, shop_status,
@@ -246,6 +375,21 @@ async function quoteDeskForStore(env, store, { nowMs, fetchImpl }) {
       p.waiver_price, JSON.stringify(p.variants || []), p.reason, JSON.stringify(p.notes || []), at).run();
     for (const q of byHandle.get(p.product_handle)) {
       await db.prepare(`UPDATE kfb_quotes SET processed_at = ?, batch_id = ?, outcome = ? WHERE id = ?`).bind(at, batchId, p.kind, q.id).run();
+    }
+    if (p.seedHold) {
+      // Remember the cost at hold time, so a later cost change re-opens the product.
+      await db.prepare(`INSERT INTO supplier_price_holds (store, product_handle, held_price, cost_at_hold, words, at) VALUES (?,?,?,?,?,?)
+        ON CONFLICT(store, product_handle) DO UPDATE SET cost_at_hold = excluded.cost_at_hold WHERE supplier_price_holds.cost_at_hold IS NULL`)
+        .bind(store, p.product_handle, p.seedHold.held_price, p.seedHold.cost_at_hold, p.seedHold.words, at).run();
+    }
+    // Every matched quote's cost goes to the Core for Margin Guard / P&L.
+    if (p.product_id) {
+      for (const q of byHandle.get(p.product_handle)) {
+        if (q.status !== "quoted" || !(q.cost > 0)) continue;
+        if (!q.variant_id) { await writeQuoteCost(db, store, `cost:product:${p.product_id}`, q, nowMs); costFacts++; }
+        const skus = (p.variants || []).filter((x) => x.sku && (q.variant_id ? sameId(q.variant_id, x.id) : true)).map((x) => x.sku);
+        for (const sku of [...new Set(skus)]) { await writeQuoteCost(db, store, `cost:sku:${sku}`, q, nowMs); costFacts++; }
+      }
     }
   }
   for (const id of superseded) {
@@ -266,11 +410,11 @@ async function quoteDeskForStore(env, store, { nowMs, fetchImpl }) {
   const counts = plans.reduce((m, p) => ((m[p.kind] = (m[p.kind] || 0) + 1), m), {});
   await logEvent(db, {
     actor: ACTOR, kind: "quotes.planned", store, target: approvalId ? "core.approvals" : "sys.shopify", at,
-    summary: `${name}: ${handles.length} quoted product${handles.length === 1 ? "" : "s"} checked against Shopify prices → ` +
+    summary: `${name}: ${plans.length} quoted product${plans.length === 1 ? "" : "s"} checked against Shopify prices → ` +
       `${reprices.length} reprice${reprices.length === 1 ? "" : "s"} proposed` + (waivers.length ? ` (${waivers.length} held by the $144.95 ceiling)` : "") +
       (counts.no_change ? `, ${counts.no_change} already right` : "") + (counts.held ? `, ${counts.held} held` : "") +
       (counts.unmatched ? `, ${counts.unmatched} not found in the store` : "") + " (shadow: nothing changed)",
-    data: { batchId, approvalId, counts, fx: FX },
+    data: { batchId, approvalId, counts, fx: FX, costFacts },
   });
   if (drafts.length || counts.already_off) {
     await logEvent(db, {
@@ -280,7 +424,7 @@ async function quoteDeskForStore(env, store, { nowMs, fetchImpl }) {
       data: { batchId, approvalId, handles: drafts.map((d) => d.product_handle) },
     });
   }
-  return { store, open: open.length, batchId, approvalId, counts, remaining: byHandle.size - handles.length };
+  return { store, open: open.length, batchId, approvalId, counts, remaining: byHandle.size - planned.length };
 }
 
 /**
@@ -320,7 +464,7 @@ export function planProduct(store, handle, quotes, product, hold = null, fx = FX
     if (usd == null) return { ...base, kind: "cannot_price", reason: `cost ${q.cost} ${q.currency} can't be converted` };
     const price = num(v.price); const cmp = num(v.compareAtPrice);
     const p = planVariantPrice(store, { costUsd: usd, price, compareAt: cmp });
-    rows.push({ id: v.id, title: v.title, cost_usd: round2(usd), old_price: price, new_price: p.newPrice, old_compare_at: cmp,
+    rows.push({ id: v.id, title: v.title, sku: v.sku || null, cost_usd: round2(usd), old_price: price, new_price: p.newPrice, old_compare_at: cmp,
       new_compare_at: p.newCompareAt, tier: p.tier, change: p.change, cogs_old: round4(p.cogsOld), cogs_new: round4(p.cogsNew),
       waiver_price: p.waiverPrice, rule: p.rule, notes: p.notes });
   }
@@ -340,14 +484,20 @@ export function planProduct(store, handle, quotes, product, hold = null, fx = FX
 
   if (!rows.some((r) => r.change)) return { ...base, kind: "no_change" };
 
-  // Standing holds: never re-proposed unless the cost changed.
-  if (hold && Math.round(hold.held_price * 100) === Math.round(first.old_price * 100) &&
-      (hold.cost_at_hold == null || Math.abs(hold.cost_at_hold - first.cost_usd) < 0.01)) {
-    return { ...base, kind: "held", reason: `held at ${money(hold.held_price)}${hold.words ? ` (Reilly: "${hold.words}")` : ""}; cost unchanged` };
-  }
-  if (!hold && store === "hc" && Math.round(first.old_price * 100) === Math.round(HC_OUTERWEAR_HOLD * 100) &&
-      OUTERWEAR_RE.test(`${product.productType || ""} ${product.title || ""}`)) {
-    return { ...base, kind: "held", reason: "H&C outerwear is held at $114.95 under band (Reilly 09-01): not re-proposed. Add it to supplier_price_holds with its cost so a cost change re-opens it." };
+  // Standing holds: never re-proposed unless the cost changed since the hold.
+  const atPrice = (x) => Math.round(Number(x) * 100) === Math.round(first.old_price * 100);
+  if (hold && atPrice(hold.held_price)) {
+    if (hold.cost_at_hold == null) {
+      return { ...base, kind: "held", seedHold: { held_price: hold.held_price, cost_at_hold: first.cost_usd, words: hold.words },
+        reason: `held at ${money(hold.held_price)}${hold.words ? ` ("${hold.words}")` : ""}; cost ${money(first.cost_usd)} recorded so a change re-opens it` };
+    }
+    if (Math.abs(hold.cost_at_hold - first.cost_usd) < 0.01) {
+      return { ...base, kind: "held", reason: `held at ${money(hold.held_price)}${hold.words ? ` ("${hold.words}")` : ""}; cost unchanged` };
+    }
+    base.notes.push(`was held at ${money(hold.held_price)}; cost moved ${money(hold.cost_at_hold)} → ${money(first.cost_usd)}, so it is proposed again`);
+  } else if (!hold && store === "hc" && atPrice(HC_OUTERWEAR_HOLD) && OUTERWEAR_RE.test(`${product.productType || ""} ${product.title || ""}`)) {
+    return { ...base, kind: "held", seedHold: { held_price: HC_OUTERWEAR_HOLD, cost_at_hold: first.cost_usd, words: HC_OUTERWEAR_WORDS },
+      reason: `${HC_OUTERWEAR_WORDS}: not re-proposed while the cost stays ${money(first.cost_usd)}` };
   }
   return { ...base, kind: "reprice" };
 }
@@ -372,32 +522,35 @@ export function batchTitle(r, d) {
   return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
-/** Old → new list for the approval (the full list is on the Supplier page). */
-function lines(plans, max = 12) {
-  const out = plans.slice(0, max).map((p) => p.kind === "draft"
-    ? `${p.title || p.product_handle}: draft (${p.reason})`
-    : `${p.title || p.product_handle}: ${money(p.old_price)} → ${money(p.new_price)}` +
-      (p.old_compare_at !== p.new_compare_at ? `, compare-at ${money(p.old_compare_at)} → ${money(p.new_compare_at)}` : "") +
-      (p.waiver_price != null ? ` (band needs ${money(p.waiver_price)})` : ""));
-  if (plans.length > max) out.push(`+${plans.length - max} more on the Supplier page`);
-  return out.join("\n");
+/** One product's lines for the approval: every changed variant, old → new (nothing summarised away). */
+export function planLines(p) {
+  const name = p.title || p.product_handle;
+  if (p.kind === "draft") return [`${name}: draft it (${p.reason})`];
+  const one = (v) => `${money(v.old_price)} → ${money(v.new_price)}, compare-at ${money(v.old_compare_at)} → ${money(v.new_compare_at)}` +
+    (v.waiver_price != null ? ` (band needs ${money(v.waiver_price)})` : "");
+  const changed = (p.variants || []).filter((v) => v.change);
+  if (!changed.length) return [`${name}: ${one(p)}`];
+  return [`${name}:`, ...changed.map((v) => `  ${v.title || v.id}: ${one(v)}`)];
 }
 
-const APPLY_NOTE = "Nothing changes until you approve. Catalog applies it with an R2 backup, Store Guard, and checks every variant against Shopify after.";
+const lines = (plans) => plans.flatMap(planLines).join("\n");
+
+/** Said plainly: no worker applies a supplier batch (there is no Shopify write scope). */
+export const APPLY_NOTE = "Approving records your yes; nothing is written to Shopify. Change the prices / draft the products yourself.";
 
 export function approvalOptions(reprices, drafts, waivers) {
   const opts = [];
   const all = [...reprices, ...drafts];
   opts.push({ id: "approve_all", label: batchTitle(reprices.length, drafts.length), detail: `${lines(all)}\n\n${APPLY_NOTE}` });
   if (reprices.length && drafts.length) {
-    opts.push({ id: "reprice_only", label: `Reprice ${reprices.length} only`, detail: lines(reprices) });
-    opts.push({ id: "drafts_only", label: `Draft ${drafts.length} only`, detail: lines(drafts) });
+    opts.push({ id: "reprice_only", label: `Reprice ${reprices.length} only`, detail: `${lines(reprices)}\n\n${APPLY_NOTE}` });
+    opts.push({ id: "drafts_only", label: `Draft ${drafts.length} only`, detail: `${lines(drafts)}\n\n${APPLY_NOTE}` });
   }
   if (waivers.length) {
     opts.push({
       id: "approve_all_waive_ceiling",
       label: `Approve all, lifting the $144.95 ceiling for ${waivers.length}`,
-      detail: `${waivers.map((p) => `${p.title || p.product_handle}: ${money(p.old_price)} → ${money(p.waiver_price)} (above the ceiling, reaches band)`).slice(0, 12).join("\n")}\n\nOnly on your word: the brain never waives the ceiling itself.`,
+      detail: `${waivers.map((p) => `${p.title || p.product_handle}: ${money(p.old_price)} → ${money(p.waiver_price)} (above the ceiling, reaches band)`).join("\n")}\n\nOnly on your word: the brain never waives the ceiling itself. ${APPLY_NOTE}`,
     });
   }
   return opts.slice(0, 4);
