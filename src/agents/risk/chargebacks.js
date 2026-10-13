@@ -222,17 +222,21 @@ function knownPii(o) {
  * Customer emails about this order, from the CS department's cs_tickets table when it exists
  * (optional input). Only the date, subject and a clipped, redacted body are taken: never the
  * sender's address or name, CS's drafts, triage or order context.
+ *
+ * Matched ONLY on the order CS verified (cs_tickets.order_id, set by Order Context when the
+ * sender's email matches the order) and never on a ticket CS marked order_mismatch. The
+ * number a customer typed (order_ref) proves nothing: a stranger writing "#1053" must not
+ * land in #1053's chargeback evidence, nor reach Claude.
  */
 async function customerMessages(db, storeId, d, o) {
-  if (!(await tableExists(db, "cs_tickets"))) return [];
-  const ref = d.order_name ? String(d.order_name).replace(/[^0-9]/g, "") : null;
+  if (!d.order_id || !(await tableExists(db, "cs_tickets"))) return [];
   try {
     const { results } = await db.prepare(
       `SELECT received_at, subject, body FROM cs_tickets
-        WHERE (store = ? OR store IS NULL)
-          AND ((? IS NOT NULL AND order_id = ?) OR (? IS NOT NULL AND order_name = ?) OR (? IS NOT NULL AND order_ref = ?))
+        WHERE order_id = ? AND COALESCE(order_mismatch, 0) = 0
+          AND (order_store = ? OR (order_store IS NULL AND store = ?))
         ORDER BY received_at LIMIT 10`
-    ).bind(storeId, d.order_id, d.order_id, d.order_name, d.order_name, ref || null, ref || null).all();
+    ).bind(d.order_id, storeId, storeId).all();
     const known = knownPii(o);
     return (results || []).map((r) => ({
       received_at: r.received_at || null,

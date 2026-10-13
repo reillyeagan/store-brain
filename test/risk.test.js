@@ -449,6 +449,30 @@ test("fix: customer PII from a real cs_tickets row never reaches Claude; only da
   assert.ok(!JSON.parse((await DB.prepare(`SELECT missing FROM risk_evidence_packs`).first()).missing).some((m) => /Customer emails/.test(m)));
 });
 
+test("fix: a stranger's ticket that only TYPED the order number (order_mismatch = 1) never joins the evidence pack or reaches Claude", async () => {
+  const DB = makeD1();
+  const ins = (gmailId, orderId) => DB.prepare(
+    `INSERT INTO cs_tickets (opened_at, updated_at, slot, gmail_id, received_at, store, from_email, from_name, subject, body,
+       order_ref, order_id, order_name, order_store, order_mismatch)
+     VALUES (?, ?, 'google', ?, '2026-10-02T15:00:00Z', 'hc', 'stranger@example.net', 'Sam Stranger', 'Order 1053',
+       'this is not the cardholder, I never got order 1053', '1053', ?, '#1053', 'hc', 1)`
+  ).bind(iso(NOW), iso(NOW), gmailId, orderId).run();
+  await ins("probe-1", null);                          // typed number only, no verified order
+  await ins("probe-2", "gid://shopify/Order/1053");     // even if an id were set, mismatch wins
+  const net = fakeNet({
+    shopify: only("hc", () => ({ disputes: { nodes: [disputeNode()] } }), emptyFor),
+    claude: "Draft. [ADD: proof of delivery]",
+  });
+  await runChargebacks({ DB, ...CREDS, ANTHROPIC_API_KEY: KEY }, { nowMs: NOW, fetchImpl: net.fetchImpl });
+  const facts = JSON.parse((await DB.prepare(`SELECT facts FROM risk_evidence_packs`).first()).facts);
+  assert.deepEqual(facts.customer_messages, []);
+  const prompt = JSON.stringify(net.calls.filter((c) => c.kind === "claude")[0].body);
+  assert.ok(!prompt.includes("not the cardholder"));
+  assert.ok(!prompt.includes("stranger"));
+  // With no verified email, the pack still asks Reilly for the customer emails.
+  assert.ok(JSON.parse((await DB.prepare(`SELECT missing FROM risk_evidence_packs`).first()).missing).some((m) => /Customer emails/.test(m)));
+});
+
 test("fix: redactPii removes emails, phones, street addresses and known names", () => {
   const s = redactPii("Jo Smith, 221 Baker Street, call +1 415-555-0100, jo@x.co, Springfield", ["Jo Smith", "Springfield"]);
   assert.ok(!/Smith|Baker|415|jo@x\.co|Springfield/.test(s), s);
