@@ -100,7 +100,7 @@ export async function csState(env, { nowMs = Date.now() } = {}) {
   const statusCounts = Object.fromEntries((await all(`SELECT status, COUNT(*) AS n FROM cs_tickets GROUP BY status`)).map((r) => [r.status, r.n]));
 
   const drafts = (await all(
-    `SELECT id, store, order_store, order_name, category, subject, from_name, from_email, draft_status, draft_body, draft_note, draft_at, gmail_draft_id
+    `SELECT id, store, order_store, order_name, category, subject, from_name, from_email, draft_status, draft_body, draft_note, draft_at, gmail_draft_id, gmail_draft_state, gmail_push, gmail_push_note
        FROM cs_tickets WHERE draft_at IS NOT NULL AND status NOT IN ('superseded','ignored') ORDER BY draft_at DESC, id DESC LIMIT 20`
   )).map((t) => ({ ...t, store: storeName(t.order_store || t.store) }));
 
@@ -121,7 +121,7 @@ export async function csState(env, { nowMs = Date.now() } = {}) {
   const staleGmailDrafts = await all(
     `SELECT s.id AS old_ticket, s.gmail_draft_id, n.id AS new_ticket, s.store, s.subject FROM cs_tickets s
        JOIN cs_tickets n ON n.slot = s.slot AND n.thread_id = s.thread_id AND n.id > s.id AND n.status <> 'superseded'
-      WHERE s.status = 'superseded' AND s.gmail_draft_id IS NOT NULL ORDER BY s.id DESC LIMIT 20`
+      WHERE s.status = 'superseded' AND s.gmail_draft_id IS NOT NULL AND s.gmail_draft_state IS NULL ORDER BY s.id DESC LIMIT 20`
   );
   const kfbAsks = await all(`SELECT id, created_at, store, ticket_id, order_name, kind, detail, shipped, status FROM cs_kfb_asks WHERE status = 'open' ORDER BY id DESC LIMIT 20`);
   const sizeComplaints = await all(`SELECT id, store, order_id, product_id, size_ordered, size_that_fits, said, at FROM size_complaints WHERE source LIKE 'gmail:%' ORDER BY id DESC LIMIT 10`);

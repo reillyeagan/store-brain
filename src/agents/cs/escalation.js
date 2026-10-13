@@ -15,6 +15,7 @@ import { nowIso } from "../../lib/time.js";
 import { CAPS, storeName } from "./config.js";
 import { routeTicket } from "./routing.js";
 import { safeJson, clip } from "./util.js";
+import { otherLiveDraft } from "./gmailDrafts.js";
 
 const ACTOR = "cs.escalation";
 
@@ -30,13 +31,11 @@ export async function threadWaitingOnReilly(db, t) {
 
 /**
  * A reply draft already sitting in Gmail from an earlier email in this conversation (the customer
- * wrote again before Reilly sent it). A second draft is never made; Reilly is told to delete it.
+ * wrote again before Reilly sent it). Checked against Gmail (gmailDrafts.js): a draft Reilly sent
+ * or deleted is not stale. A second draft is never made; Reilly is told to delete the stale one.
  */
-export async function staleGmailDraft(db, t) {
-  if (!t.thread_id) return null;
-  return db.prepare(
-    `SELECT id, gmail_draft_id FROM cs_tickets WHERE slot = ? AND thread_id = ? AND id <> ? AND gmail_draft_id IS NOT NULL AND status = 'superseded' ORDER BY id DESC LIMIT 1`
-  ).bind(t.slot, t.thread_id, t.id).first();
+export async function staleGmailDraft(env, t, opts = {}) {
+  return otherLiveDraft(env, t, opts);
 }
 
 export const STALE_DRAFT_NOTE = "stale reply draft in Gmail from earlier in this conversation — delete it, then reply";
@@ -64,7 +63,7 @@ function detailLine(t, reason, stale) {
   return clip(bits.filter(Boolean).join(" "), 900);
 }
 
-export async function escalateTickets(env, { nowMs = Date.now() } = {}) {
+export async function escalateTickets(env, { nowMs = Date.now(), fetchImpl = fetch, budget = null } = {}) {
   const db = env.DB;
   const { results } = await db.prepare(
     `SELECT * FROM cs_tickets WHERE escalated_at IS NULL AND context_at IS NOT NULL
@@ -77,7 +76,7 @@ export async function escalateTickets(env, { nowMs = Date.now() } = {}) {
     // A conversation already with Reilly stays with Reilly: a follow-up joins his flag
     // instead of getting a drafted reply that talks past him.
     const waitingOn = await threadWaitingOnReilly(db, t);
-    const stale = await staleGmailDraft(db, t);
+    const stale = await staleGmailDraft(env, t, { fetchImpl, nowMs, budget });
     const reason = escalationReason(t) || (waitingOn ? "conversation already waiting on Reilly" : null) || (stale ? STALE_DRAFT_NOTE : null);
     if (!reason) continue;
     const at = nowIso(nowMs);

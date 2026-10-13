@@ -20,6 +20,7 @@ import { nowIso } from "../../lib/time.js";
 import { CAPS, DELIVERY_FACTS, expectedSlotAccount, storeName } from "./config.js";
 import { routeTicket, checkDraft } from "./routing.js";
 import { threadWaitingOnReilly, staleGmailDraft } from "./escalation.js";
+import { otherLiveDraft } from "./gmailDrafts.js";
 import { createReplyDraft, getDraft } from "./gmail.js";
 import { safeJson, clip, logOnce } from "./util.js";
 
@@ -98,7 +99,7 @@ export async function writeReplies(env, { nowMs = Date.now(), fetchImpl = fetch,
   // first, so a busy run can't starve them. Never for a superseded ticket.
   if (draftsLive(env)) {
     const { results: pending } = await db.prepare(
-      `SELECT * FROM cs_tickets WHERE status = 'drafted' AND draft_status = 'stored' AND gmail_draft_id IS NULL AND draft_body IS NOT NULL ORDER BY id LIMIT ?`
+      `SELECT * FROM cs_tickets WHERE status = 'drafted' AND draft_status = 'stored' AND gmail_draft_id IS NULL AND gmail_push IS NULL AND draft_body IS NOT NULL ORDER BY id LIMIT ?`
     ).bind(CAPS.draftsPerTick).all();
     for (const t of pending || []) {
       if (budget.left < 3) break;
@@ -118,7 +119,7 @@ export async function writeReplies(env, { nowMs = Date.now(), fetchImpl = fetch,
     const ctx = safeJson(t.context, null);
     if (routeTicket(t, triage, ctx).action !== "draft") continue; // cs.escalation takes it
     if (await threadWaitingOnReilly(db, t)) continue; // the conversation is with Reilly; escalation joins it
-    if (await staleGmailDraft(db, t)) continue; // an older draft is still in Gmail; escalation tells Reilly to delete it
+    if (await staleGmailDraft(env, t, { fetchImpl, nowMs, budget })) continue; // an older draft is still in Gmail; escalation tells Reilly to delete it
     if (!budget.take(1)) break;
     const at = nowIso(nowMs);
     const store = storeName(t.order_store || t.store) || "our store";
@@ -178,8 +179,14 @@ export async function pushGmailDraft(env, t, body, { nowMs, fetchImpl, budget })
     return { ok: false, error: "inbox account mismatch" };
   }
   // Never a second draft in one conversation.
-  const other = t.thread_id ? await db.prepare(`SELECT id FROM cs_tickets WHERE slot = ? AND thread_id = ? AND id <> ? AND gmail_draft_id IS NOT NULL LIMIT 1`).bind(t.slot, t.thread_id, t.id).first() : null;
-  if (other) return { ok: false, error: "another draft for this conversation is already in Gmail" };
+  // Only a draft that still exists counts (Gmail is asked); one Reilly sent or deleted doesn't.
+  const other = await otherLiveDraft(env, t, { fetchImpl, nowMs, budget });
+  if (other) {
+    // Refused for good: recorded on the ticket and left out of the retry queue.
+    const why = `another reply draft for this conversation (ticket ${other.id}) is still in Gmail`;
+    await db.prepare(`UPDATE cs_tickets SET gmail_push = 'refused', gmail_push_note = ?, updated_at = ? WHERE id = ?`).bind(why, at, t.id).run();
+    return { ok: false, error: why };
+  }
   if (!budget.take(3)) return { ok: false, error: "run allowance used; retried next run" };
   try {
     const token = await getGoogleAccessToken(env, { fetchImpl, nowMs, slot: t.slot });
