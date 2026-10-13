@@ -8,9 +8,11 @@
  *   guy_fee   Guy's fee: rate x ads, only on days on/after his start date (config in stores.js)
  *   fees      Shopify Payments fees on that day's CHARGE balance transactions; null if the
  *             payouts feed isn't wired (null = unknown, never 0)
- *   cogs      ESTIMATE until KFB bills are wired: per-product cost from the Core when every
- *             line of an order has one, otherwise the store's measured COGS rate from the Core,
- *             otherwise 33% flagged loudly as ASSUMED. Never presented as actual.
+ *   cogs      per order: the ACTUAL KFB cost when the COGS Matcher has matched the order's bill
+ *             lines at the exact card rate (cogs_matches, status 'matched'); otherwise an
+ *             ESTIMATE: per-product cost from the Core when every line of an order has one,
+ *             otherwise the store's measured COGS rate from the Core, otherwise 33% flagged
+ *             loudly as ASSUMED. cogs = cogs_est + cogs_actual; cogs_source says which.
  *   profit    revenue - refunds - cogs - ads - guy_fee - fees. Null if any of those is null;
  *             `profit_partial` then shows the same sum without the missing items, and
  *             notes.missing names them, so an unwired cost can never make a day look better.
@@ -191,6 +193,20 @@ export async function productCosts(db, storeId) {
   return map;
 }
 
+/**
+ * Actual KFB cost per order for one store-day, from the COGS Matcher (src/agents/pnl/cogs.js):
+ * Map order_id → USD. Only 'matched' rows (converted at the exact card rate); an order still
+ * waiting on its FX amount stays an estimate. Empty if the table isn't there yet.
+ */
+export async function actualCosts(db, storeId, day) {
+  const map = new Map();
+  const res = await db.prepare(
+    `SELECT order_id, cost_usd FROM cogs_matches WHERE store = ? AND local_day = ? AND status = 'matched' AND cost_usd > 0`
+  ).bind(storeId, day).all().catch(() => null);
+  for (const r of (res && res.results) || []) map.set(r.order_id, Number(r.cost_usd));
+  return map;
+}
+
 /* ---------------- freshness of each input ---------------- */
 
 /**
@@ -336,11 +352,13 @@ export async function computeStoreDay(db, storeId, day, { nowMs = Date.now(), fe
     fees = r2((txns || []).filter((t) => t.date && localDay(t.date, tz) === day).reduce((s, t) => s + (Number(t.fee) || 0), 0));
   } else why.fees = notUsable("payouts");
 
-  // --- COGS (estimate) ---
+  // --- COGS: actual where the COGS Matcher has a real KFB cost, estimate for the rest ---
   const rate = await cogsRate(db, storeId);
   const costs = await productCosts(db, storeId);
-  let cogsEst = 0, perProduct = 0, byRate = 0;
+  const actual = await actualCosts(db, storeId, day);
+  let cogsEst = 0, perProduct = 0, byRate = 0, actualSum = 0, byActual = 0;
   for (const o of counted) {
+    if (actual.has(o.order_id)) { actualSum += actual.get(o.order_id); byActual++; continue; }
     let lineCost = null;
     if (costs.size) {
       const { results: lines } = await db.prepare(`SELECT sku, product_id, quantity FROM order_lines WHERE store = ? AND order_id = ?`).bind(storeId, o.order_id).all();
@@ -361,13 +379,15 @@ export async function computeStoreDay(db, storeId, day, { nowMs = Date.now(), fe
   }
   cogsEst = revenue != null ? r2(cogsEst) : null;
   if (cogsEst == null) why.cogs = "revenue unknown";
-  const cogsActual = null; // KFB bills are not wired yet (COGS Matcher)
+  // Actual KFB costs (COGS Matcher), only for orders counted in revenue; null when none matched.
+  const cogsActual = revenue != null && byActual ? r2(actualSum) : null;
   const cogs = cogsEst == null ? null : r2(cogsEst + (cogsActual || 0));
-  const cogsSource = cogs == null || orderCount === 0 ? null : cogsActual ? (cogsEst ? "mixed" : "actual") : "estimate";
+  const estOrders = perProduct + byRate;
+  const cogsSource = cogs == null || orderCount === 0 ? null : byActual ? (estOrders ? "mixed" : "actual") : "estimate";
   const cogsShare = cogs ? r4(cogsEst / cogs) : null;
   const cogsBasis = {
     rate: rate.rate, rate_source: rate.source, rate_assumed: rate.assumed, rate_stale: !!rate.stale,
-    orders_by_product_cost: perProduct, orders_by_rate: byRate,
+    orders_by_product_cost: perProduct, orders_by_rate: byRate, orders_actual: byActual,
   };
   if (rate.assumed && byRate > 0) notes.cogs_assumed = `COGS uses an ASSUMED ${Math.round(FALLBACK_COGS_RATE * 100)}% rate for ${byRate} order${byRate === 1 ? "" : "s"}`;
 
@@ -407,7 +427,8 @@ export async function computeStoreDay(db, storeId, day, { nowMs = Date.now(), fe
     freshness: fresh, notes,
     sources: {
       revenue: "orders (store-day of order time, original totals)", refunds: "refunds (processed day)",
-      ads: "ad_spend_days", fees: "balance_txns CHARGE fees", cogs: "estimate (KFB bills not wired)",
+      ads: "ad_spend_days", fees: "balance_txns CHARGE fees",
+      cogs: byActual ? `actual KFB cost for ${byActual} order${byActual === 1 ? "" : "s"} (cogs_matches), estimate for ${estOrders}` : "estimate (no KFB bill matched yet)",
       order_coverage: cov.covered_from,
       guy: STORES[storeId] ? { rate: STORES[storeId].guyFeeRate || 0, start: STORES[storeId].guyStart || null } : null,
     },
