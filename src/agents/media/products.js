@@ -55,6 +55,8 @@ export function parseProductRows(rows) {
  * Pure: decide a product's flag. `real` = { units, revenue } from Shopify (all channels) or null.
  * Returns null (no flag) or { kind, severity, why }.
  */
+export const UNCAPPED_LABEL = "Google's own ROAS (cap unknown)";
+
 export function judgeProduct(p, { breakeven, factor, minUsd, real: sold, beText = null }) {
   if (p.cost < minUsd) return null;
   if (p.conversions <= 0) {
@@ -67,8 +69,10 @@ export function judgeProduct(p, { breakeven, factor, minUsd, real: sold, beText 
   if (adj >= breakeven) return null;
   const realRoas = sold && sold.revenue != null ? sold.revenue / p.cost : null;
   const certain = realRoas != null && realRoas < breakeven;
-  return { kind: "losing", severity: certain ? "bad" : "warn", roas: r2(adj), real_roas: r2(realRoas),
-    why: `${CAP_LABEL} ${ratio(r2(adj))} vs ${beText || `break-even ${ratio(breakeven)}`} on ${money(p.cost)}${certain ? `; even all its Shopify sales (${money(r2(sold.revenue))}) don't cover it` : ""}` };
+  // Label what the number really is: capped only when the cap could be computed.
+  const basis = factor == null ? UNCAPPED_LABEL : CAP_LABEL;
+  return { kind: "losing", severity: certain ? "bad" : "warn", roas: r2(adj), roas_basis: basis, real_roas: r2(realRoas),
+    why: `${basis} ${ratio(r2(adj))} vs ${beText || `break-even ${ratio(breakeven)}`} on ${money(p.cost)}${certain ? `; even all its Shopify sales (${money(r2(sold.revenue))}) don't cover it` : ""}` };
 }
 
 /** Units and revenue per Shopify product id in [from, to] (store days), from order_lines. */
@@ -136,7 +140,7 @@ export async function runProducts(env, { storeId, session, nowMs = Date.now() })
     const summary = `${storeName(storeId)}: "${p.title || p.item_id}" ${j.kind === "burning" ? "spending without selling" : "losing money even when it sells"}: ${j.why}`;
     const isNew = await upsertFinding(db, { store: storeId, agent: AGENT, key, severity: j.severity, summary, at,
       data: { item_id: p.item_id, title: p.title, kind: j.kind, cost: p.cost, conversions: p.conversions, conv_value: p.conv_value,
-        roas: j.roas ?? null, roas_basis: CAP_LABEL, real_roas: j.real_roas ?? null, shopify: sold, breakeven: be.breakeven, breakeven_estimated: be.estimated, window: { from, to } } });
+        roas: j.roas ?? null, roas_basis: j.roas_basis ?? null, real_roas: j.real_roas ?? null, shopify: sold, breakeven: be.breakeven, breakeven_estimated: be.estimated, window: { from, to } } });
     if (isNew && events < MAX_FLAG_EVENTS) {
       events += 1;
       await logEvent(db, { actor: AGENT, kind: "media.flag", store: storeId, target: "sys.ads", summary, data: { item_id: p.item_id, kind: j.kind }, at });
