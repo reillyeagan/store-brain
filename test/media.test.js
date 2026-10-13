@@ -534,3 +534,13 @@ test("media: writes are batched when D1 offers batch, capped at 500 rows, and a 
   await runBatched(DB, [fake, fake, fake]);
   assert.equal(ran, 3);
 });
+
+test("media: a product's loss is labelled 'capped' only when the revenue cap is known", () => {
+  const p = { item_id: "shopify_US_1_2", title: "Coat", cost: 40, conversions: 1, conv_value: 40 };
+  const uncapped = judgeProduct(p, { breakeven: 2, factor: null, minUsd: 20, real: null });
+  assert.equal(uncapped.roas_basis, "Google's own ROAS (cap unknown)");
+  assert.match(uncapped.why, /^Google's own ROAS \(cap unknown\) 1\.00x/);
+  assert.doesNotMatch(uncapped.why, /capped at total store revenue/);
+  const capped = judgeProduct(p, { breakeven: 2, factor: 1, minUsd: 20, real: null });
+  assert.equal(capped.roas_basis, "Google ROAS, capped at total store revenue");
+});
