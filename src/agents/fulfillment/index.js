@@ -1,7 +1,7 @@
 /**
  * Fulfillment department: cron entry point and page data.
  *
- *   runFulfillment(env, {nowMs, fetchImpl}) — 15-minute cron. Never throws; throttled hourly.
+ *   runFulfillment(env, {nowMs, fetchImpl}) — department rotation (about hourly). Never throws; throttled hourly.
  *   fulfillmentState(env, {nowMs})          — JSON for the Fulfillment page.
  *
  * Built here: ful.order_watch (Order-to-Supplier Watcher), shadow.

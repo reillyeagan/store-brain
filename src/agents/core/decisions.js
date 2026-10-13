@@ -65,7 +65,7 @@ export const SEED_DECISIONS = Object.freeze([
     words: "idk if the sizing between US and chinese sizes seems accurate then its fine, but if the customer orders a M and the chinese M looks more like a S, we might want to send out a chinese L" },
   { at: "2026-10-11T12:00:00Z", topic: "sup.size_measurements", scope: "all", source: "docs/specs/supplier.md",
     words: "check everything and make logical decisions" },
-  { at: "2026-10-11T12:00:00Z", topic: "sup.store_listings", scope: "all", source: "docs/specs/supplier.md",
+  { at: "2026-10-11T12:00:00Z", topic: "sup.dont_fix_store", scope: "all", source: "docs/specs/supplier.md",
     words: "dont fix the store" },
   { at: "2026-10-11T12:00:00Z", topic: "sup.returns", scope: "all", source: "docs/specs/supplier.md",
     words: "i never return things to KFB." },
@@ -107,19 +107,56 @@ export async function recordDecision(db, { topic, words, scope = "all", at = nul
 }
 
 /**
- * Insert the seed list. Idempotent: a seed quote already present on its topic (current or
- * historical) is skipped, and a seed never supersedes a newer decision Reilly made since.
+ * One topic name per quote. The Supplier seed (src/agents/supplier/decisions.js) used
+ * "supplier.*" names for some of the same quotes; those map onto the canonical names here so
+ * a quote is never recorded twice under two topics, and rows already stored under an old name
+ * still count.
  */
+export const TOPIC_ALIASES = Object.freeze({
+  "supplier.approve_price_rewrites": "pricing.approval",
+  "supplier.dont_fix_store": "sup.dont_fix_store",
+  "sup.store_listings": "sup.dont_fix_store",
+});
+export function canonicalTopic(topic) {
+  const t = String(topic || "");
+  if (TOPIC_ALIASES[t]) return TOPIC_ALIASES[t];
+  return t.startsWith("supplier.") ? `sup.${t.slice(9)}` : t;
+}
+/** Every stored name a canonical topic may have been written under. */
+export function topicNames(topic) {
+  const c = canonicalTopic(topic);
+  const names = new Set([c]);
+  if (c.startsWith("sup.")) names.add(`supplier.${c.slice(4)}`);
+  for (const [alias, to] of Object.entries(TOPIC_ALIASES)) if (to === c) names.add(alias);
+  return [...names];
+}
+
+/**
+ * THE guard every seeded decision goes through (Decision Keeper seed, Supplier seed, the
+ * parcel-tracking switch-off). A seed is inserted only when its topic (under any of its
+ * names) has no decision at all: the same words already there -> nothing to do; other words
+ * there -> those are Reilly's newer words, and a seed never overrules them. Dedupe is by
+ * topic, never by words alone, so a generic quote ("looks good") on one topic can't block
+ * another topic's seed.
+ * @returns {{added:boolean, id?:number, reason?:string}}
+ */
+export async function seedDecision(db, s, { nowMs = Date.now() } = {}) {
+  const topic = canonicalTopic(s.topic);
+  const names = topicNames(topic);
+  const marks = names.map(() => "?").join(", ");
+  const same = await db.prepare(`SELECT id FROM decisions WHERE topic IN (${marks}) AND words = ? LIMIT 1`).bind(...names, s.words).first();
+  if (same) return { added: false, id: same.id, reason: "already recorded" };
+  const other = await db.prepare(`SELECT id FROM decisions WHERE topic IN (${marks}) LIMIT 1`).bind(...names).first();
+  if (other) return { added: false, id: other.id, reason: "topic already has Reilly's words" };
+  const r = await recordDecision(db, { ...s, topic }, { nowMs, quiet: true, source: s.source || null });
+  return { added: r.created, id: r.id };
+}
+
+/** Insert the Decision Keeper's seed list through the guard. Idempotent. */
 export async function seedDecisions(db, { nowMs = Date.now() } = {}) {
   let added = 0;
   for (const s of SEED_DECISIONS) {
-    // Skip words already recorded under any topic (the Supplier seed records some of the same quotes).
-    const have = await db.prepare(`SELECT id FROM decisions WHERE words = ? LIMIT 1`).bind(s.words).first();
-    if (have) continue;
-    const newer = await db.prepare(`SELECT id FROM decisions WHERE topic = ? LIMIT 1`).bind(s.topic).first();
-    if (newer) continue; // the topic already has words from Reilly; the seed doesn't overrule them
-    await recordDecision(db, s, { nowMs, quiet: true, source: s.source });
-    added++;
+    if ((await seedDecision(db, s, { nowMs })).added) added++;
   }
   if (added) {
     await logEvent(db, {

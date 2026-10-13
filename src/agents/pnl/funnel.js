@@ -55,6 +55,20 @@ export function parseFunnelRows(table) {
   return out;
 }
 
+/** The ShopifyQL columns the funnel needs. */
+export const FUNNEL_COLUMNS = Object.freeze(["sessions", "sessions_with_cart_additions", "sessions_that_reached_checkout", "sessions_that_completed_checkout"]);
+const FIELD = { sessions: "sessions", sessions_with_cart_additions: "cart_sessions", sessions_that_reached_checkout: "checkout_sessions", sessions_that_completed_checkout: "converted_sessions" };
+
+/** Pure: expected columns absent from the answer's column list or null on any row. */
+export function missingColumns(table, rows) {
+  const names = table && Array.isArray(table.columns) && table.columns.length ? new Set(table.columns.map((c) => c && c.name)) : null;
+  return FUNNEL_COLUMNS.filter((c) => (names && !names.has(c)) || rows.some((r) => r[FIELD[c]] == null));
+}
+
+/** Pure: converted / sessions, null unless both are known (and sessions > 0). */
+export const conversionRate = (converted, sessions) =>
+  converted == null || sessions == null || !(sessions > 0) ? null : Math.round((converted / sessions) * 10000) / 10000;
+
 /** Why a failure means "not wired" rather than a broken pull. */
 function notWiredReason(err) {
   const m = String((err && err.message) || err);
@@ -93,8 +107,10 @@ export async function pullStoreFunnel(env, storeId, { nowMs = Date.now(), fetchI
   const q = data && data.shopifyqlQuery;
   const errs = q && Array.isArray(q.parseErrors) ? q.parseErrors.filter(Boolean) : [];
   const rows = q && !errs.length ? parseFunnelRows(q.tableData) : null;
-  if (!rows) {
-    const reason = errs.length ? `ShopifyQL: ${errs.join("; ").slice(0, 250)}` : "no table in the answer";
+  // Every expected column must be there on every row: a missing column is not "0 carts".
+  const gap = rows ? missingColumns(q.tableData, rows) : [];
+  if (!rows || gap.length) {
+    const reason = errs.length ? `ShopifyQL: ${errs.join("; ").slice(0, 250)}` : !rows ? "no table in the answer" : `Shopify's answer is missing ${gap.join(", ")}`;
     await setRun(db, storeId, "error", reason, at, false);
     if (!(await loggedWithin(db, ACTOR, "error.funnel_pull", 60, nowMs))) {
       await logEvent(db, { actor: ACTOR, kind: "error.funnel_pull", store: storeId, target: "sys.shopify", summary: `${STORES[storeId].name} funnel: ${reason}`, at });
@@ -160,12 +176,12 @@ export async function funnelFor(db, store, from, to, { nowMs = Date.now() } = {}
     const missing = ids.filter((id, i) => !parts[i]);
     const day = { day: d, partial: parts.some((p) => p && p.partial), missing_stores: missing };
     for (const k of KEYS) day[k] = missing.length ? null : parts.reduce((s, p) => (s == null || p[k] == null ? null : s + p[k]), 0);
-    day.conversion_rate = day.sessions ? Math.round((day.converted_sessions / day.sessions) * 10000) / 10000 : null;
+    day.conversion_rate = conversionRate(day.converted_sessions, day.sessions);
     days.push(day);
   }
   const totals = {};
   for (const k of KEYS) totals[k] = days.length && days.every((d) => d[k] != null) ? days.reduce((s, d) => s + d[k], 0) : null;
-  totals.conversion_rate = totals.sessions ? Math.round((totals.converted_sessions / totals.sessions) * 10000) / 10000 : null;
+  totals.conversion_rate = conversionRate(totals.converted_sessions, totals.sessions);
   return { ok: true, store, from, to, wired: ids.every((id) => status[id].usable), status, days, totals };
 }
 

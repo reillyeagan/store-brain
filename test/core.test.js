@@ -11,6 +11,11 @@ import { runCore, coreState } from "../src/agents/core/index.js";
 import { logEvent } from "../src/lib/eventlog.js";
 import { createApproval } from "../src/lib/approvals.js";
 import { PARCEL_TRACKING_DECISION } from "../src/config/stores.js";
+import { seedDecision, canonicalTopic } from "../src/agents/core/decisions.js";
+import { ensureSupplierDecisions, SUPPLIER_DECISIONS } from "../src/agents/supplier/decisions.js";
+import { trackingOff } from "../src/lib/tracking.js";
+import { chainOf } from "../src/agents/core/incidents.js";
+import { ROUTE_BATCH } from "../src/agents/core/router.js";
 
 const T0 = Date.parse("2026-10-13T12:00:00Z");
 const iso = (ms) => new Date(ms).toISOString();
@@ -231,4 +236,118 @@ test("runCore: runs each agent on its cadence, never throws even when the databa
   assert.equal(st.mode, "shadow");
   assert.ok(st.decisions.current.length > 0);
   assert.ok(Array.isArray(st.router.routes));
+});
+
+/* ---------------- review fixes ---------------- */
+
+test("review fix 1: 400 vault-seeded facts can't hide a new fact from the vault outbox", async () => {
+  const DB = makeD1();
+  for (let i = 0; i < 400; i++) await fact(DB, { key: `vault.fact.${i}`, value: "x", source: `vault:Stores/Note${i}.md` });
+  await fact(DB, { key: "learned.today", value: "1", source: "api:shopify" });
+  let q = await queueVaultSync(DB, { nowMs: T0 });
+  for (let i = 0; i < 3 && !q.fact; i++) q = await queueVaultSync(DB, { nowMs: T0 });
+  assert.equal(q.fact, 1);
+  const pending = await vaultOutbox(DB, { limit: 200 });
+  assert.deepEqual(pending.filter((p) => p.kind === "fact").map((p) => p.body.key), ["learned.today"]);
+  await fact(DB, { key: "learned.later", value: "2", source: "api:shopify" });
+  assert.equal((await queueVaultSync(DB, { nowMs: T0 })).fact, 1);
+});
+
+test("review fix 9: one seed guard — one topic per quote across both seeds, generic quotes don't block other topics, Reilly's newer words always win", async () => {
+  assert.equal(canonicalTopic("supplier.returns"), "sup.returns");
+  assert.equal(canonicalTopic("supplier.approve_price_rewrites"), "pricing.approval");
+  const DB = makeD1();
+  await recordDecision(DB, { topic: "sup.bills", words: "i pay KFB bills on fridays now" }, { nowMs: T0 });
+  await ensureSupplierDecisions(DB, { nowMs: T0 });
+  await seedDecisions(DB, { nowMs: T0 });
+  await ensureSupplierDecisions(DB, { nowMs: T0 });
+  const { results } = await DB.prepare(`SELECT words, COUNT(*) AS n FROM decisions GROUP BY words HAVING COUNT(*) > 1`).all();
+  assert.deepEqual(results, []); // no quote twice
+  assert.equal((await currentDecision(DB, "sup.bills")).words, "i pay KFB bills on fridays now");
+  assert.equal(await count(DB, `SELECT COUNT(*) AS n FROM decisions WHERE topic LIKE 'supplier.%'`), 0);
+  // The same generic words on two topics are both recorded.
+  assert.equal((await seedDecision(DB, { topic: "x.one", words: "looks good" }, { nowMs: T0 })).added, true);
+  assert.equal((await seedDecision(DB, { topic: "x.two", words: "looks good" }, { nowMs: T0 })).added, true);
+  // A row stored under the old name still counts.
+  const DB2 = makeD1();
+  await DB2.prepare(`INSERT INTO decisions (at, topic, words, scope, settled) VALUES (?, 'supplier.returns', 'i never return things to KFB.', 'all', 1)`).bind(iso(T0)).run();
+  await seedDecisions(DB2, { nowMs: T0 });
+  await ensureSupplierDecisions(DB2, { nowMs: T0 });
+  assert.equal(await count(DB2, `SELECT COUNT(*) AS n FROM decisions WHERE words = 'i never return things to KFB.'`), 1);
+  assert.ok(SUPPLIER_DECISIONS.every((d) => !d.topic.startsWith("supplier.")));
+});
+
+test("review fix 9: the tracking switch-off goes through the guard (never over Reilly's newer words on parcel tracking)", async () => {
+  const DB = makeD1();
+  await recordDecision(DB, { topic: "parcel_tracking", words: "turn parcel tracking back on for H&C" }, { nowMs: T0 });
+  await trackingOff({ DB }, T0);
+  await trackingOff({ DB }, T0 + 1000);
+  assert.equal(await count(DB, `SELECT COUNT(*) AS n FROM decisions WHERE topic = 'parcel_tracking'`), 1);
+  const DB2 = makeD1();
+  await trackingOff({ DB: DB2 }, T0);
+  await trackingOff({ DB: DB2 }, T0 + 1000);
+  assert.equal((await currentDecision(DB2, "parcel_tracking")).words, PARCEL_TRACKING_DECISION.words);
+  assert.equal(await count(DB2, `SELECT COUNT(*) AS n FROM decisions`), 1);
+});
+
+test("review fix 6: failed API requests logged under core.incidents count; only the desk's own step errors are ignored", async () => {
+  const DB = makeD1();
+  for (let h = 0; h <= 3; h++) {
+    await logEvent(DB, { actor: "core.incidents", kind: "error.request", summary: `GET /api/state failed ${h}`, at: iso(T0 + h * 3600000) });
+    await logEvent(DB, { actor: "core.incidents", kind: "error.core_incidents", summary: "desk step failed", at: iso(T0 + h * 3600000) });
+  }
+  const r = await runIncidents({ DB }, { nowMs: T0 + 3 * 3600000 + 60000 });
+  assert.equal(r.asked, 1);
+  assert.equal(await count(DB, `SELECT COUNT(*) AS n FROM incidents WHERE kind = 'error.core_incidents'`), 0);
+});
+
+test("review fix 6: a daily job failing once a day reaches Reilly on the second day; a job with a job_runs row stays open until it reports ok", async () => {
+  assert.equal(chainOf([T0 + 86400000, T0]).count, 2);
+  assert.equal(chainOf([T0 + 5 * 86400000, T0]).count, 1); // days apart: not one incident
+  const DB = makeD1();
+  await logEvent(DB, { actor: "pnl.calendar", kind: "error.calendar_daily", summary: "failed", at: iso(T0) });
+  let r = await runIncidents({ DB }, { nowMs: T0 + 3 * 3600000 });
+  assert.equal(r.asked, 0);
+  await logEvent(DB, { actor: "pnl.calendar", kind: "error.calendar_daily", summary: "failed again", at: iso(T0 + 86400000) });
+  r = await runIncidents({ DB }, { nowMs: T0 + 86400000 + 60000 });
+  assert.equal(r.asked, 1);
+  // 10 h later (no error since): still open, the daily rhythm says it isn't quiet yet.
+  r = await runIncidents({ DB }, { nowMs: T0 + 86400000 + 10 * 3600000 });
+  assert.equal(r.resolved, 0);
+
+  // A job_runs-backed step: open past 2 h of silence until the job reports ok.
+  const DB2 = makeD1();
+  await DB2.prepare(`INSERT INTO job_runs (job, last_run_at, last_result) VALUES ('core.librarian.weekly', ?, 'error: boom')`).bind(iso(T0)).run();
+  await logEvent(DB2, { actor: "core.librarian", kind: "error.core_librarian_weekly", summary: "boom", at: iso(T0) });
+  await runIncidents({ DB: DB2 }, { nowMs: T0 + 60000 });
+  r = await runIncidents({ DB: DB2 }, { nowMs: T0 + 5 * 3600000 });
+  assert.equal(r.resolved, 0);
+  await DB2.prepare(`UPDATE job_runs SET last_run_at = ?, last_result = 'ok: {}' WHERE job = 'core.librarian.weekly'`).bind(iso(T0 + 6 * 3600000)).run();
+  r = await runIncidents({ DB: DB2 }, { nowMs: T0 + 6 * 3600000 + 60000 });
+  assert.equal(r.resolved, 1);
+  assert.match((await evs(DB2, "incident.resolved"))[0].summary, /ran OK again/);
+});
+
+test("review fix 16: if raising the approval fails, the claim is released so the next run can ask", async () => {
+  const DB = makeD1();
+  for (let h = 0; h <= 3; h++) await logEvent(DB, { actor: "pnl.pullers", kind: "error.money_job", summary: "x", at: iso(T0 + h * 3600000) });
+  const failing = { prepare(sql) { if (/INSERT INTO approvals/.test(sql)) throw new Error("D1 hiccup"); return DB.prepare(sql); } };
+  await assert.rejects(() => runIncidents({ DB: failing }, { nowMs: T0 + 3 * 3600000 + 60000 }));
+  assert.equal((await DB.prepare(`SELECT approval_id FROM incidents`).first()).approval_id, null);
+  const r = await runIncidents({ DB }, { nowMs: T0 + 3 * 3600000 + 120000 });
+  assert.equal(r.asked, 1);
+});
+
+test("review fix 8: the router catches up past one page in a single run", async () => {
+  const DB = makeD1();
+  await runRouter({ DB }, { nowMs: T0 });
+  for (let i = 0; i < ROUTE_BATCH + 50; i++) {
+    await logEvent(DB, { actor: "pnl.money_map", kind: "payout.mismatch", summary: `m${i}`, at: iso(T0 + i) });
+    await logEvent(DB, { actor: "x.y", kind: "noise", summary: "n", at: iso(T0 + i) });
+  }
+  const r = await runRouter({ DB }, { nowMs: T0 + 60000 });
+  assert.equal(r.routed, ROUTE_BATCH + 50);
+  assert.equal(r.caught_up, true);
+  const r2 = await runRouter({ DB }, { nowMs: T0 + 120000 });
+  assert.equal(r2.routed, 0);
 });

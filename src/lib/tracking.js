@@ -28,6 +28,7 @@
  * A parcel that isn't tracked still gets day-15 / day-20 flags from its order date.
  */
 import { LIVE_STORE_IDS, STORES, parcelTrackingOn, PARCEL_TRACKING_DECISION } from "../config/stores.js";
+import { seedDecision } from "../agents/core/decisions.js";
 import { shopifyGraphQL } from "./storeGuard.js";
 import { logEvent } from "./eventlog.js";
 import { markFeedOk, markFeedFailed } from "./freshness.js";
@@ -791,8 +792,9 @@ export async function trackingOff(env, nowMs = Date.now()) {
   const db = env.DB;
   const at = nowIso(nowMs);
   const d = PARCEL_TRACKING_DECISION;
-  const had = await db.prepare(`SELECT id FROM decisions WHERE topic = ? AND words = ?`).bind(d.topic, d.words).first();
-  if (!had) await db.prepare(`INSERT INTO decisions (at, topic, words, scope, settled) VALUES (?, ?, ?, 'all', 1)`).bind(d.at, d.topic, d.words).run();
+  // Through the Decision Keeper's guard: never recorded twice, never over Reilly's newer words.
+  const seeded = await seedDecision(db, { at: d.at, topic: d.topic, words: d.words, scope: "all", source: "src/config/stores.js PARCEL_TRACKING_DECISION" }, { nowMs });
+  const had = !seeded.added;
   const open = await db.prepare(`UPDATE shipment_flags SET resolved_at = ? WHERE resolved_at IS NULL`).bind(at).run();
   const cleared = (open && open.meta && open.meta.changes) || 0;
   await db.prepare(`DELETE FROM feeds WHERE id = ?`).bind(FEED_ID).run();

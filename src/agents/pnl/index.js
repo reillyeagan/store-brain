@@ -2,7 +2,7 @@
  * P&L extras: cron entry point and page data for the Analyst, Tax/Admin & Triggers, the COGS
  * Matcher and the Shopify funnel feed (part of the Data Pullers).
  *
- *   runPnlExtras(env, {nowMs, fetchImpl}) — 15-minute cron. Never throws; each job in its own
+ *   runPnlExtras(env, {nowMs, fetchImpl}) — department rotation (about hourly). Never throws; each job in its own
  *                                           try, throttled through job_runs.
  *   pnlExtrasState(env, {nowMs})          — JSON for the P&L department page.
  *
