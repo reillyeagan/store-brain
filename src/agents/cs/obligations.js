@@ -2,7 +2,7 @@
  * cs.obligations — Obligations Tracker (code). SHADOW: reads Gmail threads; writes only to D1.
  *
  * What it does, honestly limited to what code can see:
- *   1. Re-reads the Gmail thread of recent tickets (capped per tick) to see whether Reilly has
+ *   1. Re-reads the Gmail thread of recent tickets (capped per run) to see whether Reilly has
  *      replied (a SENT message after the customer's). If he has, the ticket is marked replied.
  *   2. If his sent reply makes a dated promise in a recognisable form ("we'll update you by
  *      Friday", "I'll get back to you within 2 business days", "tomorrow"), it is recorded in the
@@ -133,7 +133,7 @@ export async function checkThreads(env, { nowMs = Date.now(), fetchImpl = fetch,
         await db.prepare(`INSERT INTO obligations (created_at, store, kind, party, order_ref, due_at, status, note) VALUES (?, ?, 'reply', ?, ?, ?, 'open', ?)`)
           .bind(at, t.order_store || t.store, t.from_email, t.order_name || (t.order_ref ? `#${t.order_ref}` : null), dueIso, note).run();
         promises++;
-        await logEvent(db, { actor: ACTOR, kind: "cs.obligation_recorded", store: t.store, at, summary: `Promise to ${t.from_name || t.from_email} recorded, due ${p.due_day}: "${clip(p.said, 120)}"`, data: { ticket: t.id } });
+        await logEvent(db, { actor: ACTOR, kind: "cs.obligation_recorded", store: t.store, at, summary: `Promise in a sent reply recorded (ticket ${t.id}${t.order_name ? `, ${t.order_name}` : ""}), due ${p.due_day}`, data: { ticket: t.id } });
       }
     }
     const { results: open } = await db.prepare(`SELECT id, note FROM obligations WHERE status = 'open' AND note LIKE ?`).bind(`cs ticket ${t.id}:%`).all();
@@ -143,7 +143,7 @@ export async function checkThreads(env, { nowMs = Date.now(), fetchImpl = fetch,
       if (Number.isFinite(promisedAt) && later) {
         closed++;
         await db.prepare(`UPDATE obligations SET status = 'done', done_at = ? WHERE id = ? AND status = 'open'`).bind(new Date(Number(later.internalDate)).toISOString(), o.id).run();
-        await logEvent(db, { actor: ACTOR, kind: "cs.obligation_kept", store: t.store, at, summary: `Promise kept: Reilly followed up with ${t.from_name || t.from_email}`, data: { obligation: o.id } });
+        await logEvent(db, { actor: ACTOR, kind: "cs.obligation_kept", store: t.store, at, summary: `Promise kept: Reilly followed up (ticket ${t.id})`, data: { obligation: o.id } });
       }
     }
     await db.prepare(`UPDATE cs_tickets SET thread_checked_at = ? WHERE id = ?`).bind(at, t.id).run();
@@ -163,7 +163,7 @@ export async function flagOverdue(env, { nowMs = Date.now() } = {}) {
   for (const o of results || []) {
     const ins = await db.prepare(`INSERT OR IGNORE INTO cs_overdue_flags (obligation_id, flagged_at) VALUES (?, ?)`).bind(o.id, at).run();
     if (!ins.meta || ins.meta.changes !== 1) continue;
-    await logEvent(db, { actor: ACTOR, kind: "cs.obligation_overdue", store: o.store, at, summary: `Overdue promise to ${o.party}${o.order_ref ? ` (${o.order_ref})` : ""}, due ${o.due_at.slice(0, 10)}: ${clip(o.note.replace(/^cs ticket \d+: /, ""), 160)}`, data: { obligation: o.id } });
+    await logEvent(db, { actor: ACTOR, kind: "cs.obligation_overdue", store: o.store, at, summary: `Overdue promise to a customer${o.order_ref ? ` (${o.order_ref})` : ""}, due ${o.due_at.slice(0, 10)}: see the CS page (${clip((o.note.match(/^cs ticket \d+/) || ["cs"])[0], 30)})`, data: { obligation: o.id } });
   }
   return { overdue: (results || []).length };
 }

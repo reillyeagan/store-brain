@@ -19,7 +19,7 @@ import { logEvent } from "../../lib/eventlog.js";
 import { nowIso } from "../../lib/time.js";
 import { CAPS, DELIVERY_FACTS, expectedSlotAccount, storeName } from "./config.js";
 import { routeTicket, checkDraft } from "./routing.js";
-import { threadWaitingOnReilly } from "./escalation.js";
+import { threadWaitingOnReilly, staleGmailDraft } from "./escalation.js";
 import { createReplyDraft, getDraft } from "./gmail.js";
 import { safeJson, clip, logOnce } from "./util.js";
 
@@ -58,7 +58,9 @@ function system(store, policy) {
 Voice: warm, short, plain English, no corporate filler. 3-8 sentences. Greet the customer by first name if known. Sign off exactly: "${store} Customer Care".
 Hard rules:
 - Use ONLY the order facts given. Never invent order numbers, tracking numbers, dates, measurements or policies.
-- Never promise a refund, a reship, a replacement, or a guaranteed delivery date.
+- Never promise a refund, a reship, a replacement, or a delivery date.
+- Never write any date, weekday or month name (not even when the order shipped), and never the words refund, money, credit, discount, code, free, replace, reship, resend. The only numbers you may write are the order number, tracking numbers and links given, delivery-time ranges in business days, and size-chart measurements.
+- If the order status is marked as not current, don't state where the order is; say you're checking the latest status.
 - Express shipping can be described as the faster option, never with a guaranteed date.
 - Delivery timing you may use: ${DELIVERY_FACTS.join(" ")}
 - If a tracking number and link are given, include them. If no order was found, ask politely for the order number.
@@ -72,14 +74,16 @@ Return {"body":"the full reply text","needs_reilly":false,"reason":null}`;
 function userPrompt(t, ctx, chart) {
   const facts = ctx ? {
     order: ctx.name, placed: ctx.created_at, payment: ctx.financial_status, fulfillment: ctx.fulfillment_status,
-    cancelled: !!ctx.cancelled_at, shipped: ctx.shipped, express: ctx.express, shipping_method: ctx.shipping_method,
+    cancelled: !!ctx.cancelled_at,
+    shipped: ctx.status_stale ? `not current (order data is ${ctx.age_hours ?? "?"} hours old)` : ctx.shipped == null ? "unknown" : ctx.shipped,
+    express: ctx.express == null ? "unknown" : ctx.express, shipping_method: ctx.shipping_method,
     items: (ctx.items || []).map((i) => `${i.qty || 1} × ${i.title}${i.variant ? ` (${i.variant})` : ""}`),
-    tracking: (ctx.shipments || []).map((s) => ({ number: s.tracking_number, link: s.tracking_url, carrier: s.carrier, shipped: s.shipped_at, shopify_status: s.shopify_status, delivered: s.delivered_at })),
+    tracking: (ctx.shipments || []).map((s) => ({ number: s.tracking_number, link: s.tracking_url, carrier: s.carrier, shopify_status: ctx.status_stale ? "not current" : s.shopify_status, delivered: ctx.status_stale ? "not current" : !!s.delivered_at })),
     data_as_of: ctx.as_of,
   } : null;
   return [
     `Category: ${t.category}`,
-    `Customer: ${t.from_name || "(name unknown)"} <${t.from_email}>`,
+    `Customer name: ${t.from_name || "(unknown)"}`,
     `Subject: ${t.subject || ""}`,
     `Their email:\n${clip(t.body || "", 2000)}`,
     facts ? `Order facts (from Shopify):\n${JSON.stringify(facts)}` : `Order facts: no order found (${t.context_note || "not matched"}).`,
@@ -89,16 +93,32 @@ function userPrompt(t, ctx, chart) {
 
 export async function writeReplies(env, { nowMs = Date.now(), fetchImpl = fetch, budget }) {
   const db = env.DB;
+  let drafted = 0, blocked = 0, toReilly = 0, gmail = 0, waiting = 0;
+  // Drafts stored earlier whose Gmail copy wasn't made (allowance ran out, Gmail fault): retry
+  // first, so a busy run can't starve them. Never for a superseded ticket.
+  if (draftsLive(env)) {
+    const { results: pending } = await db.prepare(
+      `SELECT * FROM cs_tickets WHERE status = 'drafted' AND draft_status = 'stored' AND gmail_draft_id IS NULL AND draft_body IS NOT NULL ORDER BY id LIMIT ?`
+    ).bind(CAPS.draftsPerTick).all();
+    for (const t of pending || []) {
+      if (budget.left < 3) break;
+      const g = await pushGmailDraft(env, t, t.draft_body, { nowMs, fetchImpl, budget });
+      if (g.ok) {
+        gmail++;
+        await logEvent(db, { actor: ACTOR, kind: "cs.draft_to_gmail", store: t.store, target: "sys.gmail", at: nowIso(nowMs), summary: `Stored reply for ticket ${t.id} saved as a Gmail draft (retry). Nothing sent.`, data: { ticket: t.id } });
+      }
+    }
+  }
   const { results } = await db.prepare(
     `SELECT * FROM cs_tickets WHERE status = 'open' AND context_at IS NOT NULL AND draft_status IS NULL ORDER BY (urgency = 'high') DESC, id LIMIT 20`
   ).all();
-  let drafted = 0, blocked = 0, toReilly = 0, gmail = 0, waiting = 0;
   for (const t of results || []) {
     if (drafted + blocked + toReilly >= CAPS.draftsPerTick) break;
     const triage = safeJson(t.triage, {});
     const ctx = safeJson(t.context, null);
     if (routeTicket(t, triage, ctx).action !== "draft") continue; // cs.escalation takes it
     if (await threadWaitingOnReilly(db, t)) continue; // the conversation is with Reilly; escalation joins it
+    if (await staleGmailDraft(db, t)) continue; // an older draft is still in Gmail; escalation tells Reilly to delete it
     if (!budget.take(1)) break;
     const at = nowIso(nowMs);
     const store = storeName(t.order_store || t.store) || "our store";
@@ -154,10 +174,13 @@ export async function pushGmailDraft(env, t, body, { nowMs, fetchImpl, budget })
   const row = await db.prepare(`SELECT account FROM oauth_tokens WHERE provider = ?`).bind(t.slot).first();
   const expected = expectedSlotAccount(env, t.slot);
   if (!row || !expected || String(row.account).toLowerCase() !== expected) {
-    await logEvent(db, { actor: ACTOR, kind: "cs.draft_guard_stop", store: t.store, target: "sys.gmail", at, summary: `Gmail draft NOT made for ticket ${t.id}: ${t.slot} is connected as ${row ? row.account : "nobody"}, expected ${expected || "an unset account"}. Hard stop.` });
+    await logOnce(db, { actor: ACTOR, kind: "cs.draft_guard_stop", store: t.store, target: "sys.gmail", at, summary: `Gmail drafts NOT made in ${t.slot}: it is connected as a different account than expected (${expected || "none set"}). Hard stop; drafts stay on the CS page.` }, { key: t.slot, windowMin: 24 * 60, nowMs });
     return { ok: false, error: "inbox account mismatch" };
   }
-  if (!budget.take(3)) return { ok: false, error: "tick budget used; will not retry this one" };
+  // Never a second draft in one conversation.
+  const other = t.thread_id ? await db.prepare(`SELECT id FROM cs_tickets WHERE slot = ? AND thread_id = ? AND id <> ? AND gmail_draft_id IS NOT NULL LIMIT 1`).bind(t.slot, t.thread_id, t.id).first() : null;
+  if (other) return { ok: false, error: "another draft for this conversation is already in Gmail" };
+  if (!budget.take(3)) return { ok: false, error: "run allowance used; retried next run" };
   try {
     const token = await getGoogleAccessToken(env, { fetchImpl, nowMs, slot: t.slot });
     const d = await createReplyDraft(token, { threadId: t.thread_id, to: t.from_email, subject: t.subject, inReplyTo: t.rfc_message_id, body }, { fetchImpl });

@@ -28,6 +28,19 @@ export async function threadWaitingOnReilly(db, t) {
   return r ? r.approval_id : null;
 }
 
+/**
+ * A reply draft already sitting in Gmail from an earlier email in this conversation (the customer
+ * wrote again before Reilly sent it). A second draft is never made; Reilly is told to delete it.
+ */
+export async function staleGmailDraft(db, t) {
+  if (!t.thread_id) return null;
+  return db.prepare(
+    `SELECT id, gmail_draft_id FROM cs_tickets WHERE slot = ? AND thread_id = ? AND id <> ? AND gmail_draft_id IS NOT NULL AND status = 'superseded' ORDER BY id DESC LIMIT 1`
+  ).bind(t.slot, t.thread_id, t.id).first();
+}
+
+export const STALE_DRAFT_NOTE = "stale reply draft in Gmail from earlier in this conversation — delete it, then reply";
+
 export function escalationReason(t) {
   const triage = safeJson(t.triage, {});
   const ctx = safeJson(t.context, null);
@@ -37,12 +50,13 @@ export function escalationReason(t) {
   return r.action === "escalate" ? r.reason : null;
 }
 
-function detailLine(t, reason) {
+function detailLine(t, reason, stale) {
   const ctx = safeJson(t.context, null);
   const retention = safeJson(t.retention, null);
   const bits = [
     t.summary || clip(t.subject, 120),
     `Why it's yours: ${reason}.`,
+    stale && reason !== STALE_DRAFT_NOTE ? `Also: ${STALE_DRAFT_NOTE}.` : null,
     ctx ? `Order ${ctx.name}: ${ctx.financial_status || "payment ?"}, ${ctx.shipped ? "shipped" : ctx.shipped === false ? "not shipped" : "shipping unknown"}${ctx.express ? ", express" : ""}${ctx.refunds && ctx.refunds.length ? `, ${ctx.refunds.length} refund event(s) already` : ""}.` : `No order matched (${t.context_note || "?"}).`,
     retention && retention.option ? `Retention idea: ${retention.option}` : null,
     `From ${t.from_name ? `${t.from_name} ` : ""}<${t.from_email}>. Reply in Gmail; nothing has been sent.`,
@@ -63,30 +77,38 @@ export async function escalateTickets(env, { nowMs = Date.now() } = {}) {
     // A conversation already with Reilly stays with Reilly: a follow-up joins his flag
     // instead of getting a drafted reply that talks past him.
     const waitingOn = await threadWaitingOnReilly(db, t);
-    const reason = escalationReason(t) || (waitingOn ? "conversation already waiting on Reilly" : null);
+    const stale = await staleGmailDraft(db, t);
+    const reason = escalationReason(t) || (waitingOn ? "conversation already waiting on Reilly" : null) || (stale ? STALE_DRAFT_NOTE : null);
     if (!reason) continue;
     const at = nowIso(nowMs);
-    // Claim it once; a second overlapping run gets 0 changes and moves on.
-    const claim = await db.prepare(`UPDATE cs_tickets SET escalated_at = ?, status = 'needs_reilly', updated_at = ? WHERE id = ? AND escalated_at IS NULL`).bind(at, at, t.id).run();
+    // Claim → create → release on failure: a ticket is never left marked "escalated" without
+    // its flag (a second overlapping run gets 0 changes and moves on).
+    const claim = await db.prepare(`UPDATE cs_tickets SET escalated_at = ?, updated_at = ? WHERE id = ? AND escalated_at IS NULL`).bind(at, at, t.id).run();
     if (!claim.meta || claim.meta.changes !== 1) continue;
     const store = t.order_store || t.store;
-    // Same conversation already waiting on Reilly → join that flag.
-    const open = waitingOn ? { approval_id: waitingOn } : null;
-    if (open) {
-      joined++;
-      await db.prepare(`UPDATE cs_tickets SET approval_id = ? WHERE id = ?`).bind(open.approval_id, t.id).run();
-      await logEvent(db, { actor: ACTOR, kind: "cs.escalation_joined", store, at, summary: `Customer wrote again in a conversation already waiting on Reilly (flag ${open.approval_id}): ${clip(t.summary || t.subject, 120)}`, data: { ticket: t.id, approvalId: open.approval_id } });
-      continue;
+    try {
+      if (waitingOn) {
+        // Same conversation already waiting on Reilly → join that flag.
+        await db.prepare(`UPDATE cs_tickets SET approval_id = ?, status = 'needs_reilly' WHERE id = ?`).bind(waitingOn, t.id).run();
+        joined++;
+        await logEvent(db, { actor: ACTOR, kind: "cs.escalation_joined", store, at, summary: `Customer wrote again in a conversation already waiting on Reilly (flag ${waitingOn})${stale ? "; a stale Gmail draft should be deleted" : ""}`, data: { ticket: t.id, approvalId: waitingOn } });
+        continue;
+      }
+      const ctx = safeJson(t.context, null);
+      // No customer name or email in the title: approval titles are copied into the event log.
+      const title = clip(`${storeName(store) || "Unknown store"}: ${String(t.category || "other").replace(/_/g, " ")}${ctx ? ` ${ctx.name}` : t.order_ref ? ` (customer wrote #${t.order_ref})` : ""}${t.urgency === "high" ? " (urgent)" : ""} — ticket ${t.id}`, 160);
+      const id = await createApproval(db, {
+        dept: "cs", requestedBy: ACTOR, store, title,
+        options: [{ id: "handled", label: "I'll handle it in Gmail", detail: detailLine(t, reason, stale) }],
+      });
+      await db.prepare(`UPDATE cs_tickets SET approval_id = ?, status = 'needs_reilly' WHERE id = ?`).bind(id, t.id).run();
+      flagged++;
+      await logEvent(db, { actor: ACTOR, kind: "cs.escalated", store, target: "core.approvals", at, summary: `Flagged for Reilly: ${title} (${clip(reason, 80)})`, data: { ticket: t.id, approvalId: id } });
+    } catch (err) {
+      // Give the claim back so the next run tries again.
+      await db.prepare(`UPDATE cs_tickets SET escalated_at = NULL WHERE id = ? AND escalated_at = ? AND approval_id IS NULL`).bind(t.id, at).run();
+      throw err;
     }
-    const ctx = safeJson(t.context, null);
-    const title = clip(`${storeName(store) || "Unknown store"}: ${String(t.category || "other").replace(/_/g, " ")}${ctx ? ` ${ctx.name}` : t.order_ref ? ` #${t.order_ref}` : ""} — ${t.from_name || t.from_email}${t.urgency === "high" ? " (urgent)" : ""}`, 160);
-    const id = await createApproval(db, {
-      dept: "cs", requestedBy: ACTOR, store, title,
-      options: [{ id: "handled", label: "I'll handle it in Gmail", detail: detailLine(t, reason) }],
-    });
-    flagged++;
-    await db.prepare(`UPDATE cs_tickets SET approval_id = ? WHERE id = ?`).bind(id, t.id).run();
-    await logEvent(db, { actor: ACTOR, kind: "cs.escalated", store, target: "core.approvals", at, summary: `Flagged for Reilly: ${title} (${clip(reason, 80)})`, data: { ticket: t.id, approvalId: id } });
   }
   return { flagged, joined };
 }

@@ -8,6 +8,8 @@ import { checkDraft, routeTicket } from "../src/agents/cs/routing.js";
 import { findPromises, flagOverdue } from "../src/agents/cs/obligations.js";
 import { validateTriage, orderRefFromText } from "../src/agents/cs/triage.js";
 import { b64urlEncode, b64urlDecode, stripQuoted } from "../src/agents/cs/gmail.js";
+import { findLedgerOrder } from "../src/agents/cs/orderContext.js";
+import { _resetTokenCacheForTests } from "../src/lib/storeGuard.js";
 
 const NOW = Date.parse("2026-10-13T16:00:00Z"); // Tuesday, 12:00 Eastern
 const MIN = 60000;
@@ -35,7 +37,7 @@ function mail({ id, threadId, from, to = "info@auberlane.com", subject = "Hello"
 }
 
 /** A fake Google + Claude + Shopify. Records every call. */
-function world({ boxes = {}, triage = () => ({}), reply = () => ({ body: "" }), retention = () => ({ option: "exchange_size", why: "fits", line: "Would a bigger size help?" }) } = {}) {
+function world({ boxes = {}, triage = () => ({}), reply = () => ({ body: "" }), retention = () => ({ option: "exchange_size", why: "fits", line: "Would a bigger size help?" }), pageCap = 500, failGet = new Set(), shopify = null } = {}) {
   const calls = [];
   const drafts = new Map();
   const tokenFor = { "rt-main": "at-main", "rt-hc": "at-hc" };
@@ -53,13 +55,20 @@ function world({ boxes = {}, triage = () => ({}), reply = () => ({ body: "" }), 
       const box = boxes[tok] || { messages: [], threads: {} };
       const path = new URL(u).pathname.replace("/gmail/v1/users/me", "");
       if (method === "GET" && path === "/messages") {
-        const q = new URL(u).searchParams.get("q") || "";
+        // Like Gmail: newest first, honours maxResults (capped) and pageToken.
+        const sp = new URL(u).searchParams;
+        const q = sp.get("q") || "";
         const after = Number((q.match(/after:(\d+)/) || [])[1] || 0) * 1000;
-        const list = box.messages.filter((m) => Number(m.internalDate) >= after).sort((a, b) => Number(b.internalDate) - Number(a.internalDate));
-        return json({ messages: list.map((m) => ({ id: m.id, threadId: m.threadId })) });
+        const per = Math.min(Number(sp.get("maxResults") || 100), pageCap);
+        const from = Number(sp.get("pageToken") || 0);
+        const list = box.messages.filter((m) => Number(m.internalDate) >= after && !(m.labelIds || []).includes("SENT"))
+          .sort((a, b) => Number(b.internalDate) - Number(a.internalDate));
+        const page = list.slice(from, from + per);
+        return json({ messages: page.map((m) => ({ id: m.id, threadId: m.threadId })), ...(from + per < list.length ? { nextPageToken: String(from + per) } : {}) });
       }
       let m;
       if (method === "GET" && (m = path.match(/^\/messages\/(.+)$/))) {
+        if (failGet.has(decodeURIComponent(m[1]))) return json({ error: "boom" }, 500);
         const msg = box.messages.find((x) => x.id === decodeURIComponent(m[1]));
         return msg ? json(msg) : json({ error: "nf" }, 404);
       }
@@ -85,6 +94,11 @@ function world({ boxes = {}, triage = () => ({}), reply = () => ({ body: "" }), 
       const out = sys.includes("You sort") ? triage(user) : sys.includes("You write customer-service") ? reply(user) : retention(user);
       return json({ model: b.model, content: [{ type: "text", text: JSON.stringify(out) }], usage: { input_tokens: 200, output_tokens: 80 }, stop_reason: "end_turn" });
     }
+    if (u.includes(".myshopify.com/admin/oauth/access_token")) return json({ access_token: "shp-tok", expires_in: 86399, scope: "read_orders" });
+    if (u.includes(".myshopify.com/admin/api/") && shopify) {
+      const b = JSON.parse(init.body);
+      return json({ data: { orders: { nodes: shopify(b.variables.q) } } });
+    }
     return json({ error: "no route" }, 404);
   };
   return { fetchImpl, calls, drafts };
@@ -96,9 +110,9 @@ async function setup(extraEnv = {}) {
   return { ...BASE_ENV, DB, ...extraEnv };
 }
 
-async function addOrder(DB, { store = "aub", id = "gid://shopify/Order/1", name = "#1001", email = "jane@buyer.com", express = 0, raw = null } = {}) {
+async function addOrder(DB, { store = "aub", id = "gid://shopify/Order/1", name = "#1001", email = "jane@buyer.com", express = 0, raw = null, updatedAt = new Date(NOW - 30 * 60000).toISOString(), shippingTitle } = {}) {
   await DB.prepare(`INSERT INTO orders (store, order_id, name, created_at, local_day, currency, total, financial_status, raw, updated_at, express, shipping_title) VALUES (?, ?, ?, ?, ?, 'USD', 59.9, 'paid', ?, ?, ?, ?)`)
-    .bind(store, id, name, "2026-10-05T15:00:00Z", "2026-10-05", raw || JSON.stringify({ email, fulfillment_status: "fulfilled" }), "2026-10-12T00:00:00Z", express, express ? "Express" : "Standard").run();
+    .bind(store, id, name, "2026-10-05T15:00:00Z", "2026-10-05", raw || JSON.stringify({ email, fulfillment_status: "fulfilled" }), updatedAt, express, shippingTitle !== undefined ? shippingTitle : express ? "Express" : "Standard").run();
   await DB.prepare(`INSERT INTO order_lines (store, order_id, line_id, product_id, title, variant_title, size, color, quantity, price, updated_at) VALUES (?, ?, ?, 'gid://shopify/Product/77', 'Wool Overshirt', 'Navy / M', 'M', 'Navy', 1, 59.9, 't')`)
     .bind(store, id, `${id}-l1`).run();
 }
@@ -135,23 +149,58 @@ test("cs triage validation: unknown categories become other, invented quotes dro
   assert.equal(v.size.quote, null);
   assert.equal(orderRefFromText("Hi, order #1043 hasn't arrived"), "1043");
   assert.equal(orderRefFromText("order number: 1077"), "1077");
+  assert.equal(orderRefFromText("My order is 1055"), "1055");
   assert.equal(orderRefFromText("I am 5 foot 10"), null);
   assert.equal(stripQuoted("Thanks!\n\nOn Mon, Oct 12, 2026 at 9:00 AM Shop <a@b.com> wrote:\n> old"), "Thanks!");
   assert.equal(b64urlDecode(b64urlEncode("héllo ✓")), "héllo ✓");
 });
 
-test("cs draft check: refunds, reships, dates, foreign order/tracking numbers and placeholders are blocked", () => {
-  const ctx = { name: "#1001", shipments: [{ tracking_number: "YT2512345678901" }] };
-  assert.deepEqual(checkDraft("Hi Jane, your order #1001 shipped. Tracking: YT2512345678901. Best, Auberlane Customer Care", { ctx }), []);
-  assert.ok(checkDraft("Hi Jane, we'll issue a full refund today. Best, Auberlane", { ctx }).some((p) => p.includes("refund")));
-  assert.ok(checkDraft("Hi Jane, we will send you a replacement right away. Best", { ctx }).some((p) => p.includes("reship")));
-  assert.ok(checkDraft("Hi Jane, it will arrive by Friday, guaranteed. Best", { ctx }).some((p) => p.includes("date")));
-  assert.ok(checkDraft("Hi Jane, your tracking number is LX999888777CN. Best regards", { ctx }).some((p) => p.includes("tracking")));
-  assert.ok(checkDraft("Hi Jane, about order #2002, it's on the way. Best regards", { ctx }).some((p) => p.includes("#2002")));
-  assert.ok(checkDraft("Hi [Customer Name], it's on the way. Best regards", { ctx }).some((p) => p.includes("placeholder")));
-  // Routing: money and anger are Reilly's.
+test("cs order numbers: addresses are never order numbers; a bare #number needs the AI to agree", () => {
+  assert.equal(orderRefFromText("Please send it to 12 Main St, Apt #1001 instead"), null);
+  assert.equal(orderRefFromText("Please send it to 12 Main St, Apt #1001 instead", "1001"), null);
+  assert.equal(orderRefFromText("Suite #200, Boston", "200"), null);
+  assert.equal(orderRefFromText("Where is #1043?"), null); // bare number, AI didn't say so
+  assert.equal(orderRefFromText("Where is #1043?", "1043"), "1043");
+  assert.equal(orderRefFromText("Where is #1043?", "1099"), null); // AI and text disagree
+});
+
+test("cs draft check: keyword-strict — every unsafe phrase is blocked, a plain tracking reply passes", () => {
+  const ctx = { name: "#1001", shipments: [{ tracking_number: "YT2512345678901", tracking_url: "https://t.example/YT2512345678901" }] };
+  const ok = "Hi Jane, your order #1001 is on its way. Tracking: YT2512345678901 (https://t.example/YT2512345678901). Standard delivery usually takes 8-12 business days. Feel free to reply with any questions. Auberlane Customer Care";
+  assert.deepEqual(checkDraft(ok, { ctx }), []);
+  assert.deepEqual(checkDraft("Hi Sam, it's 100% wool with a chest of 104 cm in size M. Auberlane Customer Care", { ctx }), []);
+  const unsafe = [
+    "I've refunded your order.",
+    "A refund is on its way.",
+    "Your money will be back in your account soon.",
+    "We'll replace it for you.",
+    "We can ship you another one free of charge.",
+    "Here is a discount code for your next order.",
+    "Enjoy 15% off your next order.",
+    "We'll add store credit to your account.",
+    "No need to send it back, just keep it.",
+    "You'll have it by Friday.",
+    "It should arrive on Oct 20.",
+    "Expect delivery on October 20th.",
+    "Your parcel is due 10/20.",
+    "We'll resend the parcel.",
+    "Your order 2002 is on the way.",
+    "About order #2002, it's on the way.",
+    "Tracking: YT25 9999 8888 777.",
+    "Your tracking number is LX999888777CN.",
+    "Track it here: https://evil.example/track",
+    "Hi [Customer Name], it's on the way.",
+    "We'll reimburse the shipping.",
+    "We'd like to compensate you.",
+  ];
+  for (const phrase of unsafe) {
+    const p = checkDraft(`Hi Jane, thanks for writing. ${phrase} Auberlane Customer Care`, { ctx });
+    assert.ok(p.length > 0, `should block: ${phrase}`);
+  }
+  // Routing: money, anger and someone else's order number are Reilly's.
   assert.equal(routeTicket({ category: "return_refund" }, {}, null).action, "escalate");
   assert.equal(routeTicket({ category: "where_is_order" }, { angry: true }, null).action, "escalate");
+  assert.equal(routeTicket({ category: "where_is_order", order_mismatch: 1, order_ref: "1001" }, {}, null).action, "escalate");
   assert.equal(routeTicket({ category: "exchange" }, {}, { shipped: false }).action, "draft");
   assert.equal(routeTicket({ category: "exchange" }, {}, { shipped: true }).action, "escalate");
   assert.equal(routeTicket({ category: "where_is_order" }, {}, null).action, "draft");
@@ -199,7 +248,7 @@ test("cs: main inbox → customer ticket, order matched, reply drafted in D1 onl
   const w = world({
     boxes,
     triage: () => ({ is_customer: true, category: "where_is_order", store: "aub", order_number: "1001", urgency: "normal", summary: "Asks where order #1001 is" }),
-    reply: (user) => { replyPrompt = user; return { body: "Hi Jane,\n\nYour order #1001 shipped on Oct 8 with YunExpress. Tracking: YT2512345678901 (https://t.example/YT2512345678901). Standard delivery usually takes 8-12 business days.\n\nAuberlane Customer Care", needs_reilly: false }; },
+    reply: (user) => { replyPrompt = user; return { body: "Hi Jane,\n\nYour order #1001 has shipped with YunExpress. Tracking: YT2512345678901 (https://t.example/YT2512345678901). Standard delivery usually takes 8-12 business days.\n\nAuberlane Customer Care", needs_reilly: false }; },
   });
   const out = await runCs(env, { nowMs: NOW, fetchImpl: w.fetchImpl });
   assert.ok(!out.read.error, JSON.stringify(out));
@@ -227,6 +276,7 @@ test("cs: main inbox → customer ticket, order matched, reply drafted in D1 onl
   assert.equal(w.calls.filter((c) => /\/messages\/a\d/.test(c.url)).length, gets);
   assert.equal((await tickets(env.DB)).length, 1);
 
+  await noEmailsInEvents(env.DB, "jane@buyer.com");
   const st = await csState(env, { nowMs: NOW + 15 * MIN });
   assert.equal(st.mode, "shadow");
   assert.equal(st.drafts_to_gmail, false);
@@ -452,4 +502,239 @@ test("cs: a Gmail fault is logged (at most hourly) and runCs never throws", asyn
   assert.equal((await evs(env.DB, "error.cs_read")).length, 1);
   const inbox = await env.DB.prepare(`SELECT * FROM cs_inboxes WHERE slot = 'google'`).first();
   assert.match(inbox.last_error, /HTTP 500/);
+});
+
+/* ---------- review fixes (2026-10-13) ---------- */
+
+const AUB_CREDS = { SB_AUB_CLIENT_ID: "aub-id", SB_AUB_CLIENT_SECRET: "aub-secret" };
+const noEmailsInEvents = async (DB, ...emails) => {
+  const all = JSON.stringify((await DB.prepare(`SELECT summary FROM events`).all()).results);
+  for (const e of emails) assert.ok(!all.includes(e), `event log must not contain ${e}`);
+};
+
+test("cs privacy: an order number that belongs to a different email is never attached, never sent to KFB, and goes to Reilly", async () => {
+  const env = await setup();
+  await connect(env, "google", "reillyworking26@gmail.com", "rt-main");
+  await addOrder(env.DB, {}); // #1001 belongs to jane@buyer.com
+  let replyCalled = false;
+  const w = world({
+    boxes: { "at-main": { messages: [mail({ id: "p1", from: "Mallory <mallory@else.com>", subject: "order", body: "Please change the colour on order #1001 to black." })] } },
+    triage: () => ({ category: "colour_change", order_number: "1001", summary: "Wants colour change", change: { colour_to: "black" } }),
+    reply: () => { replyCalled = true; return { body: "x" }; },
+  });
+  await runCs(env, { nowMs: NOW, fetchImpl: w.fetchImpl });
+  const t = (await tickets(env.DB))[0];
+  assert.equal(t.order_ref, "1001");
+  assert.equal(t.order_id, null);
+  assert.equal(t.context, null);
+  assert.equal(t.order_mismatch, 1);
+  assert.match(t.context_note, /belongs to a different email/);
+  assert.equal(replyCalled, false);
+  assert.equal(t.status, "needs_reilly");
+  assert.equal((await env.DB.prepare(`SELECT COUNT(*) AS n FROM cs_kfb_asks`).first()).n, 0);
+  const ap = await env.DB.prepare(`SELECT title, options FROM approvals`).first();
+  assert.match(ap.options, /different email/);
+  assert.ok(!ap.options.includes("jane@buyer.com") && !ap.title.includes("mallory"));
+  await noEmailsInEvents(env.DB, "jane@buyer.com", "mallory@else.com");
+});
+
+test("cs privacy: an address line is not an order number, and a Shopify match under another email is refused", async () => {
+  const env = await setup(AUB_CREDS);
+  _resetTokenCacheForTests();
+  await connect(env, "google", "reillyworking26@gmail.com", "rt-main");
+  await addOrder(env.DB, {}); // #1001 (jane)
+  const w = world({
+    boxes: { "at-main": { messages: [
+      mail({ id: "q1", from: "Sam <sam@buyer.com>", subject: "address", body: "Please ship to 4 Elm Rd, Apt #1001 instead." }),
+      mail({ id: "q2", from: "Tom <tom@buyer.com>", subject: "where", body: "Where is my order #1500?", at: NOW - 30 * MIN }),
+    ] } },
+    triage: (u) => u.includes("Apt") ? { category: "address_change", order_number: "1001", summary: "New address", change: { address: true } } : { category: "where_is_order", order_number: "1500", summary: "Where is it" },
+    shopify: (q) => q === "name:#1500" ? [{ id: "gid://shopify/Order/15", name: "#1500", email: "someone@else.com", displayFulfillmentStatus: "FULFILLED", fulfillments: [], lineItems: { nodes: [] } }] : [],
+    reply: () => ({ body: "Hi Sam, thanks. Could you send your order number so we can pass this on? Auberlane Customer Care" }),
+  });
+  await runCs(env, { nowMs: NOW, fetchImpl: w.fetchImpl });
+  const [sam, tom] = await tickets(env.DB);
+  assert.equal(sam.order_ref, null); // "Apt #1001" is an address
+  assert.equal(sam.order_id, null);
+  assert.equal(tom.order_id, null);
+  assert.equal(tom.order_mismatch, 1);
+  assert.equal(tom.status, "needs_reilly");
+  const asks = (await env.DB.prepare(`SELECT * FROM cs_kfb_asks`).all()).results;
+  assert.ok(asks.every((a) => a.order_id === null));
+});
+
+test("cs backlog: 65 new emails over several pages are all read exactly once, oldest first; the cursor never skips unread mail", async () => {
+  const env = await setup({ ANTHROPIC_API_KEY: undefined });
+  await connect(env, "google", "reillyworking26@gmail.com", "rt-main");
+  const msgs = [];
+  for (let i = 0; i < 65; i++) msgs.push(mail({ id: `x${String(i).padStart(2, "0")}`, from: `C${i} <c${i}@buyer.com>`, subject: `q${i}`, body: "hello", at: NOW - (70 - i) * MIN }));
+  const w = world({ boxes: { "at-main": { messages: msgs } }, pageCap: 25 });
+  let t = NOW;
+  await runCs(env, { nowMs: t, fetchImpl: w.fetchImpl });
+  // First run read the 6 OLDEST; the cursor hasn't moved past anything unread.
+  const first = (await tickets(env.DB)).map((x) => x.gmail_id);
+  assert.deepEqual(first, ["x00", "x01", "x02", "x03", "x04", "x05"]);
+  const inbox = await env.DB.prepare(`SELECT cursor_ms FROM cs_inboxes WHERE slot = 'google'`).first();
+  assert.ok(inbox.cursor_ms <= NOW - 70 * MIN);
+  // The list followed nextPageToken (25 per page here).
+  assert.ok(w.calls.some((c) => c.url.includes("pageToken=25")));
+  for (let i = 0; i < 15; i++) { t += 20 * MIN; await runCs(env, { nowMs: t, fetchImpl: w.fetchImpl }); }
+  const ids = (await tickets(env.DB)).map((x) => x.gmail_id);
+  assert.equal(ids.length, 65);
+  assert.equal(new Set(ids).size, 65);
+  const gets = w.calls.filter((c) => /\/messages\/x\d\d\?/.test(c.url)).map((c) => c.url);
+  assert.equal(gets.length, 65); // each email fetched once
+  const after = await env.DB.prepare(`SELECT cursor_ms FROM cs_inboxes WHERE slot = 'google'`).first();
+  assert.equal(after.cursor_ms, NOW - 6 * MIN); // newest email read
+  // The main inbox search is narrowed to the stores it serves + Shopify, and includes archived mail.
+  const q = decodeURIComponent(w.calls.find((c) => c.url.includes("/messages?")).url);
+  assert.match(q, /to:auberlane\.com/);
+  assert.match(q, /from:shopify\.com/);
+  assert.ok(!q.includes("in:inbox"));
+});
+
+test("cs: one unreadable email doesn't block the inbox; after 3 tries it is skipped and logged", async () => {
+  const env = await setup({ ANTHROPIC_API_KEY: undefined });
+  await connect(env, "google", "reillyworking26@gmail.com", "rt-main");
+  const msgs = [
+    mail({ id: "bad", from: "A <a@buyer.com>", subject: "a", at: NOW - 50 * MIN }),
+    mail({ id: "ok1", from: "B <b@buyer.com>", subject: "b", at: NOW - 40 * MIN }),
+  ];
+  const box = { messages: msgs };
+  const w = world({ boxes: { "at-main": box }, failGet: new Set(["bad"]) });
+  await runCs(env, { nowMs: NOW, fetchImpl: w.fetchImpl });
+  assert.deepEqual((await tickets(env.DB)).map((t) => t.gmail_id), ["ok1"]);
+  box.messages.push(mail({ id: "ok2", from: "C <c@buyer.com>", subject: "c", at: NOW + 5 * MIN }));
+  await runCs(env, { nowMs: NOW + 20 * MIN, fetchImpl: w.fetchImpl });
+  await runCs(env, { nowMs: NOW + 40 * MIN, fetchImpl: w.fetchImpl });
+  assert.deepEqual((await tickets(env.DB)).map((t) => t.gmail_id), ["ok1", "ok2"]);
+  assert.equal((await evs(env.DB, "error.cs_mail_unreadable")).length, 1);
+  assert.match((await env.DB.prepare(`SELECT outcome FROM cs_mail_seen WHERE gmail_id = 'bad'`).first()).outcome, /^error:/);
+  const inbox = await env.DB.prepare(`SELECT cursor_ms FROM cs_inboxes WHERE slot = 'google'`).first();
+  assert.equal(inbox.cursor_ms, NOW + 5 * MIN);
+});
+
+test("cs escalation: if creating the approval fails, the claim is released and the next run flags it", async () => {
+  const env = await setup();
+  await connect(env, "google", "reillyworking26@gmail.com", "rt-main");
+  await addOrder(env.DB, {});
+  let failNext = true;
+  const real = env.DB;
+  env.DB = { ...real, prepare: (sql) => {
+    if (failNext && /INSERT INTO approvals/.test(sql)) { failNext = false; throw new Error("D1 hiccup"); }
+    return real.prepare(sql);
+  } };
+  const w = world({
+    boxes: { "at-main": { messages: [mail({ id: "e1", from: "Jane <jane@buyer.com>", subject: "refund", body: "I want a refund for order #1001" })] } },
+    triage: () => ({ category: "return_refund", wants_refund: true, summary: "Wants refund" }),
+  });
+  await runCs(env, { nowMs: NOW, fetchImpl: w.fetchImpl });
+  let t = (await tickets(real))[0];
+  assert.equal(t.escalated_at, null);
+  assert.equal(t.approval_id, null);
+  assert.equal(t.status, "open");
+  await runCs(env, { nowMs: NOW + 20 * MIN, fetchImpl: w.fetchImpl });
+  t = (await tickets(real))[0];
+  assert.ok(t.approval_id > 0);
+  assert.equal(t.status, "needs_reilly");
+  assert.equal((await real.prepare(`SELECT COUNT(*) AS n FROM approvals`).first()).n, 1);
+});
+
+test("cs: customer writes again after a Gmail draft was made → no second draft; Reilly told to delete the stale one", async () => {
+  const env = await setup({ CS_DRAFTS_LIVE: "1" });
+  await connect(env, "google", "reillyworking26@gmail.com", "rt-main");
+  await addOrder(env.DB, {});
+  const box = { messages: [mail({ id: "d1", threadId: "TD", from: "Jane <jane@buyer.com>", subject: "q", body: "Is the overshirt warm? My order #1001" })] };
+  const w = world({
+    boxes: { "at-main": box },
+    triage: () => ({ category: "product_question", summary: "Asks about warmth" }),
+    reply: () => ({ body: "Hi Jane, yes, it's a heavy wool blend and very warm. Auberlane Customer Care" }),
+  });
+  await runCs(env, { nowMs: NOW, fetchImpl: w.fetchImpl });
+  assert.equal(w.drafts.size, 1);
+  box.messages.push(mail({ id: "d2", threadId: "TD", from: "Jane <jane@buyer.com>", subject: "Re: q", body: "Also, is it itchy?", at: NOW + 10 * MIN }));
+  await runCs(env, { nowMs: NOW + 20 * MIN, fetchImpl: w.fetchImpl });
+  await runCs(env, { nowMs: NOW + 40 * MIN, fetchImpl: w.fetchImpl });
+  assert.equal(w.drafts.size, 1); // never a second draft in the thread
+  const [old, neu] = await tickets(env.DB);
+  assert.equal(old.status, "superseded");
+  assert.equal(neu.status, "needs_reilly");
+  const ap = await env.DB.prepare(`SELECT options FROM approvals`).first();
+  assert.match(ap.options, /stale reply draft in Gmail/);
+  const st = await csState(env, { nowMs: NOW + 40 * MIN });
+  assert.equal(st.stale_gmail_drafts.length, 1);
+  assert.match(st.stale_gmail_drafts[0].note, /delete it/);
+});
+
+test("cs: a stored draft whose Gmail copy wasn't made is retried on a later run (CS_DRAFTS_LIVE=1)", async () => {
+  const env = await setup({ CS_DRAFTS_LIVE: "1" });
+  await connect(env, "google", "reillyworking26@gmail.com", "rt-main");
+  await env.DB.prepare(`INSERT INTO cs_tickets (opened_at, updated_at, slot, gmail_id, thread_id, rfc_message_id, store, from_email, subject, body, via, status, category, draft_body, draft_status, draft_at, context_at)
+    VALUES ('t','t','google','r1','TR','<r1@x>','aub','jane@buyer.com','q','hi','email','drafted','product_question','Hi Jane, it is warm. Auberlane Customer Care','stored','t','t')`).run();
+  const w = world({ boxes: { "at-main": { messages: [] } } });
+  await runCs(env, { nowMs: NOW, fetchImpl: w.fetchImpl });
+  assert.equal(w.drafts.size, 1);
+  const t = (await tickets(env.DB))[0];
+  assert.equal(t.draft_status, "gmail_draft");
+  await runCs(env, { nowMs: NOW + 20 * MIN, fetchImpl: w.fetchImpl });
+  assert.equal(w.drafts.size, 1); // not again
+});
+
+test("cs: email matching escapes LIKE wildcards ('_' in an address)", async () => {
+  const env = await setup();
+  await addOrder(env.DB, { email: "j_ane@buyer.com" });
+  await addOrder(env.DB, { id: "gid://shopify/Order/2", name: "#1002", email: "jxane@buyer.com" });
+  const hit = await findLedgerOrder(env.DB, { store: "aub", from_email: "j_ane@buyer.com", received_at: new Date(NOW).toISOString() });
+  assert.equal(hit.order.name, "#1001");
+  const none = await findLedgerOrder(env.DB, { store: "aub", from_email: "j%ne@buyer.com", received_at: new Date(NOW).toISOString() });
+  assert.equal(none.order, null);
+});
+
+test("cs freshness: old order data → fresh read-only Shopify read before a where-is-my-order reply; if that fails, status is 'not current'; unknown express stays unknown", async () => {
+  // a) Shopify answers: live status is used.
+  let env = await setup(AUB_CREDS);
+  _resetTokenCacheForTests();
+  await connect(env, "google", "reillyworking26@gmail.com", "rt-main");
+  await addOrder(env.DB, { updatedAt: new Date(NOW - 5 * 3600000).toISOString(), shippingTitle: null });
+  let prompt = "";
+  const node = { id: "gid://shopify/Order/1", name: "#1001", email: "jane@buyer.com", displayFinancialStatus: "PAID", displayFulfillmentStatus: "FULFILLED", shippingLine: null,
+    lineItems: { nodes: [] }, fulfillments: [{ createdAt: "2026-10-08T00:00:00Z", displayStatus: "IN_TRANSIT", trackingInfo: [{ number: "YT2512345678901", url: "https://t.example/YT2512345678901", company: "YunExpress" }] }] };
+  let w = world({
+    boxes: { "at-main": { messages: [mail({ id: "f1", from: "Jane <jane@buyer.com>", subject: "where", body: "Where is my order #1001?" })] } },
+    triage: () => ({ category: "where_is_order", summary: "Where is it" }),
+    shopify: (q) => (q === "name:#1001" ? [node] : []),
+    reply: (u) => { prompt = u; return { body: "Hi Jane, your order #1001 is on its way: YT2512345678901. Auberlane Customer Care" }; },
+  });
+  await runCs(env, { nowMs: NOW, fetchImpl: w.fetchImpl });
+  let ctx = JSON.parse((await tickets(env.DB))[0].context);
+  assert.equal(ctx.source, "shopify_live");
+  assert.equal(ctx.express, null);
+  assert.equal(ctx.items.length, 1); // sizes kept from the ledger
+  assert.match(prompt, /"express":"unknown"/);
+
+  // b) Shopify not reachable (no credentials): status marked not current, not stated as fact.
+  env = await setup();
+  _resetTokenCacheForTests();
+  await connect(env, "google", "reillyworking26@gmail.com", "rt-main");
+  await addOrder(env.DB, { updatedAt: new Date(NOW - 5 * 3600000).toISOString() });
+  w = world({
+    boxes: { "at-main": { messages: [mail({ id: "f2", from: "Jane <jane@buyer.com>", subject: "where", body: "Where is my order #1001?" })] } },
+    triage: () => ({ category: "where_is_order", summary: "Where is it" }),
+    reply: (u) => { prompt = u; return { body: "Hi Jane, I'm checking the latest status of order #1001 and will get back to you. Auberlane Customer Care" }; },
+  });
+  await runCs(env, { nowMs: NOW, fetchImpl: w.fetchImpl });
+  ctx = JSON.parse((await tickets(env.DB))[0].context);
+  assert.equal(ctx.status_stale, true);
+  assert.equal(ctx.age_hours, 5);
+  assert.match(prompt, /not current \(order data is 5 hours old\)/);
+});
+
+test("cs state: main-inbox drafts warn they go out from Reilly's address unless a send-as alias exists", async () => {
+  const env = await setup();
+  await connect(env, "google", "reillyworking26@gmail.com", "rt-main");
+  const st = await csState(env, { nowMs: NOW });
+  const main = st.inboxes.find((i) => i.slot === "google");
+  assert.match(main.draft_from_warning, /reillyworking26@gmail\.com/);
+  assert.match(main.draft_from_warning, /Send mail as/);
+  assert.equal(st.warnings.length, 1);
 });

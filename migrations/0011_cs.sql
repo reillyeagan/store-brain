@@ -20,7 +20,20 @@ CREATE TABLE IF NOT EXISTS cs_mail_seen (
   slot          TEXT    NOT NULL,
   gmail_id      TEXT    NOT NULL,
   seen_at       TEXT    NOT NULL,
-  outcome       TEXT    NOT NULL,            -- ticket | ignored:<reason>
+  outcome       TEXT    NOT NULL,            -- ticket | ignored:<reason> | error:<reason>
+  internal_ms   INTEGER,                     -- Gmail internalDate (moves the cursor only past mail really read)
+  PRIMARY KEY (slot, gmail_id)
+);
+CREATE INDEX IF NOT EXISTS idx_cs_mail_seen_time ON cs_mail_seen(slot, internal_ms);
+
+-- A message Gmail listed but wouldn't hand over. Retried; after 3 failures it is recorded as
+-- seen with the error (and logged) so one bad message can't block the inbox.
+CREATE TABLE IF NOT EXISTS cs_mail_failures (
+  slot          TEXT    NOT NULL,
+  gmail_id      TEXT    NOT NULL,
+  fails         INTEGER NOT NULL DEFAULT 0,
+  last_error    TEXT,
+  last_at       TEXT,
   PRIMARY KEY (slot, gmail_id)
 );
 
@@ -58,6 +71,7 @@ CREATE TABLE IF NOT EXISTS cs_tickets (
   context         TEXT,                      -- JSON: status, items, express, shipments, refunds, source
   context_at      TEXT,
   context_note    TEXT,                      -- e.g. "no order matched"
+  order_mismatch  INTEGER NOT NULL DEFAULT 0, -- 1 = the order number written belongs to a different email (never attached)
   feeds_at        TEXT,                      -- size complaint / KFB ask recorded (once)
   -- cs.reply_writer
   draft_body      TEXT,

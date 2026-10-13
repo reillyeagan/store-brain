@@ -3,7 +3,7 @@ import { logEvent } from "../../lib/eventlog.js";
 import { nowIso } from "../../lib/time.js";
 
 /**
- * One tick's allowance of outside calls (Gmail, Shopify, Claude). Every agent takes from the
+ * One run's allowance of outside calls (Gmail, Shopify, Claude). Every agent takes from the
  * same allowance, so a busy inbox can't push the whole Worker past its subrequest limit.
  */
 export class Budget {
@@ -13,6 +13,8 @@ export class Budget {
     this.left -= n;
     return true;
   }
+  /** Count calls already made (never below zero). */
+  spend(n) { this.left = Math.max(0, this.left - Math.max(0, n)); }
 }
 
 /**
@@ -21,15 +23,22 @@ export class Budget {
  */
 export async function logOnce(db, e, { windowMin = 60, key = null, nowMs = Date.now() } = {}) {
   const since = nowIso(nowMs - windowMin * 60000);
-  const like = key ? `%"_k":"${String(key).replace(/["%_]/g, "")}"%` : "%";
+  const like = key ? `%${likeEscape(`"_k":"${cleanKey(key)}"`)}%` : "%";
   const recent = await db
-    .prepare(`SELECT id FROM events WHERE actor = ? AND kind = ? AND at >= ? AND COALESCE(data, '') LIKE ? LIMIT 1`)
+    .prepare(`SELECT id FROM events WHERE actor = ? AND kind = ? AND at >= ? AND COALESCE(data, '') LIKE ? ESCAPE '\\' LIMIT 1`)
     .bind(e.actor, e.kind, since, like)
     .first()
     .catch(() => null);
   if (recent) return null;
-  const data = key ? { ...(e.data || {}), _k: String(key).replace(/["%_]/g, "") } : e.data;
+  const data = key ? { ...(e.data || {}), _k: cleanKey(key) } : e.data;
   return logEvent(db, { ...e, data, at: e.at || nowIso(nowMs) });
+}
+
+const cleanKey = (k) => String(k).replace(/["\\]/g, "");
+
+/** Escape a value for a LIKE pattern used with ESCAPE '\' ("_" and "%" are wildcards otherwise). */
+export function likeEscape(s) {
+  return String(s).replace(/[\\%_]/g, (c) => `\\${c}`);
 }
 
 export function safeJson(s, fallback = null) {

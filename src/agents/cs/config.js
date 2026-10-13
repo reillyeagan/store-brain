@@ -38,24 +38,25 @@ export const DRAFT_CATEGORIES = Object.freeze([
 /** Retention ideas are proposed for these (cs.retention). */
 export const RETENTION_CATEGORIES = Object.freeze(["cancel", "return_refund"]);
 
-/** Per-tick caps. The Worker has subrequest/CPU limits; work is spread across ticks. */
+/** Per-run caps. The Worker has subrequest/CPU limits; work is spread across runs. */
 export const CAPS = Object.freeze({
-  subrequests: 28,           // every Gmail / Shopify / Claude call in one tick counts against this
-  readPerInbox: 6,           // Gmail messages fetched per inbox per tick
-  listPage: 50,              // ids asked for per Gmail list call
-  classifyPerTick: 5,        // AI classifications per tick
-  contextPerTick: 10,        // tickets matched to orders per tick (D1 only)
+  subrequests: 28,           // every Gmail / Shopify / Claude call in one run counts against this
+  readPerInbox: 6,           // Gmail messages fetched per inbox per run
+  listPage: 500,             // ids per Gmail list page (Gmail's maximum)
+  listMaxPages: 5,           // list pages followed per inbox per run (nextPageToken)
+  classifyPerTick: 5,        // AI classifications per run
+  contextPerTick: 10,        // tickets matched to orders per run (D1 only)
   shopifyLookupsPerTick: 2,  // live Shopify order lookups when the ledger has no match
-  draftsPerTick: 3,          // AI reply drafts per tick
-  retentionPerTick: 2,       // AI retention suggestions per tick
-  escalationsPerTick: 5,     // approvals created per tick
-  threadChecksPerTick: 3,    // Gmail threads re-read per tick for Reilly's sent replies
+  draftsPerTick: 3,          // AI reply drafts per run
+  retentionPerTick: 2,       // AI retention suggestions per run
+  escalationsPerTick: 5,     // approvals created per run
+  threadChecksPerTick: 3,    // Gmail threads re-read per run for Reilly's sent replies
 });
 
 /** First read of an inbox only looks this far back (bounded, so a first run can't flood). */
 export const FIRST_READ_DAYS = 3;
 
-/** Cadences (minutes) for claimJob. The Worker cron fires every 15 minutes. */
+/** Cadences (minutes) for claimJob. CS comes round in the department rotation about every 20 minutes. */
 export const CADENCE = Object.freeze({ read: 15, work: 15, obligations: 60 });
 
 /**

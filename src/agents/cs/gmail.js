@@ -18,13 +18,34 @@ async function gget(token, path, { fetchImpl }) {
   return body;
 }
 
-/** Message ids in the inbox newer than `afterMs` (newest first, one page). */
-export async function listInboxIds(token, { afterMs, max = 50, fetchImpl = fetch }) {
-  // in:inbox and -from:me: only mail that arrived, never Reilly's own sent mail or drafts.
-  // -category:promotions/social/forums: marketing never lands in the CS queue.
-  const q = `in:inbox -from:me -category:promotions -category:social -category:forums after:${Math.floor(afterMs / 1000)}`;
-  const body = await gget(token, `/messages?maxResults=${max}&q=${encodeURIComponent(q)}`, { fetchImpl });
-  return (body.messages || []).map((m) => ({ id: m.id, threadId: m.threadId }));
+/**
+ * The Gmail search for one inbox. Not "in:inbox": mail Reilly already archived still counts.
+ * Never his own sent mail or drafts (-from:me -in:sent -in:drafts), never the marketing tabs.
+ * Reilly's main inbox is narrowed to mail sent to the store domains it serves, plus Shopify
+ * (contact forms); the code filter (filters.js) still decides.
+ * @param {string[]|null} domains null = a store's own inbox (no narrowing)
+ */
+export function inboxQuery(afterMs, domains = null) {
+  const base = `-from:me -in:sent -in:drafts -in:chats -category:promotions -category:social -category:forums after:${Math.floor(afterMs / 1000)}`;
+  if (!domains) return base;
+  const who = [...domains.flatMap((d) => [`to:${d}`, `deliveredto:${d}`]), "from:shopify.com"];
+  return `${base} {${who.join(" ")}}`;
+}
+
+/**
+ * Message ids matching `q`, newest first, following nextPageToken up to `maxPages` pages.
+ * Returns { ids, complete } — complete = false means older matches exist beyond what was listed.
+ */
+export async function listIds(token, { q, perPage = 500, maxPages = 5, fetchImpl = fetch }) {
+  const ids = [];
+  let pageToken = null, pages = 0;
+  do {
+    const body = await gget(token, `/messages?maxResults=${perPage}&q=${encodeURIComponent(q)}${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ""}`, { fetchImpl });
+    for (const m of body.messages || []) ids.push({ id: m.id, threadId: m.threadId });
+    pageToken = body.nextPageToken || null;
+    pages++;
+  } while (pageToken && pages < maxPages);
+  return { ids, complete: !pageToken, pages };
 }
 
 export const getMessage = (token, id, { fetchImpl = fetch }) => gget(token, `/messages/${encodeURIComponent(id)}?format=full`, { fetchImpl });

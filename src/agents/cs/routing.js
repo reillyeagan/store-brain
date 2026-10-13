@@ -3,12 +3,15 @@
  * (rule 9: the author never audits its own work — the reply writer's model writes, this code checks).
  */
 import { ESCALATE_CATEGORIES, DRAFT_CATEGORIES } from "./config.js";
+import { clip } from "./util.js";
 
 /**
  * @returns {{action:"escalate"|"draft", reason:string}}
  */
 export function routeTicket(t, triage, ctx) {
   const cat = t.category || "other";
+  // The order number written belongs to someone else's email: never answer from it.
+  if (t.order_mismatch) return { action: "escalate", reason: `order #${t.order_ref || "?"} belongs to a different email; confirm the customer's order email before sharing anything` };
   if (ESCALATE_CATEGORIES.includes(cat)) return { action: "escalate", reason: cat === "other" ? "not covered by the playbook" : cat.replace(/_/g, " ") };
   if (triage && triage.angry) return { action: "escalate", reason: "customer is angry" };
   if (triage && triage.wants_refund) return { action: "escalate", reason: "asks for a refund" };
@@ -21,34 +24,59 @@ export function routeTicket(t, triage, ctx) {
 }
 
 /**
- * What a draft must never do (spec + rules): promise a refund, reship or replacement; give a
- * guaranteed delivery date; quote an order or tracking number the code didn't supply; leave a
- * placeholder. Returns a list of problems (empty = passes).
+ * What a draft must never do (spec + rules), checked keyword-strict on purpose: a false alarm
+ * only sends the email to Reilly, a miss can promise money or a date to a customer.
+ * Blocks:
+ *   - money / compensation words: refund, money (back), reimburse, credit, discount, coupon,
+ *     promo, code, %, $/€/£ amounts, free, compensate, "keep it"
+ *   - replacements: replace, reship, resend, "another one", "new one"
+ *   - any date: weekday, month name, numeric date, tomorrow, tonight, next week, guarantee
+ *   - any 3+ digit run (spaces/dashes ignored) that isn't the matched order or one of its
+ *     Shopify tracking numbers (delivery-time ranges and cm/inch measurements excepted)
+ *   - any link that isn't one of this order's tracking links
+ *   - placeholders
+ * Returns a list of problems (empty = passes).
  */
 export function checkDraft(body, { ctx = null, orderRef = null } = {}) {
-  const s = String(body || "");
+  const raw = String(body || "");
   const problems = [];
-  if (s.trim().length < 20) problems.push("empty draft");
-  if (s.length > 3000) problems.push("too long");
-  if (/\b(we|i)('ll| will| are going to| can| would be happy to)\b[^.!?\n]{0,50}\brefund/i.test(s) || /\brefund\b[^.!?\n]{0,20}\b(has been|will be|is being|was) (issued|processed|sent|approved)/i.test(s) || /\bfull refund\b/i.test(s)) {
-    problems.push("promises a refund (refunds are Reilly's)");
-  }
-  if (/\b(we|i)('ll| will| are going to| can)\b[^.!?\n]{0,50}\b(reship|re-ship|resend|send (you )?(a )?(new|replacement)|replacement)\b/i.test(s)) {
-    problems.push("promises a reship or replacement (Reilly's)");
-  }
-  if (/\bguarantee/i.test(s) || /\b(will|should|is going to)\s+(arrive|be delivered|reach you|get to you)\s+(by|on|before)\b/i.test(s)) {
-    problems.push("gives a delivery date (never guaranteed)");
-  }
+  if (raw.trim().length < 20) problems.push("empty draft");
+  if (raw.length > 3000) problems.push("too long");
+
+  // Harmless set phrases that would otherwise trip the word lists.
+  const s = raw.replace(/\bfeel free\b/gi, " ").replace(/\b(zip|postal|post)\s*code\b/gi, " ")
+    .replace(/\b\d{1,3}\s?%\s+(cotton|wool|polyester|linen|silk|cashmere|viscose|nylon|acrylic|spandex|elastane|rayon|leather|merino|modal|lyocell)\b/gi, " fabric ");
+
+  const money = s.match(/\b(refund\w*|money|reimburs\w*|credit\w*|discount\w*|coupon\w*|promo\w*|code|compensat\w*|free|keep (it|them|the item|the order))\b|%|[$€£]\s?\d/i);
+  if (money) problems.push(`mentions money or compensation ("${money[0]}") — Reilly's call`);
+  const repl = s.match(/\b(replac\w*|re-?ship\w*|re-?send\w*|another one|new one|send (you )?another)\b/i);
+  if (repl) problems.push(`mentions a replacement ("${repl[0]}") — Reilly's call`);
+  const date = s.match(/\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tues?|wed|thur?s?|fri|sat|sun|january|february|march|april|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sept?|oct|nov|dec|tomorrow|tonight|next week|this week|guarantee\w*)\b|\b\d{1,2}[/.]\d{1,2}([/.]\d{2,4})?\b|\b\d{1,2}(st|nd|rd|th)\b/i);
+  // "May" is a common verb, so it only counts followed by a day number.
+  const mayDate = /\bmay\s+\d{1,2}\b/i.test(s);
+  if (date || mayDate) problems.push(`mentions a date ("${date ? date[0] : "May"}") — never give dates`);
   if (/\[[^\]]{2,40}\]|\{\{|\}\}|<(name|order|tracking)[^>]*>/i.test(s)) problems.push("contains a placeholder");
-  // Order numbers: only the matched order's (or the one the customer wrote).
-  const allowedOrders = new Set([ctx && ctx.name ? String(ctx.name).replace(/^#/, "") : null, orderRef].filter(Boolean));
-  for (const m of s.matchAll(/#\s?(\d{3,6})\b/g)) {
-    if (!allowedOrders.has(m[1])) { problems.push(`quotes order #${m[1]} that isn't this customer's`); break; }
+
+  // Links: only this order's tracking links.
+  const shipments = (ctx && ctx.shipments) || [];
+  const allowedUrls = shipments.map((x) => String(x.tracking_url || "")).filter(Boolean);
+  let rest = s;
+  for (const m of s.matchAll(/\b(?:https?:\/\/|www\.)[^\s<>()]+/gi)) {
+    const url = m[0].replace(/[.,;:!?)]+$/, "");
+    if (!allowedUrls.includes(url)) { problems.push(`contains a link that isn't this order's tracking link (${clip(url, 60)})`); break; }
   }
-  // Tracking numbers: only ones Shopify holds for this order.
-  const known = new Set(((ctx && ctx.shipments) || []).map((x) => String(x.tracking_number || "").toUpperCase()).filter(Boolean));
-  for (const m of s.matchAll(/\b(?=[A-Z0-9]*\d)(?=[A-Z0-9]*[A-Z]?)[A-Z0-9]{10,30}\b/g)) {
-    if (!known.has(m[0].toUpperCase())) { problems.push(`quotes tracking number ${m[0]} that Shopify doesn't hold for this order`); break; }
-  }
+  for (const u of allowedUrls) rest = rest.split(u).join(" ");
+
+  // Numbers: drop the allowed ones, then no 3+ digit run may remain (spaces/dashes ignored, so
+  // a spaced-out number is still caught).
+  rest = rest
+    .replace(/\b\d{1,2}\s*(?:-|–|to)\s*\d{1,2}\s+(?:business\s+|working\s+)?days?\b/gi, " ")
+    .replace(/\b\d{1,3}(?:\.\d)?\s*(?:cm|centimet(?:er|re)s?|in|inch(?:es)?|")(?![a-z])/gi, " ");
+  let compact = rest.toUpperCase().replace(/(?<=[A-Z0-9])[\s-]+(?=[A-Z0-9])/g, "");
+  for (const tn of shipments.map((x) => String(x.tracking_number || "").toUpperCase().replace(/[\s-]/g, "")).filter(Boolean)) compact = compact.split(tn).join(" ");
+  const allowedOrders = [ctx && ctx.name ? String(ctx.name).replace(/^#/, "") : null, orderRef].filter(Boolean);
+  for (const o of allowedOrders) compact = compact.replace(new RegExp(`#?(?<!\\d)${o}(?!\\d)`, "g"), " ");
+  const stray = compact.match(/\d{3,}/);
+  if (stray) problems.push(`quotes a number the code didn't supply (${clip(stray[0], 30)})`);
   return problems;
 }
