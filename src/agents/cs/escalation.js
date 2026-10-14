@@ -16,6 +16,7 @@ import { CAPS, storeName } from "./config.js";
 import { routeTicket } from "./routing.js";
 import { safeJson, clip } from "./util.js";
 import { otherLiveDraft } from "./gmailDrafts.js";
+import { noActionCheck, earlierUnansweredAsk, SUMMARY_NO_ACTION } from "./noAction.js";
 
 const ACTOR = "cs.escalation";
 
@@ -70,9 +71,25 @@ export async function escalateTickets(env, { nowMs = Date.now(), fetchImpl = fet
        AND (status = 'open' OR draft_status IN ('blocked','escalated')) AND status NOT IN ('superseded','ignored','replied')
      ORDER BY (urgency = 'high') DESC, id LIMIT 30`
   ).all();
-  let flagged = 0, joined = 0;
+  let flagged = 0, joined = 0, quiet = 0;
+  // Flags made before the no_action guard existed, for mail the classifier itself called
+  // "no action requested": closed now, with the reason recorded.
+  const reclosed = await recloseNoActionFlags(db, { nowMs });
   for (const t of results || []) {
     if (flagged + joined >= CAPS.escalationsPerTick) break;
+    // Sorted before the guard existed: a bare thank-you is closed quietly here instead of
+    // reaching Reilly (same guard as triage; any question, request or problem vetoes it).
+    const na = noActionCheck(t);
+    if (na.close && !t.draft_status && !(await earlierUnansweredAsk(db, t))) {
+      const at = nowIso(nowMs);
+      const r = await db.prepare(`UPDATE cs_tickets SET status = 'no_action', classify_note = ?, updated_at = ? WHERE id = ? AND escalated_at IS NULL AND status = 'open'`)
+        .bind(clip(`no_action: ${na.reason}`, 300), at, t.id).run();
+      if (r.meta && r.meta.changes === 1) {
+        quiet++;
+        await logEvent(db, { actor: ACTOR, kind: "cs.no_action", store: t.order_store || t.store, at, summary: `Ticket ${t.id} closed quietly, nothing to do (${clip(t.summary || t.subject, 100)}). Not sent to Reilly.`, data: { ticket: t.id, no_action: na.reason } });
+      }
+      continue;
+    }
     // A conversation already with Reilly stays with Reilly: a follow-up joins his flag
     // instead of getting a drafted reply that talks past him.
     const waitingOn = await threadWaitingOnReilly(db, t);
@@ -109,5 +126,45 @@ export async function escalateTickets(env, { nowMs = Date.now(), fetchImpl = fet
       throw err;
     }
   }
-  return { flagged, joined };
+  return { flagged, joined, no_action: quiet, reclosed };
+}
+
+/**
+ * Re-close CS flags still waiting on Reilly whose every email the classifier itself described
+ * as "no action requested / raised" (or marked no_action) and which pass the code fail-safe
+ * (no question, request, problem, anger or money word). The approval is closed as expired with
+ * the reason; its tickets become no_action. Nothing is sent to anyone.
+ */
+export async function recloseNoActionFlags(db, { nowMs = Date.now() } = {}) {
+  const { results: flags } = await db.prepare(
+    `SELECT id, store, title FROM approvals WHERE status = 'pending' AND requested_by = ? ORDER BY id LIMIT 50`
+  ).bind(ACTOR).all();
+  let n = 0;
+  for (const a of flags || []) {
+    const { results: ts } = await db.prepare(`SELECT * FROM cs_tickets WHERE approval_id = ? ORDER BY id`).bind(a.id).all();
+    if (!ts || !ts.length) continue;
+    const checks = ts.map((t) => ({
+      t, c: noActionCheck(t),
+      saidSo: SUMMARY_NO_ACTION.test(String(t.summary || "")) || (safeJson(t.triage, {}) || {}).no_action === true,
+    }));
+    // Every email on the flag must be nothing-to-do in the classifier's own words, pass the
+    // fail-safe, and have no draft trouble (a blocked draft means there was something to say).
+    if (!checks.every((x) => x.c.close && x.saidSo && !x.t.draft_status)) continue;
+    const at = nowIso(nowMs);
+    const why = `the classifier described it as "${clip(checks[0].t.summary || "", 140)}" and the email has no question, request, problem, anger or refund word`;
+    const r = await db.prepare(`UPDATE approvals SET status = 'expired', decided_at = ?, note = ? WHERE id = ? AND status = 'pending'`)
+      .bind(at, clip(`Closed by the brain (cs.escalation, not Reilly): no action needed; ${why}`, 400), a.id).run();
+    if (!r.meta || r.meta.changes !== 1) continue;
+    for (const x of checks) {
+      await db.prepare(`UPDATE cs_tickets SET status = 'no_action', classify_note = ?, updated_at = ? WHERE id = ?`)
+        .bind(clip(`no_action (re-closed flag ${a.id}): ${why}`, 300), at, x.t.id).run();
+    }
+    n++;
+    await logEvent(db, {
+      actor: ACTOR, kind: "cs.no_action_reclosed", store: a.store, target: "core.approvals", at,
+      summary: `No longer waiting on Reilly: ${clip(a.title, 120)}. Re-closed as no action needed (${clip(checks[0].t.summary || "", 100)})`,
+      data: { approvalId: a.id, tickets: ts.map((t) => t.id), reason: why },
+    });
+  }
+  return n;
 }
