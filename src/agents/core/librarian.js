@@ -210,7 +210,7 @@ export function vaultEntry(item) {
         `- Source: ${b.source || "?"}`,
         `- Observed: ${b.observed_at || "?"}${b.stale_after ? ` · re-check by ${b.stale_after}` : ""}`,
         `- Store Brain fact id: ${b.id ?? item.ref_id}${b.live === 0 ? " (archived)" : ""}`, "",
-        "Value:", "", "```", String(value ?? ""), "```", "",
+        "Value:", "", fenceFor(value), String(value ?? ""), fenceFor(value), "",
         queued,
       ].join("\n"),
     };
@@ -226,7 +226,14 @@ export function vaultEntry(item) {
       ].join("\n"),
     };
   }
-  return { vault_path: `${VAULT_DIR}/Other/${fileSafe(item.title)}.md`, markdown: `# ${item.title}\n\n\`\`\`\n${JSON.stringify(b, null, 2)}\n\`\`\`\n\n${queued}` };
+  const raw = JSON.stringify(b, null, 2);
+  return { vault_path: `${VAULT_DIR}/Other/${fileSafe(item.title)}.md`, markdown: `# ${item.title}\n\n${fenceFor(raw)}\n${raw}\n${fenceFor(raw)}\n\n${queued}` };
+}
+
+/** A code fence longer than any run of backticks inside the content, so a ``` in a fact can't end the block early. */
+export function fenceFor(content) {
+  const runs = String(content ?? "").match(/`+/g) || [];
+  return "`".repeat(Math.max(3, ...runs.map((r) => r.length + 1)));
 }
 
 /** For the endpoint Claude on Reilly's PC reads (wired by the integrator, behind the API key). */

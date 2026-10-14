@@ -266,8 +266,8 @@ export async function settleBatches(db, store, nowMs = Date.now()) {
 }
 
 async function expireBatch(db, b, status, why, at) {
-  await db.prepare(`UPDATE approvals SET status = 'expired', decided_at = ?, note = ? WHERE id = ? AND status = 'pending'`)
-    .bind(at, `Expired by the brain: ${why}`, b.approval_id).run();
+  await db.prepare(`UPDATE approvals SET status = 'expired', decided_at = ?, result = ? WHERE id = ? AND status = 'pending'`)
+    .bind(at, JSON.stringify({ closed_by: ACTOR, not_reilly: true, outcome: status, reason: `Expired by the brain: ${why}` }), b.approval_id).run();
   await db.prepare(`UPDATE supplier_batches SET status = ? WHERE id = ?`).bind(status, b.id).run();
   await logEvent(db, {
     actor: ACTOR, kind: `quotes.batch_${status}`, target: "core.approvals", at,

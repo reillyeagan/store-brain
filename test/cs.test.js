@@ -913,9 +913,31 @@ test("cs no_action: the two live thank-you summaries close; a question, a refund
   ]) assert.equal(noActionCheck(t(REAL_9, body)).close, false, body);
   // Only "other" can be a bare thank-you; a real category always has something to do.
   assert.equal(noActionCheck(t(REAL_9, "Thankyou", { category: "where_is_order" })).close, false);
-  // A bare thank-you closes even without the classifier's words; a long email doesn't.
-  assert.equal(noActionCheck(t("Customer thanks the store", "Thanks so much Jane!")).close, true);
+  // A bare thank-you closes even without the classifier's words; anything more doesn't.
+  assert.equal(noActionCheck(t("Customer thanks the store", "Thanks so much!\nJane", { from_name: "Jane Doe" })).close, true);
+  assert.equal(noActionCheck(t("Customer thanks the store", "Hi team,\nThank you for the update.\nBest,\nJane Doe\nSent from my iPhone", { from_name: "Jane Doe" })).close, true);
   assert.equal(noActionCheck(t("Customer thanks the store", "Thanks so much, the jacket looks lovely on my husband who wore it to the wedding on saturday in town")).close, false);
+});
+
+test("cs no_action review: an allowlist, not a problem list — any word beyond a plain thank-you keeps it with Reilly, whatever the classifier said", () => {
+  // The classifier claims "nothing asked" on every one of these; code must still refuse.
+  const t = (body, extra = {}) => ({ category: "other", urgency: "low", subject: "Re: Your order is on the way", from_name: "Jane Doe", body,
+    summary: "Customer thanks the store. No action requested.", triage: JSON.stringify({ category: "other", no_action: true }), ...extra });
+  for (const body of [
+    "thanks, but the zipper broke", "thanks, the parcel was empty", "thank you the shoes hurt", "Thanks got it but it smells",
+    "thanks. received two of the same", "Thank you, but I ordered a medium", "thanks it arrived opened", "Thanks, the item is used",
+    "thank you, it's not what i ordered",
+    // Not English: the model alone never closes.
+    "Gracias, pero el pedido no llegó", "Danke, aber die Jacke ist kaputt", "Merci mais je n'ai rien reçu",
+    // HTML is read as text first.
+    "<html><head><style>p{color:red}</style></head><body><p>Thank you</p><p>but the box was crushed</p></body></html>",
+    // A "name" line that isn't the sender's name, and a greeting to someone who isn't the store.
+    "Thanks\nZipper Broke", "Hi Broken, thanks",
+  ]) assert.equal(noActionCheck(t(body)).close, false, body);
+  // A plain thank-you in HTML closes once the HTML is read as text.
+  assert.equal(noActionCheck(t("<html><head><style>.x{}</style></head><body><div>Thank you!</div><div>Jane</div></body></html>")).close, true);
+  // Everything the classifier says is only a supporting sign: the reason records it.
+  assert.match(noActionCheck(t("Thankyou")).reason, /only a thank-you.*classifier said nothing was asked/);
 });
 
 test("cs no_action: a thank-you is closed quietly (no flag, no draft, listed on the CS page); 'thanks! when will it arrive?' and a wrong-colour refund still reach Reilly", async () => {
@@ -954,13 +976,7 @@ test("cs no_action: open flags the classifier called 'no action requested/raised
   const env = await setup();
   const DB = env.DB;
   const at = new Date(NOW - 3600000).toISOString();
-  const add = async ({ id, summary, body, category = "other", urgency = "low", order = "#1253" }) => {
-    const ap = await createApproval(DB, { dept: "cs", requestedBy: "cs.escalation", store: "hc", title: `Holt & Crane: ${category} ${order} — ticket ${id}`, options: [{ id: "handled", label: "I'll handle it in Gmail", detail: summary }] });
-    await DB.prepare(`INSERT INTO cs_tickets (id, opened_at, updated_at, slot, gmail_id, thread_id, store, from_email, subject, body, via, status, category, urgency, summary, triage, context_at, order_name, escalated_at, approval_id)
-      VALUES (?, ?, ?, 'google:hc', ?, ?, 'hc', 'c@x.com', ?, ?, 'email', 'needs_reilly', ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .bind(id, at, at, `g${id}`, `T${id}`, `Re: order ${order}`, body, category, urgency, summary, JSON.stringify({ category, summary }), at, order, at, ap).run();
-    return ap;
-  };
+  const add = (o) => addFlagged(DB, at, o);
   const a9 = await add({ id: 9, summary: REAL_9, body: "Thankyou" });
   const a2 = await add({ id: 2, summary: REAL_2, body: "Thank you for the update, I will get back to you once I receive the item.", order: "#1059" });
   const a3 = await add({ id: 3, summary: "Received the wrong colour and wants a refund or return.", body: "Wrong colour arrived. I want a refund or a return.", category: "return_refund", urgency: "normal", order: "#1100" });
@@ -971,12 +987,49 @@ test("cs no_action: open flags the classifier called 'no action requested/raised
   for (const id of [a9, a2]) {
     const ap = await DB.prepare(`SELECT * FROM approvals WHERE id = ?`).bind(id).first();
     assert.equal(ap.status, "expired");
-    assert.match(ap.note, /Closed by the brain .*not Reilly.*no action needed/);
+    // The brain's reason never goes in `note` (Reilly's verbatim words).
+    assert.equal(ap.note, null);
+    const res = JSON.parse(ap.result);
+    assert.equal(res.closed_by, "cs.escalation");
+    assert.equal(res.not_reilly, true);
+    assert.match(res.reason, /only a thank-you/);
   }
   const ts = await tickets(DB);
   assert.deepEqual(ts.map((t) => [t.id, t.status]), [[2, "no_action"], [3, "needs_reilly"], [9, "no_action"]]);
   assert.match(ts[0].classify_note, /re-closed flag/);
-  assert.equal((await evs(DB, "cs.no_action_reclosed")).length, 2);
-  // Running again changes nothing.
+  const ev = await evs(DB, "cs.no_action_reclosed");
+  assert.equal(ev.length, 2);
+  assert.match(JSON.parse(ev[0].data).reason, /only a thank-you/);
+  // A one-off: a later run does nothing, even for a qualifying flag from before the cutoff.
+  await add({ id: 11, summary: REAL_9, body: "Thankyou", order: "#1300" });
   assert.equal((await escalateTickets(env, { nowMs: NOW + MIN, fetchImpl: nf })).reclosed, 0);
+  assert.equal((await DB.prepare(`SELECT value FROM agent_cursors WHERE name = 'cs.no_action_reclose'`).first()).value, 2);
+});
+
+/** A CS flag already waiting on Reilly, as the escalation desk made them before the guard. */
+async function addFlagged(DB, at, { id, summary, body, category = "other", urgency = "low", order = "#1253", thread = null, created = "2026-10-14T12:00:00Z", status = "needs_reilly", flag = true }) {
+  let ap = null;
+  if (flag) {
+    ap = await createApproval(DB, { dept: "cs", requestedBy: "cs.escalation", store: "hc", title: `Holt & Crane: ${category} ${order} — ticket ${id}`, options: [{ id: "handled", label: "I'll handle it in Gmail", detail: summary }] });
+    await DB.prepare(`UPDATE approvals SET created_at = ? WHERE id = ?`).bind(created, ap).run();
+  }
+  await DB.prepare(`INSERT INTO cs_tickets (id, opened_at, updated_at, slot, gmail_id, thread_id, store, from_email, from_name, subject, body, via, status, category, urgency, summary, triage, context_at, order_name, escalated_at, approval_id)
+    VALUES (?, ?, ?, 'google:hc', ?, ?, 'hc', 'c@x.com', 'Casey Shopper', ?, ?, 'email', ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .bind(id, at, at, `g${id}`, thread || `T${id}`, `Re: order ${order}`, body, status, category, urgency, summary, JSON.stringify({ category, summary }), at, order, flag ? at : null, ap).run();
+  return ap;
+}
+
+test("cs no_action review: the one-off re-close never overrides an earlier unanswered ask in the thread, and leaves flags made after the cutoff alone", async () => {
+  const env = await setup();
+  const DB = env.DB;
+  const at = "2026-10-14T11:00:00Z";
+  // A superseded real problem, then "Thanks" in the same conversation (the flag is on "Thanks").
+  await addFlagged(DB, at, { id: 20, thread: "TT", flag: false, status: "superseded", category: "exchange", summary: "Jacket arrived torn; asks for a replacement", body: "My jacket arrived torn, can I get a replacement?" });
+  const aThanks = await addFlagged(DB, at, { id: 21, thread: "TT", summary: REAL_9, body: "Thanks" });
+  // A plain thank-you flagged AFTER the cutoff: not the one-off's business.
+  const aLate = await addFlagged(DB, at, { id: 22, summary: REAL_9, body: "Thankyou", created: "2026-10-14T17:00:00Z" });
+  const nf = async () => new Response("{}", { status: 404 });
+  for (const m of [0, 20, 40]) await escalateTickets(env, { nowMs: NOW + m * MIN, fetchImpl: nf });
+  assert.deepEqual((await listPending(DB)).map((a) => a.id).sort(), [aThanks, aLate].sort());
+  assert.equal((await evs(DB, "cs.no_action_reclosed")).length, 0);
 });

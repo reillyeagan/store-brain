@@ -130,30 +130,63 @@ export async function escalateTickets(env, { nowMs = Date.now(), fetchImpl = fet
 }
 
 /**
- * Re-close CS flags still waiting on Reilly whose every email the classifier itself described
- * as "no action requested / raised" (or marked no_action) and which pass the code fail-safe
- * (no question, request, problem, anger or money word). The approval is closed as expired with
- * the reason; its tickets become no_action. Nothing is sent to anyone.
+ * ONE-OFF clean-up of the flags made before the no_action guard existed (live 2026-10-14).
+ * Only flags created before RECLOSE_CUTOFF, and only once (agent_cursors RECLOSE_DONE): every
+ * later thank-you is handled by the guard before it is ever flagged, so this never becomes a
+ * standing way to take things off Reilly's list.
+ */
+export const RECLOSE_CUTOFF = "2026-10-14T16:00:00Z";
+export const RECLOSE_DONE = "cs.no_action_reclose";
+
+/**
+ * Re-close those flags when every email on them, and every email in their conversations,
+ * passes the full code check (allowlisted thank-you; no question, request, problem, anger or
+ * money word), the classifier itself called it "no action requested / raised", no earlier
+ * unanswered email in the thread was replaced by it, and no draft was attempted. The approval
+ * is closed as expired; the brain's reason goes in `result` and the event, never in `note`
+ * (that column is Reilly's words). Nothing is sent to anyone.
  */
 export async function recloseNoActionFlags(db, { nowMs = Date.now() } = {}) {
+  // Claim the one-off first, so two overlapping runs can't both do it.
+  const claim = await db.prepare(`INSERT INTO agent_cursors (name, value, updated_at) VALUES (?, -1, ?) ON CONFLICT(name) DO NOTHING`)
+    .bind(RECLOSE_DONE, nowIso(nowMs)).run();
+  if (!claim.meta || claim.meta.changes !== 1) return 0;
+  let n = 0;
+  try {
+    n = await recloseOnce(db, nowMs);
+  } catch (err) {
+    // Give the claim back so the next run tries again.
+    await db.prepare(`DELETE FROM agent_cursors WHERE name = ? AND value = -1`).bind(RECLOSE_DONE).run();
+    throw err;
+  }
+  await db.prepare(`UPDATE agent_cursors SET value = ?, updated_at = ? WHERE name = ?`).bind(n, nowIso(nowMs), RECLOSE_DONE).run();
+  return n;
+}
+
+async function recloseOnce(db, nowMs) {
   const { results: flags } = await db.prepare(
-    `SELECT id, store, title FROM approvals WHERE status = 'pending' AND requested_by = ? ORDER BY id LIMIT 50`
-  ).bind(ACTOR).all();
+    `SELECT id, store, title FROM approvals WHERE status = 'pending' AND requested_by = ? AND created_at < ? ORDER BY id LIMIT 200`
+  ).bind(ACTOR, RECLOSE_CUTOFF).all();
   let n = 0;
   for (const a of flags || []) {
     const { results: ts } = await db.prepare(`SELECT * FROM cs_tickets WHERE approval_id = ? ORDER BY id`).bind(a.id).all();
     if (!ts || !ts.length) continue;
-    const checks = ts.map((t) => ({
-      t, c: noActionCheck(t),
-      saidSo: SUMMARY_NO_ACTION.test(String(t.summary || "")) || (safeJson(t.triage, {}) || {}).no_action === true,
-    }));
-    // Every email on the flag must be nothing-to-do in the classifier's own words, pass the
-    // fail-safe, and have no draft trouble (a blocked draft means there was something to say).
-    if (!checks.every((x) => x.c.close && x.saidSo && !x.t.draft_status)) continue;
+    let ok = true;
+    for (const t of ts) {
+      const saidSo = SUMMARY_NO_ACTION.test(String(t.summary || "")) || (safeJson(t.triage, {}) || {}).no_action === true;
+      if (!saidSo || t.draft_status || !noActionCheck(t).close || (await earlierUnansweredAsk(db, t))) { ok = false; break; }
+      // Every other email in the conversation must be answered, ignored, or itself nothing-to-do.
+      if (t.thread_id) {
+        const { results: thread } = await db.prepare(`SELECT * FROM cs_tickets WHERE slot = ? AND thread_id = ? AND id <> ?`).bind(t.slot, t.thread_id, t.id).all();
+        if ((thread || []).some((o) => !["replied", "ignored", "no_action"].includes(o.status) && !o.replied_at && !noActionCheck(o).close)) { ok = false; break; }
+      }
+    }
+    if (!ok) continue;
+    const checks = ts.map((t) => ({ t }));
     const at = nowIso(nowMs);
-    const why = `the classifier described it as "${clip(checks[0].t.summary || "", 140)}" and the email has no question, request, problem, anger or refund word`;
-    const r = await db.prepare(`UPDATE approvals SET status = 'expired', decided_at = ?, note = ? WHERE id = ? AND status = 'pending'`)
-      .bind(at, clip(`Closed by the brain (cs.escalation, not Reilly): no action needed; ${why}`, 400), a.id).run();
+    const why = `the classifier described it as "${clip(checks[0].t.summary || "", 140)}"; code check: only a thank-you, no question, request, problem, anger or refund word, nothing else open in the conversation`;
+    const r = await db.prepare(`UPDATE approvals SET status = 'expired', decided_at = ?, result = ? WHERE id = ? AND status = 'pending'`)
+      .bind(at, JSON.stringify({ closed_by: ACTOR, not_reilly: true, outcome: "no_action", reason: clip(why, 400) }), a.id).run();
     if (!r.meta || r.meta.changes !== 1) continue;
     for (const x of checks) {
       await db.prepare(`UPDATE cs_tickets SET status = 'no_action', classify_note = ?, updated_at = ? WHERE id = ?`)
