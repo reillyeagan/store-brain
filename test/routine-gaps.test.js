@@ -371,3 +371,32 @@ test("billing: only the APPROVED budget in force today is judged (an expired, fu
   assert.equal(judgeBudget([old, future, pending], NOWB).status, "none");
   assert.match(Q_BUDGET, /approved_start_date_time/);
 });
+
+test("spend alarm: each alarm type has its own daily slot (a morning 'stopped' never hides an afternoon 'no_orders')", async () => {
+  const DB = makeD1();
+  await seedAlarmWorld(DB, { spendToday: 0 });
+  await DB.prepare(`UPDATE ad_spend_days SET cost = 0 WHERE day = '2026-10-13'`).run(); // stopped yesterday
+  const AM = Date.parse("2026-10-14T13:00:00Z"); // 9:00 Eastern
+  await DB.prepare(`UPDATE feeds SET last_ok_at = ?, last_try_at = ?`).bind("2026-10-14T12:55:00Z", "2026-10-14T12:55:00Z").run();
+  assert.match(await runSpendAlarm({ DB }, { storeId: "hc", nowMs: AM }), /ALARM stopped/);
+  // Afternoon: spend came back ($45), still 0 orders.
+  await DB.prepare(`UPDATE ad_spend_days SET cost = 45 WHERE day = '2026-10-14'`).run();
+  const PM = Date.parse("2026-10-14T20:05:00Z");
+  await DB.prepare(`UPDATE feeds SET last_ok_at = ?, last_try_at = ?`).bind("2026-10-14T20:00:00Z", "2026-10-14T20:00:00Z").run();
+  const r = await runSpendAlarm({ DB }, { storeId: "hc", nowMs: PM });
+  assert.match(r, /no_orders/);
+  assert.match(r, /already raised today: stopped/);
+  const e = await evs(DB, "media.spend_alarm");
+  assert.deepEqual(e.map((x) => JSON.parse(x.data).type), ["stopped", "no_orders"]);
+  // Both stay listed today; the next day they close.
+  const open = (await DB.prepare(`SELECT key FROM media_findings WHERE agent = 'media.spend_alarm' AND cleared_at IS NULL AND key LIKE 'alarm:%' ORDER BY key`).all()).results.map((x) => x.key);
+  assert.deepEqual(open, ["alarm:no_orders:2026-10-14", "alarm:stopped:2026-10-14"]);
+});
+
+test("spend alarm: 'Google not connected' is logged at most once a week per store; other can't-checks daily", async () => {
+  const DB = makeD1();
+  const T = Date.parse("2026-10-14T20:00:00Z");
+  for (let d = 0; d < 9; d++) await runSpendAlarm({ DB }, { storeId: "hc", nowMs: T + d * 86400000 });
+  assert.equal((await evs(DB, "media.spend_alarm_skipped")).length, 2); // day 0 and day 8 (not days 1-7)
+  assert.match((await evs(DB, "media.spend_alarm_skipped"))[0].summary, /not wired/);
+});

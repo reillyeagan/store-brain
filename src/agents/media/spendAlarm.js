@@ -20,9 +20,10 @@
  * the two "0 orders" checks (0 orders from a stale feed is not a claim). Then it says "can't
  * check" and why, once a day, instead of alarming.
  *
- * One alarm per store per day: the finding key is "alarm:<store-local day>", the event is
- * logged only when that finding is NEW (later conditions the same day refresh the finding's
- * text, never a second alarm). The event (kind media.spend_alarm) reaches the morning brief's
+ * One alarm per store, per alarm TYPE (no_orders, runaway, stopped), per day: each type has its
+ * own finding key "alarm:<type>:<store-local day>", and its event is logged only if that type
+ * hasn't been announced for that store-day (so a "stopped" in the morning never hides a
+ * "no_orders" in the afternoon, and neither repeats). The event (kind media.spend_alarm) reaches the morning brief's
  * Risk list and the Event Log — the same path as feed alarms. Nothing is ever paused, raised
  * or changed in Google Ads: Guy runs the ads.
  * Inputs: feeds, ad_spend_days, orders. Outputs: media_findings (agent media.spend_alarm), events.
@@ -96,11 +97,15 @@ async function feedRow(db, id) {
   return db.prepare(`SELECT * FROM feeds WHERE id = ?`).bind(id).first().catch(() => null);
 }
 
-/** "Can't check" once a day per store (finding kept open while it lasts; event at most daily). */
-async function cantCheck(db, storeId, reason, nowMs) {
+/**
+ * "Can't check": the finding stays open while it lasts; the event at most once a day per store,
+ * or once a WEEK when Google simply isn't connected (a known setup gap, not news every day).
+ */
+export const NOT_WIRED_SKIP_EVERY_DAYS = 7;
+async function cantCheck(db, storeId, reason, nowMs, { notWired = false } = {}) {
   const at = nowIso(nowMs);
   await upsertFinding(db, { store: storeId, agent: AGENT, key: "cant_check", severity: "warn", summary: `Spend alarm can't check: ${reason}`, at });
-  const since = nowIso(nowMs - 24 * 3600000);
+  const since = nowIso(nowMs - (notWired ? NOT_WIRED_SKIP_EVERY_DAYS : 1) * 24 * 3600000);
   const recent = await db.prepare(`SELECT id FROM events WHERE kind = 'media.spend_alarm_skipped' AND store = ? AND at >= ? LIMIT 1`).bind(storeId, since).first().catch(() => null);
   if (!recent) {
     await logEvent(db, { actor: AGENT, kind: "media.spend_alarm_skipped", store: storeId, target: "sys.ads", at,
@@ -113,7 +118,7 @@ export async function runSpendAlarm(env, { storeId, nowMs = Date.now() }) {
   const db = env.DB;
   const cfg = spendAlarmConfig(storeId);
   const ads = feedState(await feedRow(db, `ads.spend.${storeId}`), nowMs);
-  if (ads !== "fresh") return cantCheck(db, storeId, `Google Ads spend feed is ${ads.replace("_", " ")}`, nowMs);
+  if (ads !== "fresh") return cantCheck(db, storeId, `Google Ads spend feed is ${ads.replace("_", " ")}`, nowMs, { notWired: ads === "not_wired" });
   const tzRow = await db.prepare(`SELECT account_tz FROM ad_spend_days WHERE store = ? AND account_tz IS NOT NULL ORDER BY day DESC LIMIT 1`).bind(storeId).first();
   if (!tzRow) return cantCheck(db, storeId, "no Google Ads days stored yet", nowMs);
   const acctTz = tzRow.account_tz;
@@ -135,20 +140,30 @@ export async function runSpendAlarm(env, { storeId, nowMs = Date.now() }) {
   });
 
   const at = nowIso(nowMs);
-  const key = `alarm:${storeToday}`;
   // The page shows a "can't check" only while it's true.
   await clearUnseen(db, { store: storeId, agent: AGENT, keys: [], at, prefix: "cant_check" });
-  // Yesterday's alarm stays in history (events); its finding closes when the day turns.
-  await clearUnseen(db, { store: storeId, agent: AGENT, keys: [key], at, prefix: "alarm:" });
+  // Earlier days' alarms stay in history (events); their findings close when the day turns.
+  // Today's stay open all day, even if the condition passes (it happened today).
+  const { results: openRows } = await db.prepare(`SELECT key FROM media_findings WHERE store = ? AND agent = ? AND cleared_at IS NULL AND key LIKE 'alarm:%'`)
+    .bind(storeId, AGENT).all();
+  const todays = (openRows || []).map((r) => r.key).filter((k) => k.endsWith(`:${storeToday}`));
+  await clearUnseen(db, { store: storeId, agent: AGENT, keys: [...todays, ...verdict.alarms.map((a) => `alarm:${a.key}:${storeToday}`)], at, prefix: "alarm:" });
   if (!verdict.alarms.length) {
     return `ok: no alarm (spend today ${money(r2(spendToday))}, ${ordersFresh ? `${ordersToday} orders` : "orders feed not fresh"})`;
   }
-  const summary = `${storeName(storeId)}: ${verdict.alarms.map((a) => a.summary).join("; ")}. Watch only: nothing was changed in Google Ads.`;
-  const data = { day: storeToday, account_day: acctToday, alarms: verdict.alarms.map((a) => a.key), spend_today: r2(spendToday),
-    orders_today: ordersFresh ? ordersToday : null, usual_day: verdict.usual, notes: verdict.notes };
-  const isNew = await upsertFinding(db, { store: storeId, agent: AGENT, key, severity: "bad", summary, data, at });
-  if (isNew) {
+  const raised = [], already = [];
+  for (const a of verdict.alarms) {
+    const summary = `${storeName(storeId)}: ${a.summary}. Watch only: nothing was changed in Google Ads.`;
+    const data = { day: storeToday, account_day: acctToday, type: a.key, alarms: [a.key], spend_today: r2(spendToday),
+      orders_today: ordersFresh ? ordersToday : null, usual_day: verdict.usual, notes: verdict.notes };
+    await upsertFinding(db, { store: storeId, agent: AGENT, key: `alarm:${a.key}:${storeToday}`, severity: "bad", summary, data, at });
+    // One event per store, type and day (checked in the Event Log itself, so a finding that was
+    // cleared and re-opened can't announce the same type twice).
+    const seen = await db.prepare(`SELECT id FROM events WHERE kind = 'media.spend_alarm' AND store = ? AND data LIKE ? AND data LIKE ? LIMIT 1`)
+      .bind(storeId, `%"day":"${storeToday}"%`, `%"type":"${a.key}"%`).first();
+    if (seen) { already.push(a.key); continue; }
     await logEvent(db, { actor: AGENT, kind: "media.spend_alarm", store: storeId, target: "sys.ads", summary, data, at });
+    raised.push(a.key);
   }
-  return `ok: ALARM ${verdict.alarms.map((a) => a.key).join("+")}${isNew ? "" : " (already raised today)"}`;
+  return `ok: ALARM ${verdict.alarms.map((a) => a.key).join("+")}${already.length ? ` (already raised today: ${already.join("+")})` : ""}`;
 }
