@@ -43,7 +43,11 @@ export const ACTOR = "risk.chargebacks";
 export const REMINDER_DAYS = Object.freeze([7, 2]);
 /** At most this many rebuttal drafts per run: AI is capped, and each dispute gets one. */
 export const MAX_AI_DRAFTS_PER_RUN = 1;
-/** A failed AI attempt is retried, at most this many attempts per dispute in total ... */
+/**
+ * A failed AI attempt is retried, at most this many attempts per dispute in total ...
+ * (Packs from before migration 0017, like live #1098, start with ai_attempts = 0 even though
+ * one attempt was already spent, so they can get up to 4 in all. Accepted: it is bounded.)
+ */
 export const MAX_AI_ATTEMPTS = 3;
 /** ... and no sooner than this after the last one (a broken API isn't hammered every hour). */
 export const AI_RETRY_AFTER_HOURS = 3;
@@ -357,24 +361,33 @@ export function buildCodeDraft(f, missing) {
   L.push("");
   L.push(`Order ${o.name}, placed ${day(o.created_at) || "[ADD: order date]"}, total ${fmtMoney(o.total, o.currency)}.`);
   if (o.lines.length) L.push(`Items: ${o.lines.map((l) => `${l.qty} x ${l.title}${l.variant ? ` (${l.variant})` : ""}`).join("; ")}.`);
+  // A shipment is only CLAIMED when Shopify has a fulfillment WITH a tracking number. A
+  // fulfillment without tracking proves nothing to a bank, and no fulfillment means nothing
+  // shipped as far as Shopify knows: then the draft asks for proof instead of asserting it.
+  const tracked = f.fulfillments.some((x) => x.tracking.some((t) => t.number));
   const sa = f.shipping_address;
-  if (sa) L.push(`Shipped to the address the customer gave at checkout${[sa.city, sa.province, sa.country].filter(Boolean).length ? ` (${[sa.city, sa.province, sa.country].filter(Boolean).join(", ")})` : ""}.`);
+  const place = sa ? [sa.city, sa.province, sa.country].filter(Boolean).join(", ") : "";
+  if (tracked) L.push(`Shipped to the address the customer gave at checkout${place ? ` (${place})` : ""}.`);
   L.push("");
   if (f.fulfillments.length) {
     L.push(`Fulfillment (Shopify, order status ${o.fulfillment_status || "unknown"}):`);
     for (const x of f.fulfillments) {
       const tr = x.tracking.filter((t) => t.number)
         .map((t) => `${t.company && !/^other$/i.test(t.company) ? t.company : "[ADD: carrier]"} tracking ${t.number}${t.url ? ` (${t.url})` : ""}`);
-      const deliv = x.delivered_at ? `delivered ${day(x.delivered_at)} per Shopify` : `Shopify shows ${String(x.status || "no status").toLowerCase().replace(/_/g, " ")}, no delivery date`;
-      L.push(`- Shipped ${day(x.shipped_at) || "[ADD: ship date]"}: ${tr.length ? tr.join("; ") : "[ADD: tracking number]"}; ${deliv}.`);
+      // deliveredAt can be set by the merchant, so it is Shopify's word, not the carrier's.
+      const deliv = x.delivered_at ? `Shopify shows it delivered on ${day(x.delivered_at)}` : `Shopify shows ${String(x.status || "no status").toLowerCase().replace(/_/g, " ")}, no delivery date`;
+      L.push(`- Fulfilled in Shopify ${day(x.shipped_at) || "[ADD: date]"}: ${tr.length ? tr.join("; ") : "no tracking number [ADD: proof of shipment with a tracking number]"}; ${deliv}.`);
     }
   } else {
-    L.push(`Fulfillment: Shopify shows no fulfillment for this order (status ${o.fulfillment_status || "unknown"}). [ADD: proof of shipment]`);
+    L.push(`Fulfillment: Shopify shows no fulfillment for this order (status ${o.fulfillment_status || "unknown"}).`);
   }
-  if (dsp.reason === "PRODUCT_NOT_RECEIVED") {
+  if (!tracked) L.push("[ADD: proof of shipment: Shopify has no fulfillment with a tracking number for this order]");
+  if (dsp.reason === "PRODUCT_NOT_RECEIVED" && tracked) {
     L.push("");
+    const deliveredOn = f.fulfillments.map((x) => x.delivered_at).filter(Boolean).sort()[0];
     L.push("The order was shipped to the address the customer entered, with the tracking above."
-      + (f.fulfillments.some((x) => x.delivered_at) ? " The carrier reports it delivered." : " [ADD: carrier proof of delivery, e.g. a screenshot of the tracking page showing delivered]"));
+      + (deliveredOn ? ` Shopify shows it delivered on ${day(deliveredOn)}. [ADD: the carrier's own proof of delivery]`
+        : " [ADD: carrier proof of delivery, e.g. a screenshot of the tracking page showing delivered]"));
   }
   if (f.customer_messages.length) {
     L.push("");
