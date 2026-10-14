@@ -8,7 +8,8 @@
  *
  * Cadence: funnel hourly (≤ 2 Shopify calls per live store) · COGS Matcher hourly (does
  * nothing until KFB bills exist) · calendar hourly (each reminder/trigger at most once a day)
- * · Analyst once a day, from 06:00 UTC (after the 05:00 UTC day close)
+ * · Analyst once a day, from 06:00 UTC (after the 05:00 UTC day close) · Guy's fee daily
+ * (end-date questions asked once, the fee check once a month per store)
  * · Google Ads history backfill hourly until done (≤ 3 calls per store) · P&L Sheets hourly
  *   (reads the workbooks, fills the brain's gaps, cross-checks, then fills blank sheet cells).
  * Shadow: everything stays in the ledger, except the P&L Sheets writes, which Reilly asked for
@@ -24,6 +25,7 @@ import { runSheets, sheetsState } from "./sheets.js";
 import { runAdsHistory, adsHistoryState } from "../../lib/adsHistory.js";
 import { historyExtensionState } from "../../lib/historyExtend.js";
 import { callBudget } from "../../lib/callBudget.js";
+import { askGuyEndDates, monthlyGuyCheck } from "./guyFee.js";
 
 export const PNL_EXTRA_JOBS = Object.freeze({
   "pnl.funnel": 60,
@@ -32,6 +34,8 @@ export const PNL_EXTRA_JOBS = Object.freeze({
   "pnl.analyst": 24 * 60,
   "pnl.ads_history": 60,
   "pnl.sheets": 60,
+  // Guy's fee: end-date questions (asked once) + the monthly fee check (once a month per store).
+  "pnl.guy_fee": 24 * 60,
 });
 export const ANALYST_AFTER_UTC_HOUR = 6;
 
@@ -60,6 +64,9 @@ export async function runPnlExtras(env, { nowMs = Date.now(), fetchImpl = fetch 
   out.funnel = await step(env, "pnl.funnel", "pnl.pullers", nowMs, () => pullFunnel(env, { nowMs, fetchImpl: f }));
   out.cogs = await step(env, "pnl.cogs", "pnl.cogs", nowMs, () => matchBills(env.DB, { nowMs }));
   out.calendar = await step(env, "pnl.calendar", "pnl.calendar", nowMs, () => runCalendar(env, { nowMs }));
+  out.guyFee = await step(env, "pnl.guy_fee", "pnl.calendar", nowMs, async () => ({
+    asked: await askGuyEndDates(env.DB, { nowMs }), checks: await monthlyGuyCheck(env.DB, { nowMs }),
+  }));
   // The daily analysis waits for the day close, so "yesterday" is final-ish. It runs before the
   // loops below so they can't use up its one call.
   out.analyst = new Date(nowMs).getUTCHours() >= ANALYST_AFTER_UTC_HOUR

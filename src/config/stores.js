@@ -59,6 +59,57 @@ export const SHEETS_FILL_DECISION = Object.freeze({
  * (H&C: first ad spend 2026-07-13, first order 2026-08-15).
  */
 export const HISTORY_FROM = "2026-07-01";
+/**
+ * Guy's END date, per store (`guyEnd` on each store below): the LAST day his fee is charged.
+ * null = still active (the fee runs on). Every end date is null on purpose: only Reilly's own
+ * words set one (rule 10). The vault says Auberlane's media buyer ended after 2026-10-13, but
+ * that comes from Reilly's P&L sheet (Auberlane SETUP!B11) and the Memory Log (2026-10-14),
+ * not from his words in chat, so it is ASKED (below), not assumed.
+ * When Reilly answers, set that store's guyEnd here and record his words in `decisions`.
+ */
+export const GUY_END_QUESTIONS = Object.freeze([
+  {
+    store: "aub",
+    title: "Auberlane's media buyer: did Guy stop after Oct 13? (your sheet says so). Reply to set the end date.",
+    source: "Auberlane P&L sheet SETUP!B11 and vault Memory Log 2026-10-14 (not Reilly's chat words)",
+  },
+]);
+
+/**
+ * Spend alarm (media.spend_alarm): "money is going out and nothing is coming in", or "the
+ * money stopped going out". Watch only: it raises one alarm per store per day, never touches
+ * the ad account (Guy runs the ads). Numbers are in the ad account's currency (USD today).
+ * Why each threshold (none came from Reilly; change them here, per store if needed):
+ *  - noOrdersMinSpend 40: about two-thirds of a normal day's spend on one store (H&C ran ~$60/day
+ *    in Aug-Sep, Vault Brain State 08-28). $40 gone with not one order is not noise.
+ *  - noOrdersFromHour 15: "by mid-afternoon" in the STORE's timezone. Mornings are thin; by 3 pm
+ *    a store spending $40+ has nearly always had an order.
+ *  - usualMultiple 2 + usualDays 14: today's spend already over 2x a normal FULL day (median of
+ *    the last 14 closed days) with no orders is an alarm at any hour: a budget doubled or a
+ *    campaign ran away (Auberlane spent 85-95 clicks/day with 0 orders on 10-11/12, Memory Log 10-13).
+ *  - stoppedMinUsual 15 + stoppedNormalDays 5 of 7: an account counts as "normally spending"
+ *    when its median closed day is $15+ and at least 5 of the last 7 closed days spent anything.
+ *    Then a closed day at $0, or $0 so far today after stoppedFromHour (13, account time), is an
+ *    alarm: billing failed or a campaign was paused (Auberlane stopped spending 09-27 unnoticed).
+ * A stale ads feed (or orders feed, for the zero-orders checks) is never judged: the alarm says
+ * "can't check" instead (rule 4). Zero orders from a stale feed is not a claim.
+ */
+export const SPEND_ALARM = Object.freeze({
+  noOrdersMinSpend: 40,
+  noOrdersFromHour: 15,
+  usualMultiple: 2,
+  usualDays: 14,
+  stoppedMinUsual: 15,
+  stoppedNormalDays: 5,
+  stoppedWindow: 7,
+  stoppedFromHour: 13,
+  perStore: {}, // e.g. { aub: { noOrdersMinSpend: 25 } } — overrides for one store only
+});
+/** The alarm thresholds for one store (defaults + that store's overrides). */
+export function spendAlarmConfig(storeId) {
+  const { perStore, ...base } = SPEND_ALARM;
+  return { ...base, ...((perStore && perStore[storeId]) || {}) };
+}
 
 /**
  * Who each store sells to (`audience` on each store below): "men", "women", "both", or null
@@ -89,6 +140,7 @@ export const STORES = Object.freeze({
     // Guy (media buyer) fee: see GUY_FEE below.
     guyFeeRate: GUY_FEE.rate,
     guyStart: GUY_FEE.start,
+    guyEnd: null, // still active until Reilly says otherwise (see GUY_END_QUESTIONS)
   },
   aub: {
     id: "aub",
@@ -104,6 +156,7 @@ export const STORES = Object.freeze({
     // Guy (media buyer) fee: see GUY_FEE below.
     guyFeeRate: GUY_FEE.rate,
     guyStart: GUY_FEE.start,
+    guyEnd: null, // still active until Reilly says otherwise (see GUY_END_QUESTIONS)
   },
   mar: {
     id: "mar",
@@ -119,6 +172,7 @@ export const STORES = Object.freeze({
     // Guy (media buyer) fee: see GUY_FEE below.
     guyFeeRate: GUY_FEE.rate,
     guyStart: GUY_FEE.start,
+    guyEnd: null, // still active until Reilly says otherwise (see GUY_END_QUESTIONS)
   },
   cc: {
     id: "cc",

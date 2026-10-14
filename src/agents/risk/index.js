@@ -135,6 +135,11 @@ export async function riskState(env, { nowMs = Date.now() } = {}) {
       WHERE verdict = 'risky' AND last_seen_at >= ? ORDER BY store, category, id LIMIT 50`
   ).bind(new Date(nowMs - 8 * 86400000).toISOString()).all();
   const { results: claimCounts } = await db.prepare(`SELECT verdict, COUNT(*) AS n FROM risk_claims GROUP BY verdict`).all();
+  // Reilly's personal details found customer-facing (open until a weekly read no longer finds them).
+  const { results: personal } = await db.prepare(
+    `SELECT store, source, pattern, label, excerpt, severity, found_at, last_seen_at FROM risk_personal_hits
+      WHERE cleared_at IS NULL ORDER BY store, source LIMIT 50`
+  ).all().catch(() => ({ results: [] }));
 
   const { results: runs } = await db.prepare(`SELECT job, last_run_at, last_result FROM job_runs WHERE job LIKE 'risk.%' ORDER BY job`).all();
   const { results: notWired } = await db.prepare(
@@ -171,6 +176,7 @@ export async function riskState(env, { nowMs = Date.now() } = {}) {
     claims: {
       risky: (claims || []).map((c) => ({ ...c, storeName: storeName(c.store) })),
       counts: Object.fromEntries((claimCounts || []).map((c) => [c.verdict, c.n])),
+      personal_details: (personal || []).map((p) => ({ ...p, storeName: storeName(p.store) })),
     },
     lastRuns: runs || [],
     notWired: notWired || [],

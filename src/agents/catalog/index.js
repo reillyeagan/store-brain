@@ -8,7 +8,9 @@
  *      every catalog run reads; the claim only stops overlapping runs reading twice).
  *   2. Once a day per store, after 06:00 store time, and only if that copy is fresh:
  *      Margin Guard, Pricing, Product Status, New-Product Check (in that order).
- *   3. Once a day per store: Merchant Center Health (doesn't need the product copy).
+ *   3. Once a month per store (fresh copy only): the Feed Hygiene report (zombies, best-sellers
+ *      not on sale, SKU count vs ad spend).
+ *   4. Once a day per store: Merchant Center Health (doesn't need the product copy).
  * Each agent runs in its own try: one failing never stops the others, a failed daily run
  * gives its claim back so the next tick retries (rule 6), and errors are logged at most
  * once an hour. Nothing is ever written to Shopify, Merchant Center or anywhere outside D1.
@@ -22,6 +24,7 @@ import { runMarginGuardStore, AGENT as MARGIN } from "./marginGuard.js";
 import { runStatusStore, AGENT as STATUS } from "./status.js";
 import { runPrepublishStore, AGENT as PREPUBLISH } from "./prepublish.js";
 import { runFeedHealthStore, AGENT as FEED } from "./feedHealth.js";
+import { runHygieneStore, AGENT as HYGIENE } from "./hygiene.js";
 import { rulesFor, PRICE_CEILING } from "./pricingRules.js";
 import { dailyDue, claimDaily, releaseDaily, markWaiting, getRun, loadProducts, logEventOnce } from "./common.js";
 
@@ -109,6 +112,29 @@ export async function runCatalog(env, { nowMs = Date.now(), fetchImpl = fetch, f
       }
     }
 
+    // 2b. Feed hygiene (monthly: the course's zombie drafting is a monthly job), fresh copy only.
+    const hjob = `${HYGIENE}.${store}`;
+    try {
+      const due = await dailyDue(db, hjob, store, nowMs);
+      const month = due.day.slice(0, 7);
+      const row = await db.prepare(`SELECT day FROM cat_daily WHERE job = ?`).bind(hjob).first();
+      if (force || (due.due && (!row || row.day < month))) {
+        if (!ready) ready = cacheReady(await getSync(db, store), nowMs);
+        if (!ready.ready) {
+          await markWaiting(db, { agent: HYGIENE, store, day: due.day, nowMs, note: `Waiting for a fresh product read: ${ready.reason}` });
+          out.agents[hjob] = { status: "waiting", reason: ready.reason };
+        } else if (force || (await claimDaily(db, hjob, month, nowMs))) {
+          try {
+            if (!products) products = await loadProducts(db, store);
+            out.agents[hjob] = await runHygieneStore(env, store, products, { nowMs, day: due.day });
+          } catch (err) { await releaseDaily(db, hjob, month).catch(() => {}); throw err; }
+        }
+      }
+    } catch (err) {
+      out.agents[hjob] = { status: "error", error: String(err && err.message) };
+      await logError(db, HYGIENE, store, "feed hygiene report", err, nowMs);
+    }
+
     // 3. Merchant Center health (daily).
     const job = `${FEED}.${store}`;
     try {
@@ -149,7 +175,7 @@ export async function catalogState(env, { nowMs = Date.now() } = {}) {
     ).bind(store).first();
     const ready = cacheReady(sync, nowMs);
     const agents = {};
-    for (const id of [PRICING, MARGIN, STATUS, PREPUBLISH, FEED]) agents[id] = trimRun(await getRun(db, id, store));
+    for (const id of [PRICING, MARGIN, STATUS, PREPUBLISH, FEED, HYGIENE]) agents[id] = trimRun(await getRun(db, id, store));
     stores.push({
       store, name: STORES[store].name,
       rules: { band: rules.band, shape: rules.shape, floor: rules.floor, ceiling: rules.ceiling, badge: rules.badge },
@@ -163,6 +189,7 @@ export async function catalogState(env, { nowMs = Date.now() } = {}) {
         last_error: sync && sync.last_error ? { message: sync.last_error, at: sync.last_error_at } : null,
       },
       pricing: agents[PRICING], margin: agents[MARGIN], status: agents[STATUS], new_products: agents[PREPUBLISH], merchant_center: agents[FEED],
+      feed_hygiene: agents[HYGIENE], // monthly: zombies, best-sellers not on sale, SKUs vs spend
     });
   }
   const { results } = await db.prepare(

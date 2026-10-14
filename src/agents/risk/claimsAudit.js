@@ -17,8 +17,12 @@
  *      most 2 batches per run) against the measured reality. Code keeps the snippet text;
  *      Claude only labels it.
  *
+ *   3. Personal details (personalDetails.js, plain code, high severity): the same read, plus the
+ *      store's contact email and store address, is matched against Reilly's home / old Kansas
+ *      addresses, personal Gmail and 913 phone. Stored in risk_personal_hits.
+ *
  * Inputs: Shopify Admin GraphQL (Store Guard), core_facts policy notes.
- * Outputs: risk_claims (findings for Reilly), events.
+ * Outputs: risk_claims (findings for Reilly), risk_personal_hits, events.
  */
 import { LIVE_STORE_IDS, STORES } from "../../config/stores.js";
 import { shopifyGraphQL } from "../../lib/storeGuard.js";
@@ -26,6 +30,7 @@ import { logEvent } from "../../lib/eventlog.js";
 import { askJson } from "../../lib/ai.js";
 import { nowIso } from "../../lib/time.js";
 import { fingerprint, logProblem, logOnce, isAccessDenied, isNotWired } from "./shared.js";
+import { SHOP_SETTINGS_QUERY, SETTINGS_SOURCES, scanItems, settingsItems, saveHits } from "./personalDetails.js";
 
 export const ACTOR = "risk.claims_audit";
 export const BATCH_SIZE = 15;
@@ -129,6 +134,24 @@ export function snippetsFromStorefront(storefront, policies) {
   return { items, themeName: theme ? theme.name : null };
 }
 
+/** Pure: every raw text read (whole theme strings, descriptions, policies), for the personal-details scan. */
+export function rawStorefrontItems(storefront, policies) {
+  const out = [];
+  const theme = storefront && storefront.themes && storefront.themes.nodes && storefront.themes.nodes[0];
+  for (const f of (theme && theme.files && theme.files.nodes) || []) {
+    const content = f && f.body && f.body.content;
+    if (!content) continue;
+    const strings = themeStrings(content);
+    // A theme file that isn't JSON (or has no strings) is scanned as plain text.
+    out.push({ source: `theme:${f.filename}`, text: strings.length ? strings.join(" \n ") : content });
+  }
+  for (const p of (storefront && storefront.products && storefront.products.nodes) || []) {
+    out.push({ source: `product:${p.handle}`, text: plainText(p.description) });
+  }
+  for (const p of policies || []) out.push({ source: `policy:${String(p.type || p.title).toLowerCase()}`, text: plainText(p.body) });
+  return out;
+}
+
 /** Collect one store's snippets. */
 export async function collectStore(env, storeId, { nowMs = Date.now(), fetchImpl = fetch } = {}) {
   const db = env.DB;
@@ -149,6 +172,22 @@ export async function collectStore(env, storeId, { nowMs = Date.now(), fetchImpl
   }
   const { items, themeName } = snippetsFromStorefront(sf, policies);
   if (!themeName) notes.push("no live theme files readable; product and policy text only");
+
+  // Personal-details scan (plain code, high severity) over ALL the text read, not just the
+  // promise-like snippets, plus the store's customer-facing settings.
+  let shop = null;
+  try {
+    const s = await shopifyGraphQL(env, storeId, SHOP_SETTINGS_QUERY, {}, { fetchImpl, nowMs });
+    shop = (s && s.shop) || null;
+  } catch (err) {
+    if (!(isAccessDenied(err) || isNotWired(err))) throw err;
+    notes.push("store contact settings not readable for the personal-details scan (not wired)");
+  }
+  // Exactly what was read this run: only these sources can have an old hit cleared.
+  const raw = rawStorefrontItems(sf, policies);
+  const readSources = new Set(raw.map((it) => it.source));
+  if (shop) for (const s of SETTINGS_SOURCES) readSources.add(s);
+  const personal = await saveHits(db, storeId, scanItems([...raw, ...settingsItems(shop)]), { nowMs, readSources });
   let added = 0;
   for (const it of items) {
     const hash = await fingerprint(it.text);
@@ -165,9 +204,9 @@ export async function collectStore(env, storeId, { nowMs = Date.now(), fetchImpl
   await logEvent(db, {
     actor: ACTOR, kind: "risk.claims_collected", store: storeId, target: "sys.shopify",
     summary: `${name} storefront read${themeName ? ` (theme "${themeName}")` : ""}: ${items.length} promise-like snippet${items.length === 1 ? "" : "s"}, ${added} new to check${notes.length ? `. Note: ${notes.join("; ")}` : ""}`.slice(0, 480),
-    data: { snippets: items.length, added, policies: policies.length, notes }, at,
+    data: { snippets: items.length, added, policies: policies.length, notes, personal }, at,
   });
-  return { snippets: items.length, added, notes };
+  return { snippets: items.length, added, notes, personal };
 }
 
 const CLASSIFY_SYSTEM = `You audit an online clothing store's storefront text for promises that could lose a chargeback or break Google Ads / Merchant Center policy.

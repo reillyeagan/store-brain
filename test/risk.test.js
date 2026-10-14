@@ -8,6 +8,7 @@ import { runFraud, screenOrder, shopifyLevel } from "../src/agents/risk/fraud.js
 import { runAccountHealth, judgeHealth, mergeHealth, smallSampleNote } from "../src/agents/risk/accountHealth.js";
 import { collectStore, classifyPending, claimSnippets, themeStrings } from "../src/agents/risk/claimsAudit.js";
 import { daysLeft } from "../src/agents/risk/shared.js";
+import { scanText } from "../src/agents/risk/personalDetails.js";
 import { _resetTokenCacheForTests } from "../src/lib/storeGuard.js";
 import { listPending } from "../src/lib/approvals.js";
 
@@ -735,4 +736,93 @@ test("fix: a partial health read keeps the last values and never lowers 'bad'; n
   ratesFail = false;
   await runAccountHealth(env, { nowMs: NOW + 2 * DAY, fetchImpl: net.fetchImpl });
   assert.equal((await evs(DB, "risk.health_worse")).length, 1); // only the first time it went bad
+});
+
+/* ---------------- personal-details scan (routine audit, 2026-10-14) ---------------- */
+
+test("personal details: Reilly's addresses, personal Gmail and 913 phone are matched; ordinary text is not", () => {
+  const ids = (t) => scanText(t).map((h) => h.pattern).sort();
+  assert.deepEqual(ids("Holt & Crane LLC, 12345 W 169th St, Olathe, KS 66062"), ["169th", "ks_zip", "olathe"]);
+  assert.deepEqual(ids("Governed by the laws of Kansas."), ["kansas"]);
+  assert.deepEqual(ids("Old office: Indian Creek Pkwy, Overland Park"), ["indian_creek", "overland_park"]);
+  assert.deepEqual(ids("Questions? Email reillyworking26@gmail.com"), ["personal_gmail"]);
+  assert.deepEqual(ids("Call us on (913) 555-0142 or +1 913.555.0142"), ["phone_913"]);
+  assert.deepEqual(ids("Ships in 8-12 business days. Size 913 mm? Order #9130."), []);
+  assert.deepEqual(ids("Contact info@holtandcrane.com"), []);
+  const h = scanText("Our address: 12345 W 169th St, Olathe")[0];
+  assert.match(h.excerpt, /169th/);
+});
+
+test("personal details: the weekly read flags theme, product, policy and settings text (high), clears what's fixed, and settings it can't read are not wired", async () => {
+  const DB = makeD1();
+  let policyBody = "<p>These terms are governed by the laws of Kansas.</p>";
+  let contact = "reillyworking26@gmail.com";
+  const sf = () => ({
+    themes: { nodes: [{ id: "t", name: "Dawn", files: { nodes: [{ filename: "sections/footer-group.json", body: { content: `{"s":{"x":{"settings":{"text":"Call (913) 555-0142"}}}}` } }] } }] },
+    products: { nodes: [{ id: "p", title: "Blazer", handle: "blazer", description: "<p>Shipped from Olathe.</p>" }] },
+  });
+  const net = fakeNet({
+    shopify: (s, op) => op === "RiskPolicies" ? { shop: { shopPolicies: [{ type: "TERMS_OF_SERVICE", title: "Terms", body: policyBody }] } }
+      : op === "RiskShopSettings" ? { shop: { name: "H&C", contactEmail: contact, billingAddress: { address1: "1 Main St", city: "Austin", province: "Texas", zip: "73301", country: "US" } } }
+      : sf(),
+  });
+  const env = { DB, ...CREDS };
+  const a = await collectStore(env, "hc", { nowMs: NOW, fetchImpl: net.fetchImpl });
+  assert.equal(a.personal.found, 4);
+  const open = (await DB.prepare(`SELECT source, pattern, severity FROM risk_personal_hits WHERE cleared_at IS NULL ORDER BY source`).all()).results;
+  assert.deepEqual(open.map((r) => `${r.source}|${r.pattern}`), [
+    "policy:terms_of_service|kansas", "product:blazer|olathe", "settings:contact_email|personal_gmail", "theme:sections/footer-group.json|phone_913",
+  ]);
+  assert.ok(open.every((r) => r.severity === "high"));
+  assert.equal((await evs(DB, "risk.personal_details")).length, 1);
+  // Reilly fixes the policy and the contact email: those close on the next read; nothing new is announced.
+  policyBody = "<p>These terms are governed by the laws of Delaware.</p>";
+  contact = "info@holtandcrane.com";
+  await collectStore(env, "hc", { nowMs: NOW + 7 * DAY, fetchImpl: net.fetchImpl });
+  const still = (await DB.prepare(`SELECT pattern FROM risk_personal_hits WHERE cleared_at IS NULL ORDER BY pattern`).all()).results.map((r) => r.pattern);
+  assert.deepEqual(still, ["olathe", "phone_913"]);
+  assert.equal((await evs(DB, "risk.personal_details")).length, 1);
+  const st = await riskState(env, { nowMs: NOW + 7 * DAY });
+  assert.equal(st.claims.personal_details.length, 2);
+});
+
+test("personal details: settings Shopify refuses are noted as not wired, and their old hits are NOT cleared (unknown is not clean)", async () => {
+  const DB = makeD1();
+  await DB.prepare(`INSERT INTO risk_personal_hits (store, source, pattern, label, excerpt, found_at, last_seen_at) VALUES ('hc', 'settings:contact_email', 'personal_gmail', 'g', 'x', 't', 't')`).run();
+  const net = fakeNet({
+    shopify: (s, op) => op === "RiskShopSettings" ? { errors: [{ message: "Access denied for billingAddress field. Required access: `read_shop` scope." }] }
+      : op === "RiskPolicies" ? { shop: { shopPolicies: [] } }
+      : { themes: { nodes: [] }, products: { nodes: [] } },
+  });
+  const r = await collectStore({ DB, ...CREDS }, "hc", { nowMs: NOW, fetchImpl: net.fetchImpl });
+  assert.ok(r.notes.some((n) => /contact settings not readable/.test(n)));
+  assert.equal((await DB.prepare(`SELECT cleared_at FROM risk_personal_hits`).first()).cleared_at, null);
+});
+
+test("personal details: 913 phones in every common form, E.164 included; never inside a longer number", () => {
+  const ph = (t) => scanText(t).some((h) => h.pattern === "phone_913");
+  for (const t of ["+19135551234", "(913) 592-9849", "9132163296", "+1 (913) 592-9849", "1-913-555-1234", "913.555.1234"]) assert.equal(ph(t), true, t);
+  for (const t of ["49135551234", "91355512345", "SKU 913-55", "order 2913555123"]) assert.equal(ph(t), false, t);
+});
+
+test("personal details: a product hit is cleared only when THAT product was re-read (the run reads 20 products, not all)", async () => {
+  const DB = makeD1();
+  let products = [{ id: "p1", title: "A", handle: "coat", description: "<p>Made in Olathe.</p>" }];
+  const net = fakeNet({
+    shopify: (s, op) => op === "RiskPolicies" ? { shop: { shopPolicies: [] } }
+      : op === "RiskShopSettings" ? { shop: { name: "H&C", contactEmail: "info@holtandcrane.com" } }
+      : { themes: { nodes: [] }, products: { nodes: products } },
+  });
+  const env = { DB, ...CREDS };
+  await collectStore(env, "hc", { nowMs: NOW, fetchImpl: net.fetchImpl });
+  const open = async () => (await DB.prepare(`SELECT source FROM risk_personal_hits WHERE cleared_at IS NULL`).all()).results.map((r) => r.source);
+  assert.deepEqual(await open(), ["product:coat"]);
+  // Next week "coat" isn't among the 20 most recently updated products: unknown, NOT cleared.
+  products = [{ id: "p2", title: "B", handle: "scarf", description: "<p>Soft wool.</p>" }];
+  await collectStore(env, "hc", { nowMs: NOW + 7 * DAY, fetchImpl: net.fetchImpl });
+  assert.deepEqual(await open(), ["product:coat"]);
+  // Re-read and fixed: cleared.
+  products = [{ id: "p1", title: "A", handle: "coat", description: "<p>Made with care.</p>" }];
+  await collectStore(env, "hc", { nowMs: NOW + 14 * DAY, fetchImpl: net.fetchImpl });
+  assert.deepEqual(await open(), []);
 });

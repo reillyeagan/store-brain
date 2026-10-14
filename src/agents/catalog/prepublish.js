@@ -4,10 +4,13 @@
  * Does: the morning after Reilly publishes, checks every ACTIVE product published (or created)
  *   in the last CATALOG_NEW_DAYS days (default 3) for the basics in the catalog spec: price
  *   within the rules ($44.95–$144.95, Marlowe $49.95 floor, .95 ending, COGS band if cost is
- *   known), a valid compare-at tier (and which tier it should take if the spread is short),
+ *   known), NO compare-at while the product is younger than NO_COMPARE_AT_DAYS (GMC Playbook),
+ *   a valid compare-at tier for older ones (and which tier it should take if the spread is short),
  *   images, a size option, a size chart in the library, cost on file, title and description,
  *   SEO title/description, no duplicate handle ("name-1" next to "name"), and the Supplier's
  *   Supply Pre-flight (preflightProduct: a confirmed KFB supply line, quoted and not denied).
+ *   Plus, over EVERY active product: the post-publish channel check (channelCheck: on the
+ *   Online Store channel, in at least one collection).
  * Inputs: `cat_products` (fresh copy), Core costs (per variant), `size_charts`, Pricing's tier
  *   spread, Supplier `kfb_quotes` via preflightProduct.
  * Outputs: a `cat_runs` row (per-product checklist) and one digest event per store per day.
@@ -27,6 +30,18 @@ export function newDays(env) {
   const n = parseInt(env && env.CATALOG_NEW_DAYS, 10);
   return Number.isFinite(n) && n > 0 && n <= 30 ? n : DEFAULT_NEW_DAYS;
 }
+
+/**
+ * No compare-at on a product younger than this many days. The rule, from the GMC Playbook in
+ * the vault (04 Resources/Courses/GMC Playbook (UNLMTD - Fixable)/UNLMTD GMC Playbook - Full
+ * Distillation.md, line 122): "do NOT use compare-at prices on new products — the single most
+ * common mistake ... Wait 30–60+ days of stable sales before any compare-at, and even then it
+ * remains one of the most sensitive misrep triggers". Repeated at line 158 ("Don't use
+ * compare-at prices on new products ... wait 30–60+ days of stable sales"). 30 is the rule's
+ * MINIMUM; the playbook says many wait longer. Course Module 8.5 agrees: "list products without
+ * discounts while the GMC is fresh (month 1)".
+ */
+export const NO_COMPARE_AT_DAYS = 30;
 
 /** A new product has this long to get a KFB quote before "no quote" counts as a problem. */
 export const QUOTE_GRACE_DAYS = 2;
@@ -81,8 +96,19 @@ export function checkNewProduct(storeId, p, ctx) {
       if (!problems.some((x) => x.code === i.code)) problems.push({ ...i, variant: v.title });
     }
   }
+  // GMC Playbook: no compare-at on a product younger than NO_COMPARE_AT_DAYS. An unknown age
+  // counts as new (the safe side): a strikethrough on a new product is a misrep trigger.
+  const age = productAgeDays(p, ctx.nowMs);
+  const young = age == null || age < NO_COMPARE_AT_DAYS;
+  const struck = (p.variants || []).filter((v) => v.compareAt != null && v.price != null && v.compareAt > v.price);
+  if (young && struck.length) {
+    const n = (p.variants || []).length;
+    add("compare_at_on_new_product", "high",
+      `Has a compare-at (${struck.length} of ${n} variant${n === 1 ? "" : "s"}) but is ${age == null ? "of unknown age" : `${age.toFixed(1)} days old`}: the GMC Playbook says no compare-at for the first ${NO_COMPARE_AT_DAYS}-60 days (the most common misrep trigger). Flag only; Reilly decides.`);
+  }
   // A product with no compare-at is a legitimate "none" tier, unless "none" is not the short tier.
-  if (v0 && (v0.compareAt == null || v0.compareAt <= v0.price) && ctx.tierCounts) {
+  // Never proposed for a product younger than the GMC rule's minimum: "none" is its only tier.
+  if (!young && v0 && (v0.compareAt == null || v0.compareAt <= v0.price) && ctx.tierCounts) {
     const t = assignTier(p.product_id, ctx.tierCounts);
     if (t !== 0) { suggestedTier = t; add("tier_unassigned", "low", `No compare-at; the ${t}% tier is the short one (seeded pick)`); }
   }
@@ -110,6 +136,36 @@ export async function supplyCheck(db, storeId, p) {
   } catch (err) {
     return { error: String(err && err.message).slice(0, 160) };
   }
+}
+
+/**
+ * Post-publish channel check (vault: 08 System/Blueprints/Post-Publish Verification SOP — the
+ * publish switches: status, the product's channel, and its collection). Over EVERY active
+ * product, from the read-only copy:
+ *   - not on the Online Store channel (Shopify's onlineStoreUrl is null): active but invisible;
+ *   - in no collection: not reachable from the store's navigation / collection pages.
+ * Unknown stays unknown: a product read before the channel field existed is counted as
+ * "not read yet", never as unpublished. Whether each COLLECTION is itself published to the
+ * Online Store is not checked (needs a collections read the catalog reader doesn't do yet).
+ */
+export const CHANNEL_LIST_CAP = 50;
+export function channelCheck(products) {
+  const active = products.filter((p) => p.status === "ACTIVE");
+  const list = [];
+  let notOnline = 0, noCollection = 0, unknown = 0;
+  for (const p of active) {
+    const issues = [];
+    if (p.on_online_store === 0) { issues.push("not published to the Online Store channel"); notOnline++; }
+    else if (p.on_online_store == null) unknown++;
+    if (p.collections_count === 0) { issues.push("in no collection"); noCollection++; }
+    if (issues.length) list.push({ product_id: p.product_id, handle: p.handle, title: p.title, issues });
+  }
+  return {
+    checked: active.length, not_on_online_store: notOnline, no_collection: noCollection, online_store_unknown: unknown,
+    online_store_note: unknown ? `${unknown} active product(s) not read since the channel check was added: unknown until the next full read` : null,
+    collection_published: "not wired: whether each collection is itself published to the Online Store isn't read yet",
+    products: list.slice(0, CHANNEL_LIST_CAP), products_total: list.length,
+  };
 }
 
 export async function runPrepublishStore(env, storeId, products, { nowMs, day }) {
@@ -144,14 +200,18 @@ export async function runPrepublishStore(env, storeId, products, { nowMs, day })
   const rank = { high: 3, medium: 2, low: 1, info: 0 };
   results.sort((a, b) => rank[b.severity] - rank[a.severity]);
   const failed = results.filter((r) => !r.passed).length;
-  const summary = { window_days: days, new_products: results.length, passed: results.length - failed, flagged: failed };
+  const channel = channelCheck(products);
+  const summary = { window_days: days, new_products: results.length, passed: results.length - failed, flagged: failed, channel };
   await saveRun(db, { agent: AGENT, store: storeId, day, nowMs, status: "ok", summary, findings: results });
+  const ch = channel.not_on_online_store || channel.no_collection
+    ? ` Channel check: ${channel.not_on_online_store} active not on the Online Store, ${channel.no_collection} in no collection.`
+    : channel.online_store_unknown ? ` Channel check: ${channel.online_store_unknown} active product(s) not read for the channel yet.` : " Channel check: every active product is on the Online Store and in a collection.";
   await logEvent(db, {
     actor: AGENT, kind: "catalog.new_product_digest", store: storeId, at: nowIso(nowMs),
-    summary: results.length
-      ? `${STORES[storeId].name}: ${results.length} product(s) published in the last ${days} days; ${failed} flagged, ${results.length - failed} pass. Flags only.`
-      : `${STORES[storeId].name}: no products published in the last ${days} days.`,
-    data: summary,
+    summary: (results.length
+      ? `${STORES[storeId].name}: ${results.length} product(s) published in the last ${days} days; ${failed} flagged, ${results.length - failed} pass.`
+      : `${STORES[storeId].name}: no products published in the last ${days} days.`) + `${ch} Flags only.`,
+    data: { ...summary, channel: { ...channel, products: undefined } },
   });
   return { status: "ok", ...summary };
 }

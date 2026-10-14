@@ -187,7 +187,7 @@ export async function gatherBriefData(env, { nowMs = Date.now() } = {}) {
   // a run of tiny ones can never push a real alarm out of the list.
   const { results: alarmRows } = await db.prepare(
     `SELECT kind, store, summary, data FROM events
-      WHERE at >= ? AND (kind IN ('payout.mismatch', 'feed.alarm') OR kind LIKE 'error.%')
+      WHERE at >= ? AND (kind IN ('payout.mismatch', 'feed.alarm', 'media.spend_alarm') OR kind LIKE 'error.%')
         AND (? = 1 OR kind NOT LIKE 'error.tracking%')
       ORDER BY id DESC LIMIT 8`
   ).bind(nowIso(nowMs - 86400000), tracking ? 1 : 0).all();
@@ -312,6 +312,9 @@ function riskItem(a) {
     });
   } else if (a.kind === "payout.mismatch" && d && d.payoutCents != null) {
     item.payout_check = { payout: d.payoutCents / 100, transactions_add_up_to: d.sumCents == null ? null : d.sumCents / 100, off_by: d.diffCents == null ? null : d.diffCents / 100 };
+  } else if (a.kind === "media.spend_alarm" && d) {
+    // The alarm's own figures as numbers, so the brief may quote them and the check finds them.
+    item.spend_alarm = { day: d.day, alarms: d.alarms, spend_today: d.spend_today, orders_today: d.orders_today, usual_day: d.usual_day };
   }
   return item;
 }

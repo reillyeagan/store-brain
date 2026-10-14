@@ -5,7 +5,7 @@
  *   revenue   orders placed that day (order time in the store's timezone), gross of refunds
  *   refunds   refund events by the day they were PROCESSED (rule 7), SUCCESS and PENDING kept apart
  *   ads       Google Ads cost for that day (ad_spend_days)
- *   guy_fee   Guy's fee: rate x ads, only on days on/after his start date (config in stores.js)
+ *   guy_fee   Guy's fee: rate x ads, only on days from his start date to his end date, if any (stores.js)
  *   fees      Shopify Payments fees on that day's CHARGE balance transactions; null if the
  *             payouts feed isn't wired (null = unknown, never 0)
  *   cogs      per order: the ACTUAL KFB cost when the COGS Matcher has matched the order's bill
@@ -87,13 +87,20 @@ export function storeTz(storeId) {
   return (STORES[storeId] && STORES[storeId].timezone) || "America/New_York";
 }
 
-/** Guy's fee for one day: null when ads are unknown, 0 before his start date. */
+/**
+ * Guy's fee for one day: null when ads are unknown, 0 before his start date and after his end
+ * date (`guyEnd`, the LAST day he is paid for; null = still active, the default).
+ */
 export function guyFeeFor(storeId, day, ads) {
   const s = STORES[storeId];
   if (ads == null) return null;
   if (!s || !s.guyFeeRate || !s.guyStart || day < s.guyStart) return 0;
+  if (s.guyEnd && day > s.guyEnd) return 0;
   return r2(ads * s.guyFeeRate);
 }
+
+/** Guy's terms for one store, as shown on the P&L page. */
+export const guyTerms = (id) => (STORES[id] ? { rate: STORES[id].guyFeeRate || 0, start: STORES[id].guyStart || null, end: STORES[id].guyEnd || null } : null);
 
 /** Break-even ROAS for a margin. Null when there's no margin or the store can't break even at any ROAS. */
 export function breakevenRoas(margin) {
@@ -518,7 +525,7 @@ export async function computeStoreDay(db, storeId, day, { nowMs = Date.now(), fe
       cogs: cogsBasis.sheet ? `P&L sheet: KFB ledger EUR ${cogsBasis.sheet.cog_eur.toFixed(2)} at ${cogsBasis.sheet.fx_rate} (estimated FX)`
         : byActual ? `actual KFB cost for ${byActual} order${byActual === 1 ? "" : "s"} (cogs_matches), estimate for ${estOrders}` : "estimate (no KFB bill matched yet)",
       order_coverage: cov.covered_from,
-      guy: STORES[storeId] ? { rate: STORES[storeId].guyFeeRate || 0, start: STORES[storeId].guyStart || null } : null,
+      guy: guyTerms(storeId),
     },
   };
 }
@@ -767,7 +774,7 @@ export async function pnlState(db, { nowMs = Date.now() } = {}) {
       return m;
     })(),
   };
-  return { stores, group, guy: Object.fromEntries(LIVE_STORE_IDS.map((id) => [id, { rate: STORES[id].guyFeeRate || 0, start: STORES[id].guyStart || null }])) };
+  return { stores, group, guy: Object.fromEntries(LIVE_STORE_IDS.map((id) => [id, guyTerms(id)])) };
 }
 
 /**
@@ -829,5 +836,5 @@ export async function pnlHistory(db, store = "all", { nowMs = Date.now() } = {})
   const today = localDay(nowMs, storeTz(ids[0]));
   const coverage = [];
   for (const id of ids) coverage.push({ store: id, covered_from: (await orderCoverage(db, id)).covered_from || null });
-  return { ok: true, store, stores: ids, today, days, coverage, guy: Object.fromEntries(ids.map((id) => [id, { rate: STORES[id].guyFeeRate || 0, start: STORES[id].guyStart || null }])) };
+  return { ok: true, store, stores: ids, today, days, coverage, guy: Object.fromEntries(ids.map((id) => [id, guyTerms(id)])) };
 }

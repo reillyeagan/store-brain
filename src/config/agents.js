@@ -43,6 +43,8 @@ export const AGENTS = Object.freeze([
   a("media.season", "media", "Keyword & Season", "ai", "L2", "built"),
   a("media.guy_monitor", "media", "Guy Monitor", "code", "L1", "built"),
   a("media.conversions", "media", "Conversion Integrity", "code", "L0", "built"),
+  a("media.spend_alarm", "media", "Spend Alarm", "code", "L2", "built"),
+  a("media.billing", "media", "Billing Watch", "code", "L2", "built"),
 
   // Customer service
   a("cs.triage", "cs", "Inbox Triage", "ai", "L2", "built"),
@@ -95,6 +97,7 @@ export const AGENTS = Object.freeze([
   a("cat.margin_guard", "cat", "Margin Guard", "code", "L0", "built"),
   a("cat.status", "cat", "Product Status", "code", "L1", "built"),
   a("cat.prepublish", "cat", "New-Product Check", "code", "L2", "built"),
+  a("cat.hygiene", "cat", "Feed Hygiene", "code", "L0", "built"),
   a("cat.feed_health", "cat", "Merchant Center Health", "code", "L0"),
   // Dropped 2026-10-11 (Reilly): content & size notes, import builder, theme desk.
 ]);
@@ -159,6 +162,8 @@ export const AGENT_DOES = Object.freeze({
   "media.season": "Watches keywords and seasonal demand.",
   "media.guy_monitor": "Watches what Guy changes in the ad accounts and logs it.",
   "media.conversions": "Checks that conversion tracking matches real orders.",
+  "media.billing": "Reads each ad account's status, billing setup and account budget, and flags a suspension, a held billing setup or a budget nearly used up (watch only).",
+  "media.spend_alarm": "Raises one alarm a day when a store spends with no orders, or an account that normally spends stops (watch only).",
   "cs.triage": "Reads every store inbox and sorts each email by what it needs.",
   "cs.order_context": "Matches each email to its order, tracking and history.",
   "cs.reply_writer": "Drafts replies into Gmail for Reilly to review and send.",
@@ -194,5 +199,6 @@ export const AGENT_DOES = Object.freeze({
   "cat.margin_guard": "Flags products whose cost makes the price unprofitable.",
   "cat.status": "Keeps product status in line with supplier availability.",
   "cat.prepublish": "Checks new products before they go live.",
+  "cat.hygiene": "Monthly feed report from the course: zombie products, best-sellers not on sale, SKU count vs ad spend (proposals only).",
   "cat.feed_health": "Watches Merchant Center for disapprovals and feed errors.",
 });

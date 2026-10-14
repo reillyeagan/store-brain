@@ -60,6 +60,14 @@ export const FIRST_READ_DAYS = 3;
 export const CADENCE = Object.freeze({ read: 15, work: 15, obligations: 60 });
 
 /**
+ * Days a money/goods promise in Reilly's sent mail may stay open before it goes to Waiting on
+ * you (promises.js). Not Reilly's numbers, so change them freely:
+ *  - refund 3: a Shopify refund is a few clicks; 3 days covers a weekend. (#1019 waited 30+.)
+ *  - replacement / exchange 7: the replacement has to be ordered (Shopify or KFB) first.
+ */
+export const PROMISE_DAYS = Object.freeze({ refund: 3, replacement: 7, exchange: 7 });
+
+/**
  * Delivery facts the reply writer may quote. From the CS Playbook measurement quoted in
  * docs/specs/fulfillment.md (96 parcels, Aug–Sep) and docs/specs/risk.md ("measured 8–12
  * business days"). Express: Reilly 2026-10-11 "express is fine its all been good and getting
