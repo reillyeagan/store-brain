@@ -18,6 +18,8 @@
  *     computing — never assume". Auberlane's and Marlowe's live themes were read on 2026-10-13
  *     and they do NOT match H&C (see BADGE_MODELS).
  *   - When the ceiling stops a product reaching band, say so and offer the waiver; never waive.
+ *   - Auberlane: at least $30 gross margin per unit (price − landed cost), Reilly "yes" 2026-10-13.
+ *     Checked on known cost only; no product is exempt (high-margin exemption: Reilly "no").
  *
  * Money is handled in whole cents internally so .95 endings never drift with float maths.
  * Cost: USD, or EUR converted at EUR_USD_ESTIMATE (1.17, the quoting-sheet rate in pnl.js) until
@@ -56,6 +58,9 @@ export const STORE_PRICING = Object.freeze({
   aub: Object.freeze({
     store: "aub", band: Object.freeze({ lo: 0.25, hi: 0.29 }), shape: "single",
     floor: 44.95, ceiling: PRICE_CEILING,
+    // Minimum gross margin per unit (price minus landed cost), confirmed by Reilly 2026-10-13:
+    // asked "Auberlane $30 minimum margin per unit?", he said "yes" (decision cat.min_margin.aub).
+    minMarginUsd: 30,
     badge: Object.freeze({ model: "round5", verified: true, source: "Auberlane live theme snippets/product-card.liquid + pdp-sale-pct.liquid (read 2026-10-13)" }),
   }),
   mar: Object.freeze({
@@ -342,6 +347,13 @@ export function validatePrice(storeId, { price, compareAt = null, cost = null } 
     if (rec.ceilingBlocksBand) add("ceiling_blocks_band", "info", `Even $${rules.ceiling} leaves COGS ${pct(c.usd / rules.ceiling)}: needs Reilly's waiver or a cheaper source`);
   }
 
+  // Minimum margin per unit (stores that have one). Known cost only: an unknown cost gives
+  // met = null ("can't tell"), never a pass. No exemption for any product (Reilly: "no").
+  const minMargin = checkMinMargin(rules, p, c);
+  if (minMargin && minMargin.met === false) {
+    add("below_min_margin", "medium", `Margin $${minMargin.margin.toFixed(2)} per unit is under the $${minMargin.required} minimum (price $${p.toFixed(2)} − cost $${c.usd.toFixed(2)})`);
+  }
+
   // Compare-at: clean ending, above the price, badge prints an exact tier.
   let tier = 0;
   if (ca != null && ca > 0) {
@@ -371,7 +383,20 @@ export function validatePrice(storeId, { price, compareAt = null, cost = null } 
     : null;
 
   const ok = !issues.some((i) => i.severity === "high" || i.severity === "medium");
-  return { ok, issues, cogs, costUsd: c ? c.usd : null, fxEstimated: !!(c && c.fxEstimated), tier, proposed };
+  return { ok, issues, cogs, costUsd: c ? c.usd : null, fxEstimated: !!(c && c.fxEstimated), tier, proposed, minMargin };
+}
+
+/**
+ * The store's minimum-margin check, or null when the store has no such rule.
+ * @returns {null | {required:number, margin:number|null, met:boolean|null}}  margin/met null = cost unknown
+ */
+export function checkMinMargin(rules, price, costUsd) {
+  if (!rules || rules.minMarginUsd == null) return null;
+  const pc = toCents(price);
+  if (!costUsd || pc == null) return { required: rules.minMarginUsd, margin: null, met: null };
+  // Whole cents, and the cost already rounds UP (costToUsd), so the margin is never overstated.
+  const marginCents = pc - Math.round(costUsd.usd * 100);
+  return { required: rules.minMarginUsd, margin: fromCents(marginCents), met: marginCents >= Math.round(rules.minMarginUsd * 100) };
 }
 
 /** For a wrong-tier compare-at: the 10/20/30/40 tier its raw discount is closest to. */

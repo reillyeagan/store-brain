@@ -4,6 +4,7 @@
  */
 import { ESCALATE_CATEGORIES, DRAFT_CATEGORIES } from "./config.js";
 import { clip } from "./util.js";
+import { sizeUpMention } from "./sizeUpGate.js";
 
 /**
  * @returns {{action:"escalate"|"draft", reason:string}}
@@ -39,13 +40,19 @@ export function routeTicket(t, triage, ctx) {
  *   - any link (with or without http/www, bare domain.tld) that isn't one of this order's
  *     tracking links, and any email address
  *   - placeholders
+ *   - sizing up / factory sizes, unless the customer's own email asked about size or fit
+ *     (`sizeAsked`; Reilly 2026-10-13: "no unless they ask")
  * Returns a list of problems (empty = passes).
  */
-export function checkDraft(body, { ctx = null, orderRef = null } = {}) {
+export function checkDraft(body, { ctx = null, orderRef = null, sizeAsked = false } = {}) {
   const raw = String(body || "");
   const problems = [];
   if (raw.trim().length < 20) problems.push("empty draft");
   if (raw.length > 3000) problems.push("too long");
+  // A bigger Chinese size shipping is never volunteered (Reilly: "no unless they ask").
+  // Defaults to "didn't ask", so a caller that forgets to say fails safe.
+  const sizeUp = sizeAsked ? null : sizeUpMention(raw);
+  if (sizeUp) problems.push(`mentions sizing up ("${sizeUp}") but the customer didn't ask about size or fit`);
 
   // Harmless set phrases that would otherwise trip the word lists.
   const s = raw.replace(/\bfeel free\b/gi, " ").replace(/\b(zip|postal|post)\s*code\b/gi, " ")

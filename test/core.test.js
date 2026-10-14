@@ -261,8 +261,12 @@ test("review fix 9: one seed guard — one topic per quote across both seeds, ge
   await ensureSupplierDecisions(DB, { nowMs: T0 });
   await seedDecisions(DB, { nowMs: T0 });
   await ensureSupplierDecisions(DB, { nowMs: T0 });
-  const { results } = await DB.prepare(`SELECT words, COUNT(*) AS n FROM decisions GROUP BY words HAVING COUNT(*) > 1`).all();
-  assert.deepEqual(results, []); // no quote twice
+  // No quote twice. Bare "yes"/"no" answers recur on different topics by design (each seed's
+  // source carries its question), so they're checked per topic instead.
+  const { results } = await DB.prepare(`SELECT words, COUNT(*) AS n FROM decisions WHERE words NOT IN ('yes', 'no') GROUP BY words HAVING COUNT(*) > 1`).all();
+  assert.deepEqual(results, []);
+  const { results: bare } = await DB.prepare(`SELECT topic, words, COUNT(*) AS n FROM decisions WHERE words IN ('yes', 'no') GROUP BY topic, words HAVING COUNT(*) > 1`).all();
+  assert.deepEqual(bare, []);
   assert.equal((await currentDecision(DB, "sup.bills")).words, "i pay KFB bills on fridays now");
   assert.equal(await count(DB, `SELECT COUNT(*) AS n FROM decisions WHERE topic LIKE 'supplier.%'`), 0);
   // The same generic words on two topics are both recorded.
@@ -395,4 +399,30 @@ test("nice 5: an open incident outside the 50 most recent groups is judged on it
   // Once it has been quiet past its rhythm it does resolve.
   await runIncidents({ DB }, { nowMs: T0 + 6 * 3600000 });
   assert.equal(await count(DB, `SELECT COUNT(*) AS n FROM incidents WHERE key = 'pnl.pullers|error.money_job' AND status = 'resolved'`), 1);
+});
+
+test("decisions: Reilly's open-questions answers (2026-10-13) are seeded verbatim, with the question kept for bare yes/no", async () => {
+  const DB = makeD1();
+  await seedDecisions(DB, { nowMs: T0 });
+  const want = {
+    "core.store_audiences": ["all", "H&C is mens and womens. Auberlane is womens. Marlowe is mens."],
+    "sup.kfb_match_key": ["all", "product handle is prob best"],
+    "sup.similar_substitutions": ["all", "yes"],
+    "cat.min_margin.aub": ["aub", "yes"],
+    "cat.high_margin_exemption": ["all", "no"],
+    "cs.size_up_disclosure": ["all", "no unless they ask"],
+    "sup.kfb_quote_status_40": ["all", "FFG quote status 40 i think means i just havent approved it"],
+    "risk.order_1098": ["hc", "1098 turned into a chargeback and the shipping status still isnt updating"],
+    "cs.review_requests": ["all", "off turn them off on all stores please"],
+  };
+  for (const [topic, [scope, words]] of Object.entries(want)) {
+    const d = await currentDecision(DB, topic);
+    assert.ok(d, topic);
+    assert.equal(d.words, words, topic);
+    assert.equal(d.scope, scope, topic);
+    assert.equal(d.at, "2026-10-14T00:23:00Z", topic);
+    const seed = SEED_DECISIONS.find((s) => s.topic === topic);
+    assert.match(seed.source, /^chat 2026-10-13/, topic);
+    if (words === "yes" || words === "no") assert.match(seed.source, /Q: .+\?/, `${topic}: the question stands with the bare answer`);
+  }
 });

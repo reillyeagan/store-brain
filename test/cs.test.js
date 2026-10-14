@@ -5,6 +5,7 @@ import { encryptToken, _resetGoogleCacheForTests } from "../src/lib/google.js";
 import { runCs, csState } from "../src/agents/cs/index.js";
 import { screenMail } from "../src/agents/cs/filters.js";
 import { checkDraft, routeTicket } from "../src/agents/cs/routing.js";
+import { emailAsksAboutSize, sizeUpMention } from "../src/agents/cs/sizeUpGate.js";
 import { findPromises, flagOverdue } from "../src/agents/cs/obligations.js";
 import { validateTriage, orderRefFromText } from "../src/agents/cs/triage.js";
 import { b64urlEncode, b64urlDecode, stripQuoted } from "../src/agents/cs/gmail.js";
@@ -819,4 +820,20 @@ test("cs: a Gmail push refused because another draft still exists is recorded an
   const before = w.calls.length;
   await runCs(env, { nowMs: NOW + 20 * MIN, fetchImpl: w.fetchImpl });
   assert.equal(w.calls.filter((c, i) => i >= before && c.url.includes("/drafts")).length, 0); // not retried
+});
+
+test("cs size-up gate: a bigger Chinese size is never volunteered (Reilly: 'no unless they ask')", () => {
+  const draft = "Hi Sam, thanks for your order. We're sending a larger size because the Chinese sizing runs small. Holt & Crane Customer Care";
+  // Didn't ask (where-is-my-order): the draft fails the check, and fails by default.
+  assert.equal(emailAsksAboutSize({ category: "where_is_my_order", subject: "Order status", body: "Where is my order?" }), false);
+  const p = checkDraft(draft, {});
+  assert.ok(p.some((x) => /sizing up/.test(x)), p.join("; "));
+  assert.ok(checkDraft("Hi Sam, we'll size it up for you. Holt & Crane Customer Care", {}).some((x) => /sizing up/.test(x)));
+  // Asked about size or fit (by category or in their own words): allowed.
+  assert.equal(emailAsksAboutSize({ category: "size_question" }), true);
+  assert.equal(emailAsksAboutSize({ category: "other", body: "Will the medium fit me? I'm usually a M." }), true);
+  assert.equal(emailAsksAboutSize({ category: "other", subject: "sizing", body: "hi" }), true);
+  assert.deepEqual(checkDraft(draft, { sizeAsked: true }).filter((x) => /sizing up/.test(x)), []);
+  // Ordinary size words in a reply are not a size-up.
+  assert.equal(sizeUpMention("Your order of the Shawl Cardigan in size M is on its way."), null);
 });

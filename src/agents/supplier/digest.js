@@ -73,7 +73,7 @@ export async function digestData(db, nowMs = Date.now()) {
     const latest = await db.prepare(`SELECT status, COUNT(*) AS n FROM (${LATEST_QUOTE_SQL}) GROUP BY status`).all();
     const m = (rs) => Object.fromEntries((rs.results || []).map((r) => [r.status, r.n]));
     const lt = m(latest);
-    quotes = { open: m(open), awaitingReilly: lt.awaiting_reilly || 0, unknown: lt.unknown || 0, pending: lt.pending || 0, lastImport: quotesAny.last,
+    quotes = { open: m(open), awaitingReilly: lt.awaiting_reilly || 0, awaitingReilly40: lt.awaiting_reilly_guess || 0, unknown: lt.unknown || 0, pending: lt.pending || 0, lastImport: quotesAny.last,
       ageHours: ageHours(quotesAny.last, nowMs), stale: ageHours(quotesAny.last, nowMs) > KFB_READ_MAX_AGE_H };
   }
   const { results: batches } = await db.prepare(
@@ -88,6 +88,8 @@ export async function digestData(db, nowMs = Date.now()) {
   const flags = await db.prepare(`SELECT COUNT(*) AS n FROM supply_flags WHERE created_at >= ?`).bind(nowIso(nowMs - 86400000)).first();
   const scout = await db.prepare(`SELECT COUNT(*) AS n FROM sourcing_flags`).first();
   const similar = await db.prepare(`SELECT COUNT(*) AS n FROM kfb_similar_offers WHERE verdict = 'ask_reilly' AND judged_at >= ?`).bind(nowIso(nowMs - 86400000)).first();
+  // Order substitutions are fine (Reilly: "yes", 2026-10-13) but still reported, so they're never invisible.
+  const subs = await db.prepare(`SELECT COUNT(*) AS n FROM kfb_similar_offers WHERE context = 'order' AND verdict = 'accepted' AND judged_at >= ?`).bind(nowIso(nowMs - 86400000)).first();
   return {
     kfbSession: quotes ? "has data" : "waiting on KFB session",
     quotes,
@@ -100,6 +102,7 @@ export async function digestData(db, nowMs = Date.now()) {
     preflightFlags24h: flags ? flags.n : 0,
     sourcingFlags: scout ? scout.n : 0,
     similarAsks24h: similar ? similar.n : 0,
+    similarSubs24h: subs ? subs.n : 0,
   };
 }
 
@@ -116,7 +119,8 @@ export function digestBody(d) {
     const o = d.quotes.open;
     out.push(`• Quotes: ${(o.quoted || 0) + (o.denied || 0)} not yet planned (${o.quoted || 0} quoted, ${o.denied || 0} denied)` +
       (d.quotes.awaitingReilly ? ` · ${d.quotes.awaitingReilly} waiting for your KFB confirmation (status 25)` : "") +
-      (d.quotes.unknown ? ` · ${d.quotes.unknown} with unknown status (40): check` : "") + ".");
+      (d.quotes.awaitingReilly40 ? ` · ${d.quotes.awaitingReilly40} at status 40: waiting on your approval (your best guess, "i think")` : "") +
+      (d.quotes.unknown ? ` · ${d.quotes.unknown} with an unknown status: check` : "") + ".");
   }
   for (const b of d.batchesWaiting) {
     out.push(`• Waiting on you: ${b.storeName} ${[b.reprice_count && `reprice ${b.reprice_count}`, b.draft_count && `draft ${b.draft_count}`].filter(Boolean).join(" · ")}` +
@@ -138,7 +142,8 @@ export function digestBody(d) {
       (d.credits.unknownAmount ? ` (+${d.credits.unknownAmount} amount not known)` : "") + `, oldest ${d.credits.oldestDays} days.`);
   }
   if (d.preflightFlags24h) out.push(`• Pre-flight: ${plural(d.preflightFlags24h, "order line")} flagged in 24h.`);
-  if (d.similarAsks24h) out.push(`• Similar items offered for customers' orders: ${d.similarAsks24h} (ask the customer first).`);
+  if (d.similarSubs24h) out.push(`• Similar substitutes on customers' orders: ${d.similarSubs24h} in 24h (fine per your rule; recorded).`);
+  if (d.similarAsks24h) out.push(`• Similar offers the rule doesn't cover: ${d.similarAsks24h} (check).`);
   if (d.sourcingFlags) out.push(`• Sourcing: ${plural(d.sourcingFlags, "category")} failing at KFB (flag only).`);
   return out.join("\n");
 }

@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import { makeD1 } from "./helpers/d1.js";
 
 import { up95, down95, planVariantPrice, compareAtFor, tierOf, badgePct } from "../src/agents/supplier/pricing.js";
-import { importQuotes, runQuoteDesk, validateQuoteRow, planProduct, PRODUCTS_BY_HANDLE_QUERY, VARIANT_PAGE_QUERY, settleBatches, writeQuoteCost } from "../src/agents/supplier/quotes.js";
-import { recommendSize, runSizeChecker, complaintShift, chartFromRows, garmentOf, listedSizes } from "../src/agents/supplier/sizeChecker.js";
+import { importQuotes, runQuoteDesk, validateQuoteRow, STATUS_LABELS, planProduct, PRODUCTS_BY_HANDLE_QUERY, VARIANT_PAGE_QUERY, settleBatches, writeQuoteCost } from "../src/agents/supplier/quotes.js";
+import { recommendSize, runSizeChecker, complaintShift, chartFromRows, garmentOf, listedSizes, coreSizing, productAudience } from "../src/agents/supplier/sizeChecker.js";
 import { runSimilarQc, recordSimilarOffer, judgeSimilar } from "../src/agents/supplier/similarQc.js";
 import { runPreflight, preflightProduct } from "../src/agents/supplier/preflight.js";
 import { addCredit, runClaims, creditAging, markCredited } from "../src/agents/supplier/claims.js";
@@ -504,11 +504,20 @@ async function seedChart(DB, product = "p1", rows = SMALL_CHART, verified = 1) {
   }
 }
 
+/** Catalog's copy of a product (title, tags, type), as the Size Checker reads it. */
+async function seedCatProduct(DB, { store = "hc", product = "p1", title = "Shawl Collar Cardigan", tags = [], productType = null, variants = null }) {
+  await DB.prepare(`INSERT INTO cat_products (store, product_id, title, tags, product_type, variants, read_at) VALUES (?,?,?,?,?,?,?)`)
+    .bind(store, `gid://shopify/Product/${product}`, title, JSON.stringify(tags), productType, variants ? JSON.stringify(variants) : null, iso(NOW)).run();
+}
+
 test("Size Checker run: records recommendations and one KFB ask per line, idempotent", async () => {
   const DB = makeD1();
   await seedOrder(DB, { n: 1201 });
   await seedOrder(DB, { n: 1202, product: "p2", handle: "no-chart", title: "Plain Sweater" });
   await seedOrder(DB, { n: 1203, status: "refunded" });
+  // H&C sells both: these products are tagged men's, so the men's reference applies.
+  await seedCatProduct(DB, { product: "p1", tags: ["Mens", "Knitwear"] });
+  await seedCatProduct(DB, { product: "p2", title: "Plain Sweater", productType: "Men's Sweaters" });
   await seedChart(DB, "p1", SMALL_CHART, 0);
   const r = await runSizeChecker({ DB }, { nowMs: NOW });
   assert.equal(r.checked, 2);
@@ -519,7 +528,7 @@ test("Size Checker run: records recommendations and one KFB ask per line, idempo
   assert.equal(asks[0].send_size, "L");
   const rec = await DB.prepare(`SELECT * FROM size_recommendations WHERE order_id = 'gid://shopify/Order/1201'`).first();
   assert.match(rec.reason, /not yet checked/);
-  assert.match(rec.reason, /audience assumed men's/);
+  assert.doesNotMatch(rec.reason, /audience assumed/, "H&C's audience is known now (Reilly, 2026-10-13)");
   const nc = await DB.prepare(`SELECT verdict FROM size_recommendations WHERE order_id = 'gid://shopify/Order/1202'`).first();
   assert.equal(nc.verdict, "no_chart");
 
@@ -533,18 +542,117 @@ test("Size Checker run: records recommendations and one KFB ask per line, idempo
   assert.equal((await DB.prepare(`SELECT COUNT(*) AS n FROM kfb_size_asks`).first()).n, 1);
 });
 
+test("Size Checker audiences: women → no reference; men → men's chart, no 'assumed' note; both (H&C) → per product, never assumed", () => {
+  const base = { title: "Shawl Collar Cardigan", orderedSize: "M", chartRows: SMALL_CHART };
+  // women (Auberlane)
+  const w = recommendSize({ ...base, audience: "women" });
+  assert.equal(w.verdict, "no_reference");
+  assert.match(w.reason, /women's item: no women's US reference yet/);
+  // men (Marlowe)
+  const m = recommendSize({ ...base, audience: "men" });
+  assert.equal(m.verdict, "size_up");
+  assert.equal(m.send_size, "L");
+  // both (H&C): unmarked → no size, never men's by default
+  const u = recommendSize({ ...base, audience: "both" });
+  assert.equal(u.verdict, "no_reference");
+  assert.equal(u.reason, "H&C sells men's and women's; this product isn't marked either way");
+  // both: marked men's by tags, by product type, or by title
+  assert.equal(recommendSize({ ...base, audience: "both", tags: JSON.stringify(["Mens"]) }).send_size, "L");
+  assert.equal(recommendSize({ ...base, audience: "both", productType: "Men's Knitwear" }).send_size, "L");
+  assert.equal(recommendSize({ ...base, audience: "both", title: "Men's Shawl Collar Cardigan" }).send_size, "L");
+  // both: a women's line is never sized against the men's chart ("women" contains "men")
+  for (const marks of [{ tags: ["Womens"] }, { tags: ["Women"] }, { productType: "Ladies Knitwear" }, { title: "Womens Shawl Cardigan" }, { tags: ["Mens", "Womens"] }]) {
+    const r = recommendSize({ ...base, audience: "both", ...marks });
+    assert.equal(r.verdict, "no_reference", JSON.stringify(marks));
+    assert.equal(r.send_size, null);
+    assert.match(r.reason, /women's/);
+  }
+  // a women's tag blocks the men's chart even at a men's store
+  assert.equal(recommendSize({ ...base, audience: "men", tags: ["Womens"] }).verdict, "no_reference");
+});
+
+test("Size Checker audiences from config and the Core: H&C's unmarked line gets no size; a Core fact overrides; Marlowe has no 'assumed' note", async () => {
+  const DB = makeD1();
+  // H&C, no Catalog tags: not marked either way → no reference, no KFB ask.
+  await seedOrder(DB, { n: 1401 });
+  await seedChart(DB, "p1", SMALL_CHART, 1);
+  // H&C, a Women's line (tagged): never sized against the men's chart.
+  await seedOrder(DB, { n: 1402, product: "pw", handle: "w-cardigan", title: "Shawl Collar Cardigan" });
+  await seedCatProduct(DB, { product: "pw", tags: ["Womens", "Knitwear"] });
+  await seedChart(DB, "pw", SMALL_CHART, 1);
+  // Marlowe (men): men's reference, no "assumed" note.
+  await seedOrder(DB, { store: "mar", n: 1403, product: "pm", handle: "m-cardigan" });
+  for (const r of SMALL_CHART) {
+    await DB.prepare(`INSERT INTO size_charts (store, product_id, size_label, measurements, source, verified) VALUES ('mar', ?, ?, ?, 'test', 1)`)
+      .bind("gid://shopify/Product/pm", r.size_label, JSON.stringify(r.measurements)).run();
+  }
+  // Auberlane (women): no reference.
+  await seedOrder(DB, { store: "aub", n: 1404, product: "pa", handle: "a-cardigan" });
+  await runSizeChecker({ DB }, { nowMs: NOW });
+  const rec = async (n) => DB.prepare(`SELECT * FROM size_recommendations WHERE order_id = ?`).bind(`gid://shopify/Order/${n}`).first();
+  const hcUnmarked = await rec(1401);
+  assert.equal(hcUnmarked.verdict, "no_reference");
+  assert.match(hcUnmarked.reason, /isn't marked either way/);
+  const hcWomen = await rec(1402);
+  assert.equal(hcWomen.verdict, "no_reference");
+  assert.match(hcWomen.reason, /women's item/);
+  const mar = await rec(1403);
+  assert.equal(mar.verdict, "size_up");
+  assert.doesNotMatch(mar.reason, /assumed/);
+  assert.equal((await rec(1404)).verdict, "no_reference");
+  const asks = (await DB.prepare(`SELECT order_name FROM kfb_size_asks ORDER BY order_name`).all()).results.map((a) => a.order_name);
+  assert.deepEqual(asks, ["#1403"], "only Marlowe's men's line gets a size ask");
+
+  // A live Core fact still overrides the config.
+  await DB.prepare(`INSERT INTO core_facts (store, area, key, value, kind, source, observed_at, live) VALUES ('hc', 'profile', 'profile.audience', 'mens', 'rule', 'test', ?, 1)`).bind(iso(NOW)).run();
+  assert.equal((await coreSizing(DB, "hc")).audience, "men");
+  assert.equal((await coreSizing(DB, "aub")).audience, "women");
+  assert.equal((await coreSizing(DB, "cc")).audience, null, "not told yet: null, never a default");
+  assert.equal(productAudience({ tags: '["Mens"]' }), "men");
+  assert.equal(productAudience({ tags: '["Womens"]' }), "women");
+  assert.equal(productAudience({ title: "Plain Sweater" }), null);
+});
+
 /* ------------------------------------------------------------ Similar QC */
 
-test("Similar QC: quotes accepted per 'q4 always fine'; a customer's order is flagged, never accepted", async () => {
+test("Similar QC: quotes accepted per 'q4 always fine'; a substitute on a customer's order is fine too (Reilly: 'yes') but recorded", async () => {
   const DB = makeD1();
   assert.equal(judgeSimilar({ context: "quote" }).verdict, "accepted");
+  const order = judgeSimilar({ context: "order" });
+  assert.equal(order.verdict, "accepted");
+  assert.match(order.reason, /Recorded, not flagged/);
+  assert.equal(judgeSimilar({ context: "something else" }).verdict, "ask_reilly", "an unknown context is still not covered");
   await recordSimilarOffer(DB, { store: "hc", context: "quote", handle: "a", remark: "only similar ones" }, { nowMs: NOW });
   await recordSimilarOffer(DB, { store: "hc", context: "order", order_name: "#1210", remark: "similar colour" }, { nowMs: NOW });
   await assert.rejects(recordSimilarOffer(DB, { store: "tund", context: "quote" }));
   const r = await runSimilarQc({ DB }, { nowMs: NOW });
-  assert.deepEqual([r.accepted, r.flagged], [1, 1]);
+  assert.deepEqual([r.accepted, r.substituted, r.flagged], [2, 1, 0]);
+  // Recorded: the verdict on the offer row and one event naming the order.
+  assert.equal((await DB.prepare(`SELECT verdict FROM kfb_similar_offers WHERE order_name = '#1210'`).first()).verdict, "accepted");
+  const ev = await DB.prepare(`SELECT summary FROM events WHERE kind = 'similar.substituted'`).first();
+  assert.match(ev.summary, /#1210/);
+  assert.equal((await DB.prepare(`SELECT COUNT(*) AS n FROM events WHERE kind = 'similar.flagged'`).first()).n, 0);
+  const d = await digestData(DB, NOW);
+  assert.equal(d.similarSubs24h, 1);
+  assert.match(digestBody({ ...d, quotes: null }), /Similar substitutes on customers' orders: 1 in 24h \(fine per your rule; recorded\)/);
   const again = await runSimilarQc({ DB }, { nowMs: NOW });
   assert.equal(again.judged, 0);
+});
+
+test("Quote status 40 means 'waiting on Reilly's approval' (his best guess), not an error", async () => {
+  const v = validateQuoteRow({ store: "hc", handle: "a", status: 40, quoted_at: "2026-10-12" });
+  assert.equal(v.reason, undefined);
+  assert.equal(v.status, "awaiting_reilly_guess");
+  assert.match(STATUS_LABELS[v.status], /waiting on Reilly's approval/);
+  assert.match(STATUS_LABELS[v.status], /best guess/);
+  const DB = makeD1();
+  await importQuotes(DB, [{ store: "hc", handle: "a", status: 40, quoted_at: "2026-10-13" }], { nowMs: NOW });
+  const d = await digestData(DB, NOW);
+  assert.equal(d.quotes.awaitingReilly40, 1);
+  assert.equal(d.quotes.unknown, 0);
+  const body = digestBody(d);
+  assert.match(body, /1 at status 40: waiting on your approval \(your best guess, "i think"\)/);
+  assert.doesNotMatch(body, /unknown status/);
 });
 
 /* ------------------------------------------------------------ Pre-flight */

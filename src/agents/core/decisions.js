@@ -12,9 +12,13 @@
  */
 import { logEvent } from "../../lib/eventlog.js";
 import { nowIso } from "../../lib/time.js";
-import { PARCEL_TRACKING_DECISION } from "../../config/stores.js";
+import { PARCEL_TRACKING_DECISION, AUDIENCE_DECISION } from "../../config/stores.js";
 
 const ACTOR = "core.decisions";
+
+/** Reilly answered the open questions in chat on 2026-10-13 at about 20:23 Eastern. */
+const OPEN_QS = "chat 2026-10-13 (open-questions answers)";
+const OPEN_QS_AT = "2026-10-14T00:23:00Z";
 
 /**
  * Verbatim quotes, with the date Reilly said them and where they are written down. The specs
@@ -71,6 +75,28 @@ export const SEED_DECISIONS = Object.freeze([
     words: "i never return things to KFB." },
   { at: PARCEL_TRACKING_DECISION.at, topic: PARCEL_TRACKING_DECISION.topic, scope: "all", source: "src/config/stores.js PARCEL_TRACKING_DECISION",
     words: PARCEL_TRACKING_DECISION.words },
+
+  // Open-questions answers, chat 2026-10-13 ~20:23 Eastern. Words verbatim (typos kept). Where
+  // the words are only "yes"/"no", the question is in `source` so the quote stands on its own.
+  { at: AUDIENCE_DECISION.at, topic: AUDIENCE_DECISION.topic, scope: "all", source: `${OPEN_QS} — wired: stores.js audience, Size Checker`,
+    words: AUDIENCE_DECISION.words },
+  { at: OPEN_QS_AT, topic: "sup.kfb_match_key", scope: "all", source: `${OPEN_QS} — Q: match KFB products to Shopify by product handle or KFB un_good_id?`,
+    words: "product handle is prob best" },
+  { at: OPEN_QS_AT, topic: "sup.similar_substitutions", scope: "all", source: "chat 2026-10-13 — Q: does 'similar always fine' cover substitutions on customer orders?",
+    words: "yes" },
+  { at: OPEN_QS_AT, topic: "cat.min_margin.aub", scope: "aub", source: "chat 2026-10-13 — Q: confirm a $30 minimum gross margin per unit for Auberlane?",
+    words: "yes" },
+  { at: OPEN_QS_AT, topic: "cat.high_margin_exemption", scope: "all", source: "chat 2026-10-13 — Q: should high-margin products be exempt from the pricing rules?",
+    words: "no" },
+  { at: OPEN_QS_AT, topic: "cs.size_up_disclosure", scope: "all", source: "chat 2026-10-13 — Q: tell the customer when a bigger Chinese size ships?",
+    words: "no unless they ask" },
+  { at: OPEN_QS_AT, topic: "sup.kfb_quote_status_40", scope: "all", source: `${OPEN_QS} — Reilly's best guess ("i think"), not confirmed`,
+    words: "FFG quote status 40 i think means i just havent approved it" },
+  // A fact for Risk, not a rule: #1098 is a chargeback (dispute), so the refund question on it is closed.
+  { at: OPEN_QS_AT, topic: "risk.order_1098", scope: "hc", source: `${OPEN_QS} — H&C #1098: now a chargeback; refund question closed`,
+    words: "1098 turned into a chargeback and the shipping status still isnt updating" },
+  { at: OPEN_QS_AT, topic: "cs.review_requests", scope: "all", source: `${OPEN_QS} — Judge.me review-request emails (setting changed in the browser separately)`,
+    words: "off turn them off on all stores please" },
 ]);
 
 /** Latest (unsuperseded) decision on a topic, or null. */

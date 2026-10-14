@@ -42,11 +42,28 @@ import { isOuterwear } from "../catalog/common.js";
 const ACTOR = "sup.quote_desk";
 const DENIAL_ACTOR = "sup.denial_sync";
 
-/** KFB quotation status codes (spec, Quote Desk). */
-export const STATUS_BY_CODE = Object.freeze({ 10: "pending", 25: "awaiting_reilly", 26: "denied", 30: "quoted", 40: "unknown" });
+/**
+ * KFB quotation status codes (spec, Quote Desk).
+ * 40 was "unknown (flag)" in the spec. Reilly, 2026-10-13: "FFG quote status 40 i think means i
+ * just havent approved it". So 40 is "waiting on Reilly's approval", kept as its own status
+ * (awaiting_reilly_guess) rather than merged into 25 because it is his best guess ("i think"),
+ * not a confirmed meaning. It is not an error and is never flagged as one; like 25 it is never
+ * planned (only quoted/denied rows are).
+ */
+export const STATUS_BY_CODE = Object.freeze({ 10: "pending", 25: "awaiting_reilly", 26: "denied", 30: "quoted", 40: "awaiting_reilly_guess" });
+/** Plain-English meaning per status, for screens and the digest. */
+export const STATUS_LABELS = Object.freeze({
+  pending: "waiting on KFB to quote",
+  awaiting_reilly: "waiting on Reilly's KFB confirmation (status 25)",
+  awaiting_reilly_guess: "waiting on Reilly's approval (status 40: Reilly's best guess, \"i think\")",
+  denied: "denied by KFB",
+  quoted: "quoted",
+  unknown: "unknown status",
+});
 const STATUS_WORDS = Object.freeze({
   pending: "pending", "to-quote": "pending", priority: "pending",
   awaiting: "awaiting_reilly", awaiting_reilly: "awaiting_reilly", confirm: "awaiting_reilly",
+  awaiting_reilly_guess: "awaiting_reilly_guess",
   denied: "denied", quoted: "quoted", unknown: "unknown",
 });
 
@@ -117,6 +134,9 @@ export function validateQuoteRow(r) {
     : (Object.values(STORES).find((s) => s.kfbShopCode && s.kfbShopCode === storeRaw) || {}).id;
   if (!store) return { reason: `unknown store "${r.store ?? ""}"` };
   if (!STORES[store].live) return { reason: `${STORES[store].name} is not live` };
+  // THE matching key: the store product handle. Reilly, 2026-10-13: "product handle is prob best"
+  // (decision sup.kfb_match_key). KFB's own ids (un_good_id, kfb_id) and SKUs are kept for
+  // information only and are never a fallback: no code here matches on them.
   const handle = handleFrom(r.link ?? r.handle ?? r.product_handle);
   if (!handle) return { reason: "no store link / handle (quotes are matched by handle, never title or SKU)" };
   const st = String(r.status ?? "").trim().toLowerCase();

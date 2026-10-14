@@ -32,6 +32,17 @@ export const PARCEL_TRACKING_DECISION = Object.freeze({
 
 export const GUY_FEE = Object.freeze({ rate: 0.10, start: "2026-09-07" });
 
+/**
+ * Who each store sells to (`audience` on each store below): "men", "women", "both", or null
+ * when unknown (null is "not told", never a default). The Size Checker reads it.
+ * Reilly, 2026-10-13: "H&C is mens and womens. Auberlane is womens. Marlowe is mens."
+ */
+export const AUDIENCE_DECISION = Object.freeze({
+  at: "2026-10-14T00:23:00Z",
+  topic: "core.store_audiences",
+  words: "H&C is mens and womens. Auberlane is womens. Marlowe is mens.",
+});
+
 export const STORES = Object.freeze({
   hc: {
     id: "hc",
@@ -42,6 +53,7 @@ export const STORES = Object.freeze({
     // The store's own customer-service Gmail, connected separately (Reilly, 2026-10-11:
     // "it has its own gmail, we need to connect it. also, eventually all the stores will have their own gmails").
     mailbox: "info@holtandcrane.com",
+    audience: "both", // see AUDIENCE_DECISION: sized per product, never assumed men's
     live: true,
     timezone: "America/New_York",
     secrets: { clientId: "SB_HC_CLIENT_ID", clientSecret: "SB_HC_CLIENT_SECRET" },
@@ -55,6 +67,7 @@ export const STORES = Object.freeze({
     domain: "3as2ya-dw.myshopify.com",
     kfbShopCode: "3as2ya-dw",
     adsCustomerId: "148-187-2496",
+    audience: "women", // see AUDIENCE_DECISION
     live: true,
     timezone: "America/New_York",
     secrets: { clientId: "SB_AUB_CLIENT_ID", clientSecret: "SB_AUB_CLIENT_SECRET" },
@@ -68,6 +81,7 @@ export const STORES = Object.freeze({
     domain: "806080-g8.myshopify.com",
     kfbShopCode: "806080-g8",
     adsCustomerId: "774-220-2674",
+    audience: "men", // see AUDIENCE_DECISION
     live: true,
     timezone: "America/New_York",
     secrets: { clientId: "SB_MAR_CLIENT_ID", clientSecret: "SB_MAR_CLIENT_SECRET" },
@@ -81,6 +95,7 @@ export const STORES = Object.freeze({
     domain: null, // filled in when the store goes live
     kfbShopCode: null,
     adsCustomerId: null,
+    audience: null, // not told yet
     live: false,
     timezone: "America/New_York",
     secrets: { clientId: "SB_CC_CLIENT_ID", clientSecret: "SB_CC_CLIENT_SECRET" },
@@ -91,6 +106,7 @@ export const STORES = Object.freeze({
     domain: "mek6yu-91.myshopify.com",
     kfbShopCode: "mek6yu-91",
     adsCustomerId: null,
+    audience: null, // not told yet
     live: false,
     timezone: "America/New_York",
     secrets: { clientId: "SB_TUND_CLIENT_ID", clientSecret: "SB_TUND_CLIENT_SECRET" },

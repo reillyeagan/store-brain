@@ -703,3 +703,26 @@ test("new-product check: 'no KFB quote' is info while quotes aren't wired or the
   assert.equal(sev(r, "supply_preflight"), "medium");
   assert.match(r.issues.find((i) => i.code === "supply_preflight").message, /denied/);
 });
+
+test("rules: Auberlane $30 minimum margin per unit (Reilly: 'yes'): known cost only; unknown cost is null, never a pass; no exemption", () => {
+  assert.equal(R.STORE_PRICING.aub.minMarginUsd, 30);
+  // $44.95 − $20 = $24.95 → under $30: a medium issue.
+  const low = R.validatePrice("aub", { price: 44.95, cost: 20 });
+  const issue = low.issues.find((i) => i.code === "below_min_margin");
+  assert.ok(issue, "flagged");
+  assert.equal(issue.severity, "medium");
+  assert.deepEqual(low.minMargin, { required: 30, margin: 24.95, met: false });
+  assert.equal(low.ok, false);
+  // Exactly $30 passes; well above passes (a high margin is a pass, not an exemption).
+  assert.equal(R.validatePrice("aub", { price: 59.95, cost: 29.95 }).minMargin.met, true);
+  assert.ok(!R.validatePrice("aub", { price: 69.95, cost: 20 }).issues.some((i) => i.code === "below_min_margin"));
+  // EUR cost converts rounded up, so the margin is never overstated: €20 × 1.17 = $23.40.
+  assert.equal(R.validatePrice("aub", { price: 52.95, cost: { eur: 20 } }).minMargin.margin, 29.55);
+  // Unknown cost: null, never a pass, and no issue invented.
+  const unknown = R.validatePrice("aub", { price: 44.95 });
+  assert.deepEqual(unknown.minMargin, { required: 30, margin: null, met: null });
+  assert.ok(!unknown.issues.some((i) => i.code === "below_min_margin"));
+  // Stores without the rule have no check at all (null, not "met").
+  assert.equal(R.validatePrice("hc", { price: 44.95, cost: 14 }).minMargin, null);
+  assert.equal(R.validatePrice("mar", { price: 49.95, cost: 14 }).minMargin, null);
+});

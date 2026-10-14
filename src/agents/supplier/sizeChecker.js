@@ -26,6 +26,11 @@
  *    fine; the size-up is learned from what customers said fit.
  *  - No chart and no complaints → "no_chart", no guess. Bottoms (waist sizes) and women's
  *    items → "no_reference" until a reference exists.
+ *  - Audience per store (Reilly, 2026-10-13: "H&C is mens and womens. Auberlane is womens.
+ *    Marlowe is mens."): STORES[store].audience, overridable by a live Core fact
+ *    `profile.audience`. "women" → no_reference. "men" → men's reference. "both" (H&C) →
+ *    decided per product from its title, tags and product type; a product marked neither way
+ *    is NOT assumed men's (that could size a women's line against the men's chart).
  *  - Runs large → still shipped as ordered (sizing DOWN is not automated; noted only).
  */
 import { LIVE_STORE_IDS, STORES } from "../../config/stores.js";
@@ -72,6 +77,27 @@ export const GARMENTS = Object.freeze({
 });
 const BOTTOMS_RE = /\b(pants|trousers|jeans|chinos?|shorts|joggers|slacks|skirt)\b/i;
 const WOMENS_RE = /\b(women'?s?|womens|ladies|her)\b/i;
+// Word boundaries matter: "women" contains "men", and \bmen never matches inside "women".
+const WOMEN_MARK_RE = /\b(women'?s?|womens|ladies)\b/i;
+const MEN_MARK_RE = /\b(men'?s?|mens)\b/i;
+
+/** The reason a "both" store's unmarked product gets no size (only H&C is "both" today). */
+export const UNMARKED_BOTH_REASON = "H&C sells men's and women's; this product isn't marked either way";
+
+/**
+ * Which audience one product is marked for, from its title, tags (array or JSON array) and
+ * product type. Women's wins when both appear: a women's line must never be sized against
+ * the men's chart, so any doubt falls on the cautious side.
+ * @returns {"women"|"men"|null}
+ */
+export function productAudience({ title = null, tags = null, productType = null } = {}) {
+  let t = tags;
+  if (typeof t === "string") { try { t = JSON.parse(t); } catch { t = [t]; } }
+  const text = [title, productType, ...(Array.isArray(t) ? t : [])].filter(Boolean).map(String).join(" | ");
+  if (WOMEN_MARK_RE.test(text)) return "women";
+  if (MEN_MARK_RE.test(text)) return "men";
+  return null;
+}
 
 export function garmentOf(title) {
   const t = String(title || "");
@@ -137,14 +163,18 @@ export function complaintShift(complaints) {
  * Decide the size to send for one line. Pure.
  * @returns {{verdict, send_size, reason, conflict:boolean}}
  */
-export function recommendSize({ title, orderedSize, chartRows, complaints = [], reference = US_REFERENCE_MEN, audience = null, productSizes = null }) {
+export function recommendSize({ title, orderedSize, chartRows, complaints = [], reference = US_REFERENCE_MEN, audience = null, productSizes = null, tags = null, productType = null }) {
   const ordered = normSize(orderedSize);
   const garment = garmentOf(title);
   const nComplaints = (complaints || []).length;
   const shift = complaintShift(complaints);
   if (!ordered) return { verdict: "no_reference", send_size: null, reason: `size "${orderedSize}" is not a letter size (waist/number sizes have no reference yet)`, conflict: false };
   if (garment === "bottoms") return { verdict: "no_reference", send_size: null, reason: "bottoms: no US waist/inseam reference yet", conflict: false };
-  if (audience === "women" || WOMENS_RE.test(String(title || ""))) return { verdict: "no_reference", send_size: null, reason: "women's item: no women's US reference yet", conflict: false };
+  // Women's by store audience, by the title, or by the product's own tags/type (at any store).
+  const marked = productAudience({ title, tags, productType });
+  if (audience === "women" || WOMENS_RE.test(String(title || "")) || marked === "women") return { verdict: "no_reference", send_size: null, reason: "women's item: no women's US reference yet", conflict: false };
+  // A store that sells both: only a product marked men's gets the men's reference. Never assume.
+  if (audience === "both" && marked !== "men") return { verdict: "no_reference", send_size: null, reason: UNMARKED_BOTH_REASON, conflict: false };
   if (!reference[ordered]) return { verdict: "no_reference", send_size: null, reason: `no US reference for size ${ordered}`, conflict: false };
 
   const { chart, notes } = chartFromRows(chartRows);
@@ -242,15 +272,22 @@ export function listedSizes(variantsJson) {
   return [...out];
 }
 
-/** Optional Core overrides: audience per store and the US reference per garment. */
-async function coreSizing(db, store) {
-  const out = { audience: null, references: {} };
+/**
+ * Audience (store config default, Core override) and the US reference per garment.
+ * The config holds Reilly's word; a live Core fact `profile.audience` still overrides it.
+ */
+export async function coreSizing(db, store) {
+  const out = { audience: (STORES[store] && STORES[store].audience) || null, references: {} };
   const { results } = await db.prepare(
     `SELECT key, value FROM core_facts WHERE live = 1 AND (store = ? OR store IS NULL) AND (key = 'profile.audience' OR key LIKE 'sizing.us_reference:%')
       ORDER BY id`
   ).bind(store).all().catch(() => ({ results: [] }));
   for (const f of results || []) {
-    if (f.key === "profile.audience") out.audience = /women|ladies/i.test(f.value) ? "women" : /men/i.test(f.value) ? "men" : null;
+    // A fact naming both ("mens and womens") is "both"; an unreadable fact keeps the config value.
+    if (f.key === "profile.audience") {
+      const w = WOMEN_MARK_RE.test(f.value), m = MEN_MARK_RE.test(f.value) || /\bboth\b/i.test(f.value);
+      out.audience = w && m ? "both" : w ? "women" : m ? "men" : out.audience;
+    }
     else {
       try { out.references[f.key.split(":")[1]] = JSON.parse(f.value); } catch { /* bad fact: ignored, default used */ }
     }
@@ -290,12 +327,14 @@ export async function runSizeChecker(env, { nowMs = Date.now() } = {}) {
     ).bind(l.store, l.product_id || "").all();
     const garment = garmentOf(l.title);
     const reference = (garment && core[l.store].references[garment]) || US_REFERENCE_MEN;
-    // The sizes the product is listed in (Catalog's copy), so complaints alone never ask beyond them.
-    const listing = (complaints || []).length && !(chartRows || []).length
-      ? await db.prepare(`SELECT variants FROM cat_products WHERE store = ? AND product_id = ?`).bind(l.store, l.product_id || "").first().catch(() => null)
-      : null;
+    // Catalog's copy of the product: its title/tags/type say men's or women's at a store that
+    // sells both, and its sizes cap a complaints-only ask.
+    const listing = await db.prepare(`SELECT title, tags, product_type, variants FROM cat_products WHERE store = ? AND product_id = ?`)
+      .bind(l.store, l.product_id || "").first().catch(() => null);
     const productSizes = listedSizes(listing && listing.variants);
-    const rec = recommendSize({ title: l.title, orderedSize: l.size, chartRows, complaints, reference, audience: core[l.store].audience, productSizes });
+    const title = [l.title, listing && listing.title].filter(Boolean).join(" | ");
+    const rec = recommendSize({ title, orderedSize: l.size, chartRows, complaints, reference, audience: core[l.store].audience, productSizes,
+      tags: listing && listing.tags, productType: listing && listing.product_type });
     let reason = rec.reason;
     if (rec.verdict !== "no_chart" && rec.verdict !== "no_reference" && !core[l.store].audience) reason += " (audience assumed men's: not in the Core yet)";
     const verified = chartRows && chartRows.length ? (chartRows.every((r) => r.verified) ? 1 : 0) : null;

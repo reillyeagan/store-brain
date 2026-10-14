@@ -19,6 +19,7 @@ import { logEvent } from "../../lib/eventlog.js";
 import { nowIso } from "../../lib/time.js";
 import { CAPS, DELIVERY_FACTS, expectedSlotAccount, storeName } from "./config.js";
 import { routeTicket, checkDraft } from "./routing.js";
+import { emailAsksAboutSize } from "./sizeUpGate.js";
 import { threadWaitingOnReilly, staleGmailDraft } from "./escalation.js";
 import { otherLiveDraft } from "./gmailDrafts.js";
 import { createReplyDraft, getDraft } from "./gmail.js";
@@ -66,6 +67,7 @@ Hard rules:
 - Delivery timing you may use: ${DELIVERY_FACTS.join(" ")}
 - If a tracking number and link are given, include them. If no order was found, ask politely for the order number.
 - For size questions use only the size chart given; if there is none, say you'll check the measurements and get back to them (no date).
+- Never mention that a bigger or different factory size may be sent, or that factory sizes run small, unless the customer's email asks about size or fit.
 - For address / colour / size changes before shipping: say you've passed the request on and will confirm once it's updated (no promise it will be possible).
 - If the email needs a decision only the owner can make (money back, a replacement, a complaint, a threat), set needs_reilly true and write no body.
 ${policy ? `Store policy (from the playbook):\n${policy}` : ""}
@@ -123,9 +125,12 @@ export async function writeReplies(env, { nowMs = Date.now(), fetchImpl = fetch,
     if (!budget.take(1)) break;
     const at = nowIso(nowMs);
     const store = storeName(t.order_store || t.store) || "our store";
+    // Sizing is only discussed when the customer asked (Reilly: "no unless they ask"): the
+    // factory size chart isn't even shown to the writer otherwise.
+    const sizeAsked = emailAsksAboutSize(t);
     let r;
     try {
-      r = await askJson(env, { system: system(store, await corePolicy(db, t.order_store || t.store)), user: userPrompt(t, ctx, await sizeChartFor(db, ctx)), maxTokens: 600, actor: ACTOR, label: "CS reply draft", store: t.store || undefined }, { fetchImpl, nowMs });
+      r = await askJson(env, { system: system(store, await corePolicy(db, t.order_store || t.store)), user: userPrompt(t, ctx, sizeAsked ? await sizeChartFor(db, ctx) : null), maxTokens: 600, actor: ACTOR, label: "CS reply draft", store: t.store || undefined }, { fetchImpl, nowMs });
     } catch (err) {
       blocked++;
       await db.prepare(`UPDATE cs_tickets SET draft_status = 'blocked', draft_note = ?, draft_at = ?, updated_at = ? WHERE id = ?`).bind(`AI answer unusable: ${clip(err.message, 120)}`, at, at, t.id).run();
@@ -144,7 +149,7 @@ export async function writeReplies(env, { nowMs = Date.now(), fetchImpl = fetch,
       continue;
     }
     const body = typeof j.body === "string" ? j.body.trim() : "";
-    const problems = checkDraft(body, { ctx, orderRef: t.order_ref });
+    const problems = checkDraft(body, { ctx, orderRef: t.order_ref, sizeAsked });
     if (problems.length) {
       blocked++;
       await db.prepare(`UPDATE cs_tickets SET draft_body = ?, draft_status = 'blocked', draft_note = ?, draft_at = ?, updated_at = ? WHERE id = ?`).bind(clip(body, 3000), clip(`Draft failed the check: ${problems.join("; ")}`, 300), at, at, t.id).run();
