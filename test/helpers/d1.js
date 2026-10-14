@@ -19,6 +19,7 @@ export function makeD1() {
   const prepare = (sql) => {
     let params = [];
     const stmt = {
+      _exec() { return db.prepare(sql).run(...params); },
       bind(...p) { params = p.map((v) => (v === undefined ? null : v)); return stmt; },
       async run() {
         const r = db.prepare(sql).run(...params);
@@ -29,7 +30,24 @@ export function makeD1() {
     };
     return stmt;
   };
-  return { prepare, _raw: db };
+  /** D1's batch: every statement in one transaction, all or nothing. `failAt` lets a test break one. */
+  const api = { prepare, _raw: db, _failBatchAt: null };
+  api.batch = async (stmts) => {
+    db.exec("BEGIN");
+    try {
+      const out = stmts.map((s, i) => {
+        if (api._failBatchAt === i) throw new Error("injected batch failure");
+        const r = s._exec();
+        return { success: true, meta: { last_row_id: Number(r.lastInsertRowid), changes: Number(r.changes) } };
+      });
+      db.exec("COMMIT");
+      return out;
+    } catch (err) {
+      db.exec("ROLLBACK");
+      throw err;
+    }
+  };
+  return api;
 }
 
 /** In-memory stand-in for an R2 bucket. */

@@ -4,7 +4,8 @@ import { makeD1 } from "./helpers/d1.js";
 
 import { recommendSize, runSizeChecker, coreSizing, REFERENCE_SOURCE, referenceForLine } from "../src/agents/supplier/sizeChecker.js";
 import { US_REFERENCES, GARMENTS_BY_AUDIENCE, FITS, REF_SIZES, garmentOf, fitOf, referenceFor } from "../src/agents/supplier/sizeReferences.js";
-import { validateChart, addPastedChart, addChartFromImage, confirmChart, chartsNeeded, resolveProduct, IMAGE_SOURCE } from "../src/agents/supplier/sizeIntake.js";
+import { validateChart, addPastedChart, addChartFromImage, confirmChart, chartsNeeded, resolveProduct, IMAGE_SOURCE, MAX_IMAGE_BASE64 } from "../src/agents/supplier/sizeIntake.js";
+import { sizeChartFor, userPrompt } from "../src/agents/cs/replyWriter.js";
 import { supplierState } from "../src/agents/supplier/index.js";
 import worker from "../src/index.js";
 
@@ -196,25 +197,32 @@ test("Core overrides: sizing.us_reference:<audience>:<garment>, and the old sizi
 
 /* ------------------------------------------------------------ intake validation */
 
-test("intake validation: inches, flat, auto-flat, bad rows", () => {
+test("intake validation: inches, flat, the inches-or-flat question, bad rows", () => {
   const inch = validateChart({ unit: "in", rows: [{ size: "M", chest: 44, length: 28 }, { size: "L", chest: 46, length: 29 }] });
   assert.equal(inch.ok, true);
   assert.equal(inch.rows[0].chest, 111.8);
   assert.equal(inch.rows[0].length, 71.1);
-  const flat = validateChart({ flat: true, rows: [{ size: "S", chest: 52, waist: 40 }, { size: "M", chest: 55, waist: 43 }] });
+  const flat = validateChart({ unit: "cm", flat: true, rows: [{ size: "S", chest: 52, waist: 40 }, { size: "M", chest: 55, waist: 43 }] });
   assert.equal(flat.rows[1].chest, 110);
   assert.equal(flat.rows[1].waist, 86);
-  const auto = validateChart({ rows: [{ size: "m", chest: 55 }, { size: "XXL", chest: "62" }] });
-  assert.equal(auto.ok, true);
-  assert.deepEqual(auto.rows.map((r) => [r.size, r.chest]), [["M", 110], ["2XL", 124]]);
-  assert.match(auto.notes.join(" "), /flat/);
+  // Never silently doubled: chests under 75cm need the unit AND an explicit flat tick.
+  const names = validateChart({ rows: [{ size: "m", chest: 110 }, { size: "XXL", chest: "125" }] });
+  assert.deepEqual(names.rows.map((r) => [r.size, r.chest]), [["M", 110], ["2XL", 125]]);
+  const inchesAsCm = validateChart({ unit: "cm", rows: [{ size: "M", chest: 44 }, { size: "L", chest: 46 }] });
+  assert.equal(inchesAsCm.ok, false);
+  assert.match(inchesAsCm.error, /unclear: inches or a flat \(half\) measurement\? say which/);
+  assert.match(validateChart({ rows: [{ size: "M", chest: 55 }, { size: "L", chest: 57 }] }).error, /unclear/, "no unit, no flat: refused");
+  assert.match(validateChart({ flat: true, rows: [{ size: "M", chest: 55 }, { size: "L", chest: 57 }] }).error, /unclear/, "flat but no unit: refused");
+  assert.match(validateChart({ unit: "cm", flat: false, rows: [{ size: "M", chest: 55 }, { size: "L", chest: 57 }] }).error, /unclear/);
+  assert.match(validateChart({ unit: "in", rows: [{ size: "M", chest: 22 }, { size: "L", chest: 23 }] }).error, /unclear/, "22in could be a flat inch chart");
+  assert.equal(validateChart({ unit: "in", flat: true, rows: [{ size: "M", chest: 22 }, { size: "L", chest: 23 }] }).rows[0].chest, 111.8);
   const bad = (rows, extra = {}) => validateChart({ rows, ...extra });
   assert.match(bad([{ size: "L", chest: 115 }, { size: "M", chest: 110 }]).error, /out of order/);
   assert.match(bad([{ size: "M", chest: 110 }, { size: "M", chest: 115 }]).error, /out of order/);
   assert.match(bad([{ size: "M", chest: 110 }]).error, /at least 2 sizes/);
   assert.match(bad([{ size: "M", chest: 250 }, { size: "L", chest: 260 }]).error, /outside 60–200cm/);
-  assert.match(bad([{ size: "M", chest: 110 }, { size: "L", chest: 115 }], { flat: true }).error, /outside 60–200cm/, "flat on a full chest doubles past 200");
-  assert.match(bad([{ size: "M", chest: 20 }, { size: "L", chest: 22 }]).error, /outside 60–200cm/, "even doubled, 40cm is nonsense");
+  assert.match(bad([{ size: "M", chest: 110 }, { size: "L", chest: 115 }], { unit: "cm", flat: true }).error, /outside 60–200cm/, "flat on a full chest doubles past 200");
+  assert.match(bad([{ size: "M", chest: 20 }, { size: "L", chest: 22 }], { unit: "cm", flat: true }).error, /outside 60–200cm/, "even doubled, 40cm is nonsense");
   assert.match(bad([{ size: "M", chest: 110 }, { size: "L", chest: 105 }]).error, /gets smaller/);
   assert.match(bad([{ size: "M", chest: "abc" }, { size: "L", chest: 105 }]).error, /not a number/);
   assert.match(bad([{ size: "32", chest: 110 }, { size: "34", chest: 115 }]).error, /not a letter size/);
@@ -233,7 +241,7 @@ async function seedOrder(DB, { store = "aub", n, product = "p1", handle = "pea-c
 }
 const AUDIT_ROWS = AUDIT.map((r) => ({ size: r.size_label, ...r.measurements }));
 
-test("paste intake: saves unchecked, resolves the handle, re-checks recent lines for that product, confirm marks it checked", async () => {
+test("paste intake: saves unconfirmed (no KFB ask), re-checks the product at once; confirm refreshes the line and only then makes the ask", async () => {
   const DB = makeD1();
   const env = { DB };
   await seedOrder(DB, { n: 2001 });
@@ -249,13 +257,15 @@ test("paste intake: saves unchecked, resolves the handle, re-checks recent lines
   const rows = (await DB.prepare(`SELECT * FROM size_charts ORDER BY size_label`).all()).results;
   assert.equal(rows.length, 6);
   assert.ok(rows.every((x) => x.verified === 0 && x.source.startsWith(`intake:${r.id} `)));
-  // Re-checked straight away (no 6-hour wait): the women's coat reference says ship a 3XL.
-  const rec = await DB.prepare(`SELECT verdict, send_size, reason, chart_verified FROM size_recommendations`).first();
+  // Re-checked straight away: the women's coat reference says 3XL, but the chart is unconfirmed → no ask.
+  let rec = await DB.prepare(`SELECT verdict, send_size, reason, chart_verified FROM size_recommendations`).first();
   assert.equal(rec.verdict, "size_up");
   assert.equal(rec.send_size, "3XL");
+  assert.equal(rec.chart_verified, 0);
   assert.match(rec.reason, /vs US women's coat\/outerwear \(regular fit\) reference/);
-  assert.match(rec.reason, /not yet checked/);
-  assert.equal((await DB.prepare(`SELECT COUNT(*) AS n FROM kfb_size_asks`).first()).n, 1);
+  assert.match(rec.reason, /Pending your chart confirm/);
+  assert.match(rec.reason, /chart pasted by Reilly, not yet confirmed/);
+  assert.equal((await DB.prepare(`SELECT COUNT(*) AS n FROM kfb_size_asks`).first()).n, 0, "an unconfirmed chart never makes a KFB ask");
   assert.ok(await DB.prepare(`SELECT id FROM events WHERE kind = 'size_chart.added' AND actor = 'sup.size_charts'`).first());
 
   const c = await confirmChart(env, r.id, { nowMs: NOW + 120000 });
@@ -264,11 +274,155 @@ test("paste intake: saves unchecked, resolves the handle, re-checks recent lines
   const ev = await DB.prepare(`SELECT actor, summary FROM events WHERE kind = 'size_chart.confirmed'`).first();
   assert.equal(ev.actor, "sup.size_charts");
   assert.match(ev.summary, /confirmed by Reilly/);
+  rec = await DB.prepare(`SELECT reason, chart_verified FROM size_recommendations`).first();
+  assert.equal(rec.chart_verified, 1, "refreshed on confirm");
+  assert.doesNotMatch(rec.reason, /not yet confirmed|Pending your chart confirm/);
+  const ask = await DB.prepare(`SELECT send_size, status FROM kfb_size_asks`).first();
+  assert.deepEqual([ask.send_size, ask.status], ["3XL", "pending"]);
   // A confirmed chart is not replaced by accident.
-  const again = await addPastedChart(env, { store: "aub", product_handle: "pea-coat", rows: AUDIT_ROWS }, { nowMs: NOW + 180000 });
+  const again = await addPastedChart(env, { store: "aub", product_handle: "pea-coat", unit: "cm", rows: AUDIT_ROWS }, { nowMs: NOW + 180000 });
   assert.equal(again.ok, false);
   assert.equal(again.status, 409);
   assert.equal((await confirmChart(env, 999)).status, 404);
+});
+
+test("fixing a chart undoes what the wrong chart decided: lines re-decided, a pending ask that no longer holds is withdrawn (never deleted)", async () => {
+  const DB = makeD1();
+  const env = { DB };
+  await seedOrder(DB, { n: 2101, size: "M" });
+  // A wrong chart (too small), confirmed → size-up + ask.
+  const small = [{ size: "M", chest: 96 }, { size: "L", chest: 104 }, { size: "XL", chest: 112 }];
+  const r1 = await addPastedChart(env, { store: "aub", product_handle: "pea-coat", unit: "cm", rows: small }, { nowMs: NOW });
+  await confirmChart(env, r1.id, { nowMs: NOW + 1000 });
+  let ask = await DB.prepare(`SELECT * FROM kfb_size_asks`).first();
+  assert.equal(ask.status, "pending");
+  assert.equal(ask.send_size, "L");
+  // Reilly replaces it with the right chart: the M line is re-decided (it was size_up, not no_chart).
+  const r2 = await addPastedChart(env, { store: "aub", product_handle: "pea-coat", unit: "cm", replace: true, rows: AUDIT_ROWS }, { nowMs: NOW + 2000 });
+  assert.equal(r2.ok, true, r2.error);
+  const rec = await DB.prepare(`SELECT verdict, send_size, chart_verified FROM size_recommendations`).first();
+  assert.equal(rec.verdict, "as_ordered");
+  assert.equal(rec.chart_verified, 0);
+  const asks = (await DB.prepare(`SELECT * FROM kfb_size_asks`).all()).results;
+  assert.equal(asks.length, 1, "never deleted");
+  assert.equal(asks[0].status, "withdrawn");
+  assert.match(asks[0].why, /withdrawn .*no longer holds \(now as ordered M, chart pasted by Reilly, not yet confirmed\)/);
+  assert.equal((await DB.prepare(`SELECT COUNT(*) AS n FROM kfb_size_asks WHERE status = 'pending'`).first()).n, 0);
+  assert.match((await DB.prepare(`SELECT summary FROM events WHERE kind = 'sizes.checked' ORDER BY id DESC`).first()).summary, /1 ask withdrawn/);
+});
+
+test("image-read chart: the reason names it as read by the brain from an image, not yet confirmed", async () => {
+  const DB = makeD1();
+  await seedOrder(DB, { n: 2201 });
+  await DB.prepare(`INSERT INTO size_charts (store, product_id, product_handle, size_label, measurements, source, verified) VALUES ('aub', 'handle:pea-coat', 'pea-coat', 'XL', '{"chest":120}', ?, 0)`).bind(`intake:1 · ${IMAGE_SOURCE}`).run();
+  await DB.prepare(`INSERT INTO size_charts (store, product_id, product_handle, size_label, measurements, source, verified) VALUES ('aub', 'handle:pea-coat', 'pea-coat', '2XL', '{"chest":125}', ?, 0)`).bind(`intake:1 · ${IMAGE_SOURCE}`).run();
+  await runSizeChecker({ DB }, { nowMs: NOW });
+  const rec = await DB.prepare(`SELECT reason FROM size_recommendations`).first();
+  assert.match(rec.reason, /chart read by the brain from an image, not yet confirmed/);
+});
+
+test("an unconfirmed chart still lets the complaints logic ask (complaints are their own evidence)", async () => {
+  const DB = makeD1();
+  await seedOrder(DB, { n: 2301, size: "M" });
+  await DB.prepare(`INSERT INTO cat_products (store, product_id, handle, title, variants, read_at) VALUES ('aub', 'gid://shopify/Product/p1', 'pea-coat', 'Pea Coat', ?, ?)`)
+    .bind(JSON.stringify([{ title: "Navy / M" }, { title: "Navy / L" }, { title: "Navy / XL" }]), iso(NOW)).run();
+  for (let i = 0; i < 2; i++) {
+    await DB.prepare(`INSERT INTO size_complaints (store, product_id, size_ordered, size_that_fits, said, at) VALUES ('aub', 'gid://shopify/Product/p1', 'M', 'L', 'too small', ?)`).bind(iso(NOW)).run();
+  }
+  await addPastedChart({ DB }, { store: "aub", product_handle: "pea-coat", unit: "cm", rows: AUDIT_ROWS }, { nowMs: NOW });
+  const ask = await DB.prepare(`SELECT send_size, why FROM kfb_size_asks`).first();
+  assert.equal(ask.send_size, "L");
+  assert.match(ask.why, /customer complaints \(the chart is pending your confirm\)/);
+});
+
+test("review fixes: chest decides; shoulder/length shortfalls are notes with conflict, never a size-up", () => {
+  // Men's knit: a US M sweater with a short length stays M; slim XS stays XS.
+  const knit = [{ size_label: "M", measurements: { chest: 112, length: 68.5 } }, { size_label: "L", measurements: { chest: 122, length: 71 } }];
+  const k = recommendSize({ title: "Men's Merino Sweater", orderedSize: "M", chartRows: knit, audience: "men" });
+  assert.equal(k.send_size, "M");
+  assert.equal(k.conflict, true);
+  assert.match(k.reason, /length shortfall is noted only/);
+  const slim = [{ size_label: "XS", measurements: { chest: 92, length: 64 } }, { size_label: "S", measurements: { chest: 98, length: 67 } }];
+  assert.equal(recommendSize({ title: "Men's Smooth Fine Knit Sweater, Slim Fit Long Sleeve Layering Pullover", orderedSize: "XS", chartRows: slim, audience: "men" }).send_size, "XS");
+  const hoodie = recommendSize({ title: "Men's Hoodie", orderedSize: "M", chartRows: [{ size_label: "M", measurements: { chest: 114, length: 66 } }, { size_label: "L", measurements: { chest: 122, length: 70 } }], audience: "men" });
+  assert.equal(hoodie.send_size, "M");
+  // Women's longline coat L: the chest fits, the shoulder is short → stays L, conflict noted.
+  const coatChart = [{ size_label: "M", measurements: { chest: 108, shoulder: 37 } }, { size_label: "L", measurements: { chest: 116, shoulder: 38.5 } }, { size_label: "XL", measurements: { chest: 122, shoulder: 40.5 } }];
+  const coat = recommendSize({ title: "Women's Longline Wool Coat", orderedSize: "L", chartRows: coatChart, audience: "women" });
+  assert.equal(coat.send_size, "L");
+  assert.equal(coat.verdict, "as_ordered");
+  assert.equal(coat.conflict, true);
+  assert.match(coat.reason, /chest says L, shoulder says XL/);
+  // When the chest itself falls short, it still goes up (never above the largest listed).
+  const smallChest = [{ size_label: "M", measurements: { chest: 100, shoulder: 40 } }, { size_label: "L", measurements: { chest: 108, shoulder: 41 } }];
+  const up = recommendSize({ title: "Women's Longline Wool Coat", orderedSize: "M", chartRows: smallChest, audience: "women" });
+  assert.equal(up.verdict, "size_up");
+  assert.equal(up.send_size, "L");
+  const top = recommendSize({ title: "Women's Longline Wool Coat", orderedSize: "L", chartRows: smallChest, audience: "women" });
+  assert.equal(top.verdict, "no_fit", "never above the largest listed size");
+  assert.equal(top.send_size, null);
+});
+
+test("review fixes: a women's blouse with no fit word uses the fitted-blouse ease; a dress is sized on the chest only", () => {
+  const elise = [{ size_label: "S", measurements: { chest: 92, shoulder: 36 } }, { size_label: "M", measurements: { chest: 98, shoulder: 37.5 } }, { size_label: "L", measurements: { chest: 104, shoulder: 39 } }];
+  const b = recommendSize({ title: "Elise | Twist-Front Satin Blouse, V-Neck Short-Sleeve Top", orderedSize: "M", chartRows: elise, audience: "women" });
+  assert.equal(b.send_size, "M");
+  assert.match(b.reason, /blouse\/top \(regular fit\)/);
+  assert.equal(referenceFor("women", "top", "regular").table.M.chest, referenceFor("women", "top", "fitted").table.M.chest + 0, "regular = fitted-blouse ease");
+  assert.ok(referenceFor("women", "top", "relaxed").table.M.chest > referenceFor("women", "top", "regular").table.M.chest, "relaxed titles get the relaxed allowance");
+  // Smocked / elastic waist dress: waist 68 is a note, not a no-fit.
+  const dress = [{ size_label: "S", measurements: { chest: 90, waist: 64 } }, { size_label: "M", measurements: { chest: 98, waist: 68 } }, { size_label: "L", measurements: { chest: 104, waist: 72 } }];
+  const d = recommendSize({ title: "Women's Smocked Midi Dress", orderedSize: "M", chartRows: dress, audience: "women" });
+  assert.equal(d.verdict, "as_ordered");
+  assert.equal(d.send_size, "M");
+  assert.match(d.reason, /waist/);
+});
+
+test("review fixes: replacing a chart is all or nothing (one batch)", async () => {
+  const DB = makeD1();
+  const r1 = await addPastedChart({ DB }, { store: "mar", product_handle: "knit", unit: "cm", rows: AUDIT_ROWS }, { nowMs: NOW });
+  assert.equal(r1.ok, true);
+  DB._failBatchAt = 3; // the third insert fails
+  await assert.rejects(addPastedChart({ DB }, { store: "mar", product_handle: "knit", unit: "cm", rows: AUDIT_ROWS.slice(0, 4) }, { nowMs: NOW + 1000 }));
+  DB._failBatchAt = null;
+  const rows = (await DB.prepare(`SELECT source FROM size_charts`).all()).results;
+  assert.equal(rows.length, 6, "the old chart is intact");
+  assert.ok(rows.every((x) => x.source.startsWith(`intake:${r1.id} `)));
+});
+
+test("review fixes: image route refuses a confirmed product before the paid call, refuses an image with no unit, and caps the size", async () => {
+  const DB = makeD1();
+  const env = { DB, ANTHROPIC_API_KEY: "sk-ant-test-key-123456" };
+  let calls = 0;
+  const answer = (j) => async (url, init) => { calls++; return new Response(JSON.stringify({ model: "m", content: [{ type: "text", text: JSON.stringify(j) }], usage: { input_tokens: 10, output_tokens: 10 } }), { status: 200 }); };
+  // No explicit unit from the model → refused, nothing saved.
+  const noUnit = await addChartFromImage(env, { store: "mar", product_handle: "knit", image_base64: "iVBORw0KGgo=", media_type: "image/png" }, { fetchImpl: answer({ rows: [{ size: "M", chest: 110 }, { size: "L", chest: 115 }] }), nowMs: NOW });
+  assert.equal(noUnit.status, 422);
+  assert.match(noUnit.error, /unclear: inches or a flat/);
+  assert.equal((await DB.prepare(`SELECT COUNT(*) AS n FROM size_charts`).first()).n, 0);
+  // Confirmed chart → 409 before any AI call.
+  const r = await addPastedChart({ DB }, { store: "mar", product_handle: "knit", unit: "cm", rows: AUDIT_ROWS }, { nowMs: NOW });
+  await confirmChart({ DB }, r.id, { nowMs: NOW });
+  calls = 0;
+  const blocked = await addChartFromImage(env, { store: "mar", product_handle: "knit", image_base64: "iVBORw0KGgo=", media_type: "image/png" }, { fetchImpl: answer({ unit: "cm", rows: [] }), nowMs: NOW });
+  assert.equal(blocked.status, 409);
+  assert.equal(calls, 0, "no paid call");
+  // Size cap: 5,242,880 base64 characters.
+  const big = await addChartFromImage(env, { store: "mar", product_handle: "other", image_base64: "A".repeat(5_242_884), media_type: "image/png" }, { fetchImpl: answer({}), nowMs: NOW });
+  assert.equal(big.status, 400);
+  assert.match(big.error, /3\.75 MB/);
+  assert.equal(MAX_IMAGE_BASE64, 5_242_880);
+  assert.equal(calls, 0);
+});
+
+test("CS drafts: an unconfirmed chart is labelled 'factory chart, unconfirmed' in what the model sees", async () => {
+  const DB = makeD1();
+  await DB.prepare(`INSERT INTO size_charts (store, product_id, size_label, measurements, source, verified) VALUES ('aub', 'gid://shopify/Product/p1', 'M', '{"chest":110}', 'intake:1 · x', 0)`).run();
+  const chart = await sizeChartFor(DB, { store: "aub", items: [{ product_id: "gid://shopify/Product/p1", title: "Pea Coat" }] });
+  assert.equal(chart[0].label, "factory chart, unconfirmed");
+  const prompt = userPrompt({ category: "size", body: "will it fit?" }, null, chart);
+  assert.match(prompt, /factory chart, unconfirmed/);
+  assert.match(prompt, /never as confirmed fact/);
 });
 
 test("paste intake: an unknown handle is kept as handle:<handle> and still matches order lines; non-live stores and bad ids refused", async () => {

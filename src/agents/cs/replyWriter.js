@@ -44,13 +44,18 @@ async function corePolicy(db, store) {
   return out;
 }
 
-async function sizeChartFor(db, ctx) {
+export async function sizeChartFor(db, ctx) {
   if (!ctx || !ctx.items) return null;
   const out = [];
   for (const it of ctx.items.slice(0, 3)) {
     if (!it.product_id) continue;
     const { results } = await db.prepare(`SELECT size_label, measurements, verified FROM size_charts WHERE store = ? AND product_id = ? LIMIT 12`).bind(ctx.store, it.product_id).all();
-    if ((results || []).length) out.push({ product: it.title, verified: results.every((r) => r.verified === 1), sizes: results.map((r) => ({ size: r.size_label, cm: safeJson(r.measurements, null) })) });
+    if ((results || []).length) {
+      const verified = results.every((r) => r.verified === 1);
+      // An unconfirmed chart (pasted, or read by the brain from an image) is labelled on the chart
+      // itself, so a draft never states its numbers as fact.
+      out.push({ product: it.title, verified, label: verified ? "factory chart, confirmed by Reilly" : "factory chart, unconfirmed", sizes: results.map((r) => ({ size: r.size_label, cm: safeJson(r.measurements, null) })) });
+    }
   }
   return out.length ? out : null;
 }
@@ -74,7 +79,7 @@ ${policy ? `Store policy (from the playbook):\n${policy}` : ""}
 Return {"body":"the full reply text","needs_reilly":false,"reason":null}`;
 }
 
-function userPrompt(t, ctx, chart) {
+export function userPrompt(t, ctx, chart) {
   const facts = ctx ? {
     order: ctx.name, placed: ctx.created_at, payment: ctx.financial_status, fulfillment: ctx.fulfillment_status,
     cancelled: !!ctx.cancelled_at,
@@ -90,7 +95,7 @@ function userPrompt(t, ctx, chart) {
     `Subject: ${t.subject || ""}`,
     `Their email:\n${clip(t.body || "", 2000)}`,
     facts ? `Order facts (from Shopify):\n${JSON.stringify(facts)}` : `Order facts: no order found (${t.context_note || "not matched"}).`,
-    chart ? `Size chart (cm${chart.every((c) => c.verified) ? "" : ", not yet verified by a person"}):\n${JSON.stringify(chart)}` : null,
+    chart ? `Size chart (cm${chart.every((c) => c.verified) ? "" : "; any chart labelled \"factory chart, unconfirmed\" is not checked by a person: give its numbers as the factory chart's approximate measurements, never as confirmed fact"}):\n${JSON.stringify(chart)}` : null,
   ].filter(Boolean).join("\n\n");
 }
 

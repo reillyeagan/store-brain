@@ -427,9 +427,11 @@ test("Size Checker: true to size ships as ordered; disagreement states the confl
   assert.equal(recommendSize({ title: "Merino Sweater", orderedSize: "Medium", chartRows: true2size }).verdict, "as_ordered");
   const conflict = [{ size_label: "M", measurements: { chest: 112, length: 66 } }, { size_label: "L", measurements: { chest: 122, length: 71 } }];
   const r = recommendSize({ title: "Merino Sweater", orderedSize: "M", chartRows: conflict });
-  assert.equal(r.send_size, "L");
+  // The chest decides (review of 1e5fd64): a short length is a noted conflict, never a size-up.
+  assert.equal(r.send_size, "M");
   assert.equal(r.conflict, true);
   assert.match(r.reason, /chest says M, length says L/);
+  assert.match(r.reason, /length shortfall is noted only/);
 });
 
 test("Size Checker: never above the factory's largest; no chart means no guess", () => {
@@ -522,7 +524,7 @@ test("Size Checker run: records recommendations and one KFB ask per line, idempo
   // H&C sells both: these products are tagged men's, so the men's reference applies.
   await seedCatProduct(DB, { product: "p1", tags: ["Mens", "Knitwear"] });
   await seedCatProduct(DB, { product: "p2", title: "Plain Sweater", productType: "Men's Sweaters" });
-  await seedChart(DB, "p1", SMALL_CHART, 0);
+  await seedChart(DB, "p1", SMALL_CHART, 1); // confirmed: only a confirmed chart makes a KFB ask
   const r = await runSizeChecker({ DB }, { nowMs: NOW });
   assert.equal(r.checked, 2);
   const asks = (await DB.prepare(`SELECT * FROM kfb_size_asks`).all()).results;
@@ -531,7 +533,7 @@ test("Size Checker run: records recommendations and one KFB ask per line, idempo
   assert.equal(asks[0].ordered_size, "M");
   assert.equal(asks[0].send_size, "L");
   const rec = await DB.prepare(`SELECT * FROM size_recommendations WHERE order_id = 'gid://shopify/Order/1201'`).first();
-  assert.match(rec.reason, /not yet checked/);
+  assert.equal(rec.chart_verified, 1);
   assert.doesNotMatch(rec.reason, /audience assumed/, "H&C's audience is known now (Reilly, 2026-10-13)");
   const nc = await DB.prepare(`SELECT verdict FROM size_recommendations WHERE order_id = 'gid://shopify/Order/1202'`).first();
   assert.equal(nc.verdict, "no_chart");
