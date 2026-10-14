@@ -39,6 +39,7 @@ import { recomputeDays, rowsBetween, sumRows, storeTz } from "./pnl.js";
 import { orderCoverage, coveredDays } from "./orderBackfill.js";
 import { minusDays } from "./adsSpend.js";
 import { localDay, nowIso } from "./time.js";
+import { kfbImportStatus } from "./kfbReads.js";
 
 export const BRIEF_AFTER_MIN = 8 * 60; // 08:00 Eastern
 export const DEFAULT_BRIEF_MODEL = "claude-sonnet-5-5";
@@ -156,6 +157,8 @@ export async function gatherBriefData(env, { nowMs = Date.now() } = {}) {
   // Waiting on Reilly.
   const pending = await listPending(db);
   const kfb = (await listKfbMessages(db, 1))[0] || null;
+  // KFB morning import: "not done today" until one lands (Reilly logs in, clicks the bookmarklet).
+  const kfbImp = await kfbImportStatus(db, nowMs);
 
   // Orders + shipping. Parcel tracking is off (Reilly, Oct 13): no parcel flags at all.
   const tracking = parcelTrackingOn(env);
@@ -219,6 +222,7 @@ export async function gatherBriefData(env, { nowMs = Date.now() } = {}) {
     waiting: {
       approvals: pending.map((a) => waitingItem(a, disputeByApproval.get(a.id), nowMs)),
       kfb_latest: kfb ? { day: kfb.local_day, status: kfb.status, mode: kfb.mode, orders: kfb.item_count } : null,
+      kfb_import: { done_today: kfbImp.doneToday, status: kfbImp.doneToday ? "KFB import done today" : "KFB import not done today", ever_imported: !!kfbImp.lastAt },
     },
     orders: {
       express_yesterday: express ? Number(express.n) : 0,
@@ -346,7 +350,9 @@ export function plainBrief(d) {
   }
   L.push("");
   L.push("## Waiting on you");
-  if (!d.waiting.approvals.length) L.push("- Nothing waiting.");
+  const kfbImp = d.waiting.kfb_import;
+  if (kfbImp && !kfbImp.done_today) L.push(`- **KFB import not done today**: log in to KungFuBuy, then click the KFB → Store Brain bookmark${kfbImp.ever_imported ? "" : " (no import has ever landed, so quotes, KFB orders and bills are not read yet)"}.`);
+  if (!d.waiting.approvals.length && !(kfbImp && !kfbImp.done_today)) L.push("- Nothing waiting.");
   for (const a of d.waiting.approvals.slice(0, 8)) L.push(`- ${a.title}${a.waiting_days ? ` (${a.waiting_days} d)` : ""}`);
   if (d.waiting.kfb_latest) L.push(`- KFB message ${d.waiting.kfb_latest.day}: ${d.waiting.kfb_latest.status} (${d.waiting.kfb_latest.mode}, ${d.waiting.kfb_latest.orders} orders)`);
   L.push("");
@@ -395,6 +401,7 @@ Hard rules:
 7. Give the reasoning behind each judgement in a few words.
 8. Mention an order number (#1234) or a date only if it is listed in DATA.references; write dates as YYYY-MM-DD.
 9. A figure that appears inside a text field (an approval title, a risk "what") may be quoted only from the number field next to it: amounts_in_title, dispute.amount, changes[].before / after / change, payout_check. Never work out a difference, total, average or per-store split yourself; use the computed field (e.g. changes[].change, pending_refunds.by_store). If DATA has no field for a figure, describe it in words without the number.
+10. If waiting.kfb_import.done_today is false, the first line of Waiting on you is "KFB import not done today" (log in to KungFuBuy, click the bookmark).
 
 Format: plain markdown subset only: "## " headings, "- " bullets, **bold**. No tables, no links, no HTML.
 Sections in this order: Yesterday's money (per store + group, then month to date) · Waiting on you · Orders · Risk (omit if empty) · Media · Feeds.

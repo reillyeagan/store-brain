@@ -7,7 +7,7 @@ import { nowIso } from "../../lib/time.js";
 export const DEPT = "sup";
 
 /** Why most supplier inputs are empty today. Shown on the page and in the digest. */
-export const WAITING_ON_KFB = "waiting on KFB session: KFB has no API and a CAPTCHA login; the KFB Morning Session service (planned) or a manual import fills this";
+export const WAITING_ON_KFB = "waiting on KFB session: KFB has no API and a CAPTCHA login; the KFB morning import (log in, click the bookmarklet, #/import/kfb) fills this";
 
 /**
  * Log an event at most once per `withinMin` for the same actor + kind (+ target), so a
