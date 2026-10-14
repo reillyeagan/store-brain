@@ -11,6 +11,7 @@ import { SPEND_ALARM, spendAlarmConfig } from "../src/config/stores.js";
 import { judgeSpend, runSpendAlarm, normallySpending } from "../src/agents/media/spendAlarm.js";
 import { gatherBriefData } from "../src/lib/brief.js";
 import { checkNewProduct, NO_COMPARE_AT_DAYS } from "../src/agents/catalog/prepublish.js";
+import { hygieneReport, runHygieneStore } from "../src/agents/catalog/hygiene.js";
 import { runBilling, judgeBudget, judgeBilling, judgeAccount, isAccessGap, Q_ACCOUNT, Q_BILLING, Q_BUDGET } from "../src/agents/media/billing.js";
 
 const evs = async (DB, kind) => (await DB.prepare(`SELECT * FROM events WHERE kind = ? ORDER BY id`).bind(kind).all()).results;
@@ -276,4 +277,50 @@ test("new-product check: never proposes a compare-at tier for a product younger 
   const old = checkNewProduct("hc", newProd("2026-09-01T12:00:00Z", null), { cost: { usd: 20 }, hasSizeChart: true, handles: new Set(), tierCounts: TIERS, nowMs: NOWP });
   assert.equal(old.suggested_tier, 10);
   assert.ok(!old.issues.some((i) => i.code === "compare_at_on_new_product"));
+});
+
+/* ---------------- 7. monthly feed hygiene ---------------- */
+
+const prod = (n, { published = "2026-06-01T00:00:00Z", compareAt = null, status = "ACTIVE", variants = 3 } = {}) => ({
+  product_id: `gid://shopify/Product/${n}`, handle: `p-${n}`, title: `P ${n}`, status, published_at: published, created_at: published,
+  variants_count: variants, variants: [{ id: `v${n}`, price: 64.95, compareAt }],
+});
+
+test("feed hygiene: zombies need 60 days live and no sales; best-sellers not on sale listed (too-new ones marked); SKUs vs spend per course 8.6", () => {
+  const NOWH = Date.parse("2026-10-14T12:00:00Z");
+  const products = [prod(1), prod(2), prod(3, { published: "2026-10-01T00:00:00Z" }), prod(4, { compareAt: 99.95 }), prod(5, { published: "2026-10-05T00:00:00Z" }), prod(6, { status: "DRAFT" })];
+  const units = new Map([["gid://shopify/Product/2", 5], ["gid://shopify/Product/4", 9], ["gid://shopify/Product/5", 3]]);
+  const r = hygieneReport({ products, units60: units, units90: units, units30: units, coverage60: { ok: true }, avgDailySpend: 50, nowMs: NOWH });
+  // #1 old and unsold → zombie (also past the course's 90 days); #3 too new to judge; #6 draft.
+  assert.deepEqual(r.zombies.map((z) => z.product_id), ["gid://shopify/Product/1"]);
+  assert.equal(r.zombies[0].course_90d, true);
+  // Best-sellers not on sale: #2 (ready) and #5 (too new: GMC Playbook 30 days); #4 is already on sale.
+  assert.deepEqual(r.bestsellers_no_compare_at.map((b) => [b.product_id, b.too_new]), [["gid://shopify/Product/2", false], ["gid://shopify/Product/5", true]]);
+  // 5 active × 3 variants = 15 SKUs vs $50/day → course benchmark ~5,000 SKUs: room to add.
+  assert.equal(r.skus.skus, 15);
+  assert.equal(r.skus.course_benchmark_skus, 5000);
+  assert.match(r.skus.verdict, /room to add/);
+  // Incomplete order history: no zombie claim at all (0 sales from missing data is not a claim).
+  const r2 = hygieneReport({ products, units60: new Map(), units90: null, units30: new Map(), coverage60: { ok: false, why: "backfill not finished" }, avgDailySpend: null, spendWhy: "feed stale", nowMs: NOWH });
+  assert.equal(r2.zombies, null);
+  assert.match(r2.zombies_note, /backfill not finished/);
+  assert.equal(r2.skus.verdict, null);
+});
+
+test("feed hygiene: a store run saves the state section and one monthly event; zombies wait for full order history", async () => {
+  const DB = makeD1();
+  const NOWH = Date.parse("2026-10-14T12:00:00Z");
+  const r = await runHygieneStore({ DB }, "hc", [prod(1), prod(2)], { nowMs: NOWH, day: "2026-10-14" });
+  assert.equal(r.zombies, null);
+  assert.match(r.zombies_note, /order history not fully read/);
+  await DB.prepare(`INSERT INTO order_coverage (store, covered_from, completed_at) VALUES ('hc', '2026-06-01', 'x')`).run();
+  await DB.prepare(`INSERT INTO orders (store, order_id, name, created_at, local_day, total, updated_at) VALUES ('hc', 'o1', '#1', '2026-10-01T12:00:00Z', '2026-10-01', 64.95, 'x')`).run();
+  await DB.prepare(`INSERT INTO order_lines (store, order_id, line_id, product_id, quantity, updated_at) VALUES ('hc', 'o1', 'l1', 'gid://shopify/Product/2', 2, 'x')`).run();
+  const r2 = await runHygieneStore({ DB }, "hc", [prod(1), prod(2)], { nowMs: NOWH, day: "2026-10-14" });
+  assert.equal(r2.zombies, 1);
+  assert.equal(r2.bestsellers_no_compare_at, 1);
+  assert.match(r2.skus.spend_note, /not wired/);
+  const run = await DB.prepare(`SELECT * FROM cat_runs WHERE agent = 'cat.hygiene' AND store = 'hc'`).first();
+  assert.equal(JSON.parse(run.summary).month, "2026-10");
+  assert.equal((await evs(DB, "catalog.hygiene_report")).length, 2);
 });

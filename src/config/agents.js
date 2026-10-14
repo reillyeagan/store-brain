@@ -93,6 +93,7 @@ export const AGENTS = Object.freeze([
   a("cat.margin_guard", "cat", "Margin Guard", "code", "L0", "built"),
   a("cat.status", "cat", "Product Status", "code", "L1", "built"),
   a("cat.prepublish", "cat", "New-Product Check", "code", "L2", "built"),
+  a("cat.hygiene", "cat", "Feed Hygiene", "code", "L0", "built"),
   a("cat.feed_health", "cat", "Merchant Center Health", "code", "L0"),
   // Dropped 2026-10-11 (Reilly): content & size notes, import builder, theme desk.
 ]);
@@ -193,5 +194,6 @@ export const AGENT_DOES = Object.freeze({
   "cat.margin_guard": "Flags products whose cost makes the price unprofitable.",
   "cat.status": "Keeps product status in line with supplier availability.",
   "cat.prepublish": "Checks new products before they go live.",
+  "cat.hygiene": "Monthly feed report from the course: zombie products, best-sellers not on sale, SKU count vs ad spend (proposals only).",
   "cat.feed_health": "Watches Merchant Center for disapprovals and feed errors.",
 });
