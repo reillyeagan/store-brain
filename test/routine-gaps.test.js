@@ -10,6 +10,7 @@ import { minusDays } from "../src/lib/adsSpend.js";
 import { SPEND_ALARM, spendAlarmConfig } from "../src/config/stores.js";
 import { judgeSpend, runSpendAlarm, normallySpending } from "../src/agents/media/spendAlarm.js";
 import { gatherBriefData } from "../src/lib/brief.js";
+import { runBilling, judgeBudget, judgeBilling, judgeAccount, isAccessGap, Q_ACCOUNT, Q_BILLING, Q_BUDGET } from "../src/agents/media/billing.js";
 
 const evs = async (DB, kind) => (await DB.prepare(`SELECT * FROM events WHERE kind = ? ORDER BY id`).bind(kind).all()).results;
 
@@ -167,4 +168,78 @@ test("guy fee: the monthly check compares the ledger fee with 10% x spend and th
   // Once a month per store.
   assert.deepEqual(await monthlyGuyCheck(DB, { nowMs: NOWM + 86400000 }), []);
   assert.equal(compareGuyFee({ ledgerFee: 120, expectedFee: 120, sheet: 150, daysMissing: 0 }).status, "mismatch");
+});
+
+/* ---------------- 4. Google Ads billing watch ---------------- */
+
+/** A stand-in AdsSession: answers by query, or throws the Google error given for it. */
+function fakeSession(answers) {
+  const queries = [];
+  return {
+    queries,
+    async query(store, q) {
+      queries.push(q);
+      assert.match(q, /^\s*SELECT\s/); // watch only
+      const a = answers[q];
+      if (a instanceof Error) throw a;
+      return a || [];
+    },
+  };
+}
+const adsErr = (m) => Object.assign(new Error(m), { code: "ADS_HTTP" });
+
+test("billing: judges account status, billing setup and account budget", () => {
+  assert.equal(judgeAccount([{ customer: { status: "SUSPENDED" } }]).severity, "bad");
+  assert.equal(judgeAccount([{ customer: { status: "ENABLED" } }]).status, "ok");
+  const NOWB = Date.parse("2026-10-14T12:00:00Z");
+  assert.equal(judgeBilling([{ billingSetup: { status: "APPROVED", startDateTime: "2026-01-01 00:00:00" } }], NOWB).status, "ok");
+  assert.equal(judgeBilling([{ billingSetup: { status: "APPROVED_HELD" } }], NOWB).severity, "bad");
+  assert.equal(judgeBilling([], NOWB).status, "flag");
+  const b = judgeBudget([{ accountBudget: { status: "APPROVED", approvedSpendingLimitMicros: "1000000000", amountServedMicros: "950000000" } }]);
+  assert.equal(b.status, "flag");
+  assert.equal(b.severity, "warn");
+  assert.equal(b.data.left, 50);
+  assert.equal(judgeBudget([]).status, "none"); // card-paid: no account budget is normal
+  assert.equal(judgeBudget([{ accountBudget: { status: "APPROVED", approvedSpendingLimitType: "INFINITE" } }]).status, "ok");
+});
+
+test("billing: a suspended account and a nearly-used budget are flagged once each; failed payment is not wired (with why)", async () => {
+  const DB = makeD1();
+  const s = fakeSession({
+    [Q_ACCOUNT]: [{ customer: { status: "SUSPENDED" } }],
+    [Q_BILLING]: [{ billingSetup: { status: "APPROVED" } }],
+    [Q_BUDGET]: [{ accountBudget: { status: "APPROVED", approvedSpendingLimitMicros: "500000000", amountServedMicros: "490000000" } }],
+  });
+  const r = await runBilling({ DB }, { storeId: "aub", session: s, nowMs: Date.parse("2026-10-14T12:00:00Z") });
+  assert.match(r, /^ok: FLAG account\+budget; not wired: failed_payment/);
+  await runBilling({ DB }, { storeId: "aub", session: s, nowMs: Date.parse("2026-10-15T12:00:00Z") });
+  assert.equal((await evs(DB, "media.billing_flag")).length, 2); // not re-announced the next day
+  const chk = await DB.prepare(`SELECT data FROM media_findings WHERE agent = 'media.billing' AND key = 'check'`).first();
+  assert.match(JSON.parse(chk.data).parts.failed_payment.summary, /no failed-charge field/);
+});
+
+test("billing: a part Google refuses for access is 'not wired' with Google's reason, never 'fine' and never an error", async () => {
+  const DB = makeD1();
+  const s = fakeSession({
+    [Q_ACCOUNT]: [{ customer: { status: "ENABLED" } }],
+    [Q_BILLING]: adsErr("Google Ads HTTP 403: PERMISSION_DENIED: authorizationError=USER_PERMISSION_DENIED: User doesn't have permission"),
+    [Q_BUDGET]: adsErr("Google Ads HTTP 400: INVALID_ARGUMENT: queryError=PROHIBITED_RESOURCE_TYPE_IN_FROM_CLAUSE"),
+  });
+  const r = await runBilling({ DB }, { storeId: "hc", session: s });
+  assert.match(r, /not wired: billing, budget, failed_payment/);
+  const chk = JSON.parse((await DB.prepare(`SELECT data FROM media_findings WHERE agent = 'media.billing' AND key = 'check'`).first()).data);
+  assert.equal(chk.parts.billing.status, "not_wired");
+  assert.match(chk.parts.billing.summary, /USER_PERMISSION_DENIED/);
+  // Any other failure is a real error (thrown: the media runner logs and retries it).
+  const bad = fakeSession({ [Q_ACCOUNT]: adsErr("Google Ads HTTP 500: INTERNAL") });
+  await assert.rejects(() => runBilling({ DB }, { storeId: "hc", session: bad }), /INTERNAL/);
+  assert.equal(isAccessGap("Google Ads HTTP 500: INTERNAL"), false);
+});
+
+test("billing: Google saying CUSTOMER_NOT_ENABLED is news about the account (red flag), not a wiring gap", async () => {
+  const DB = makeD1();
+  const s = fakeSession({ [Q_ACCOUNT]: adsErr("Google Ads HTTP 403: PERMISSION_DENIED: authorizationError=CUSTOMER_NOT_ENABLED: The customer account can't be accessed") });
+  const r = await runBilling({ DB }, { storeId: "mar", session: s });
+  assert.match(r, /FLAG account/);
+  assert.equal(s.queries.length, 1);
 });

@@ -309,8 +309,9 @@ test("media: a full day of ticks — every agent runs, ≤ 6 Ads calls per tick,
   }
   assert.ok(maxPerTick <= 6, `max Ads calls per tick ${maxPerTick}`);
   // 3 stores × 5 Ads agents = 15 calls in the first hours, then performance comes due again
-  // at 4 hours (+3): every job ran within 6 hourly runs.
-  assert.equal(g.adsCalls().length, 18);
+  // at 4 hours (+3), plus the billing watch (3 calls × 3 stores, daily): every job ran within
+  // 6 hourly runs.
+  assert.equal(g.adsCalls().length, 27);
   for (const c of g.adsCalls()) {
     assert.match(c.url, /googleAds:searchStream$/);
     assert.match(JSON.parse(c.init.body).query, /^\s*SELECT\s/);
