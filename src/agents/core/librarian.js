@@ -167,11 +167,76 @@ export async function queueVaultSync(db, { nowMs = Date.now() } = {}) {
   return counts;
 }
 
+/** Where in Eagano's vault each kind of item goes (a suggestion; Eagano files it). */
+export const VAULT_DIR = "03 Areas/Business/Store Brain";
+
+/** A safe file name: no path separators or characters Obsidian / Windows refuse. */
+const fileSafe = (s) => String(s == null ? "" : s).replace(/[\\/:*?"<>|#^[\]]+/g, "-").replace(/\s+/g, " ").trim().slice(0, 120) || "untitled";
+
+/**
+ * The vault note for one outbox item: the target path and the full markdown, built by code
+ * from the row exactly as stored (decisions keep Reilly's words verbatim, in a quote). Shown
+ * on the Core page so Claude on Reilly's PC can read it there and copy it in, without ever
+ * holding the dashboard key.
+ */
+export function vaultEntry(item) {
+  const b = item.body || {};
+  const queued = `_Queued by the Store Brain ${item.created_at || ""} (outbox item ${item.id}, ${item.kind} ${item.ref_id})._`;
+  if (item.kind === "decision") {
+    const day = String(b.at || item.created_at || "").slice(0, 10);
+    return {
+      vault_path: `${VAULT_DIR}/Decisions/${fileSafe(`${day} ${b.topic || "decision"}`)}.md`,
+      markdown: [
+        `# Decision: ${b.topic || "?"}`, "",
+        `- Date: ${b.at || "?"}`,
+        `- Scope: ${b.scope || "all"}`,
+        b.supersedes != null ? `- Supersedes Store Brain decision ${b.supersedes}` : null,
+        `- Store Brain decision id: ${b.id ?? item.ref_id}`, "",
+        "Reilly's words, verbatim:", "",
+        ...String(b.words || "").split("\n").map((l) => `> ${l}`), "",
+        queued,
+      ].filter((l) => l !== null).join("\n"),
+    };
+  }
+  if (item.kind === "fact") {
+    let value = b.value;
+    try { value = JSON.stringify(JSON.parse(b.value), null, 2); } catch { /* plain text */ }
+    return {
+      vault_path: `${VAULT_DIR}/Facts/${fileSafe(`${b.store || "all stores"} ${b.key || "fact"}`)}.md`,
+      markdown: [
+        `# Fact: ${b.key || "?"}${b.store ? ` (${b.store})` : ""}`, "",
+        `- Store: ${b.store || "all stores"}`,
+        `- Area: ${b.area || "?"} · kind: ${b.kind || "?"}`,
+        `- Source: ${b.source || "?"}`,
+        `- Observed: ${b.observed_at || "?"}${b.stale_after ? ` · re-check by ${b.stale_after}` : ""}`,
+        `- Store Brain fact id: ${b.id ?? item.ref_id}${b.live === 0 ? " (archived)" : ""}`, "",
+        "Value:", "", "```", String(value ?? ""), "```", "",
+        queued,
+      ].join("\n"),
+    };
+  }
+  if (item.kind === "brief") {
+    return {
+      vault_path: `${VAULT_DIR}/Briefs/${fileSafe(`${b.day || "?"} Morning brief`)}.md`,
+      markdown: [
+        `# Morning brief ${b.day || "?"}`, "",
+        `_${b.composer === "ai" ? "Written by Claude from the brain's numbers" : "Plain brief, built by code"} · ${b.mode || "?"} · ${b.checked === 0 ? "has UNVERIFIED numbers" : "numbers checked"}._`, "",
+        String(b.body_md || ""), "",
+        queued,
+      ].join("\n"),
+    };
+  }
+  return { vault_path: `${VAULT_DIR}/Other/${fileSafe(item.title)}.md`, markdown: `# ${item.title}\n\n\`\`\`\n${JSON.stringify(b, null, 2)}\n\`\`\`\n\n${queued}` };
+}
+
 /** For the endpoint Claude on Reilly's PC reads (wired by the integrator, behind the API key). */
 export async function vaultOutbox(db, { status = "pending", limit = 50 } = {}) {
   const lim = Math.min(Math.max(parseInt(limit, 10) || 50, 1), 200);
   const { results } = await db.prepare(`SELECT * FROM vault_outbox WHERE status = ? ORDER BY id LIMIT ?`).bind(status, lim).all();
-  return (results || []).map((r) => ({ ...r, body: r.body ? JSON.parse(r.body) : null }));
+  return (results || []).map((r) => {
+    const item = { ...r, body: r.body ? JSON.parse(r.body) : null };
+    return { ...item, ...vaultEntry(item) };
+  });
 }
 
 /** Mark items copied once they are in the vault. Only pending items move; returns how many. */
@@ -245,6 +310,6 @@ export async function librarianState(db, { nowMs = Date.now() } = {}) {
     live_facts: facts.length,
     findings: findings.slice(0, 50), finding_counts: countBy(findings),
     vault: { pending: (pending && pending.n) || 0, oldest_pending: (pending && pending.oldest) || null, copied: (copied && copied.n) || 0,
-      note: "Copied into Eagano's vault by Claude on Reilly's PC; the worker only queues." },
+      note: "Copied into Eagano's vault by Claude on Reilly's PC from the Vault outbox box on this page (path + full note per item, then Mark copied); the worker only queues." },
   };
 }

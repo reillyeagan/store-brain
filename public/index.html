@@ -860,8 +860,58 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
     else if(p==="feeds") h+=feedsHtml();
     else if(p==="setup") h+=setupHtml();
     else h+='<div class="empty">No such page.</div>';
-    return h+'</div>';
+    h+='</div>';
+    if(p==="core") h+='<div class="box" id="vaultBox" style="margin-top:12px">'+vaultInner()+'</div>';
+    return h;
   }
+  /* ---- Vault outbox (Core page): what is waiting to be copied into the Eagano vault ----
+     Claude on Reilly's PC reads this box in the browser (it never holds the dashboard key),
+     copies each note to its vault path, then clicks Mark copied. */
+  var vaultCache=null;
+  function vaultInner(){
+    var c=vaultCache;
+    if(!c||(!c.loading&&Date.now()-c.at>30000)){ loadVault(); if(!c||!c.items&&!c.error) return '<div class="lab">Vault outbox</div><div class="empty">Loading…</div>'; }
+    var h='<div class="lab" style="margin-bottom:8px">Vault outbox · waiting to be copied into the Eagano vault</div>';
+    if(c.error) return h+'<div class="empty bad-t">Could not load the outbox ('+esc(c.error)+'). Retrying shortly.</div>';
+    var items=c.items||[];
+    if(!items.length) return h+'<div class="empty">Nothing waiting. Every item is in the vault.</div>';
+    h+='<div class="note" style="margin:0 0 10px">'+esc(items.length)+' item'+(items.length===1?"":"s")+' pending. Copy each note to its vault path exactly as shown, then mark it copied. The brain never writes to the vault itself.</div>';
+    h+='<div class="btns" style="margin-bottom:10px"><button class="btn p" data-vcopyall="'+esc(items.map(function(x){return x.id}).join(","))+'">Mark all shown as copied</button></div><div id="vaultOut"></div>';
+    h+=items.map(function(x){
+      return '<div class="rowx" data-vitem="'+esc(x.id)+'"><b style="font-weight:500">'+esc(x.title)+'</b>'+
+        '<span class="meta"><span>'+esc(x.kind)+'</span><span>item '+esc(x.id)+'</span><span>queued '+esc(ago(x.created_at))+'</span></span>'+
+        '<div class="kv"><span>Vault path</span><b style="font:12px var(--mono);word-break:break-all">'+esc(x.vault_path||"")+'</b></div>'+
+        '<pre class="msg" style="max-height:360px;overflow:auto;margin:6px 0 0">'+esc(x.markdown||"")+'</pre>'+
+        '<div class="btns"><button class="btn" data-vcopied="'+esc(x.id)+'">Mark copied</button></div></div>';
+    }).join("");
+    return h;
+  }
+  async function loadVault(){
+    if(vaultCache&&vaultCache.loading) return;
+    vaultCache=Object.assign(vaultCache||{},{loading:true});
+    try{ var r=await api("/api/vault/outbox?limit=200"); var j=await r.json(); if(!j.ok) throw new Error(j.error||("HTTP "+r.status));
+      vaultCache={at:Date.now(),items:j.items||[]};
+    }catch(e){ vaultCache={at:Date.now(),error:String(e&&e.message||"failed")}; }
+    if($("#vaultBox")&&Date.now()>busyUntil) $("#vaultBox").innerHTML=vaultInner();
+  }
+  async function markVault(ids,btn){
+    busyUntil=Date.now()+20000;
+    document.querySelectorAll("#vaultBox button").forEach(function(x){x.disabled=true});
+    var ok=false, msg="";
+    try{ var r=await api("/api/vault/outbox/copied",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({ids:ids.map(Number)})}); var b=await r.json();
+      ok=!!b.ok; msg=b.ok?("Marked "+b.marked+" as copied"+(b.marked<ids.length?" ("+(ids.length-b.marked)+" were already marked)":"")):("Not recorded: "+(b.error||"error"));
+    }catch(e){ msg="Could not reach the brain. Nothing was recorded."; }
+    var out=$("#vaultOut"); if(out) out.innerHTML='<div class="note '+(ok?"ok-t":"bad-t")+'">'+esc(msg)+'</div>';
+    if(ok){ busyUntil=0; vaultCache=null; setTimeout(function(){ if($("#vaultBox")) $("#vaultBox").innerHTML=vaultInner(); },800); }
+    else { busyUntil=Date.now()+12000; document.querySelectorAll("#vaultBox button").forEach(function(x){x.disabled=false}); }
+  }
+  /* One delegated listener: the box is redrawn often, so its buttons are never wired one by one. */
+  document.addEventListener("click",function(e){
+    var b=e.target&&e.target.closest?e.target.closest("button[data-vcopied],button[data-vcopyall]"):null;
+    if(!b) return;
+    var ids=(b.dataset.vcopied||b.dataset.vcopyall||"").split(",").filter(Boolean);
+    if(ids.length) markVault(ids,b);
+  });
   /* ---- generic department page: draws whatever the department's state contains ---- */
   function deptHtml(p){
     var c=deptCache[p];
