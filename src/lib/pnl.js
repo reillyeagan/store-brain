@@ -213,6 +213,8 @@ export async function actualCosts(db, storeId, day) {
 export const SHEET_MAX_AGE_MIN = 24 * 60;
 /** Sheet revenue may differ from the brain's by this much and still be "the same day". */
 export const SHEET_DAY_MATCH_USD = 1;
+/** A sheet COG under this share of the brain's own estimate is treated as partial (not used). */
+export const SHEET_COG_MIN_VS_ESTIMATE = 0.85;
 
 const ended0 = (day, tz, nowMs) => nowMs >= endOfLocalDayMs(day, tz);
 
@@ -228,14 +230,13 @@ const ended0 = (day, tz, nowMs) => nowMs >= endOfLocalDayMs(day, tz);
  */
 export async function sheetDay(db, storeId, day, { nowMs = Date.now(), revenue = null, orders = null } = {}) {
   const out = { row: null, use: { cog: false, fee: false }, why: { cog: null, fee: null } };
-  // Freshness is the workbook's: its last complete read (a row only changes when the sheet did).
-  const row = await db.prepare(
-    `SELECT s.*, w.last_ok_at AS wb_ok_at FROM sheet_pnl_days s LEFT JOIN sheet_workbooks w ON w.store = s.store WHERE s.store = ? AND s.day = ?`
-  ).bind(storeId, day).first().catch(() => null);
+  // Freshness is the row's TAB: seen_at = when that tab was last read in full (a row is only
+  // rewritten when the sheet changed).
+  const row = await db.prepare(`SELECT * FROM sheet_pnl_days WHERE store = ? AND day = ?`).bind(storeId, day).first().catch(() => null);
   if (!row) { out.why.cog = out.why.fee = "no sheet row"; return out; }
   out.row = row;
   let block = null;
-  if (!row.wb_ok_at || nowMs - Date.parse(row.wb_ok_at) > SHEET_MAX_AGE_MIN * 60000) block = "sheet read is older than 24 h";
+  if (!row.seen_at || nowMs - Date.parse(row.seen_at) > SHEET_MAX_AGE_MIN * 60000) block = "sheet read is older than 24 h";
   else if (revenue == null || orders == null) block = "the brain's revenue for the day is unknown";
   else if (row.orders == null || row.revenue == null) block = "the sheet's revenue or orders are blank";
   else if (Number(row.orders) !== orders || Math.abs(Number(row.revenue) - revenue) > Math.max(SHEET_DAY_MATCH_USD, 0.01 * revenue)) {
@@ -356,7 +357,14 @@ export async function computeStoreDay(db, storeId, day, { nowMs = Date.now(), fe
   // Days before the refunds' first full read are unknown, not $0 (rule 5).
   const refCov = await db.prepare(`SELECT covered_from FROM feed_coverage WHERE store = ? AND feed = 'refunds'`).bind(storeId).first().catch(() => null);
   const refundsCovered = !!(refCov && refCov.covered_from && refCov.covered_from <= day);
-  if (fresh.refunds.usable && !refundsCovered) why.refunds = refCov && refCov.covered_from ? `refunds only read from ${refCov.covered_from}` : "first refund read not finished";
+  if (fresh.refunds.usable && !refundsCovered) {
+    why.refunds = refCov && refCov.covered_from ? `refunds only read from ${refCov.covered_from}` : "first refund read not finished";
+    // Inside the older order history but outside refund coverage: say why it can't be proven.
+    if (refCov && refCov.covered_from && cov.covered_from && cov.covered_from <= day) {
+      const ext = await db.prepare(`SELECT ext_all_orders FROM order_backfill WHERE store = ?`).bind(storeId).first().catch(() => null);
+      if (ext && ext.ext_all_orders === 0) why.refunds = `refunds unprovable before ${refCov.covered_from}: Shopify hides refunds on orders older than 60 days without read_all_orders`;
+    }
+  }
   else if (fresh.refunds.usable) {
     const ref = await db.prepare(
       `SELECT SUM(CASE WHEN status LIKE '%PENDING%' THEN amount ELSE 0 END) AS pending,
@@ -439,20 +447,29 @@ export async function computeStoreDay(db, storeId, day, { nowMs = Date.now(), fe
     rate: rate.rate, rate_source: rate.source, rate_assumed: rate.assumed, rate_stale: !!rate.stale,
     orders_by_product_cost: perProduct, orders_by_rate: byRate, orders_actual: byActual,
   };
-  // No KFB bill matched for any order of the day: the sheet's COG (EUR) is the exact KFB
-  // charge per order (KungFuBuy balance ledger), so it replaces the whole-day estimate. The
-  // EUR→USD rate is the sheet's SETUP rate, which is itself an estimate and stays marked so.
+  // No KFB bill matched for any order of the day: the sheet's COG (EUR) is the KFB charge per
+  // order (KungFuBuy balance ledger) for the same orders (sheetDay proved the order count and
+  // revenue match). It replaces the rate estimate, but:
+  //  - a sheet COG well BELOW the brain's own estimate usually means an order isn't billed yet
+  //    (a partial day): refused, the estimate stays (rule 5, good news gets more scrutiny);
+  //  - the dollars rest on the sheet's EUR→USD rate, itself an estimate, so the whole USD amount
+  //    is booked as ESTIMATED (cogs_est, share 1) with the EUR part exact and the FX the estimate.
   if (cogsSource === "estimate" && sheet.use.cog) {
     const fx = Number(sheet.row.fx_rate);
-    cogsActual = r2(Number(sheet.row.cog_eur) * fx);
-    cogsEst = 0;
-    estOrders = 0;
-    cogsSource = `sheet (KFB ledger, EUR at ${fx})`;
-    cogsBasis.sheet = { cog_eur: Number(sheet.row.cog_eur), fx_rate: fx, fx_estimate: true, tab: sheet.row.tab, read_at: sheet.row.wb_ok_at };
-    cogsBasis.orders_by_product_cost = 0;
-    cogsBasis.orders_by_rate = 0;
-    cogsBasis.orders_sheet = counted.length;
-    notes.cogs_fx = `COGS from the P&L sheet: EUR ${Number(sheet.row.cog_eur).toFixed(2)} at the sheet's ${fx} EUR→USD, an estimated rate`;
+    const usd = r2(Number(sheet.row.cog_eur) * fx);
+    if (cogsEst > 0 && usd < SHEET_COG_MIN_VS_ESTIMATE * cogsEst) {
+      notes.cogs_sheet_unused = `sheet COG $${usd.toFixed(2)} is under ${Math.round(SHEET_COG_MIN_VS_ESTIMATE * 100)}% of the estimate $${cogsEst.toFixed(2)}: an order may not be billed yet, so the estimate stays`;
+    } else {
+      cogsEst = usd;
+      cogsActual = null;
+      estOrders = 0;
+      cogsSource = `sheet (KFB ledger, EUR at ${fx})`;
+      cogsBasis.sheet = { cog_eur: Number(sheet.row.cog_eur), fx_rate: fx, fx_estimate: true, estimated_part: "fx", tab: sheet.row.tab, read_at: sheet.row.seen_at };
+      cogsBasis.orders_by_product_cost = 0;
+      cogsBasis.orders_by_rate = 0;
+      cogsBasis.orders_sheet = counted.length;
+      notes.cogs_fx = `COGS from the P&L sheet: EUR ${Number(sheet.row.cog_eur).toFixed(2)} (the KFB charges) at the sheet's ${fx} EUR→USD. The EUR is exact, the rate is an estimate, so the dollar COGS counts as estimated`;
+    }
   } else if (cogsSource === "estimate" && sheet.row && sheet.row.cog_eur != null) {
     notes.cogs_sheet_unused = sheet.why.cog;
   }

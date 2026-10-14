@@ -50,6 +50,16 @@ export function extensionTarget(nowMs, tz, allOrders, historyFrom = HISTORY_FROM
   return clamp > historyFrom ? clamp : historyFrom;
 }
 
+/** Re-check a missing read_all_orders scope this often. */
+export const SCOPE_RECHECK_MIN = 24 * 60;
+
+/** Does the store's app have read_all_orders right now (asked live)? */
+async function hasAllOrders(env, id, opts) {
+  const data = await shopifyGraphQL(env, id, SCOPES_QUERY, {}, opts);
+  const handles = ((data && data.currentAppInstallation && data.currentAppInstallation.accessScopes) || []).map((s) => s.handle);
+  return handles.includes("read_all_orders");
+}
+
 /** One store's extension step. Throws on a Shopify fault (the caller logs it; the cursor stays). */
 export async function extendStoreHistory(env, id, { nowMs = Date.now(), opts = {} } = {}) {
   const db = env.DB;
@@ -60,14 +70,23 @@ export async function extendStoreHistory(env, id, { nowMs = Date.now(), opts = {
   let st = await db.prepare(`SELECT * FROM order_backfill WHERE store = ?`).bind(id).first();
   // Only after the first pass has proven its own range.
   if (!cov || !st || !st.completed_at) return { store: id, ran: false, reason: "first pass not finished" };
-  if (st.ext_done_at && st.ref_ext_done_at) return { store: id, ran: false, done: true };
-  if (!(await claimJob(db, `orders.history_ext.${id}`, EXT_EVERY_MIN, nowMs))) return { store: id, ran: false, reason: "not due" };
+  if (st.ext_done_at && st.ref_ext_done_at) {
+    // Finished WITHOUT read_all_orders: check the scope once a day, and start again from
+    // HISTORY_FROM the day it is granted.
+    if (Number(st.ext_all_orders) === 1) return { store: id, ran: false, done: true };
+    if (st.ext_checked_at && nowMs - Date.parse(st.ext_checked_at) < SCOPE_RECHECK_MIN * 60000) return { store: id, ran: false, done: true };
+    if (!(await claimJob(db, `orders.history_ext.${id}`, EXT_EVERY_MIN, nowMs))) return { store: id, ran: false, reason: "not due" };
+    const granted = await hasAllOrders(env, id, opts);
+    await db.prepare(`UPDATE order_backfill SET ext_checked_at = ? WHERE store = ?`).bind(at, id).run();
+    if (!granted) return { store: id, ran: true, done: true, note: "read_all_orders still not granted" };
+    await db.prepare(`UPDATE order_backfill SET ext_from = NULL, ext_done_at = NULL, ref_ext_done_at = NULL WHERE store = ?`).bind(id).run();
+    st = await db.prepare(`SELECT * FROM order_backfill WHERE store = ?`).bind(id).first();
+  } else if (!(await claimJob(db, `orders.history_ext.${id}`, EXT_EVERY_MIN, nowMs))) return { store: id, ran: false, reason: "not due" };
 
   // Start (or restart): decide how far back, from the scopes Shopify reports right now.
   if (!st.ext_from) {
-    const data = await shopifyGraphQL(env, id, SCOPES_QUERY, {}, opts);
-    const handles = ((data && data.currentAppInstallation && data.currentAppInstallation.accessScopes) || []).map((s) => s.handle);
-    const allOrders = handles.includes("read_all_orders");
+    const allOrders = await hasAllOrders(env, id, opts);
+    await db.prepare(`UPDATE order_backfill SET ext_checked_at = ? WHERE store = ?`).bind(at, id).run();
     const target = extensionTarget(nowMs, tz, allOrders);
     if (target >= cov.covered_from) {
       const note = allOrders ? `history already covers ${cov.covered_from}` : `read_all_orders not granted: Shopify only shows the last 60 days, and history already covers ${cov.covered_from}`;
@@ -126,6 +145,15 @@ export async function extendStoreHistory(env, id, { nowMs = Date.now(), opts = {
   if (ref.covered_from <= st.ext_from) {
     await db.prepare(`UPDATE order_backfill SET ref_ext_done_at = ? WHERE store = ?`).bind(at, id).run();
     return { store: id, ran: true, phase: "refunds", done: true };
+  }
+  // Without read_all_orders Shopify hides orders older than 60 days, refunds on them included:
+  // a refund processed in the gap on an older order would be missing and flatter profit
+  // (rule 5). Refund coverage is NOT moved back; those days stay open ("refunds unprovable")
+  // until the scope is granted (checked daily, above).
+  if (Number(st.ext_all_orders) !== 1) {
+    const note = `${st.ext_note ? `${st.ext_note}. ` : ""}refunds before ${ref.covered_from} unprovable without read_all_orders`;
+    await db.prepare(`UPDATE order_backfill SET ref_ext_done_at = ?, ext_note = ? WHERE store = ?`).bind(at, note, id).run();
+    return { store: id, ran: true, phase: "refunds", done: true, note };
   }
   const fromMs = startOfLocalDayMs(st.ext_from, tz) - 86400000;
   const toMs = Date.parse(`${ref.start_day}T00:00:00Z`) - 86400000 + OVERLAP_MIN * 60000;

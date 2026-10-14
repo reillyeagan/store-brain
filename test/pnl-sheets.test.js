@@ -86,7 +86,7 @@ function parseA1(range) {
 }
 
 /** Google token + Sheets values API over in-memory workbooks. */
-function fakeGoogle(books, { failIds = [], onUpdate = null, tamper = null } = {}) {
+function fakeGoogle(books, { failIds = [], onUpdate = null, tamper = null, failUpdate = false, failVerify = false } = {}) {
   const log = { updates: [], gets: 0, calls: [] };
   const fetchImpl = async (url, init = {}) => {
     if (url === "https://oauth2.googleapis.com/token") return j({ access_token: "g", expires_in: 3600 });
@@ -102,6 +102,7 @@ function fakeGoogle(books, { failIds = [], onUpdate = null, tamper = null } = {}
     if (parts[4] === "values:batchGet") {
       log.gets++;
       const render = u.searchParams.get("valueRenderOption");
+      if (failVerify && render === "UNFORMATTED_VALUE") return j({ error: { code: 503, status: "UNAVAILABLE", message: "try later" } }, 503);
       return j({ valueRanges: u.searchParams.getAll("ranges").map((r) => {
         const a = parseA1(r);
         const grid = b.tabs[a.tab] || [];
@@ -126,6 +127,7 @@ function fakeGoogle(books, { failIds = [], onUpdate = null, tamper = null } = {}
       }) });
     }
     if (parts[4] === "values:batchUpdate") {
+      if (failUpdate) return j({ error: { code: 500, status: "INTERNAL", message: "backend error" } }, 500);
       const body = JSON.parse(init.body);
       assert.equal(body.valueInputOption, "USER_ENTERED");
       if (onUpdate) onUpdate(id, body);
@@ -372,14 +374,11 @@ test("sheets: the P&L uses the sheet's COG and fee only where the brain has none
   await order(DB, "hc", { id: 1, created_at: "2026-09-25T15:00:00Z", total: 100 });
   await order(DB, "hc", { id: 2, created_at: "2026-09-25T16:00:00Z", total: 50 });
   await DB.prepare(`INSERT INTO ad_spend_days (store, day, cost, clicks, impressions, conv_value, currency, account_tz, fetched_at, source) VALUES ('hc', ?, 60, 90, 0, 0, 'USD', NULL, ?, 'sheet')`).bind(day, iso(NOW)).run();
-  const sheetRow = async (d, v) => {
-    // Freshness is the workbook's last complete read.
-    await DB.prepare(`INSERT OR REPLACE INTO sheet_workbooks (store, sheet_id, last_read_at, last_ok_at) VALUES ('hc', 'x', ?, ?)`).bind(v.read_at || iso(NOW - 600000), v.read_at || iso(NOW - 600000)).run();
-    await DB.prepare(
-      `INSERT OR REPLACE INTO sheet_pnl_days (store, day, sheet_id, tab, row_no, revenue, orders, fee, cog_eur, fx_rate, cog_ok, cog_why, fee_ok, fee_why, ads_ok, read_at)
-       VALUES ('hc', ?, 'x', 'SEP', 26, ?, ?, ?, ?, 1.19, ?, ?, ?, ?, 1, ?)`
-    ).bind(d, v.revenue, v.orders, v.fee, v.cog_eur, v.cog_ok, v.cog_why || null, v.fee_ok, v.fee_why || null, iso(NOW - 3 * 86400000)).run();
-  };
+  // Freshness is the row's tab: seen_at = when that tab was last read in full.
+  const sheetRow = async (d, v) => DB.prepare(
+    `INSERT OR REPLACE INTO sheet_pnl_days (store, day, sheet_id, tab, row_no, revenue, orders, fee, cog_eur, fx_rate, cog_ok, cog_why, fee_ok, fee_why, ads_ok, read_at, seen_at)
+     VALUES ('hc', ?, 'x', 'SEP', 26, ?, ?, ?, ?, 1.19, ?, ?, ?, ?, 1, ?, ?)`
+  ).bind(d, v.revenue, v.orders, v.fee, v.cog_eur, v.cog_ok, v.cog_why || null, v.fee_ok, v.fee_why || null, iso(NOW - 3 * 86400000), v.read_at || iso(NOW - 600000)).run();
 
   // Before: Sep 25 has no fees (payouts only read from Oct 1) and an estimated COGS.
   let row = await computeStoreDay(DB, "hc", day, { nowMs: NOW });
@@ -391,14 +390,24 @@ test("sheets: the P&L uses the sheet's COG and fee only where the brain has none
   row = await computeStoreDay(DB, "hc", day, { nowMs: NOW });
   assert.equal(row.fees, 5.2);
   assert.equal(row.notes.fees_source, "sheet");
-  assert.equal(row.cogs_actual, 47.6);
-  assert.equal(row.cogs_est, 0);
   assert.equal(row.cogs, 47.6);
   assert.equal(row.cogs_source, "sheet (KFB ledger, EUR at 1.19)");
   assert.equal(row.cogs_basis.sheet.fx_estimate, true, "the FX rate stays an estimate");
+  assert.equal(row.cogs_basis.sheet.estimated_part, "fx");
+  // The EUR is exact but the dollars rest on an estimated rate: the COGS counts as estimated.
+  assert.equal(row.cogs_est, 47.6);
+  assert.equal(row.cogs_actual, null);
+  assert.equal(row.cogs_estimated_share, 1);
+  assert.match(row.notes.cogs_fx, /the rate is an estimate/);
   assert.equal(row.notes.ads_source, "sheet");
-  assert.equal(row.cogs_estimated_share, 0);
   assert.ok(row.profit != null, "the day is no longer missing its costs");
+
+  // A sheet COG well under the brain's estimate ($150 x 33% = $49.50) is probably partial: refused.
+  await sheetRow(day, { revenue: 150, orders: 2, fee: 5.2, cog_eur: 20, cog_ok: 1, fee_ok: 1 });
+  row = await computeStoreDay(DB, "hc", day, { nowMs: NOW });
+  assert.equal(row.cogs_source, "estimate");
+  assert.equal(row.cogs, 49.5);
+  assert.match(row.notes.cogs_sheet_unused, /under 85% of the estimate/);
 
   // $0 COG on a day with orders: unknown → the brain keeps its own (labelled) estimate.
   await sheetRow(day, { revenue: 150, orders: 2, fee: 5.2, cog_eur: 0, cog_ok: 0, cog_why: "sheet COG is $0 on a day with 2 orders: unknown, not zero", fee_ok: 1 });
@@ -433,9 +442,9 @@ test("sheets: cross-check — revenue, orders, services and fees vs closed brain
   const DB = env.DB;
   await closedDay(DB, "hc", "2026-10-03", { revenue: 726.44, orders: 11, ads: 326.57, guy_fee: 32.66, fees: 24.19 });
   await DB.prepare(`INSERT INTO sheet_pnl_days (store, day, sheet_id, tab, row_no, revenue, orders, services, fee, read_at) VALUES ('hc', '2026-10-03', 'x', 'OCT', 4, 700.00, 10, 32.66, 24.50, ?)`).bind(iso(NOW)).run();
-  // Not compared while the workbook has no complete read in the last 24 h (rule 4).
+  // Not compared while its tab has no complete read in the last 24 h (rule 4).
   assert.equal((await crossCheck(DB, { nowMs: NOW })).length, 0);
-  await DB.prepare(`INSERT INTO sheet_workbooks (store, sheet_id, last_read_at, last_ok_at) VALUES ('hc', 'x', ?, ?)`).bind(iso(NOW), iso(NOW)).run();
+  await DB.prepare(`UPDATE sheet_pnl_days SET seen_at = ? WHERE store = 'hc' AND tab = 'OCT'`).bind(iso(NOW)).run();
   const found = await crossCheck(DB, { nowMs: NOW });
   assert.deepEqual(found.map((f) => f.field).sort(), ["orders", "revenue"], "a $0.31 fee difference is rounding, services agree");
   assert.equal((await crossCheck(DB, { nowMs: NOW + 3600000 })).length, 0, "already logged");
@@ -450,20 +459,20 @@ async function writerFixture(envExtra = {}, { tz = "EDT", oct = null } = {}) {
   const env = baseEnv(envExtra);
   await connectGoogle(env);
   const DB = env.DB;
-  // Oct 13 closed in the brain: 2 orders, $100 revenue, no shipping or tax.
-  await order(DB, "hc", { id: 11, created_at: "2026-10-13T15:00:00Z", total: 60 });
-  await order(DB, "hc", { id: 12, created_at: "2026-10-13T16:00:00Z", total: 40 });
-  await closedDay(DB, "hc", "2026-10-13", { revenue: 100, orders: 2, ads: 420.05, guy_fee: 42.01, fees: 3.5 });
+  // Oct 11 closed in the brain (3 days old, so its ad numbers have settled): 2 orders, $100, no shipping or tax.
+  await order(DB, "hc", { id: 11, created_at: "2026-10-11T15:00:00Z", total: 60 });
+  await order(DB, "hc", { id: 12, created_at: "2026-10-11T16:00:00Z", total: 40 });
+  await closedDay(DB, "hc", "2026-10-11", { revenue: 100, orders: 2, ads: 420.05, guy_fee: 42.01, fees: 3.5 });
   await closedDay(DB, "hc", "2026-10-12", { revenue: 240, orders: 4, ads: 394.42, guy_fee: 39.44, fees: 7.89 });
-  await DB.prepare(`INSERT INTO ad_spend_days (store, day, cost, clicks, impressions, conv_value, currency, account_tz, fetched_at, source) VALUES ('hc', '2026-10-13', 420.05, 543, 900, 0, 'USD', 'America/Chicago', ?, 'api')`).bind(iso(NOW)).run();
-  await DB.prepare(`INSERT INTO funnel_days (store, day, sessions, partial, fetched_at) VALUES ('hc', '2026-10-13', 727, 0, ?)`).bind(iso(NOW)).run();
+  await DB.prepare(`INSERT INTO ad_spend_days (store, day, cost, clicks, impressions, conv_value, currency, account_tz, fetched_at, source) VALUES ('hc', '2026-10-11', 420.05, 543, 900, 0, 'USD', 'America/Chicago', ?, 'api')`).bind(iso(NOW)).run();
+  await DB.prepare(`INSERT INTO funnel_days (store, day, sessions, partial, fetched_at) VALUES ('hc', '2026-10-11', 727, 0, ?)`).bind(iso(NOW)).run();
   const books = { [HC]: book("Holt & Crane P&L", {
     SUMMARY: [[cell("HOLT & CRANE — P&L")]],
     OCT: oct || monthTab(2026, 10, {
       // Reilly typed Oct 12 by hand (revenue differs from the brain's): his numbers win.
       "2026-10-12": { revenue: 236.8, adspend: 394.42, services: 39.44, fee: 7.89, orders: 4, clicks: 547, sessions: 709, cog_eur: 61.9 },
-      // Oct 13: Reilly has only typed Sessions so far.
-      "2026-10-13": { sessions: 700 },
+      // Oct 11: Reilly has only typed Clicks so far.
+      "2026-10-11": { clicks: 540 },
     }),
     SETUP: setupTab({ tz }),
   }) };
@@ -476,23 +485,25 @@ test("sheets writer: fills only BLANK input cells of a CLOSED day — never a fo
   const g = fakeGoogle(books);
   const r = await runSheets(env, { nowMs: NOW, fetchImpl: g.fetchImpl });
   assert.equal(r.written.hc, 6);
+  assert.equal(r.mode, "live (Reilly 2026-10-14, decision pnl.sheets_write)");
   const cells = Object.fromEntries(g.log.updates.map((u) => [u.range, u.value]));
   // Oct 13 is row 14.
-  assert.deepEqual(cells, { "'OCT'!B14": 100, "'OCT'!D14": 420.05, "'OCT'!E14": 42.01, "'OCT'!G14": 3.5, "'OCT'!O14": 2, "'OCT'!P14": 543 });
-  assert.ok(!("'OCT'!Q14" in cells), "Sessions was typed by Reilly: not touched");
-  assert.ok(!("'OCT'!R14" in cells), "COG (EUR) only from actual KFB charges for every order");
+  assert.deepEqual(cells, { "'OCT'!B12": 100, "'OCT'!D12": 420.05, "'OCT'!E12": 42.01, "'OCT'!G12": 3.5, "'OCT'!O12": 2, "'OCT'!Q12": 727 });
+  assert.ok(!("'OCT'!P12" in cells), "Clicks was typed by Reilly: not touched");
+  assert.ok(!("'OCT'!R12" in cells), "COG (EUR) only from actual KFB charges for every order");
+  assert.ok(Object.keys(cells).every((c) => /12$/.test(c)), "nothing outside the day's row");
   assert.ok(!Object.keys(cells).some((c) => /'OCT'!(C|H|I|J|K|L|M)\d+/.test(c)), "no formula column");
   assert.ok(!Object.keys(cells).some((c) => /13$/.test(c)), "Oct 12 (row 13) is Reilly's: untouched");
   assert.ok(!Object.keys(cells).some((c) => /'(SUMMARY|SETUP)'/.test(c)));
   // Every other cell of the workbook is exactly as it was.
   const after = books[HC].tabs.OCT;
   for (let ri = 0; ri < before.length; ri++) for (let ci = 0; ci < 18; ci++) {
-    if (ri === 13 && [1, 3, 4, 6, 14, 15].includes(ci)) continue;
+    if (ri === 11 && [1, 3, 4, 6, 14, 16].includes(ci)) continue;
     assert.deepEqual(after[ri] && after[ri][ci] ? after[ri][ci] : null, before[ri] && before[ri][ci] ? before[ri][ci] : null, `cell r${ri + 1}c${ci} unchanged`);
   }
   const ev = await evs(DB, "pnl.sheet_written");
   assert.equal(ev.length, 1);
-  assert.match(ev[0].summary, /filled 6 blank cells \(2026-10-13\), each confirmed by a re-read/);
+  assert.match(ev[0].summary, /filled 6 blank cells \(2026-10-11\), each confirmed by a re-read/);
   assert.equal((await DB.prepare(`SELECT COUNT(*) AS n FROM sheet_writes WHERE verified = 1`).first()).n, 6);
   // Reilly's Oct 12 revenue differs from the brain's: a mismatch, never an overwrite.
   const mm = await evs(DB, "pnl.sheet_mismatch");
@@ -557,7 +568,8 @@ test("sheets writer: the kill switch SHEETS_WRITE=0 stops every write; default i
   assert.equal(seed.words, "make sure things like the google drive P&L sheets are all updated by the brain automatically");
   assert.equal(seed.words, SHEETS_WRITE_DECISION.words);
   const agent = AGENTS.find((a) => a.id === "pnl.sheets");
-  assert.equal(agent.status, "built");
+  assert.equal(agent.status, "live", "Reilly asked for it in so many words: live, not shadow");
+  for (const v of ["0", "false", "off", "OFF", " False "]) assert.equal(sheetsWriteOn({ SHEETS_WRITE: v }), false, v);
   assert.ok(AGENT_DOES["pnl.sheets"]);
 });
 
@@ -566,7 +578,7 @@ test("sheets writer: a sheet that counts days in another timezone gets no day-ba
   const g = fakeGoogle(books);
   await runSheets(env, { nowMs: NOW, fetchImpl: g.fetchImpl });
   const cells = g.log.updates.map((u) => u.range).sort();
-  assert.deepEqual(cells, ["'OCT'!D14", "'OCT'!E14", "'OCT'!P14"], "ad spend, services and clicks only (ad-account days)");
+  assert.deepEqual(cells, ["'OCT'!D12", "'OCT'!E12"], "ad spend and services only (ad-account days); no sessions, revenue, orders, fees");
   const st = await sheetsState(env, { nowMs: NOW });
   assert.match(st.workbooks.find((w) => w.store === "hc").timezone_note, /America\/Chicago.*America\/New_York/);
   const last = st.workbooks.find((w) => w.store === "hc").last_write;
@@ -799,4 +811,164 @@ test("sheets: a read too big for one run is stored over several; the workbook on
   // Nothing changed in the sheet: a re-read rewrites nothing.
   const third = await storeRead(env.DB, wb, read, NOW + 2000, { rows: 0 });
   assert.deepEqual([third.complete, third.changed.length], [true, 0]);
+});
+
+
+/* ---------------- review fixes (2026-10-14) ---------------- */
+
+test("history extension: WITHOUT read_all_orders refund coverage is not moved back (those days stay open: refunds unprovable); the scope is re-checked daily and the extension resumes once granted", async () => {
+  _resetTokenCacheForTests();
+  const env = { DB: makeD1(), ...ENV_SHOP };
+  await historyFixture(env.DB);
+  const scopes = ["read_orders"];
+  const shop = fakeShop({ scopes, orders: [node(1004, "2026-08-15T18:00:00Z", 56.95), node(1010, "2026-08-20T18:00:00Z", 60)] });
+  await runHistoryExtension(env, { nowMs: NOW, opts: { fetchImpl: shop.fetchImpl } });
+  await runHistoryExtension(env, { nowMs: NOW + 15 * 60000, opts: { fetchImpl: shop.fetchImpl } });
+  assert.equal((await env.DB.prepare(`SELECT covered_from FROM order_coverage WHERE store = 'hc'`).first()).covered_from, "2026-08-17");
+  assert.equal((await env.DB.prepare(`SELECT covered_from FROM feed_coverage WHERE store = 'hc' AND feed = 'refunds'`).first()).covered_from, "2026-09-01", "refunds NOT moved back");
+  assert.ok(!shop.queries.some((q) => /^updated_at/.test(q)), "no refund read that could not be proven anyway");
+  await ensureFeeds(env.DB);
+  await env.DB.prepare(`INSERT INTO job_runs (job, last_run_at) VALUES ('refunds.hc', ?)`).bind(iso(NOW)).run();
+  const row = await computeStoreDay(env.DB, "hc", "2026-08-20", { nowMs: NOW });
+  assert.equal(row.refunds, null);
+  assert.match(row.notes.missing_why.refunds, /refunds unprovable before 2026-09-01/);
+  // Same day: no second scope check.
+  const n = shop.queries.length;
+  const again = await runHistoryExtension(env, { nowMs: NOW + 2 * 3600000, opts: { fetchImpl: shop.fetchImpl } });
+  assert.equal(again.find((x) => x.store === "hc").done, true);
+  // Reilly grants read_all_orders; a day later the brain notices and reads back to Jul 1.
+  scopes.push("read_all_orders");
+  for (let i = 0; i < 3; i++) await runHistoryExtension(env, { nowMs: NOW + 25 * 3600000 + i * 15 * 60000, opts: { fetchImpl: shop.fetchImpl } });
+  assert.equal((await env.DB.prepare(`SELECT covered_from FROM order_coverage WHERE store = 'hc'`).first()).covered_from, "2026-07-01");
+  assert.equal((await env.DB.prepare(`SELECT covered_from FROM feed_coverage WHERE store = 'hc' AND feed = 'refunds'`).first()).covered_from, "2026-07-01");
+  assert.ok(shop.queries.length > n);
+});
+
+test("sheets writer: fail-closed timezone, settled ads, and no $0 services before the media buyer started", async () => {
+  const { brainValue } = await import("../src/agents/pnl/sheets.js");
+  const DB = makeD1();
+  const tz = "America/New_York";
+  const pnl = { revenue: 100, orders: 2, ads: 50, guy_fee: 5, fees: 3, notes: "{}", cogs_basis: "{}", cogs_source: "estimate" };
+  await DB.prepare(`INSERT INTO funnel_days (store, day, sessions, partial, fetched_at) VALUES ('hc', '2026-10-01', 500, 0, 't')`).run();
+  await DB.prepare(`INSERT INTO ad_spend_days (store, day, cost, clicks, impressions, conv_value, fetched_at, source) VALUES ('hc', '2026-10-12', 50, 70, 0, 0, 't', 'api')`).run();
+  const noTz = { revenue_tz: null, services_ended: null };
+  for (const f of ["revenue", "orders", "fee", "sessions", "cog_eur"]) {
+    const v = await brainValue(DB, "hc", "2026-10-01", f, { pnl, setup: noTz, tz, today: "2026-10-14" });
+    assert.match(v.skip || "", /names no timezone/, `${f} fails closed without a SETUP timezone`);
+  }
+  assert.match((await brainValue(DB, "hc", "2026-10-01", "sessions", { pnl, setup: { revenue_tz: "America/Chicago" }, tz, today: "2026-10-14" })).skip, /America\/Chicago/);
+  assert.equal((await brainValue(DB, "hc", "2026-10-01", "sessions", { pnl, setup: { revenue_tz: tz }, tz, today: "2026-10-14" })).value, 500);
+  // Ad numbers wait 3 days.
+  for (const f of ["adspend", "clicks", "services"]) {
+    assert.match((await brainValue(DB, "hc", "2026-10-12", f, { pnl, setup: noTz, tz, today: "2026-10-14" })).skip, /settle/, f);
+  }
+  assert.equal((await brainValue(DB, "hc", "2026-10-11", "adspend", { pnl, setup: noTz, tz, today: "2026-10-14" })).value, 50);
+  // SERVICES before 2026-09-07 stays blank (never a $0 claim).
+  assert.match((await brainValue(DB, "hc", "2026-09-06", "services", { pnl: { ...pnl, guy_fee: 0 }, setup: noTz, tz, today: "2026-10-14" })).skip, /before the media buyer started/);
+  assert.equal((await brainValue(DB, "hc", "2026-09-07", "services", { pnl, setup: noTz, tz, today: "2026-10-14" })).value, 5);
+});
+
+test("sheets: older month tabs are re-read once a day (not hourly) and their rows count as fresh only from their own tab's read", async () => {
+  const { readWorkbook, storeRead, workbooks, FULL_READ_EVERY_MIN } = await import("../src/agents/pnl/sheets.js");
+  const env = baseEnv();
+  const books = { [HC]: book("Holt & Crane P&L", { AUG: monthTab(2026, 8, { "2026-08-20": { revenue: 60, orders: 1 } }), SEP: monthTab(2026, 9, {}), OCT: monthTab(2026, 10, {}), SETUP: setupTab() }) };
+  const g = fakeGoogle(books);
+  const wb = workbooks().find((w) => w.store === "hc");
+  let read = await readWorkbook(env, wb, { token: "g", fetchImpl: g.fetchImpl, nowMs: NOW });
+  assert.deepEqual(read.months.map((m) => m.tab), ["AUG", "SEP", "OCT"]);
+  await storeRead(env.DB, wb, read, NOW, { rows: 500 });
+  read = await readWorkbook(env, wb, { token: "g", fetchImpl: g.fetchImpl, nowMs: NOW + 3600000 });
+  assert.deepEqual(read.months.map((m) => m.tab), ["OCT", "SEP"], "hourly: current and previous month");
+  await storeRead(env.DB, wb, read, NOW + 3600000, { rows: 500 });
+  const seen = async (day) => (await env.DB.prepare(`SELECT seen_at FROM sheet_pnl_days WHERE store = 'hc' AND day = ?`).bind(day).first()).seen_at;
+  assert.equal(await seen("2026-08-20"), iso(NOW), "AUG was not re-read: its rows keep the older time");
+  assert.equal(await seen("2026-10-01"), iso(NOW + 3600000));
+  read = await readWorkbook(env, wb, { token: "g", fetchImpl: g.fetchImpl, nowMs: NOW + (FULL_READ_EVERY_MIN + 1) * 60000 });
+  assert.equal(read.full, true, "every tab again after the daily interval");
+});
+
+test("sheets writer: intended cells are recorded as pending BEFORE the write; a failed write call says its outcome is unknown; a failed re-read marks them unverified", async () => {
+  const a = await writerFixture();
+  const g1 = fakeGoogle(a.books, { failUpdate: true });
+  const r1 = await runSheets(a.env, { nowMs: NOW, fetchImpl: g1.fetchImpl });
+  assert.equal(r1.written.hc.phase, "write_unknown");
+  assert.equal((await a.DB.prepare(`SELECT COUNT(*) AS n FROM sheet_writes WHERE status = 'pending'`).first()).n, 6, "the record survives the failure");
+  const e1 = (await evs(a.DB, "error.sheet_write"))[0];
+  assert.match(e1.summary, /may or may not have landed/);
+  assert.doesNotMatch(e1.summary, /nothing/i, "never claims nothing changed once the write was sent");
+  assert.equal((await sheetsState(a.env, { nowMs: NOW })).pending_writes, 6);
+
+  const b = await writerFixture();
+  const g2 = fakeGoogle(b.books, { failVerify: true });
+  await runSheets(b.env, { nowMs: NOW, fetchImpl: g2.fetchImpl });
+  assert.equal(g2.log.updates.length, 6, "the write itself went through");
+  assert.equal((await b.DB.prepare(`SELECT COUNT(*) AS n FROM sheet_writes WHERE status = 'unverified'`).first()).n, 6);
+  assert.match((await evs(b.DB, "pnl.sheet_write_unverified"))[0].summary, /written but the confirming re-read failed/);
+
+  // A failure before anything is sent (no backup bucket) does say nothing changed, and records nothing.
+  const c = await writerFixture();
+  delete c.env.BACKUPS;
+  await runSheets(c.env, { nowMs: NOW, fetchImpl: fakeGoogle(c.books).fetchImpl });
+  assert.match((await evs(c.DB, "error.sheet_write"))[0].summary, /before anything was sent, nothing in the sheet changed/);
+  assert.equal((await c.DB.prepare(`SELECT COUNT(*) AS n FROM sheet_writes`).first()).n, 0);
+});
+
+test("P&L slot: one outbound-call budget shared by every job; the sheets and ads history stop cleanly when it runs out", async () => {
+  const { callBudget } = await import("../src/lib/callBudget.js");
+  const { PNL_SLOT_CALLS } = await import("../src/agents/pnl/index.js");
+  assert.ok(PNL_SLOT_CALLS < 50, "inside the Worker's 50 subrequests");
+  const { env, books } = await writerFixture();
+  const g = fakeGoogle(books);
+  const calls = callBudget(5, g.fetchImpl);
+  const r = await runSheets(env, { nowMs: NOW, fetchImpl: g.fetchImpl, calls });
+  assert.ok(calls.used <= 5);
+  assert.deepEqual(r.read, ["hc"], "one workbook read (token + 3 calls), then a clean stop");
+  assert.ok(r.skipped.some((x) => /call budget/.test(x)));
+  assert.equal(r.unreachable.length, 0, "running out of budget is not 'unreachable'");
+  assert.equal(r.written.hc, "call budget for this run used up");
+  assert.equal(g.log.updates.length, 0);
+  // The whole slot never goes past its budget, whatever the jobs want.
+  const { runPnlExtras } = await import("../src/agents/pnl/index.js");
+  let n = 0;
+  const counting = async (url, init) => { n++; return g.fetchImpl(url, init); };
+  const out = await runPnlExtras(env, { nowMs: NOW + 2 * 3600000, fetchImpl: counting });
+  assert.ok(n <= PNL_SLOT_CALLS && out.calls_used <= PNL_SLOT_CALLS);
+});
+
+test("sheets writer: planning is bounded per run (days and cells), the rest next run", async () => {
+  const { planStore, readWorkbook, workbooks } = await import("../src/agents/pnl/sheets.js");
+  const env = baseEnv();
+  const days = {};
+  for (let d = 1; d <= 9; d++) {
+    const day = `2026-10-0${d}`;
+    days[day] = {};
+    await closedDay(env.DB, "hc", day, { revenue: 10, orders: 1, ads: 5, guy_fee: 0.5, fees: 0.3 });
+  }
+  const books = { [HC]: book("Holt & Crane P&L", { OCT: monthTab(2026, 10, days), SETUP: setupTab() }) };
+  const wb = workbooks().find((w) => w.store === "hc");
+  const read = await readWorkbook(env, wb, { token: "g", fetchImpl: fakeGoogle(books).fetchImpl, nowMs: NOW });
+  const p = await planStore(env.DB, wb, read, { nowMs: NOW, maxDays: 3 });
+  assert.deepEqual([...new Set(p.plan.map((x) => x.day))], ["2026-10-01", "2026-10-02", "2026-10-03"]);
+  assert.ok(p.skipped["more days next run (per-run limit)"] > 0);
+});
+
+test("ads history: a day the hourly pull already had is re-read, and a changed figure is logged as a restatement", async () => {
+  const env = baseEnv();
+  await connectGoogle(env);
+  await env.DB.prepare(`INSERT INTO ad_spend_days (store, day, cost, clicks, impressions, conv_value, currency, account_tz, fetched_at, source) VALUES ('hc', '2026-10-05', 300, 4, 0, 0, 'USD', 'America/Chicago', ?, 'api')`).bind(iso(NOW - 86400000)).run();
+  const fetchImpl = async (url, init) => {
+    if (url === "https://oauth2.googleapis.com/token") return j({ access_token: "g", expires_in: 3600 });
+    const q = JSON.parse(init.body).query;
+    if (!/segments\.date/.test(q)) return j([{ results: [{ customer: { timeZone: "America/Chicago", currencyCode: "USD" } }] }]);
+    const cid = url.match(/customers\/(\d+)\//)[1];
+    const [, from, to] = q.match(/BETWEEN '([\d-]+)' AND '([\d-]+)'/);
+    const rows = [];
+    if (cid === "7108143649") for (let d = from; d <= to; d = new Date(Date.parse(`${d}T00:00:00Z`) + 86400000).toISOString().slice(0, 10)) rows.push({ segments: { date: d }, metrics: { costMicros: d === "2026-10-05" ? "305400000" : "1000000", clicks: "1", impressions: "1", conversionsValue: 0 } });
+    return j([{ results: rows }]);
+  };
+  for (let i = 0; i < 3; i++) await runAdsHistory(env, { nowMs: NOW + i * 3600000, fetchImpl });
+  assert.equal((await env.DB.prepare(`SELECT cost FROM ad_spend_days WHERE store = 'hc' AND day = '2026-10-05'`).first()).cost, 305.4);
+  const ev = (await evs(env.DB, "ads.restated")).filter((e) => e.store === "hc");
+  assert.equal(ev.length, 1);
+  assert.match(ev[0].summary, /2026-10-05 300\.00 → 305\.40/);
 });

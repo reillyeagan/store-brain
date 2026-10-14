@@ -56,7 +56,11 @@ Shopify refunds ──────► Refund Reconciler ┘                    �
 Reilly, 2026-10-14: "make sure things like the google drive P&L sheets are all updated by the brain automatically" and "use the spreadsheets to fill in accurate data for every single day we have". This is the first, narrower version of the Ledger Keeper's sheet writing above:
 - **Reads** the 3 store workbooks + Ecom P&L hourly (header names, not positions). Fills the brain only where it has nothing (ad spend days, fees, COG from the KFB ledger at the SETUP FX rate, marked as such) and only when the sheet's day provably is the brain's day. Differences → `pnl.sheet_mismatch`, once per store/day/field. Never overwrites system-of-record data.
 - **Writes** only BLANK, non-formula input cells of days the brain has CLOSED; Reilly's typed numbers always win. No refunds (no per-day cell), **no tab creation** (one event a day asks Reilly), no restatements, no SETUP notes. R2 backup before every batch, re-read after. Kill switch `SHEETS_WRITE = "0"`.
-- Day-based numbers (revenue, orders, fees, COG) are written only when SETUP's timezone is the brain's store timezone. On 2026-10-14 every workbook said CDT and the brain counts in Eastern, so until that is settled only ad spend, services, clicks and sessions are written.
+- Mode: LIVE on Reilly's words (decision `pnl.sheets_write`); `SHEETS_WRITE` = 0 / false / off stops it.
+- Day-based numbers (revenue, orders, fees, COG, sessions) are written only when SETUP NAMES a timezone equal to the store's configured one (fail closed). On 2026-10-14 every workbook said CDT and the brain counts in Eastern, so until that is settled only ad spend, services and clicks are written, and those only once a day is 3 days old (Google settles). No SERVICES before Guy's start (2026-09-07).
+- Sheet COG counts as ESTIMATED (EUR exact, FX estimated) and is refused under 85% of the brain's own estimate (probably an unbilled order).
+- Refund history moves back only with `read_all_orders` (scope re-checked daily); without it those days stay open: "refunds unprovable".
+- Writes are recorded as `pending` before the write call, then `verified` / `unverified`. The P&L slot shares one outbound-call budget (45).
 
 ### 5. Analyst · AI · L2 (reports)
 | | |

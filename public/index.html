@@ -665,7 +665,7 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
     var head='<div class="top"><div class="pills">'+PERIODS.map(function(p){return '<button class="pill'+(pnlSel.period===p[0]?" on":"")+'" data-per="'+p[0]+'">'+p[1]+'</button>'}).join("")+
       '<span style="width:6px"></span><button class="pill" data-step="-1" aria-label="Previous day">‹</button><input type="date" id="pnlDay" value="'+esc(pnlSel.day)+'" max="'+esc(d.today)+'"'+(first?' min="'+esc(first)+'"':'')+'><button class="pill" data-step="1" aria-label="Next day">›</button></div>'+
       '<div class="pills"><span class="status">'+esc(periodTxt)+'</span>'+verdict+'</div></div>';
-    var cogsTag=s.cogs_est_share>0?'<span class="tag">'+(s.cogs_est_share>=.999?"EST.":pct(s.cogs_est_share,0)+" EST.")+'</span>':s.cogs!=null&&s.cogs_sheet?'<span class="tag" title="KFB ledger from the P&amp;L sheet, EUR at the sheet rate (an estimate)">SHEET</span>':s.cogs!=null?'<span class="tag ok">REAL</span>':"";
+    var cogsTag=(s.cogs_est_share>0?'<span class="tag">'+(s.cogs_est_share>=.999?"EST.":pct(s.cogs_est_share,0)+" EST.")+'</span>':s.cogs!=null?'<span class="tag ok">REAL</span>':"")+(s.cogs!=null&&s.cogs_sheet?'<span class="tag" title="Some COGS from the P&amp;L sheet: KFB ledger in EUR at the sheet rate (an estimate)">SHEET</span>':"");
     var fr=s.refunds==null||s.fees==null?null:s.refunds+s.fees;
     var guyRates=Object.keys(d.guy||{}).map(function(k){return d.guy[k].rate}).filter(function(x){return x>0});
     var guyLbl=guyRates.length?"+ Guy "+Math.round(guyRates[0]*100)+"% ":"+ Guy ";
@@ -674,7 +674,7 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
       blk("Net profit",s.profit==null?"—":money(s.profit,true),s.profit==null?profitWhy(s):"margin "+pct(s.margin),s.profit==null?"":s.profit<0?"bad-t":"ok-t")+
       blk("ROAS",x2(s.roas),s.be!=null?"break-even "+x2(s.be):"",s.roas!=null&&s.be!=null?(s.roas>=s.be?"ok-t":"bad-t"):"")+
       blk("Ad spend"+(s.ads_sheet?'<span class="tag" title="Some days from the P&amp;L sheet: the Google Ads API has no row for them yet">SHEET</span>':''),money(s.ads),s.guy_fee?guyLbl+money(s.guy_fee):s.ads!=null?"no media-buyer fee these days":"")+
-      blk("COGS"+cogsTag+(s.cogs_assumed?'<span class="tag bad">33% ASSUMED</span>':''),money(s.cogs),s.cogs_assumed?"no measured rate for some orders":s.cogs_est_share>0?"KFB rate estimate until real costs land":s.cogs!=null&&s.cogs_sheet?"KFB ledger from the P&L sheet, FX estimated":s.cogs!=null?"real KFB costs":"")+
+      blk("COGS"+cogsTag+(s.cogs_assumed?'<span class="tag bad">33% ASSUMED</span>':''),money(s.cogs),s.cogs_assumed?"no measured rate for some orders":s.cogs!=null&&s.cogs_sheet?"includes KFB ledger from the P&L sheet, FX estimated":s.cogs_est_share>0?"KFB rate estimate until real costs land":s.cogs!=null?"real KFB costs":"")+
       blk("Orders",s.orders==null?"—":String(s.orders),s.aov!=null?"AOV "+money(s.aov):"")+
       blk("CVR",fun&&fun.ok&&fun.totals&&fun.totals.conversion_rate!=null&&fun.totals.converted_sessions!=null?pct(fun.totals.conversion_rate,2):"—",fun&&fun.ok&&fun.totals&&fun.totals.sessions!=null?fun.totals.sessions.toLocaleString()+" sessions"+(pr.to===d.today?" · today so far":""):"funnel not wired yet")+
       blk("Fees &amp; refunds",money(fr),"fees "+money(s.fees)+" · refunds "+money(s.refunds)+(s.refunds_pending?" ("+money(s.refunds_pending)+" pending)":""))+
@@ -762,8 +762,9 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
       var w=r.open_why||{}, why=Object.keys(w).map(function(k){return k+": "+w[k]}).join(" · ");
       return '<span class="warn-t" title="'+esc(why||"waiting on inputs")+'">open</span>'+(why?'<div class="note" style="margin:2px 0 0;max-width:260px;white-space:normal">'+esc(why)+'</div>':'')+tags;
     }
-    if((r.cogs_estimated_share||0)>0) return '<span class="warn-t">COGS est.</span>'+(fromSheet?' <span class="tag">part sheet</span>':'')+tags;
-    if(fromSheet) return '<span style="color:var(--muted)" title="COGS from the P&amp;L sheet: the KFB ledger in EUR at the sheet EUR to USD rate, itself an estimate">COGS sheet</span>'+tags;
+    /* Sheet COGS: the KFB charges in EUR are exact, the EUR to USD rate is an estimate (so it counts as estimated). */
+    if(fromSheet) return '<span class="warn-t" title="COGS from the P&amp;L sheet: the KFB ledger in EUR at the sheet EUR to USD rate, itself an estimate">COGS sheet · FX est.</span>'+(src.some(function(x){return x==="estimate"||x==="mixed"})?' <span class="tag">part rate est.</span>':'')+tags;
+    if((r.cogs_estimated_share||0)>0) return '<span class="warn-t">COGS est.</span>'+tags;
     return '<span style="color:var(--faint)">final</span>'+tags;
   }
   function byStore(rows,gap){
@@ -791,7 +792,7 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
       f("shopify.orders","Revenue (Shopify orders)")+f("ads.spend","Ad spend (Google Ads)")+
       (s.fees==null&&!s.gap_days?line("Fees (Shopify payouts)",false,"not known for this "+(pnlSel.period==="day"?"day":"period")):f("shopify.payouts","Fees (Shopify payouts)"))+
       line("Refunds (by processed date)",s.refunds!=null,s.refunds!=null?"in":"not known yet")+
-      line("COGS",s.cogs_est_share==null?null:s.cogs_est_share===0,s.cogs==null?"not known yet":s.cogs_est_share>0?"estimate until KFB costs land":s.cogs_sheet?"P&L sheet (KFB ledger, FX est.)":"real")+
+      line("COGS",s.cogs_est_share==null?null:s.cogs_est_share===0,s.cogs==null?"not known yet":s.cogs_sheet?"P&L sheet (KFB ledger, FX est.)":s.cogs_est_share>0?"estimate until KFB costs land":"real")+
       '<div class="note">'+(isToday?"Today is live: numbers move as orders and spend come in. ":"")+'A day turns final once every input has been read after it ended. Unknown is shown as —, never as $0.</div></div>';
     return h;
   }

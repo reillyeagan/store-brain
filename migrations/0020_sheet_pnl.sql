@@ -8,6 +8,7 @@
 -- cog_ok / fee_ok / ads_ok: 1 when that value may fill a gap in the brain, 0 when not, and the
 -- matching *_why says why (an estimate named in SETUP, a $0 COG on a day with orders, too recent).
 -- applied_at = when the P&L last recomputed the day after this row changed (NULL = due).
+-- read_at = when the row last changed. seen_at = when its TAB was last read in full (freshness).
 CREATE TABLE IF NOT EXISTS sheet_pnl_days (
   store        TEXT NOT NULL,
   day          TEXT NOT NULL,
@@ -34,6 +35,7 @@ CREATE TABLE IF NOT EXISTS sheet_pnl_days (
   ads_ok       INTEGER NOT NULL DEFAULT 0,
   ads_why      TEXT,
   read_at      TEXT NOT NULL,
+  seen_at      TEXT,
   applied_at   TEXT,
   PRIMARY KEY (store, day)
 );
@@ -69,8 +71,8 @@ CREATE TABLE IF NOT EXISTS sheet_mismatches (
   PRIMARY KEY (store, day, field)
 );
 
--- Every cell the brain wrote into a workbook, with the R2 backup taken before it and whether
--- the re-read confirmed it.
+-- Every cell the brain wrote (or is about to write) into a workbook, with the R2 backup taken
+-- before it. Recorded as 'pending' BEFORE the write, then 'verified' or 'unverified' by the re-read.
 CREATE TABLE IF NOT EXISTS sheet_writes (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   store       TEXT NOT NULL,
@@ -82,7 +84,8 @@ CREATE TABLE IF NOT EXISTS sheet_writes (
   value       REAL NOT NULL,
   backup_key  TEXT NOT NULL,
   written_at  TEXT NOT NULL,
-  verified    INTEGER NOT NULL DEFAULT 0
+  verified    INTEGER NOT NULL DEFAULT 0,
+  status      TEXT NOT NULL DEFAULT 'pending'
 );
 CREATE INDEX IF NOT EXISTS idx_sheet_writes_at ON sheet_writes(written_at);
 
@@ -114,3 +117,5 @@ ALTER TABLE order_backfill ADD COLUMN ext_done_at TEXT;
 ALTER TABLE order_backfill ADD COLUMN ref_ext_cursor TEXT;
 ALTER TABLE order_backfill ADD COLUMN ref_ext_done_at TEXT;
 ALTER TABLE order_backfill ADD COLUMN ext_note TEXT;
+-- When the read_all_orders scope was last checked (re-checked daily until it is granted).
+ALTER TABLE order_backfill ADD COLUMN ext_checked_at TEXT;

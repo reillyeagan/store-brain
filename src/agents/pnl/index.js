@@ -23,6 +23,7 @@ import { runAnalyst, analystState } from "./analyst.js";
 import { runSheets, sheetsState } from "./sheets.js";
 import { runAdsHistory, adsHistoryState } from "../../lib/adsHistory.js";
 import { historyExtensionState } from "../../lib/historyExtend.js";
+import { callBudget } from "../../lib/callBudget.js";
 
 export const PNL_EXTRA_JOBS = Object.freeze({
   "pnl.funnel": 60,
@@ -45,18 +46,29 @@ async function step(env, job, actor, nowMs, fn) {
   return r;
 }
 
+/**
+ * Outbound calls the whole P&L slot may make (a Worker run may make at most 50 subrequests;
+ * a little headroom is kept). Every job below shares this one budget (src/lib/callBudget.js);
+ * the jobs that loop (ads history, sheets) check it before each unit of work and stop cleanly.
+ */
+export const PNL_SLOT_CALLS = 45;
+
 export async function runPnlExtras(env, { nowMs = Date.now(), fetchImpl = fetch } = {}) {
   const out = {};
-  out.funnel = await step(env, "pnl.funnel", "pnl.pullers", nowMs, () => pullFunnel(env, { nowMs, fetchImpl }));
+  const calls = callBudget(PNL_SLOT_CALLS, fetchImpl);
+  const f = calls.fetch;
+  out.funnel = await step(env, "pnl.funnel", "pnl.pullers", nowMs, () => pullFunnel(env, { nowMs, fetchImpl: f }));
   out.cogs = await step(env, "pnl.cogs", "pnl.cogs", nowMs, () => matchBills(env.DB, { nowMs }));
-  // Ads history first, so the sheet cross-check sees the API's rows as soon as they land.
-  out.ads_history = await step(env, "pnl.ads_history", "pnl.pullers", nowMs, () => runAdsHistory(env, { nowMs, fetchImpl }));
-  out.sheets = await step(env, "pnl.sheets", "pnl.sheets", nowMs, () => runSheets(env, { nowMs, fetchImpl }));
   out.calendar = await step(env, "pnl.calendar", "pnl.calendar", nowMs, () => runCalendar(env, { nowMs }));
-  // The daily analysis waits for the day close, so "yesterday" is final-ish.
+  // The daily analysis waits for the day close, so "yesterday" is final-ish. It runs before the
+  // loops below so they can't use up its one call.
   out.analyst = new Date(nowMs).getUTCHours() >= ANALYST_AFTER_UTC_HOUR
-    ? await step(env, "pnl.analyst", "pnl.analyst", nowMs, () => runAnalyst(env, { nowMs, fetchImpl }))
+    ? await step(env, "pnl.analyst", "pnl.analyst", nowMs, () => runAnalyst(env, { nowMs, fetchImpl: f }))
     : "not due";
+  // Ads history before the sheets, so the sheet cross-check sees the API's rows as soon as they land.
+  out.ads_history = await step(env, "pnl.ads_history", "pnl.pullers", nowMs, () => runAdsHistory(env, { nowMs, fetchImpl, calls }));
+  out.sheets = await step(env, "pnl.sheets", "pnl.sheets", nowMs, () => runSheets(env, { nowMs, fetchImpl, calls }));
+  out.calls_used = calls.used;
   return out;
 }
 

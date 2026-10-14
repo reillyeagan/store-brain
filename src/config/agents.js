@@ -77,7 +77,8 @@ export const AGENTS = Object.freeze([
   a("pnl.calendar", "pnl", "Tax, Admin & Triggers", "code", "L1", "built"),
   // Built 2026-10-14 on Reilly's word ("make sure things like the google drive P&L sheets are all
   // updated by the brain automatically"): writes BLANK input cells only; SHEETS_WRITE = "0" stops it.
-  a("pnl.sheets", "pnl", "P&L Sheets", "code", "L1", "built"),
+  // Live, not shadow: his words are the go-live (decision pnl.sheets_write).
+  a("pnl.sheets", "pnl", "P&L Sheets", "code", "L1", "live"),
 
   // Risk
   a("risk.chargebacks", "risk", "Chargeback Agent", "ai", "L0", "built"),

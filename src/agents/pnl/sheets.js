@@ -45,6 +45,7 @@ import { minusDays } from "../../lib/adsSpend.js";
 import { computeStoreDay, writePnlRow, storeTz, SHEET_MAX_AGE_MIN } from "../../lib/pnl.js";
 import { orderCoverage } from "../../lib/orderBackfill.js";
 import { r2, safeJson } from "../core/shared.js";
+import { unlimited } from "../../lib/callBudget.js";
 
 const ACTOR = "pnl.sheets";
 export const WRITE_EVERY_MIN = 60;
@@ -52,6 +53,14 @@ export const MISMATCH_EVENTS_PER_RUN = 15;
 export const RECOMPUTE_PER_RUN = 12;
 /** Sheet rows stored per run at most (a first full read of four workbooks is ~450 rows). */
 export const STORE_ROWS_PER_RUN = 200;
+/** Every month tab is re-read this often; the current and previous month every run. */
+export const FULL_READ_EVERY_MIN = 20 * 60;
+/** Write planning per workbook per run (D1 work stays bounded; the rest next run). */
+export const PLAN_DAYS_PER_RUN = 10;
+export const PLAN_CELLS_PER_RUN = 40;
+/** Outbound calls one workbook read / one write needs. */
+export const READ_CALLS = 3;
+export const WRITE_CALLS = 4;
 /** A COG younger than this many days may still be missing a KFB suborder: not used yet. */
 export const COG_SETTLE_DAYS = 2;
 /** Money differences up to this are rounding, not a disagreement. */
@@ -59,8 +68,10 @@ export const MISMATCH_USD = 0.5;
 /** Google keeps adjusting the last days: ads are compared only once a day is this old. */
 export const ADS_COMPARE_AFTER_DAYS = 3;
 
-/** The kill switch: SHEETS_WRITE = "0" stops every write. Default ON (Reilly asked for it). */
-export const sheetsWriteOn = (env) => !(env && env.SHEETS_WRITE != null && String(env.SHEETS_WRITE).trim() === "0");
+/** The kill switch: SHEETS_WRITE = "0" / "false" / "off" stops every write. Default ON (Reilly asked for it). */
+export const sheetsWriteOn = (env) => !(env && env.SHEETS_WRITE != null && ["0", "false", "off", "no"].includes(String(env.SHEETS_WRITE).trim().toLowerCase()));
+/** What the writer is, in plain words: Reilly's own request made it live, not a shadow. */
+export const WRITER_MODE = "live (Reilly 2026-10-14, decision pnl.sheets_write)";
 
 /** Every workbook the brain knows: one per live store with a sheet id, plus the Ecom P&L ("all"). */
 export function workbooks() {
@@ -112,7 +123,9 @@ export async function readWorkbook(env, wb, { token, fetchImpl = fetch, nowMs = 
   const months = monthTabs(meta.tabs);
   const prev = await env.DB.prepare(`SELECT full_read_at FROM sheet_workbooks WHERE store = ?`).bind(wb.store).first().catch(() => null);
   const today = localDay(nowMs, wb.tz);
-  const full = !(prev && prev.full_read_at);
+  // Every month tab once a day (older months still get corrected by hand); the current and
+  // previous month every run.
+  const full = !(prev && prev.full_read_at) || nowMs - Date.parse(prev.full_read_at) > FULL_READ_EVERY_MIN * 60000;
   const wanted = full ? months : [tabForMonth(months, today), tabForMonth(months, `${minusDays(`${today.slice(0, 7)}-01`, 1)}`)].filter(Boolean);
   const tabs = [...new Set(wanted)];
   const ranges = [...(setupTab ? [a1(setupTab, "A1:B60")] : []), ...tabs.map((t) => a1(t, "A1:Z45"))];
@@ -132,8 +145,8 @@ export async function readWorkbook(env, wb, { token, fetchImpl = fetch, nowMs = 
 const KEY_FIELDS = ["revenue", "orders", "adspend", "fee", "cog_eur", "fx_rate", "cog_ok", "fee_ok", "ads_ok", "clicks"];
 
 /**
- * Store a read: the sheet_pnl_days rows that CHANGED (an unchanged row is not rewritten: the
- * workbook's last_ok_at is what says the data is fresh), then the workbook row. Bounded by
+ * Store a read: the sheet_pnl_days rows that CHANGED (an unchanged row is not rewritten: its
+ * seen_at, set per tab read in full, is what says the data is fresh), then the workbook row. Bounded by
  * `budget.rows` per run so a first full read can't use up the run's D1 queries; the rest are
  * stored on the next run (they still differ then). Returns the days written.
  */
@@ -145,7 +158,9 @@ export async function storeRead(db, wb, read, nowMs = Date.now(), budget = { row
   const prev = new Map((prevRows || []).map((r) => [r.day, r]));
   const stmts = [];
   let complete = true;
+  const tabsDone = [];
   for (const m of read.months) {
+    let tabComplete = true;
     for (const d of m.days) {
       const v = d.values;
       const t = trustRow(v, read.setup, d.day, today);
@@ -160,7 +175,7 @@ export async function storeRead(db, wb, read, nowMs = Date.now(), budget = { row
       const moved = before && (before.row_no !== d.row_no || before.tab !== m.tab || before.cog_why !== row.cog_why || before.fee_why !== row.fee_why || before.ads_why !== row.ads_why
         || num(before.services) !== num(row.services) || num(before.sessions) !== num(row.sessions) || before.formulas !== JSON.stringify(d.formulas));
       if (!differs && !moved) continue;
-      if (budget.rows <= 0) { complete = false; continue; }
+      if (budget.rows <= 0) { complete = false; tabComplete = false; continue; }
       budget.rows--;
       stmts.push(db.prepare(
         `INSERT INTO sheet_pnl_days (store, day, sheet_id, tab, row_no, revenue, cog_usd, adspend, services, employee, fee, profit, orders, clicks, sessions,
@@ -178,6 +193,12 @@ export async function storeRead(db, wb, read, nowMs = Date.now(), budget = { row
         row.fee_ok, row.fee_why, row.ads_ok, row.ads_why, at, null, differs ? 1 : 0));
       if (differs) changed.push(d.day);
     }
+    if (tabComplete) tabsDone.push(m.tab);
+  }
+  // Freshness per TAB: every row of a tab read in full right now is "seen" now (rule 4). A tab
+  // not read this run (an older month between daily full reads) keeps its older seen_at.
+  for (const tab of tabsDone) {
+    stmts.push(db.prepare(`UPDATE sheet_pnl_days SET seen_at = ? WHERE store = ? AND tab = ?`).bind(at, wb.store, tab));
   }
   await runBatch(db, stmts);
   // A read stored only in part is not a "full read" yet: the next run carries on.
@@ -187,7 +208,7 @@ export async function storeRead(db, wb, read, nowMs = Date.now(), budget = { row
      ON CONFLICT(store) DO UPDATE SET sheet_id = excluded.sheet_id, title = excluded.title, fx_rate = excluded.fx_rate,
        revenue_tz = excluded.revenue_tz, services_ended = excluded.services_ended, setup = excluded.setup, tabs = excluded.tabs,
        last_read_at = excluded.last_read_at, last_ok_at = COALESCE(excluded.last_ok_at, sheet_workbooks.last_ok_at), last_error = NULL,
-       full_read_at = COALESCE(sheet_workbooks.full_read_at, excluded.full_read_at)`
+       full_read_at = COALESCE(excluded.full_read_at, sheet_workbooks.full_read_at)`
   ).bind(wb.store, wb.sheetId, read.title, read.setup.fx_rate, read.setup.revenue_tz, read.setup.services_ended,
     JSON.stringify({ estimated: read.setup.estimated, revenue: read.setup.revenue_text, services: read.setup.services_text }),
     // last_ok_at says "every row in the ledger matches the sheet as of now": only when all were stored.
@@ -216,7 +237,7 @@ export async function fillAdsFromSheet(db, { nowMs = Date.now() } = {}) {
     const { results } = await db.prepare(
       `SELECT s.day, s.adspend, s.clicks FROM sheet_pnl_days s
          LEFT JOIN ad_spend_days a ON a.store = s.store AND a.day = s.day
-        WHERE s.store = ? AND s.ads_ok = 1 AND s.adspend IS NOT NULL AND a.day IS NULL AND EXISTS (SELECT 1 FROM sheet_workbooks w WHERE w.store = s.store AND w.last_ok_at >= ?) AND s.day < ?
+        WHERE s.store = ? AND s.ads_ok = 1 AND s.adspend IS NOT NULL AND a.day IS NULL AND s.seen_at >= ? AND s.day < ?
         ORDER BY s.day`
     ).bind(id, cutoff, today).all();
     if (!results || !results.length) continue;
@@ -320,8 +341,11 @@ export async function crossCheck(db, { nowMs = Date.now() } = {}) {
          FROM sheet_pnl_days s
          LEFT JOIN ad_spend_days a ON a.store = s.store AND a.day = s.day
          LEFT JOIN pnl_days p ON p.store = s.store AND p.day = s.day
-        WHERE s.store = ? AND EXISTS (SELECT 1 FROM sheet_workbooks w WHERE w.store = s.store AND w.last_ok_at >= ?) AND s.day < ? ORDER BY s.day`
+        WHERE s.store = ? AND s.seen_at >= ? AND s.day < ? ORDER BY s.day`
     ).bind(id, cutoff, today).all();
+    // KFB EUR per day in one query (not one per day).
+    const { results: kfb } = await db.prepare(`SELECT local_day, SUM(cost_eur) AS eur FROM cogs_matches WHERE store = ? AND status = 'matched' GROUP BY local_day`).bind(id).all().catch(() => ({ results: [] }));
+    const kfbBy = new Map((kfb || []).map((k) => [k.local_day, Number(k.eur)]));
     for (const r of rows || []) {
       const push = async (m) => { if (await mismatch(db, { store: id, day: r.day, ...m }, budget, at)) found.push({ store: id, day: r.day, field: m.field }); };
       if (r.a_source === "api" && r.day < adsBefore) {
@@ -339,8 +363,8 @@ export async function crossCheck(db, { nowMs = Date.now() } = {}) {
         await push({ field: "fee", sheet: r.fee, brain: r.p_fees, source: "brain (Shopify Payments)" });
       }
       if (r.cog_eur != null && r.p_cogs_source === "actual") {
-        const k = await db.prepare(`SELECT SUM(cost_eur) AS eur FROM cogs_matches WHERE store = ? AND local_day = ? AND status = 'matched'`).bind(id, r.day).first();
-        if (k && k.eur != null && Math.abs(Number(r.cog_eur) - Number(k.eur)) > MISMATCH_USD) await push({ field: "cog_eur", sheet: r.cog_eur, brain: r2(k.eur), source: "brain (KFB bills)" });
+        const eur = kfbBy.get(r.day);
+        if (eur != null && Math.abs(Number(r.cog_eur) - eur) > MISMATCH_USD) await push({ field: "cog_eur", sheet: r.cog_eur, brain: r2(eur), source: "brain (KFB bills)" });
       }
     }
   }
@@ -388,10 +412,14 @@ async function revenueMatchesDefinition(db, storeId, day) {
  * Day-based numbers (revenue, orders, fees, COG) are only written when the sheet's timezone
  * (SETUP) is the brain's store timezone: otherwise "a day" is a different set of orders.
  */
-export async function brainValue(db, storeId, day, field, { pnl, setup, tz }) {
+export async function brainValue(db, storeId, day, field, { pnl, setup, tz, today = null }) {
   const notes = safeJson(pnl.notes, {}) || {};
-  const tzOk = !setup.revenue_tz || setup.revenue_tz === tz;
-  const tzWhy = `the sheet counts days in ${setup.revenue_tz} (SETUP), the brain in ${tz}`;
+  // Fail closed: day-based numbers only when SETUP NAMES a timezone and it is the store's.
+  const tzOk = !!setup.revenue_tz && setup.revenue_tz === tz;
+  const tzWhy = setup.revenue_tz ? `the sheet counts days in ${setup.revenue_tz} (SETUP), the brain in ${tz}` : "SETUP names no timezone for the sheet's days";
+  // Google keeps adjusting the last days: ad numbers are written once they have settled.
+  const adsSettled = !today || day <= minusDays(today, ADS_COMPARE_AFTER_DAYS);
+  const adsWhy = `ad numbers settle after ${ADS_COMPARE_AFTER_DAYS} days`;
   switch (field) {
     case "revenue": {
       if (!tzOk) return { skip: tzWhy };
@@ -403,20 +431,30 @@ export async function brainValue(db, storeId, day, field, { pnl, setup, tz }) {
       if (!tzOk) return { skip: tzWhy };
       return pnl.orders == null ? { skip: "orders unknown" } : { value: Number(pnl.orders) };
     case "adspend":
+      if (!adsSettled) return { skip: adsWhy };
       if (notes.ads_source === "sheet") return { skip: "ad spend came from this sheet" };
       return pnl.ads == null ? { skip: "ad spend unknown" } : { value: r2(pnl.ads) };
-    case "services":
+    case "services": {
+      const start = STORES[storeId] && STORES[storeId].guyStart;
+      // Before the media buyer started the cell stays blank, not $0.
+      if (!start || day < start) return { skip: "before the media buyer started" };
       if (setup.services_ended && (setup.services_ended === "all" || day >= setup.services_ended)) return { skip: `SETUP says the media buyer ended (${setup.services_ended})` };
+      if (!adsSettled) return { skip: adsWhy };
+      if (notes.ads_source === "sheet") return { skip: "ad spend came from this sheet" };
       return pnl.guy_fee == null ? { skip: "services unknown" } : { value: r2(pnl.guy_fee) };
+    }
     case "fee":
       if (!tzOk) return { skip: tzWhy };
       if (notes.fees_source === "sheet") return { skip: "fees came from this sheet" };
       return pnl.fees == null ? { skip: "fees unknown" } : { value: r2(pnl.fees) };
     case "clicks": {
+      if (!adsSettled) return { skip: adsWhy };
       const a = await db.prepare(`SELECT clicks FROM ad_spend_days WHERE store = ? AND day = ? AND source = 'api'`).bind(storeId, day).first();
       return a ? { value: Number(a.clicks) } : { skip: "no Google Ads API row" };
     }
     case "sessions": {
+      // Shopify reports sessions in the shop's timezone: same check as the other day-based numbers.
+      if (!tzOk) return { skip: tzWhy };
       const f = await db.prepare(`SELECT sessions FROM funnel_days WHERE store = ? AND day = ? AND partial = 0`).bind(storeId, day).first().catch(() => null);
       return f && f.sessions != null ? { value: Number(f.sessions) } : { skip: "no Shopify sessions for that day" };
     }
@@ -435,84 +473,124 @@ export async function brainValue(db, storeId, day, field, { pnl, setup, tz }) {
 
 const close = (a, b) => a != null && b != null && Math.abs(Number(a) - Number(b)) < 0.005;
 
+/** An error that says how far a write got, so the report never claims "nothing changed" wrongly. */
+export class SheetWriteError extends Error {
+  constructor(message, phase, extra = {}) {
+    super(message);
+    this.name = "SheetWriteError";
+    this.phase = phase; // "before_write" (nothing sent) | "write_unknown" (outcome unknown)
+    Object.assign(this, extra);
+  }
+}
+
 /**
  * Write a plan of cells into one workbook: re-read the rows, keep only cells still blank,
- * back up, write, re-read and verify. `plan` = [{ tab, day, row_no, field, cell, value }].
- * Throws if the backup can't be confirmed (nothing is written).
+ * back up, RECORD the intended cells as 'pending', write, re-read and mark each one
+ * 'verified' or 'unverified'. `plan` = [{ tab, day, row_no, field, cell, value }].
+ * A failure before the write throws phase "before_write" (nothing changed); a failed write
+ * call throws phase "write_unknown" (the cells stay 'pending': the outcome is unknown); a
+ * failed re-read marks the cells 'unverified' and says so.
  */
 export async function writeCells(env, wb, plan, { token, fetchImpl = fetch, nowMs = Date.now() } = {}) {
   const opts = { token, fetchImpl };
+  const db = env.DB;
   const at = nowIso(nowMs);
   if (!plan.length) return { written: [], dropped: 0 };
-  // 1. Fresh look at exactly those rows (Reilly may have typed since the read).
-  const rowKeys = [...new Set(plan.map((p) => `${p.tab}\u0000${p.row_no}`))].map((k) => { const [tab, row] = k.split("\u0000"); return { tab, row: Number(row) }; });
-  const lastCol = colLetter(25);
-  const ranges = rowKeys.map((k) => a1(k.tab, `A${k.row}:${lastCol}${k.row}`));
-  const [fmt, frm] = [await batchGet(wb.sheetId, ranges, "FORMATTED_VALUE", opts), await batchGet(wb.sheetId, ranges, "FORMULA", opts)];
-  const snapshot = rowKeys.map((k, i) => ({ tab: k.tab, row: k.row, range: ranges[i], formatted: (fmt[i] && fmt[i][0]) || [], formulas: (frm[i] && frm[i][0]) || [] }));
-  const keep = plan.filter((p) => {
-    const s = snapshot.find((x) => x.tab === p.tab && x.row === p.row_no);
-    if (!s) return false;
-    const colIdx = p.cell.replace(/\d+$/, "").split("").reduce((n, c) => n * 26 + c.charCodeAt(0) - 64, 0) - 1;
-    const fv = s.formatted[colIdx], fo = s.formulas[colIdx];
-    const blank = (v) => v == null || String(v).trim() === "";
-    // The row must still be that day (a row inserted above it would shift everything down).
-    const sameDay = (parseSheetDate(s.formatted[0]) || parseSheetDate(s.formulas[0])) === p.day;
-    return sameDay && blank(fv) && blank(fo);
-  });
-  if (!keep.length) return { written: [], dropped: plan.length };
-  // 2. Backup (rule 8): every affected row, values and formulas, per tab, checked before writing.
-  const backups = {};
-  for (const tab of [...new Set(keep.map((p) => p.tab))]) {
-    const b = await backup(env.BACKUPS, {
-      store: wb.store, label: `sheets_${wb.sheetId}_${tab}`, atIso: at,
-      data: { sheet_id: wb.sheetId, workbook: wb.name, tab, rows: snapshot.filter((s) => s.tab === tab) },
+  const before = (err) => (err instanceof SheetWriteError ? err : new SheetWriteError(String((err && err.message) || err), "before_write"));
+  let keep, backups = {}, snapshot;
+  try {
+    // 1. Fresh look at exactly those rows (Reilly may have typed since the read).
+    const rowKeys = [...new Set(plan.map((p) => `${p.tab}\u0000${p.row_no}`))].map((k) => { const [tab, row] = k.split("\u0000"); return { tab, row: Number(row) }; });
+    const lastCol = colLetter(25);
+    const ranges = rowKeys.map((k) => a1(k.tab, `A${k.row}:${lastCol}${k.row}`));
+    const [fmt, frm] = [await batchGet(wb.sheetId, ranges, "FORMATTED_VALUE", opts), await batchGet(wb.sheetId, ranges, "FORMULA", opts)];
+    snapshot = rowKeys.map((k, i) => ({ tab: k.tab, row: k.row, range: ranges[i], formatted: (fmt[i] && fmt[i][0]) || [], formulas: (frm[i] && frm[i][0]) || [] }));
+    keep = plan.filter((p) => {
+      const s = snapshot.find((x) => x.tab === p.tab && x.row === p.row_no);
+      if (!s) return false;
+      const colIdx = p.cell.replace(/\d+$/, "").split("").reduce((n, c) => n * 26 + c.charCodeAt(0) - 64, 0) - 1;
+      const fv = s.formatted[colIdx], fo = s.formulas[colIdx];
+      const blank = (v) => v == null || String(v).trim() === "";
+      // The row must still be that day (a row inserted above it would shift everything down).
+      const sameDay = (parseSheetDate(s.formatted[0]) || parseSheetDate(s.formulas[0])) === p.day;
+      return sameDay && blank(fv) && blank(fo);
     });
-    if (!b || !b.ok) throw new Error(`backup for ${wb.name} ${tab} not confirmed; nothing written`);
-    backups[tab] = b.key;
+    if (!keep.length) return { written: [], dropped: plan.length };
+    // 2. Backup (rule 8): every affected row, values and formulas, per tab, checked before writing.
+    for (const tab of [...new Set(keep.map((p) => p.tab))]) {
+      const bk = await backup(env.BACKUPS, {
+        store: wb.store, label: `sheets_${wb.sheetId}_${tab}`, atIso: at,
+        data: { sheet_id: wb.sheetId, workbook: wb.name, tab, rows: snapshot.filter((s) => s.tab === tab) },
+      });
+      if (!bk || !bk.ok) throw new SheetWriteError(`backup for ${wb.name} ${tab} not confirmed`, "before_write");
+      backups[tab] = bk.key;
+    }
+    // 3. Record what is about to be written, BEFORE writing ('pending'), so no outcome is lost.
+    const ids = [];
+    for (const p of keep) {
+      const r = await db.prepare(
+        `INSERT INTO sheet_writes (store, sheet_id, tab, cell, day, field, value, backup_key, written_at, verified, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'pending')`
+      ).bind(wb.store, wb.sheetId, p.tab, p.cell, p.day, p.field, p.value, backups[p.tab], at).run();
+      ids.push(r.meta.last_row_id);
+    }
+    keep = keep.map((p, i) => ({ ...p, id: ids[i], backup_key: backups[p.tab] }));
+  } catch (err) {
+    throw before(err);
   }
-  // 3. Write, one batch, USER_ENTERED.
-  await batchUpdate(wb.sheetId, keep.map((p) => ({ range: a1(p.tab, p.cell), values: [[p.value]] })), opts);
-  // 4. Verify against the sheet itself (rule 3): a 200 is not proof.
-  const check = await batchGet(wb.sheetId, keep.map((p) => a1(p.tab, p.cell)), "UNFORMATTED_VALUE", opts);
-  const written = keep.map((p, i) => {
-    const got = check[i] && check[i][0] ? check[i][0][0] : null;
-    return { ...p, got: parseMoney(got), verified: close(parseMoney(got), p.value), backup_key: backups[p.tab] };
-  });
-  for (const w of written) {
-    await env.DB.prepare(
-      `INSERT INTO sheet_writes (store, sheet_id, tab, cell, day, field, value, backup_key, written_at, verified) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).bind(wb.store, wb.sheetId, w.tab, w.cell, w.day, w.field, w.value, w.backup_key, at, w.verified ? 1 : 0).run();
+  // 4. Write, one batch, USER_ENTERED.
+  try {
+    await batchUpdate(wb.sheetId, keep.map((p) => ({ range: a1(p.tab, p.cell), values: [[p.value]] })), opts);
+  } catch (err) {
+    throw new SheetWriteError(`the write call failed (${String((err && err.message) || err).slice(0, 120)}); its outcome is unknown, ${keep.length} cell${keep.length === 1 ? "" : "s"} recorded as pending`, "write_unknown", { backups, cells: keep });
   }
+  // 5. Verify against the sheet itself (rule 3): a 200 is not proof.
+  let written;
+  try {
+    const check = await batchGet(wb.sheetId, keep.map((p) => a1(p.tab, p.cell)), "UNFORMATTED_VALUE", opts);
+    written = keep.map((p, i) => {
+      const got = check[i] && check[i][0] ? check[i][0][0] : null;
+      return { ...p, got: parseMoney(got), verified: close(parseMoney(got), p.value) };
+    });
+  } catch (err) {
+    written = keep.map((p) => ({ ...p, got: null, verified: false, read_failed: true }));
+  }
+  await runBatch(db, written.map((w) => db.prepare(`UPDATE sheet_writes SET verified = ?, status = ? WHERE id = ?`).bind(w.verified ? 1 : 0, w.verified ? "verified" : "unverified", w.id)));
   const ok = written.filter((w) => w.verified), bad = written.filter((w) => !w.verified);
-  await logEvent(env.DB, {
+  await logEvent(db, {
     actor: ACTOR, kind: "pnl.sheet_written", store: wb.store === "all" ? null : wb.store, target: "sys.sheets",
     summary: `${wb.name}: filled ${ok.length} blank cell${ok.length === 1 ? "" : "s"} (${[...new Set(ok.map((w) => w.day))].sort().join(", ")}), each confirmed by a re-read; backup ${Object.values(backups).join(", ")}`,
     data: { cells: ok.map((w) => ({ tab: w.tab, cell: w.cell, day: w.day, field: w.field, value: w.value })), backups }, at,
   });
   if (bad.length) {
-    await logEvent(env.DB, {
+    const readFailed = bad.some((w) => w.read_failed);
+    await logEvent(db, {
       actor: ACTOR, kind: "pnl.sheet_write_unverified", store: wb.store === "all" ? null : wb.store, target: "sys.sheets",
-      summary: `${wb.name}: ${bad.length} written cell${bad.length === 1 ? "" : "s"} did not read back as written (${bad.map((w) => `${w.tab}!${w.cell}`).join(", ")}); check them. Backup ${Object.values(backups).join(", ")}`,
-      data: { cells: bad.map((w) => ({ tab: w.tab, cell: w.cell, wrote: w.value, got: w.got })) }, at,
+      summary: `${wb.name}: ${bad.length} cell${bad.length === 1 ? " was" : "s were"} written but ${readFailed ? "the confirming re-read failed" : "did not read back as written"} (${bad.map((w) => `${w.tab}!${w.cell}`).join(", ")}); check them. Backup ${Object.values(backups).join(", ")}`,
+      data: { cells: bad.map((w) => ({ tab: w.tab, cell: w.cell, wrote: w.value, got: w.got })), backups }, at,
     });
   }
   return { written, dropped: plan.length - keep.length, backups };
 }
 
 /** The cells the brain would fill in one store workbook (closed days, blank inputs only). */
-export async function planStore(db, wb, read, { nowMs = Date.now() } = {}) {
+export async function planStore(db, wb, read, { nowMs = Date.now(), maxDays = PLAN_DAYS_PER_RUN, maxCells = PLAN_CELLS_PER_RUN } = {}) {
   const today = localDay(nowMs, wb.tz);
   const plan = [], skipped = {};
+  // Every closed day of the store in one query (not one per day): bounded D1 work per run.
+  const { results: closed } = await db.prepare(`SELECT * FROM pnl_days WHERE store = ? AND complete = 1 AND day < ?`).bind(wb.store, today).all();
+  const closedBy = new Map((closed || []).map((r) => [r.day, r]));
+  let days = 0;
   for (const m of read.months) {
     for (const d of m.days) {
       if (d.day >= today) continue;
       const fields = INPUT_FIELDS.filter((f) => writableBlank(d, f));
       if (!fields.length) continue;
-      const pnl = await db.prepare(`SELECT * FROM pnl_days WHERE store = ? AND day = ? AND complete = 1`).bind(wb.store, d.day).first();
+      const pnl = closedBy.get(d.day);
       if (!pnl) { skipped["day not closed by the brain"] = (skipped["day not closed by the brain"] || 0) + fields.length; continue; }
+      if (days >= maxDays || plan.length >= maxCells) { skipped["more days next run (per-run limit)"] = (skipped["more days next run (per-run limit)"] || 0) + fields.length; continue; }
+      days++;
       for (const f of fields) {
-        const v = await brainValue(db, wb.store, d.day, f, { pnl, setup: read.setup, tz: wb.tz });
+        const v = await brainValue(db, wb.store, d.day, f, { pnl, setup: read.setup, tz: wb.tz, today });
         if (v.skip) { skipped[v.skip] = (skipped[v.skip] || 0) + 1; continue; }
         if (v.value == null || !Number.isFinite(Number(v.value))) continue;
         plan.push({ tab: m.tab, day: d.day, row_no: d.row_no, field: f, cell: d.cells[f], value: v.value });
@@ -534,7 +612,8 @@ export async function planEcom(db, read, { nowMs = Date.now() } = {}) {
   const marks = stores.map(() => "?").join(", ");
   const fresh = await db.prepare(`SELECT COUNT(*) AS n FROM sheet_workbooks WHERE store IN (${marks}) AND last_ok_at >= ?`).bind(...stores, nowIso(nowMs - 90 * 60000)).first();
   if (!fresh || Number(fresh.n) !== stores.length) return { plan, skipped: { "a store workbook was not read this run": 1 } };
-  const { results: all } = await db.prepare(`SELECT * FROM sheet_pnl_days WHERE store IN (${marks})`).bind(...stores).all();
+  // Only store rows whose tab was read in THIS run.
+  const { results: all } = await db.prepare(`SELECT * FROM sheet_pnl_days WHERE store IN (${marks}) AND seen_at >= ?`).bind(...stores, nowIso(nowMs - 90 * 60000)).all();
   const byDay = new Map();
   for (const r of all || []) { if (!byDay.has(r.day)) byDay.set(r.day, []); byDay.get(r.day).push(r); }
   for (const m of read.months) {
@@ -546,6 +625,7 @@ export async function planEcom(db, read, { nowMs = Date.now() } = {}) {
         const parts = results.map((r) => r[f]);
         if (parts.some((x) => x == null)) continue;
         const sum = ["orders", "clicks", "sessions"].includes(f) ? parts.reduce((s, x) => s + Number(x), 0) : r2(parts.reduce((s, x) => s + Number(x), 0));
+        if (writableBlank(d, f) && plan.length >= PLAN_CELLS_PER_RUN) { skipped["more cells next run (per-run limit)"] = (skipped["more cells next run (per-run limit)"] || 0) + 1; continue; }
         if (writableBlank(d, f)) {
           plan.push({ tab: m.tab, day: d.day, row_no: d.row_no, field: f, cell: d.cells[f], value: sum });
         } else if (d.values[f] != null && Math.abs(Number(d.values[f]) - sum) > (["orders", "clicks", "sessions"].includes(f) ? 0 : MISMATCH_USD)) {
@@ -590,8 +670,11 @@ async function unreachable(db, wb, msg, nowMs) {
 }
 
 /** The department step. Never throws past its caller's guard; returns what it did. */
-export async function runSheets(env, { fetchImpl = fetch, nowMs = Date.now() } = {}) {
+export async function runSheets(env, { fetchImpl = fetch, nowMs = Date.now(), calls = null } = {}) {
   const db = env.DB;
+  // One outbound-call budget shared with the rest of the P&L slot (src/lib/callBudget.js).
+  const budget = calls || unlimited(fetchImpl);
+  fetchImpl = budget.fetch;
   let token;
   try {
     token = await getGoogleAccessToken(env, { fetchImpl, nowMs });
@@ -599,10 +682,12 @@ export async function runSheets(env, { fetchImpl = fetch, nowMs = Date.now() } =
     // Not connected: nothing changes, and the state says so.
     return { status: err.code === "NOT_WIRED" ? "not wired: Google not connected" : `Google sign-in failed (${String(err.message).slice(0, 80)})`, read: 0 };
   }
-  const out = { status: "ran", read: [], unreachable: [], filled: 0, recomputed: 0, mismatches: 0, written: {}, missing_tabs: [], write: sheetsWriteOn(env) ? "on" : "off (SHEETS_WRITE=0)" };
+  const out = { status: "ran", read: [], unreachable: [], filled: 0, recomputed: 0, mismatches: 0, written: {}, missing_tabs: [], write: sheetsWriteOn(env) ? "on" : "off (SHEETS_WRITE=0)", mode: sheetsWriteOn(env) ? WRITER_MODE : "off" };
   const reads = {};
   const rowBudget = { rows: STORE_ROWS_PER_RUN };
   for (const wb of workbooks()) {
+    // A read is 3 calls (tabs, values, formulas): stop cleanly when they don't fit.
+    if (!budget.has(READ_CALLS)) { out.skipped = [...(out.skipped || []), `${wb.store}: call budget for this run used up`]; continue; }
     try {
       const read = await readWorkbook(env, wb, { token, fetchImpl, nowMs });
       await storeRead(db, wb, read, nowMs, rowBudget);
@@ -624,6 +709,8 @@ export async function runSheets(env, { fetchImpl = fetch, nowMs = Date.now() } =
   for (const wb of workbooks()) {
     const read = reads[wb.store];
     if (!read) continue; // unreachable this run: never write blind
+    // A write is 4 calls (two re-reads, the write, the confirming read).
+    if (!budget.has(WRITE_CALLS)) { out.written[wb.store] = "call budget for this run used up"; continue; }
     if (!(await claimJob(db, `pnl.sheets.write.${wb.store}`, WRITE_EVERY_MIN, nowMs))) { out.written[wb.store] = "not due"; continue; }
     try {
       const { plan, skipped } = wb.store === "all" ? await planEcom(db, read, { nowMs }) : await planStore(db, wb, read, { nowMs });
@@ -634,10 +721,16 @@ export async function runSheets(env, { fetchImpl = fetch, nowMs = Date.now() } =
         .bind(nowIso(nowMs), JSON.stringify({ planned: plan.length, written: ok, unverified: (r.written || []).length - ok, dropped_not_blank_any_more: r.dropped || 0, skipped }), wb.store).run();
     } catch (err) {
       const msg = String((err && err.message) || err).slice(0, 200);
-      out.written[wb.store] = { error: msg };
+      out.written[wb.store] = { error: msg, phase: err && err.phase };
+      // Say only what is true: "nothing changed" only when nothing was sent to Google.
+      const unknown = err && err.phase === "write_unknown";
       await logEvent(db, {
         actor: ACTOR, kind: "error.sheet_write", store: wb.store === "all" ? null : wb.store, target: "sys.sheets",
-        summary: `${wb.name}: write stopped before changing anything it couldn't back up or confirm (${msg})`, at: nowIso(nowMs),
+        summary: unknown
+          ? `${wb.name}: the write may or may not have landed (${msg}); check the pending cells. Backup ${Object.values(err.backups || {}).join(", ")}`
+          : `${wb.name}: write stopped before anything was sent, nothing in the sheet changed (${msg})`,
+        data: unknown ? { cells: (err.cells || []).map((c) => ({ tab: c.tab, cell: c.cell, value: c.value })), backups: err.backups } : null,
+        at: nowIso(nowMs),
       }).catch(() => {});
     }
   }
@@ -671,12 +764,13 @@ export async function sheetsState(env, { nowMs = Date.now() } = {}) {
   const n = async (sql, ...b) => ((await db.prepare(sql).bind(...b).first().catch(() => null)) || {}).n || 0;
   const { results: mm } = await db.prepare(`SELECT store, day, field, sheet_value, brain_value, brain_source, logged_at FROM sheet_mismatches ORDER BY logged_at DESC, day DESC LIMIT 25`).all().catch(() => ({ results: [] }));
   return {
-    mode: "shadow",
-    write: sheetsWriteOn(env) ? "on (SHEETS_WRITE=0 stops it)" : "off (SHEETS_WRITE=0)",
+    mode: sheetsWriteOn(env) ? WRITER_MODE : "off: SHEETS_WRITE kill switch set (reads and cross-checks continue)",
+    write: sheetsWriteOn(env) ? "on (SHEETS_WRITE=0, false or off stops it)" : "off (SHEETS_WRITE kill switch)",
     workbooks: books,
-    cells_written_today: await n(`SELECT COUNT(*) AS n FROM sheet_writes WHERE written_at >= ? AND verified = 1`, `${since}T00:00:00`),
-    cells_written_total: await n(`SELECT COUNT(*) AS n FROM sheet_writes WHERE verified = 1`),
-    unverified_writes: await n(`SELECT COUNT(*) AS n FROM sheet_writes WHERE verified = 0`),
+    cells_written_today: await n(`SELECT COUNT(*) AS n FROM sheet_writes WHERE written_at >= ? AND status = 'verified'`, `${since}T00:00:00`),
+    cells_written_total: await n(`SELECT COUNT(*) AS n FROM sheet_writes WHERE status = 'verified'`),
+    unverified_writes: await n(`SELECT COUNT(*) AS n FROM sheet_writes WHERE status = 'unverified'`),
+    pending_writes: await n(`SELECT COUNT(*) AS n FROM sheet_writes WHERE status = 'pending'`),
     days_read: await n(`SELECT COUNT(*) AS n FROM sheet_pnl_days`),
     ads_days_from_sheet: await n(`SELECT COUNT(*) AS n FROM ad_spend_days WHERE source = 'sheet'`),
     mismatches_total: await n(`SELECT COUNT(*) AS n FROM sheet_mismatches`),
