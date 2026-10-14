@@ -837,3 +837,30 @@ test("cs size-up gate: a bigger Chinese size is never volunteered (Reilly: 'no u
   // Ordinary size words in a reply are not a size-up.
   assert.equal(sizeUpMention("Your order of the Shawl Cardigan in size M is on its way."), null);
 });
+
+test("cs size-up gate: mentioning a size is not asking about fit; real size/fit questions open it", () => {
+  const asks = (body) => emailAsksAboutSize({ category: "where_is_my_order", subject: "", body });
+  for (const closed of [
+    "I ordered the cardigan in size M two weeks ago, where is it?",
+    "Order #1234\nShawl Cardigan\nSize: M / Navy\nQty: 1\nWhere is my order?",
+    "Can I change the shipping address? Size: L / Grey",
+  ]) assert.equal(asks(closed), false, closed);
+  for (const open of [
+    "what size should I get? I'm 6ft", "Which size do you recommend?", "does it run small?", "does it run large",
+    "the jacket is too small", "way too big on me", "it doesn't fit", "how is the fit on this one?", "any sizing advice?",
+    "do you have a size chart?", "can I exchange for a bigger size?", "could I swap to a smaller size",
+  ]) assert.equal(asks(open), true, open);
+});
+
+test("cs size-up gate: the draft check catches every way of saying 'we sent a bigger size'", () => {
+  for (const said of [
+    "we sent a larger one", "we upsized your order", "we've sent the XL so it fits", "we'll size up for you",
+    "we sent a bigger size", "it's one size up from what you ordered", "we shipped the L instead", "sized it up",
+  ]) {
+    assert.ok(sizeUpMention(`Hi Sam, ${said}. Holt & Crane Customer Care`), said);
+    assert.ok(checkDraft(`Hi Sam, thanks for writing, ${said}. Holt & Crane Customer Care`, {}).some((x) => /sizing up/.test(x)), said);
+  }
+  for (const fine of ["Your Shawl Cardigan in size M has shipped.", "Thanks for your order, it's on its way.", "The medium is in stock."]) {
+    assert.equal(sizeUpMention(fine), null, fine);
+  }
+});

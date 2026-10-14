@@ -25,8 +25,8 @@ Legend: **CODE** = program, no AI · **AI** = Claude for judgement/language · L
 
 ### 1. Quote Desk · CODE (+AI summary) · L1
 - **Wakes:** morning sweep.
-- **Does:** pulls all quotations per store, diffs against yesterday. Status map: 10 to-quote/priority · 25 awaiting *your* confirmation · 26 denied · 30 quoted · 40 unknown (flag). New quotes → Pricing proposals (Catalog, per-store rules). Keeps each store's "Quoted Products: Cost vs Price" sheet current via Sheets Writer.
-- **Alerts:** a product **selling with no quote** (cost unknown) · status-25 items waiting on Reilly · status 40 · the quote queue size and age (H&C ~62 waiting).
+- **Does:** pulls all quotations per store, diffs against yesterday. Status map: 10 to-quote/priority · 25 awaiting *your* confirmation · 26 denied · 30 quoted · 40 waiting on Reilly's approval (Reilly 2026-10-13, his best guess: "FFG quote status 40 i think means i just havent approved it"; not an error). New quotes → Pricing proposals (Catalog, per-store rules). Keeps each store's "Quoted Products: Cost vs Price" sheet current via Sheets Writer.
+- **Alerts:** a product **selling with no quote** (cost unknown) · status-25 and status-40 items waiting on Reilly · the quote queue size and age (H&C ~62 waiting).
 - **Proposes:** quote priority by sales rank (best-sellers first).
 - **Rules:** match by store link handle, never title or KFB SKU · KFB `un_good_price` is a stale snapshot, so store prices come from Shopify · cost = `manual_pricing…nameOne` (EUR).
 
@@ -68,7 +68,7 @@ Legend: **CODE** = program, no AI · **AI** = Claude for judgement/language · L
 ## Rules every supplier agent inherits
 - Absence in KFB means "not yet" until the day is closed. A failed probe (HTML instead of JSON) means retry and screenshot, never "logged out".
 - KFB `refund_status` says nothing about the Shopify refund.
-- Never send a customer a "similar" item without asking; offer it with a photo.
+- ~~Never send a customer a "similar" item without asking; offer it with a photo.~~ Replaced 2026-10-13: asked "does 'similar always fine' cover substitutions on customer orders?", Reilly: "yes". A similar substitute on a customer's order is fine; it is still recorded (verdict on the offer + one event per substitution + a digest line).
 - Get the number before cancelling: KFB saying "too high" is not a cost.
 - Never bypass a CAPTCHA; Reilly logs in.
 - Data files hold only observations; inferences are labelled.
@@ -137,6 +137,7 @@ Every price change and every draft is ONE approval per batch, showing old → ne
 4. **"Similar ones":** your rule: when is similar OK, and when must the listing change or be drafted?
    - **Answered 2026-10-11 (Reilly):** "q4 always fine"
    - Means: a "similar" quote is treated exactly like an exact match: priced by the rules, never drafted for being similar.
+   - **Extended 2026-10-13 (Reilly):** asked "does 'similar always fine' cover substitutions on customer orders?": "yes". Similar substitutes on customer orders are fine, still recorded. Offers judged "ask Reilly" under the old rule are re-judged as accepted, and any open approval for one is expired with a note.
 5. **WhatsApp:** what do you usually message KFB about, and how fast do they reply?
 6. **Returns:** do returned items go to your Charlotte address or back to KFB? For exchanges, does KFB ship the new size from China?
    - **Answered 2026-10-11 (Reilly):** "i never return things to KFB." Returns come to Reilly; replacements/exchanges are new shipments from KFB.

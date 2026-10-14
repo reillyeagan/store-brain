@@ -29,7 +29,7 @@ export const APPROVAL_MAX_ITEMS = 8;
 /** Reilly's words go in every catalog approval: what approving does, and what it doesn't. */
 export const SHADOW_NOTE = "Shadow: approving records your yes; nothing is written to Shopify — change it yourself.";
 /** Only these problems are worth interrupting Reilly for; everything else waits on the page. */
-const APPROVAL_CODES = new Set(["below_floor", "above_ceiling", "cogs_above_band", "ceiling_blocks_band"]);
+const APPROVAL_CODES = new Set(["below_floor", "above_ceiling", "cogs_above_band", "ceiling_blocks_band", "below_min_margin"]);
 const COGS_CODES = new Set(["cogs_above_band", "cogs_below_band", "off_target", "ceiling_blocks_band"]);
 
 /**
@@ -144,7 +144,7 @@ export async function runPricingStore(env, storeId, products, { nowMs, day }) {
 /** One approval line per product: old → new, why, and the ceiling waiver note when it applies. */
 export function approvalLine(f) {
   const c = f.changes && f.changes[0];
-  const why = f.issues.filter((i) => i.severity === "high" || i.code === "ceiling_blocks_band").map((i) => i.code.replace(/_/g, " ")).join(", ");
+  const why = f.issues.filter((i) => i.severity === "high" || i.code === "ceiling_blocks_band" || i.code === "below_min_margin").map((i) => i.code.replace(/_/g, " ")).join(", ");
   const head = c
     ? `${f.title}: ${money(c.old_price)} → ${money(c.new_price)}${c.old_compare_at !== c.new_compare_at ? `, compare-at ${money(c.old_compare_at)} → ${money(c.new_compare_at)}` : ""}`
     : `${f.title}: stays ${money(f.price_max)}`;
@@ -157,7 +157,9 @@ export function approvalLine(f) {
 async function maybeApprove(env, storeId, findings, summary) {
   if (env.CATALOG_APPROVALS === "0") return null;
   const worst = findings.filter((f) => f.issues.some((i) => APPROVAL_CODES.has(i.code)) &&
-    (f.issues.some((i) => i.code === "ceiling_blocks_band") || (f.severity === "high" && f.changes_total > 0)))
+    // A margin under a store's minimum (Auberlane $30) is asked about even though it's "medium":
+    // the rules alone can't fix it, so it needs Reilly.
+    (f.issues.some((i) => i.code === "ceiling_blocks_band" || i.code === "below_min_margin") || (f.severity === "high" && f.changes_total > 0)))
     .slice(0, APPROVAL_MAX_ITEMS);
   if (!worst.length) return null;
   const fingerprint = worst.map((f) => `${f.product_id}:${f.changes && f.changes[0] ? f.changes[0].new_price : "ceiling"}`).sort().join("|");
@@ -180,7 +182,7 @@ async function maybeApprove(env, storeId, findings, summary) {
   options.push({ id: "leave", label: "Leave these prices as they are", detail: `Nothing changes; not asked again unless the proposal changes. ${SHADOW_NOTE}` });
   const id = await createApproval(env.DB, {
     dept: DEPT, requestedBy: AGENT, store: storeId,
-    title: `${STORES[storeId].name}: ${worst.length} prices break the floor/ceiling/COGS rules${capped.length ? ` (${capped.length} blocked by the $${PRICE_CEILING} ceiling)` : ""}${total > worst.length ? `; ${total} findings in all, see Catalog page` : ""}. ${SHADOW_NOTE}`,
+    title: `${STORES[storeId].name}: ${worst.length} prices break the floor/ceiling/COGS/margin rules${capped.length ? ` (${capped.length} blocked by the $${PRICE_CEILING} ceiling)` : ""}${total > worst.length ? `; ${total} findings in all, see Catalog page` : ""}. ${SHADOW_NOTE}`,
     options,
   });
   return { id, fingerprint };

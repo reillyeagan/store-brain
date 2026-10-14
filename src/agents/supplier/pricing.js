@@ -54,10 +54,14 @@ export function planVariantPrice(store, { costUsd, price, compareAt }) {
     limitedBy = "floor";
     notes.push(`floor $${rules.floor} applied`);
   }
+  // Minimum margin per unit (Auberlane $30, Reilly "yes" 2026-10-13): a proposal under it is
+  // flagged in the batch, never quietly re-priced.
+  const belowMinMargin = !!(rec.minMargin && rec.minMargin.met === false);
+  if (belowMinMargin) notes.push(`below_min_margin: $${rec.minMargin.margin.toFixed(2)} margin per unit at $${rec.price.toFixed(2)}, under the $${rec.minMargin.required} minimum`);
   const change = priceChanges || toCents(newCompareAt) !== toCents(cmp);
   return {
     newPrice: rec.price, newCompareAt, tier, change,
     cogsOld: cogsPct(costUsd, price), cogsNew: cogsPct(costUsd, rec.price),
-    limitedBy, waiverPrice, rule: rec.reason, notes,
+    limitedBy, waiverPrice, rule: rec.reason, notes, belowMinMargin, minMargin: rec.minMargin || null,
   };
 }

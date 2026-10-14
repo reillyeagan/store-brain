@@ -425,4 +425,6 @@ test("decisions: Reilly's open-questions answers (2026-10-13) are seeded verbati
     assert.match(seed.source, /^chat 2026-10-13/, topic);
     if (words === "yes" || words === "no") assert.match(seed.source, /Q: .+\?/, `${topic}: the question stands with the bare answer`);
   }
+  // The Judge.me source claims nothing beyond where the words came from.
+  assert.equal(SEED_DECISIONS.find((s) => s.topic === "cs.review_requests").source, "chat 2026-10-13 (open-questions answers)");
 });

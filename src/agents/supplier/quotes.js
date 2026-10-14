@@ -55,7 +55,7 @@ export const STATUS_BY_CODE = Object.freeze({ 10: "pending", 25: "awaiting_reill
 export const STATUS_LABELS = Object.freeze({
   pending: "waiting on KFB to quote",
   awaiting_reilly: "waiting on Reilly's KFB confirmation (status 25)",
-  awaiting_reilly_guess: "waiting on Reilly's approval (status 40: Reilly's best guess, \"i think\")",
+  awaiting_reilly_guess: "waiting on Reilly's approval — status 40 (Reilly: FFG, 'i think')",
   denied: "denied by KFB",
   quoted: "quoted",
   unknown: "unknown status",
@@ -156,6 +156,22 @@ export function validateQuoteRow(r) {
   const similar = r.similar != null && r.similar !== "" ? /^(1|true|yes|y)$/i.test(String(r.similar)) : /similar/i.test(String(r.remark || ""));
   const variantId = r.variant_id ? String(r.variant_id) : "";
   return { store, handle, code, status, quotedAt, cost, currency, similar, variantId };
+}
+
+/**
+ * Rows imported before 2026-10-13 hold KFB's raw code 40 (status_code) but the old meaning
+ * "unknown". Re-mapped to the new meaning; the raw code is kept, so this is exact, not a guess
+ * about which rows were 40. OR IGNORE: if the same quote already exists under the new status,
+ * the old row is left as it was rather than breaking the UNIQUE key.
+ */
+export async function remapStatus40(db, nowMs = Date.now()) {
+  const r = await db.prepare(`UPDATE OR IGNORE kfb_quotes SET status = 'awaiting_reilly_guess' WHERE status_code = 40 AND status = 'unknown'`).run();
+  const n = (r.meta && r.meta.changes) || 0;
+  if (n) {
+    await logEvent(db, { actor: ACTOR, kind: "quotes.status40_remapped", at: nowIso(nowMs),
+      summary: `${n} KFB quote row${n === 1 ? "" : "s"} at status 40 re-labelled from "unknown" to "${STATUS_LABELS.awaiting_reilly_guess}"`, data: { rows: n } });
+  }
+  return n;
 }
 
 /* ---------------------------------------------------------------- Quote Desk run */
@@ -305,6 +321,7 @@ export async function writeQuoteCost(db, store, key, q, nowMs = Date.now()) {
  */
 export async function runQuoteDesk(env, { nowMs = Date.now(), fetchImpl = fetch } = {}) {
   const db = env.DB;
+  await remapStatus40(db, nowMs);
   const results = [];
   for (const store of LIVE_STORE_IDS) {
     if (!rulesFor(store)) { results.push({ store, skipped: "no pricing rules" }); continue; }
@@ -487,7 +504,7 @@ export function planProduct(store, handle, quotes, product, hold = null, fx = FX
     const p = planVariantPrice(store, { costUsd: usd, price, compareAt: cmp });
     rows.push({ id: v.id, title: v.title, sku: v.sku || null, cost_usd: round2(usd), old_price: price, new_price: p.newPrice, old_compare_at: cmp,
       new_compare_at: p.newCompareAt, tier: p.tier, change: p.change, cogs_old: round4(p.cogsOld), cogs_new: round4(p.cogsNew),
-      waiver_price: p.waiverPrice, rule: p.rule, notes: p.notes });
+      waiver_price: p.waiverPrice, rule: p.rule, notes: p.notes, below_min_margin: p.belowMinMargin });
   }
   if (!rows.length) return { ...base, kind: "cannot_price", reason: "no variant has a usable quote" };
 
@@ -499,6 +516,7 @@ export function planProduct(store, handle, quotes, product, hold = null, fx = FX
     cogs_old: first.cogs_old, cogs_new: first.cogs_new, variants: rows,
     waiver_price: rows.reduce((m, r) => (r.waiver_price != null && r.change ? Math.max(m ?? 0, r.waiver_price) : m), null),
     reason: first.rule,
+    below_min_margin: rows.some((r) => r.below_min_margin),
   });
   base.notes.push(...new Set(rows.flatMap((r) => r.notes)));
   if (q0 && String(q0.currency).toUpperCase() === "EUR") base.notes.push(`EUR→USD at ${fx.source}`);
@@ -548,7 +566,8 @@ export function planLines(p) {
   const name = p.title || p.product_handle;
   if (p.kind === "draft") return [`${name}: draft it (${p.reason})`];
   const one = (v) => `${money(v.old_price)} → ${money(v.new_price)}, compare-at ${money(v.old_compare_at)} → ${money(v.new_compare_at)}` +
-    (v.waiver_price != null ? ` (band needs ${money(v.waiver_price)})` : "");
+    (v.waiver_price != null ? ` (band needs ${money(v.waiver_price)})` : "") +
+    (v.below_min_margin ? " (UNDER the minimum margin per unit: your call)" : "");
   const changed = (p.variants || []).filter((v) => v.change);
   if (!changed.length) return [`${name}: ${one(p)}`];
   return [`${name}:`, ...changed.map((v) => `  ${v.title || v.id}: ${one(v)}`)];

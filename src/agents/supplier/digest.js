@@ -119,7 +119,7 @@ export function digestBody(d) {
     const o = d.quotes.open;
     out.push(`• Quotes: ${(o.quoted || 0) + (o.denied || 0)} not yet planned (${o.quoted || 0} quoted, ${o.denied || 0} denied)` +
       (d.quotes.awaitingReilly ? ` · ${d.quotes.awaitingReilly} waiting for your KFB confirmation (status 25)` : "") +
-      (d.quotes.awaitingReilly40 ? ` · ${d.quotes.awaitingReilly40} at status 40: waiting on your approval (your best guess, "i think")` : "") +
+      (d.quotes.awaitingReilly40 ? ` · ${d.quotes.awaitingReilly40} waiting on your approval — status 40 (Reilly: FFG, 'i think')` : "") +
       (d.quotes.unknown ? ` · ${d.quotes.unknown} with an unknown status: check` : "") + ".");
   }
   for (const b of d.batchesWaiting) {

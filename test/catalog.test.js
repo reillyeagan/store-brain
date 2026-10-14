@@ -7,7 +7,7 @@ import { EUR_USD_ESTIMATE } from "../src/lib/pnl.js";
 
 import * as R from "../src/agents/catalog/pricingRules.js";
 import { syncStore, getSync, cacheReady, PAGE_SIZE, PAGES_PER_TICK, PRODUCTS_QUERY } from "../src/agents/catalog/sync.js";
-import { checkProduct, SHADOW_NOTE } from "../src/agents/catalog/pricing.js";
+import { checkProduct, SHADOW_NOTE, runPricingStore } from "../src/agents/catalog/pricing.js";
 import { judgeProduct, contributionPerDollar } from "../src/agents/catalog/marginGuard.js";
 import { statusProposals } from "../src/agents/catalog/status.js";
 import { checkNewProduct, supplyCheck } from "../src/agents/catalog/prepublish.js";
@@ -725,4 +725,28 @@ test("rules: Auberlane $30 minimum margin per unit (Reilly: 'yes'): known cost o
   // Stores without the rule have no check at all (null, not "met").
   assert.equal(R.validatePrice("hc", { price: 44.95, cost: 14 }).minMargin, null);
   assert.equal(R.validatePrice("mar", { price: 49.95, cost: 14 }).minMargin, null);
+});
+
+test("rules: the minimum margin is checked on the PROPOSED price too, and puts the product in front of Reilly", async () => {
+  // Today $164.95 − $120 = $44.95 is fine; the rules would cut it to the $144.95 ceiling → $24.95.
+  const rec = R.recommendPrice("aub", 164.95, 120);
+  assert.equal(rec.price, 144.95);
+  assert.deepEqual(rec.minMargin, { required: 30, margin: 24.95, met: false });
+  assert.match(rec.reason, /under the \$30 minimum margin/);
+  const v = R.validatePrice("aub", { price: 164.95, cost: 120 });
+  const issue = v.issues.find((i) => i.code === "below_min_margin");
+  assert.ok(issue);
+  assert.match(issue.message, /rules' price \$144\.95 would leave \$24\.95/);
+  assert.equal(R.recommendPrice("aub", 64.95, null).minMargin.met, null, "unknown cost: null, never a pass");
+
+  // Pricing run: a below-minimum product is asked about (below_min_margin is an approval code).
+  const DB = makeD1();
+  const p = cached(7, { price: 144.95 });
+  await DB.prepare(`INSERT INTO core_facts (store, area, key, value, kind, source, observed_at, live) VALUES ('aub', 'supplier', ?, '120', 'observation', 'test', ?, 1)`)
+    .bind(`cost:product:${pid(7)}`, "2026-10-13T00:00:00Z").run();
+  const out = await runPricingStore({ DB }, "aub", [p], { nowMs: Date.parse("2026-10-13T16:00:00Z"), day: "2026-10-13" });
+  assert.ok(out.approvalId, "asked about");
+  const ap = await DB.prepare(`SELECT title, options FROM approvals WHERE id = ?`).bind(out.approvalId).first();
+  assert.match(ap.title, /floor\/ceiling\/COGS\/margin/);
+  assert.match(ap.options, /below min margin/);
 });

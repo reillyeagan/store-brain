@@ -220,7 +220,11 @@ export function recommendPrice(storeId, currentPrice, cost, { fx = EUR_USD_ESTIM
 
   if (price < rules.floor) { price = rules.floor; reason += `; floor $${rules.floor}`; }
   if (price > rules.ceiling) { price = rules.ceiling; reason += `; ceiling $${rules.ceiling}`; }
-  return { price: round2(price), reason, ceilingBlocksBand };
+  // The minimum margin is checked on the proposed price too, but never fixed silently: a
+  // proposal under it is flagged for Reilly (minMargin.met === false), the price stays the rules'.
+  const minMargin = checkMinMargin(rules, round2(price), c);
+  if (minMargin && minMargin.met === false) reason += `; under the $${minMargin.required} minimum margin`;
+  return { price: round2(price), reason, ceilingBlocksBand, minMargin };
 }
 
 /* ---------------- compare-at tiers ---------------- */
@@ -352,6 +356,9 @@ export function validatePrice(storeId, { price, compareAt = null, cost = null } 
   const minMargin = checkMinMargin(rules, p, c);
   if (minMargin && minMargin.met === false) {
     add("below_min_margin", "medium", `Margin $${minMargin.margin.toFixed(2)} per unit is under the $${minMargin.required} minimum (price $${p.toFixed(2)} − cost $${c.usd.toFixed(2)})`);
+  } else if (rec.minMargin && rec.minMargin.met === false && Math.abs(rec.price - p) > 0.004) {
+    // Today's price is fine, but the price the rules would move it to is not.
+    add("below_min_margin", "medium", `The rules' price $${rec.price.toFixed(2)} would leave $${rec.minMargin.margin.toFixed(2)} margin per unit, under the $${rec.minMargin.required} minimum`);
   }
 
   // Compare-at: clean ending, above the price, badge prints an exact tier.

@@ -603,14 +603,60 @@ test("Size Checker audiences from config and the Core: H&C's unmarked line gets 
   const asks = (await DB.prepare(`SELECT order_name FROM kfb_size_asks ORDER BY order_name`).all()).results.map((a) => a.order_name);
   assert.deepEqual(asks, ["#1403"], "only Marlowe's men's line gets a size ask");
 
-  // A live Core fact still overrides the config.
-  await DB.prepare(`INSERT INTO core_facts (store, area, key, value, kind, source, observed_at, live) VALUES ('hc', 'profile', 'profile.audience', 'mens', 'rule', 'test', ?, 1)`).bind(iso(NOW)).run();
-  assert.equal((await coreSizing(DB, "hc")).audience, "men");
   assert.equal((await coreSizing(DB, "aub")).audience, "women");
   assert.equal((await coreSizing(DB, "cc")).audience, null, "not told yet: null, never a default");
   assert.equal(productAudience({ tags: '["Mens"]' }), "men");
   assert.equal(productAudience({ tags: '["Womens"]' }), "women");
   assert.equal(productAudience({ title: "Plain Sweater" }), null);
+});
+
+test("Size Checker: Reilly's recorded audience outranks Core facts; a disagreeing fact is a conflict note; all-stores facts are ignored", async () => {
+  const DB = makeD1();
+  const fact = (store, value) => DB.prepare(`INSERT INTO core_facts (store, area, key, value, kind, source, observed_at, live) VALUES (?, 'profile', 'profile.audience', ?, 'rule', 'test', ?, 1)`).bind(store, value, iso(NOW)).run();
+  await fact(null, "womens");          // all-stores fact: can't speak for one store, ignored
+  await fact("hc", "mens");            // disagrees with H&C "both": would switch off the per-product check
+  await fact("mar", "mens");           // agrees with Marlowe: no change, no note
+  await fact("cc", "womens");          // a store Reilly hasn't described yet: the store-scoped fact is used
+  const hc = await coreSizing(DB, "hc");
+  assert.equal(hc.audience, "both", "a fact never disables H&C's per-product check");
+  assert.match(hc.audienceConflict, /disagrees with Reilly's recorded audience "both"/);
+  const mar = await coreSizing(DB, "mar");
+  assert.equal(mar.audience, "men");
+  assert.equal(mar.audienceConflict, null);
+  assert.equal((await coreSizing(DB, "aub")).audience, "women", "the all-stores 'womens' fact is ignored; config stands");
+  assert.equal((await coreSizing(DB, "aub")).audienceConflict, null);
+  assert.equal((await coreSizing(DB, "cc")).audience, "women");
+  // The run: H&C's unmarked line stays unsized, and the reason carries the conflict note.
+  await seedOrder(DB, { n: 1501 });
+  await seedChart(DB, "p1", SMALL_CHART, 1);
+  await runSizeChecker({ DB }, { nowMs: NOW });
+  const rec = await DB.prepare(`SELECT verdict, reason FROM size_recommendations WHERE order_id = 'gid://shopify/Order/1501'`).first();
+  assert.equal(rec.verdict, "no_reference");
+  assert.match(rec.reason, /conflict: Core fact profile\.audience "mens" disagrees/);
+  assert.equal((await DB.prepare(`SELECT COUNT(*) AS n FROM kfb_size_asks`).first()).n, 0);
+});
+
+test("Size Checker: every feminine marker is women's; a product marked both ways is never sized as men's", () => {
+  const base = { title: "Shawl Collar Cardigan", orderedSize: "M", chartRows: SMALL_CHART };
+  const probes = [
+    { tags: ["Mens", "Womenswear"] }, { tags: ["Men's", "Woman"] }, { productType: "Men's / Lady" }, { tags: ["Mens", "Female"] },
+    { tags: ["Girls"] }, { tags: ["Lady"] }, { title: "Woman's Cardigan" }, { tags: ["female"] },
+  ];
+  for (const audience of ["both", "men"]) {
+    for (const marks of probes) {
+      const r = recommendSize({ ...base, audience, ...marks });
+      assert.notEqual(r.verdict, "size_up", `${audience} ${JSON.stringify(marks)}`);
+      assert.equal(r.verdict, "no_reference", `${audience} ${JSON.stringify(marks)}`);
+      assert.equal(r.send_size, null);
+    }
+  }
+  assert.equal(productAudience({ tags: ["Mens", "Womenswear"] }), "mixed");
+  assert.match(recommendSize({ ...base, audience: "both", tags: ["Mens", "Female"] }).reason, /marked both men's and women's/);
+  // Men's markers, including menswear / male, still size at a "both" store.
+  for (const marks of [{ tags: ["Menswear"] }, { productType: "Male" }, { tags: ["Men"] }]) {
+    assert.equal(recommendSize({ ...base, audience: "both", ...marks }).send_size, "L", JSON.stringify(marks));
+  }
+  assert.equal(productAudience({ tags: ["Female"] }), "women", "\\bmale never matches inside 'female'");
 });
 
 /* ------------------------------------------------------------ Similar QC */
@@ -644,15 +690,59 @@ test("Quote status 40 means 'waiting on Reilly's approval' (his best guess), not
   assert.equal(v.reason, undefined);
   assert.equal(v.status, "awaiting_reilly_guess");
   assert.match(STATUS_LABELS[v.status], /waiting on Reilly's approval/);
-  assert.match(STATUS_LABELS[v.status], /best guess/);
+  assert.match(STATUS_LABELS[v.status], /status 40 \(Reilly: FFG, 'i think'\)/);
   const DB = makeD1();
   await importQuotes(DB, [{ store: "hc", handle: "a", status: 40, quoted_at: "2026-10-13" }], { nowMs: NOW });
   const d = await digestData(DB, NOW);
   assert.equal(d.quotes.awaitingReilly40, 1);
   assert.equal(d.quotes.unknown, 0);
   const body = digestBody(d);
-  assert.match(body, /1 at status 40: waiting on your approval \(your best guess, "i think"\)/);
+  assert.match(body, /1 waiting on your approval — status 40 \(Reilly: FFG, 'i think'\)/);
   assert.doesNotMatch(body, /unknown status/);
+});
+
+test("Quote status 40: rows stored before the change (raw code 40, status 'unknown') are re-mapped on the next run", async () => {
+  const DB = makeD1();
+  const ins = (handle, code, status) => DB.prepare(`INSERT INTO kfb_quotes (store, product_handle, variant_id, status_code, status, quoted_at, source, imported_at)
+    VALUES ('hc', ?, '', ?, ?, '2026-10-12T00:00:00.000Z', 'manual', ?)`).bind(handle, code, status, iso(NOW)).run();
+  await ins("old-40", 40, "unknown");
+  await ins("other-unknown", null, "unknown");   // no raw code: left alone, never guessed
+  await ins("dup", 40, "unknown");
+  await ins("dup", 40, "awaiting_reilly_guess"); // already there under the new status: the old row is kept as it was
+  await runQuoteDesk({ DB, ...HC_CREDS }, { nowMs: NOW, fetchImpl: fakeShopify({}).fetchImpl });
+  const st = async (h) => (await DB.prepare(`SELECT status FROM kfb_quotes WHERE product_handle = ? ORDER BY id`).bind(h).all()).results.map((r) => r.status);
+  assert.deepEqual(await st("old-40"), ["awaiting_reilly_guess"]);
+  assert.deepEqual(await st("other-unknown"), ["unknown"]);
+  assert.deepEqual(await st("dup"), ["unknown", "awaiting_reilly_guess"]);
+  assert.equal((await DB.prepare(`SELECT COUNT(*) AS n FROM events WHERE kind = 'quotes.status40_remapped'`).first()).n, 1);
+});
+
+test("Similar QC: old 'ask_reilly' order offers are re-judged as accepted and their open approvals expired with a note (nothing deleted)", async () => {
+  const DB = makeD1();
+  await recordSimilarOffer(DB, { store: "hc", context: "order", order_name: "#1099", remark: "similar colour" }, { nowMs: NOW - DAY });
+  await DB.prepare(`UPDATE kfb_similar_offers SET verdict = 'ask_reilly', verdict_reason = 'old rule', judged_at = ?`).bind(iso(NOW - DAY)).run();
+  await DB.prepare(`INSERT INTO approvals (created_at, dept, requested_by, title, options, status) VALUES (?, 'sup', 'sup.similar_qc', 'Similar item for #1099?', '[]', 'pending')`).bind(iso(NOW - DAY)).run();
+  const r = await runSimilarQc({ DB }, { nowMs: NOW });
+  assert.equal(r.substituted, 1);
+  assert.equal(r.approvalsExpired, 1);
+  const o = await DB.prepare(`SELECT verdict, verdict_reason FROM kfb_similar_offers WHERE order_name = '#1099'`).first();
+  assert.equal(o.verdict, "accepted");
+  assert.match(o.verdict_reason, /Re-judged .* \(was ask_reilly\)/);
+  const a = await DB.prepare(`SELECT status, note FROM approvals WHERE requested_by = 'sup.similar_qc'`).first();
+  assert.equal(a.status, "expired");
+  assert.match(a.note, /Expired by the brain: covered by Reilly's 2026-10-13 answer \("yes"/);
+  assert.equal((await DB.prepare(`SELECT COUNT(*) AS n FROM kfb_similar_offers`).first()).n, 1, "kept, not deleted");
+  assert.equal((await runSimilarQc({ DB }, { nowMs: NOW + 60000 })).judged, 0, "done once");
+});
+
+test("Quote Desk: a proposal under Auberlane's $30 minimum margin is flagged, not quietly re-priced", () => {
+  // $120 cost: band target is above the ceiling, so the rules stop at $144.95 → $24.95 margin.
+  const p = planVariantPrice("aub", { costUsd: 120, price: 129.95, compareAt: null });
+  assert.equal(p.newPrice, 144.95);
+  assert.equal(p.belowMinMargin, true);
+  assert.ok(p.notes.some((n) => /below_min_margin: \$24\.95 margin/.test(n)), p.notes.join("; "));
+  assert.equal(planVariantPrice("aub", { costUsd: 20, price: 69.95, compareAt: null }).belowMinMargin, false);
+  assert.equal(planVariantPrice("hc", { costUsd: 120, price: 129.95, compareAt: null }).belowMinMargin, false, "H&C has no minimum-margin rule");
 });
 
 /* ------------------------------------------------------------ Pre-flight */

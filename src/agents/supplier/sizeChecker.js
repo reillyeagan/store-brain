@@ -77,26 +77,37 @@ export const GARMENTS = Object.freeze({
 });
 const BOTTOMS_RE = /\b(pants|trousers|jeans|chinos?|shorts|joggers|slacks|skirt)\b/i;
 const WOMENS_RE = /\b(women'?s?|womens|ladies|her)\b/i;
-// Word boundaries matter: "women" contains "men", and \bmen never matches inside "women".
-const WOMEN_MARK_RE = /\b(women'?s?|womens|ladies)\b/i;
-const MEN_MARK_RE = /\b(men'?s?|mens)\b/i;
+// Word boundaries matter: "women" contains "men" and "female" contains "male"; \bmen and
+// \bmale never match inside them. Any feminine marker counts (woman, womenswear, lady, girl...).
+const WOMEN_MARK_RE = /\b(wom[ae]n(?:'?s)?|womens|womenswear|lad(?:y|ies)(?:'?s)?|females?|girls?(?:'?s)?)\b/i;
+const MEN_MARK_RE = /\b(m[ae]n(?:'?s)?|mens|menswear|males?)\b/i;
 
 /** The reason a "both" store's unmarked product gets no size (only H&C is "both" today). */
 export const UNMARKED_BOTH_REASON = "H&C sells men's and women's; this product isn't marked either way";
+/** A product marked both men's and women's: no reference, never men's. */
+export const MIXED_MARKS_REASON = "product is marked both men's and women's: no size reference (never sized as men's)";
+
+/** Which audience one free-text value names ("women", "men", "both"), or null. */
+export function audienceOfText(text) {
+  const s = String(text || "");
+  const w = WOMEN_MARK_RE.test(s), m = MEN_MARK_RE.test(s);
+  if ((w && m) || /\b(both|unisex)\b/i.test(s)) return "both";
+  return w ? "women" : m ? "men" : null;
+}
 
 /**
  * Which audience one product is marked for, from its title, tags (array or JSON array) and
- * product type. Women's wins when both appear: a women's line must never be sized against
- * the men's chart, so any doubt falls on the cautious side.
- * @returns {"women"|"men"|null}
+ * product type. Both markers present → "mixed": never sized as men's (a women's line must
+ * never be sized against the men's chart, so doubt falls on the cautious side).
+ * @returns {"women"|"men"|"mixed"|null}
  */
 export function productAudience({ title = null, tags = null, productType = null } = {}) {
   let t = tags;
   if (typeof t === "string") { try { t = JSON.parse(t); } catch { t = [t]; } }
   const text = [title, productType, ...(Array.isArray(t) ? t : [])].filter(Boolean).map(String).join(" | ");
-  if (WOMEN_MARK_RE.test(text)) return "women";
-  if (MEN_MARK_RE.test(text)) return "men";
-  return null;
+  const w = WOMEN_MARK_RE.test(text), m = MEN_MARK_RE.test(text);
+  if (w && m) return "mixed";
+  return w ? "women" : m ? "men" : null;
 }
 
 export function garmentOf(title) {
@@ -172,6 +183,7 @@ export function recommendSize({ title, orderedSize, chartRows, complaints = [], 
   if (garment === "bottoms") return { verdict: "no_reference", send_size: null, reason: "bottoms: no US waist/inseam reference yet", conflict: false };
   // Women's by store audience, by the title, or by the product's own tags/type (at any store).
   const marked = productAudience({ title, tags, productType });
+  if (marked === "mixed") return { verdict: "no_reference", send_size: null, reason: MIXED_MARKS_REASON, conflict: false };
   if (audience === "women" || WOMENS_RE.test(String(title || "")) || marked === "women") return { verdict: "no_reference", send_size: null, reason: "women's item: no women's US reference yet", conflict: false };
   // A store that sells both: only a product marked men's gets the men's reference. Never assume.
   if (audience === "both" && marked !== "men") return { verdict: "no_reference", send_size: null, reason: UNMARKED_BOTH_REASON, conflict: false };
@@ -273,22 +285,33 @@ export function listedSizes(variantsJson) {
 }
 
 /**
- * Audience (store config default, Core override) and the US reference per garment.
- * The config holds Reilly's word; a live Core fact `profile.audience` still overrides it.
+ * Audience and the US reference per garment.
+ *
+ * Audience: Reilly's recorded word (STORES[store].audience, 2026-10-13) wins. Core facts are
+ * only read when they are scoped to THIS store (an all-stores fact can't speak for one store),
+ * and even then never outrank the config: a fact that agrees changes nothing, a fact that
+ * disagrees is reported as a conflict note and ignored. So a fact can never switch off H&C's
+ * per-product check. Only a store Reilly hasn't described yet (audience null) takes its
+ * audience from a store-scoped fact.
+ * @returns {{audience, audienceConflict:string|null, references}}
  */
 export async function coreSizing(db, store) {
-  const out = { audience: (STORES[store] && STORES[store].audience) || null, references: {} };
+  const config = (STORES[store] && STORES[store].audience) || null;
+  const out = { audience: config, audienceConflict: null, references: {} };
   const { results } = await db.prepare(
-    `SELECT key, value FROM core_facts WHERE live = 1 AND (store = ? OR store IS NULL) AND (key = 'profile.audience' OR key LIKE 'sizing.us_reference:%')
+    `SELECT key, value, store FROM core_facts WHERE live = 1 AND (
+        (key = 'profile.audience' AND store = ?) OR (key LIKE 'sizing.us_reference:%' AND (store = ? OR store IS NULL)))
       ORDER BY id`
-  ).bind(store).all().catch(() => ({ results: [] }));
+  ).bind(store, store).all().catch(() => ({ results: [] }));
   for (const f of results || []) {
-    // A fact naming both ("mens and womens") is "both"; an unreadable fact keeps the config value.
     if (f.key === "profile.audience") {
-      const w = WOMEN_MARK_RE.test(f.value), m = MEN_MARK_RE.test(f.value) || /\bboth\b/i.test(f.value);
-      out.audience = w && m ? "both" : w ? "women" : m ? "men" : out.audience;
-    }
-    else {
+      const said = audienceOfText(f.value);
+      if (!said) continue; // unreadable fact: ignored
+      if (!config) out.audience = said;
+      else if (said !== config) {
+        out.audienceConflict = `Core fact profile.audience "${String(f.value).slice(0, 60)}" disagrees with Reilly's recorded audience "${config}" (2026-10-13): Reilly's used`;
+      }
+    } else {
       try { out.references[f.key.split(":")[1]] = JSON.parse(f.value); } catch { /* bad fact: ignored, default used */ }
     }
   }
@@ -337,6 +360,7 @@ export async function runSizeChecker(env, { nowMs = Date.now() } = {}) {
       tags: listing && listing.tags, productType: listing && listing.product_type });
     let reason = rec.reason;
     if (rec.verdict !== "no_chart" && rec.verdict !== "no_reference" && !core[l.store].audience) reason += " (audience assumed men's: not in the Core yet)";
+    if (core[l.store].audienceConflict) reason += ` (conflict: ${core[l.store].audienceConflict})`;
     const verified = chartRows && chartRows.length ? (chartRows.every((r) => r.verified) ? 1 : 0) : null;
     if (verified === 0) reason += " (chart read by the brain, not yet checked)";
 

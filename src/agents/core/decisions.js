@@ -95,7 +95,7 @@ export const SEED_DECISIONS = Object.freeze([
   // A fact for Risk, not a rule: #1098 is a chargeback (dispute), so the refund question on it is closed.
   { at: OPEN_QS_AT, topic: "risk.order_1098", scope: "hc", source: `${OPEN_QS} — H&C #1098: now a chargeback; refund question closed`,
     words: "1098 turned into a chargeback and the shipping status still isnt updating" },
-  { at: OPEN_QS_AT, topic: "cs.review_requests", scope: "all", source: `${OPEN_QS} — Judge.me review-request emails (setting changed in the browser separately)`,
+  { at: OPEN_QS_AT, topic: "cs.review_requests", scope: "all", source: OPEN_QS,
     words: "off turn them off on all stores please" },
 ]);
 

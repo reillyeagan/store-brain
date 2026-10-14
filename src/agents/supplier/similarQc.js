@@ -56,11 +56,17 @@ export async function recordSimilarOffer(db, o, { source = "manual", nowMs = Dat
 export async function runSimilarQc(env, { nowMs = Date.now() } = {}) {
   const db = env.DB;
   const at = nowIso(nowMs);
-  const { results } = await db.prepare(`SELECT * FROM kfb_similar_offers WHERE verdict IS NULL ORDER BY id LIMIT 100`).all();
+  // New offers, plus order offers judged "ask_reilly" under the old rule: Reilly's "yes"
+  // (2026-10-13) covers them too, so they are re-judged (kept, never deleted).
+  const { results } = await db.prepare(
+    `SELECT * FROM kfb_similar_offers WHERE verdict IS NULL OR (context = 'order' AND verdict = 'ask_reilly') ORDER BY id LIMIT 100`
+  ).all();
+  const expired = await expireOldOrderApprovals(db, at);
   let accepted = 0; const substitutes = []; const asks = [];
   for (const o of results || []) {
     const j = judgeSimilar(o);
-    await db.prepare(`UPDATE kfb_similar_offers SET verdict = ?, verdict_reason = ?, judged_at = ? WHERE id = ?`).bind(j.verdict, j.reason, at, o.id).run();
+    const reason = o.verdict ? `Re-judged under Reilly's 2026-10-13 answer (was ${o.verdict}): ${j.reason}` : j.reason;
+    await db.prepare(`UPDATE kfb_similar_offers SET verdict = ?, verdict_reason = ?, judged_at = ? WHERE id = ?`).bind(j.verdict, reason, at, o.id).run();
     if (j.verdict !== "accepted") asks.push(o);
     else if (o.context === "order") substitutes.push(o);
     else accepted++;
@@ -80,5 +86,23 @@ export async function runSimilarQc(env, { nowMs = Date.now() } = {}) {
       summary: `${STORES[o.store] ? STORES[o.store].name : o.store} ${o.order_name || o.product_handle}: similar offer with an unknown context: not covered by Reilly's rule`,
       data: { offerId: o.id, remark: o.remark, photo: o.photo_url } });
   }
-  return { judged: (results || []).length, accepted: accepted + substitutes.length, substituted: substitutes.length, flagged: asks.length };
+  return { judged: (results || []).length, accepted: accepted + substitutes.length, substituted: substitutes.length, flagged: asks.length, approvalsExpired: expired };
+}
+
+/**
+ * Any approval still open from the old "ask Reilly about a similar item on an order" rule is
+ * answered by his 2026-10-13 "yes": expired with a note saying so (kept as history, not deleted).
+ */
+async function expireOldOrderApprovals(db, at) {
+  const { results } = await db.prepare(`SELECT id FROM approvals WHERE requested_by = ? AND status = 'pending'`).bind(ACTOR).all();
+  for (const a of results || []) {
+    await db.prepare(`UPDATE approvals SET status = 'expired', decided_at = ?, note = ? WHERE id = ? AND status = 'pending'`)
+      .bind(at, `Expired by the brain: covered by Reilly's 2026-10-13 answer ("${SIMILAR_ORDERS_RULE.words}" to "${SIMILAR_ORDERS_RULE.question}"): similar substitutes on orders are fine`, a.id).run();
+  }
+  if ((results || []).length) {
+    await logEvent(db, { actor: ACTOR, kind: "similar.approvals_expired", target: "core.approvals", at,
+      summary: `${results.length} open similar-item approval${results.length === 1 ? "" : "s"} expired: Reilly's "yes" (2026-10-13) covers order substitutions`,
+      data: { approvalIds: results.map((a) => a.id) } });
+  }
+  return (results || []).length;
 }
