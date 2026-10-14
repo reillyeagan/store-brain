@@ -183,7 +183,7 @@ export async function gatherBriefData(env, { nowMs = Date.now() } = {}) {
   // Risk: alarms and errors in the last 24 hours. Restatements are read separately, so
   // a run of tiny ones can never push a real alarm out of the list.
   const { results: alarmRows } = await db.prepare(
-    `SELECT kind, store, summary FROM events
+    `SELECT kind, store, summary, data FROM events
       WHERE at >= ? AND (kind IN ('payout.mismatch', 'feed.alarm') OR kind LIKE 'error.%')
         AND (? = 1 OR kind NOT LIKE 'error.tracking%')
       ORDER BY id DESC LIMIT 8`
@@ -198,7 +198,18 @@ export async function gatherBriefData(env, { nowMs = Date.now() } = {}) {
     if (!d || !d.after || !d.before) return true;
     return (d.changed || []).some((k) => d.before[k] == null || d.after[k] == null || Math.abs(Number(d.after[k]) - Number(d.before[k])) >= 5);
   };
-  const alarms = [...(alarmRows || []), ...(restatedRows || []).filter(bigRestatement).slice(0, 4).map(({ kind, store, summary }) => ({ kind, store, summary }))];
+  const alarms = [...(alarmRows || []), ...(restatedRows || []).filter(bigRestatement).slice(0, 4)];
+
+  // Chargebacks / inquiries waiting on Reilly: their amounts and due dates as NUMBERS and
+  // ISO days, so the brief may quote them and the check can find them (live 2026-10-14: the
+  // #1098 chargeback's $65.95 was only inside an approval title, so it failed the check).
+  const disputeByApproval = new Map();
+  if (pending.length) {
+    const { results: dRows } = await db.prepare(
+      `SELECT approval_id, store, order_name, type, reason, amount, currency, evidence_due_by, status FROM risk_disputes WHERE approval_id IN (${pending.map(() => "?").join(", ")})`
+    ).bind(...pending.map((a) => a.id)).all().catch(() => ({ results: [] }));
+    for (const d of dRows || []) disputeByApproval.set(d.approval_id, d);
+  }
 
   const data = {
     brief_day: day,
@@ -206,7 +217,7 @@ export async function gatherBriefData(env, { nowMs = Date.now() } = {}) {
     stores,
     group,
     waiting: {
-      approvals: pending.map((a) => ({ id: a.id, title: a.title, store: a.store, waiting_days: ageDays(a.created_at, nowMs) })),
+      approvals: pending.map((a) => waitingItem(a, disputeByApproval.get(a.id), nowMs)),
       kfb_latest: kfb ? { day: kfb.local_day, status: kfb.status, mode: kfb.mode, orders: kfb.item_count } : null,
     },
     orders: {
@@ -220,17 +231,76 @@ export async function gatherBriefData(env, { nowMs = Date.now() } = {}) {
       scheduled_payouts: (scheduled || []).map((p) => ({ store: STORES[p.store].name, date: String(p.issued_at || "").slice(0, 10), amount: p.net, currency: p.currency })),
       pending_refunds: {
         count: (pend || []).length,
-        amount: Math.round((pend || []).reduce((s, r) => s + (Number(r.amount) || 0), 0) * 100) / 100,
+        amount: round2((pend || []).reduce((s, r) => s + (Number(r.amount) || 0), 0)),
         older_than_7_days: (pend || []).filter((r) => ageDays(r.processed_at, nowMs) > 7).length,
+        // Per-store split computed here, so the brief never splits the total itself.
+        by_store: LIVE_STORE_IDS.map((id) => {
+          const rows = (pend || []).filter((r) => r.store === id);
+          return { store: STORES[id].name, count: rows.length, amount: round2(rows.reduce((s, r) => s + (Number(r.amount) || 0), 0)) };
+        }).filter((x) => x.count),
       },
     },
-    risk: (alarms || []).map((a) => ({ kind: a.kind, store: a.store, what: a.summary })),
+    risk: (alarms || []).map(riskItem),
     feeds_not_fresh: feeds.filter((f) => f.current !== "fresh").map((f) => ({ feed: f.label, state: f.current, last_ok_at: f.last_ok_at })),
   };
   // The only order names and dates the brief may mention (checked afterwards).
   const w = briefWhitelist(data);
   data.references = { order_names: [...w.orderNames].sort(), dates: [...w.dates].sort() };
   return data;
+}
+
+const round2 = (n) => Math.round(Number(n) * 100) / 100;
+
+/**
+ * "$65.95", "$-61.29", "-$47.23" written inside a code-built text (approval titles, event
+ * summaries), as numbers. The texts are written by the agents' code from computed figures;
+ * this hands those same figures to the brief as numbers (numbers by code, words by Claude).
+ */
+export function dollarsIn(text) {
+  const out = [];
+  for (const m of String(text || "").matchAll(/([-−]?)\$\s?([-−]?)(\d[\d,]*(?:\.\d+)?)/g)) {
+    const v = Number(m[3].replace(/,/g, ""));
+    if (Number.isFinite(v)) out.push(m[1] || m[2] ? -v : v);
+  }
+  return out;
+}
+
+/** One approval waiting on Reilly, with every amount in it as a number. */
+function waitingItem(a, dispute, nowMs) {
+  const item = { id: a.id, title: a.title, store: a.store, waiting_days: ageDays(a.created_at, nowMs) };
+  const amounts = dollarsIn(a.title);
+  if (amounts.length) item.amounts_in_title = amounts;
+  if (dispute) {
+    item.dispute = {
+      order: dispute.order_name || null, type: dispute.type || null, reason: dispute.reason || null,
+      amount: dispute.amount == null ? null : Number(dispute.amount), currency: dispute.currency || null,
+      evidence_due_by: dispute.evidence_due_by ? String(dispute.evidence_due_by).slice(0, 10) : null,
+      status: dispute.status || null,
+    };
+  }
+  return item;
+}
+
+/**
+ * One risk line. The event's text is kept, and the figures it states are given as numbers:
+ * a restated P&L day as before / after / change per field (change computed here, never by
+ * the model), a payout check as payout / transactions / off by. Live 2026-10-14: a
+ * restatement "$-61.29 → $-47.23" failed the check because those were only text.
+ */
+function riskItem(a) {
+  const item = { kind: a.kind, store: a.store, what: a.summary };
+  let d = null; try { d = a.data ? JSON.parse(a.data) : null; } catch { d = null; }
+  if (a.kind === "pnl.restated" && d && d.before && d.after) {
+    if (d.day) item.day = d.day;
+    item.changes = (d.changed || Object.keys(d.after)).map((k) => {
+      const before = d.before[k] == null ? null : Number(d.before[k]);
+      const after = d.after[k] == null ? null : Number(d.after[k]);
+      return { field: k, before, after, change: before == null || after == null ? null : round2(after - before) };
+    });
+  } else if (a.kind === "payout.mismatch" && d && d.payoutCents != null) {
+    item.payout_check = { payout: d.payoutCents / 100, transactions_add_up_to: d.sumCents == null ? null : d.sumCents / 100, off_by: d.diffCents == null ? null : d.diffCents / 100 };
+  }
+  return item;
 }
 
 function verdict(roas, be) {
@@ -315,6 +385,7 @@ Hard rules:
 6. Media is watch only: describe ROAS against break-even and the reason; never recommend changing bids, budgets or campaigns.
 7. Give the reasoning behind each judgement in a few words.
 8. Mention an order number (#1234) or a date only if it is listed in DATA.references; write dates as YYYY-MM-DD.
+9. A figure that appears inside a text field (an approval title, a risk "what") may be quoted only from the number field next to it: amounts_in_title, dispute.amount, changes[].before / after / change, payout_check. Never work out a difference, total, average or per-store split yourself; use the computed field (e.g. changes[].change, pending_refunds.by_store). If DATA has no field for a figure, describe it in words without the number.
 
 Format: plain markdown subset only: "## " headings, "- " bullets, **bold**. No tables, no links, no HTML.
 Sections in this order: Yesterday's money (per store + group, then month to date) · Waiting on you · Orders · Risk (omit if empty) · Media · Feeds.

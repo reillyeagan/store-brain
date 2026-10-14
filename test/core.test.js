@@ -86,6 +86,46 @@ test("librarian: finds missing values, stale facts, contradictions with the conf
   assert.deepEqual(kinds(9), ["stale"]);
 });
 
+test("librarian: only like with like — a fact stating floor AND ceiling is read label by label, a KFB supply tier is not a retail ceiling, a real ceiling of 150 is still caught", () => {
+  const at = "2026-10-01T00:00:00Z";
+  const facts = [
+    // Live fact 263's shape: both numbers in one value, for all three stores.
+    { id: 263, store: null, key: "pricing.price_floor_ceiling", value: "Floor $44.95 on H&C and Auberlane, $49.95 on Marlowe; ceiling $144.95 all 3 stores (Reilly 2026-10-11)", observed_at: at },
+    { id: 264, store: null, key: "pricing.price_floor_ceiling", value: "min price 44.95 on H&C going forwards. max price 144.95 all 3 stores", observed_at: at },
+    { id: 265, store: "mar", key: "pricing.price_floor_ceiling", value: "{\"floor\":49.95,\"ceiling\":144.95}", observed_at: at },
+    // Live fact 384: a KFB supply price tier, not the store's retail ceiling.
+    { id: 384, store: null, key: "kfb.price_tier_supply_ceiling", value: "175", observed_at: at },
+    // Genuine contradictions must still be found.
+    { id: 400, store: "hc", key: "pricing.price_ceiling", value: "150", observed_at: at },
+    { id: 401, store: null, key: "pricing.price_floor_ceiling", value: "floor $44.95 H&C, AUB, $49.95 MAR; ceiling $150 all stores", observed_at: at },
+    { id: 402, store: "mar", key: "pricing.price_floor", value: "$44.95", observed_at: at },
+    // Can't tell which number is which: unparsed, not a contradiction.
+    { id: 500, store: null, key: "pricing.price_floor_ceiling", value: "44.95 / 144.95", observed_at: at },
+    { id: 501, store: null, key: "pricing.price_floor_ceiling", value: "Floor and ceiling: 44.95 / 144.95", observed_at: at },
+    { id: 502, store: null, key: "pricing.price_floor", value: "$44.95 H&C, $49.95 Marlowe", observed_at: at },
+  ];
+  const f = checkFacts(facts, T0);
+  // (Several of these share a key on purpose, so "conflicting_live" is expected and set aside.)
+  const of = (id, kind) => f.filter((x) => x.fact_id === id && x.kind !== "conflicting_live" && (!kind || x.kind === kind));
+  for (const id of [263, 264, 265, 384]) assert.deepEqual(of(id), [], `fact ${id}: ${JSON.stringify(of(id))}`);
+  assert.equal(f.filter((x) => /ceiling is 44\.95/.test(x.summary)).length, 0);
+
+  const c400 = of(400, "contradicts_spec");
+  assert.equal(c400.length, 1);
+  assert.match(c400[0].summary, /Holt & Crane price ceiling is 150 .*the spec says 144\.95/);
+  assert.equal(c400[0].found, 150);
+  assert.equal(c400[0].expected, 144.95);
+  // Stated for all stores: one contradiction per store, floors (all correct) not flagged.
+  const c401 = of(401, "contradicts_spec");
+  assert.deepEqual(c401.map((x) => [x.rule_store, x.kind_of_rule, x.found]).sort(), [["aub", "ceiling", 150], ["hc", "ceiling", 150], ["mar", "ceiling", 150]]);
+  assert.deepEqual(of(402, "contradicts_spec").map((x) => [x.rule_store, x.found, x.expected]), [["mar", 44.95, 49.95]]);
+  for (const id of [500, 501]) {
+    assert.deepEqual(of(id).map((x) => x.kind), ["unparsed"], `fact ${id}`);
+  }
+  // Prices tied to named stores without a floor/ceiling word: read by the key, per store.
+  assert.deepEqual(of(502), []);
+});
+
 test("librarian: the vault outbox queues decisions, new facts and briefs once each; vault-sourced facts are not sent back", async () => {
   const DB = makeD1();
   await recordDecision(DB, { topic: "t", words: "do it" }, { nowMs: T0 });
@@ -102,6 +142,46 @@ test("librarian: the vault outbox queues decisions, new facts and briefs once ea
   assert.ok(pending.every((p) => p.status === "pending"));
   assert.equal(await markVaultCopied(DB, [pending[0].id, pending[0].id], { nowMs: T0 }), 1);
   assert.equal((await vaultOutbox(DB)).length, 2);
+});
+
+test("vault outbox: every item comes with its vault path and full markdown (Reilly's words verbatim); the Core page shows them and marks them copied through the existing endpoints", async () => {
+  const DB = makeD1();
+  await recordDecision(DB, { topic: "pricing.ceiling", words: "max price 144.95 all 3 stores", scope: "all" }, { nowMs: T0 });
+  await fact(DB, { store: "hc", key: "pricing.price_floor", value: "{\"usd\":44.95}", source: "api:test" });
+  await DB.prepare(`INSERT INTO briefs (day, created_at, status, mode, composer, body_md, checked) VALUES ('2026-10-14', ?, 'ready', 'shadow', 'ai', '## Yesterday''s money\n- fine', 1)`).bind(iso(T0)).run();
+  await queueVaultSync(DB, { nowMs: T0 });
+  const items = await vaultOutbox(DB, { limit: 200 });
+  const by = (k) => items.find((x) => x.kind === k);
+  assert.match(by("decision").vault_path, /^03 Areas\/Business\/Store Brain\/Decisions\/\d{4}-\d{2}-\d{2} pricing\.ceiling\.md$/);
+  assert.match(by("decision").markdown, /\n> max price 144\.95 all 3 stores\n/);
+  assert.equal(by("fact").vault_path, "03 Areas/Business/Store Brain/Facts/hc pricing.price_floor.md");
+  assert.match(by("fact").markdown, /"usd": 44\.95/);
+  assert.equal(by("brief").vault_path, "03 Areas/Business/Store Brain/Briefs/2026-10-14 Morning brief.md");
+  assert.match(by("brief").markdown, /## Yesterday's money\n- fine/);
+
+  // Through the worker, with the key, the way the dashboard calls it.
+  const worker = (await import("../src/index.js")).default;
+  const env = { DB, MC_KEY: "k".repeat(32) };
+  const h = { "x-store-brain-key": "k".repeat(32) };
+  assert.equal((await worker.fetch(new Request("https://b/api/vault/outbox"), env)).status, 401);
+  const got = await (await worker.fetch(new Request("https://b/api/vault/outbox?limit=200", { headers: h }), env)).json();
+  assert.equal(got.items.length, 3);
+  assert.ok(got.items.every((x) => x.vault_path && x.markdown));
+  const marked = await (await worker.fetch(new Request("https://b/api/vault/outbox/copied", { method: "POST", headers: { ...h, "content-type": "application/json" }, body: JSON.stringify({ ids: got.items.map((x) => x.id) }) }), env)).json();
+  assert.equal(marked.marked, 3);
+  assert.equal((await vaultOutbox(DB)).length, 0);
+
+  // The Core page draws the box from those endpoints, and its script still parses.
+  const { readFileSync } = await import("node:fs");
+  const html = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(html, /if\(p==="core"\) h\+='<div class="box" id="vaultBox"/);
+  assert.match(html, /api\("\/api\/vault\/outbox\?limit=200"\)/);
+  assert.match(html, /api\("\/api\/vault\/outbox\/copied",\{method:"POST",headers:\{"content-type":"application\/json"\},body:JSON\.stringify\(\{ids:/);
+  assert.match(html, /Mark all shown as copied/);
+  const block = html.slice(html.indexOf("/* ---- Vault outbox"), html.indexOf("/* One delegated listener"));
+  // No apostrophes inside single-quoted strings (one blanked the page before).
+  for (const s of block.match(/'(?:[^'\\\n]|\\.)*'/g) || []) assert.ok(!/\\'/.test(s), `escaped apostrophe in ${s}`);
+  assert.doesNotThrow(() => new Function(html.match(/<script>([\s\S]*)<\/script>/)[1]));
 });
 
 test("librarian: a check event only when findings change; weekly report event", async () => {

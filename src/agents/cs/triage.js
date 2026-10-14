@@ -22,6 +22,7 @@ import { CATEGORIES, CAPS, FIRST_READ_DAYS, STORE_MAIL_DOMAINS, inboxPlan, store
 import { listIds, inboxQuery, getMessage, headerMap, bodyText, stripQuoted } from "./gmail.js";
 import { screenMail } from "./filters.js";
 import { logOnce, clip } from "./util.js";
+import { noActionCheck, earlierUnansweredAsk } from "./noAction.js";
 
 const ACTOR = "cs.triage";
 
@@ -216,8 +217,9 @@ Categories (pick exactly one):
 - chargeback_or_scam_angry: threatens a chargeback/dispute, calls the store a scam, or is very angry
 - product_question: question about a product (material, stock, care) not about a placed order
 - other: anything else
-Return: {"is_customer":true|false,"category":"...","store":"hc|aub|mar|null","order_number":"digits or null","urgency":"low|normal|high","angry":true|false,"wants_refund":true|false,"summary":"max 20 words","size":{"ordered":null,"wanted":null,"fit":"too_small|too_big|null","product":null,"quote":"the customer's exact words about fit, or null"},"change":{"size_to":null,"colour_to":null,"address":false}}
+Return: {"is_customer":true|false,"category":"...","store":"hc|aub|mar|null","order_number":"digits or null","urgency":"low|normal|high","angry":true|false,"wants_refund":true|false,"no_action":true|false,"summary":"max 20 words","size":{"ordered":null,"wanted":null,"fit":"too_small|too_big|null","product":null,"quote":"the customer's exact words about fit, or null"},"change":{"size_to":null,"colour_to":null,"address":false}}
 is_customer is false only for mail that is clearly not from a shopper (vendor pitch, spam, partnership offer).
+no_action is true ONLY when the email just thanks or acknowledges (e.g. "thank you", "ok, I'll let you know when it arrives") and asks nothing, requests nothing and reports no problem. Any question, request, complaint or problem means false. When unsure, false.
 The summary must not contain names, email addresses, phone numbers or street addresses.
 Never invent an order number: null unless it is written in the email.`;
 
@@ -263,6 +265,8 @@ export function validateTriage(j, body) {
     urgency: pick(j && j.urgency, ["low", "normal", "high"]) || "normal",
     angry: !!(j && j.angry === true),
     wants_refund: !!(j && j.wants_refund === true),
+    // Only a literal true counts; code (noAction.js) still vetoes it on any question or problem.
+    no_action: !!(j && j.no_action === true),
     summary: str(j && j.summary, 160),
     size: { ordered: str(size.ordered, 12), wanted: str(size.wanted, 12), fit: pick(size.fit, ["too_small", "too_big"]), product: str(size.product, 120), quote },
     change: { size_to: str(change.size_to, 12), colour_to: str(change.colour_to, 30), address: change.address === true },
@@ -317,16 +321,26 @@ async function saveTriage(db, t, v, at, note) {
   // The AI's number alone is never enough: it must be written as an order number in the email.
   const orderRef = orderRefFromText(`${t.subject || ""}\n${t.body || ""}`, v.order_number);
   const urgency = v.category === "chargeback_or_scam_angry" || v.angry ? "high" : v.urgency;
-  const status = v.is_customer ? "open" : "ignored";
+  // A bare thank-you / acknowledgement is closed quietly (noAction.js; code vetoes on any
+  // question, request, problem, anger or money word). Not if an earlier email in the same
+  // conversation still had something unanswered: this one replaced it, so Reilly must see it.
+  let quiet = null;
+  if (v.is_customer) {
+    const c = noActionCheck({ ...t, category: v.category, summary: v.summary }, v);
+    if (c.close && !(await earlierUnansweredAsk(db, t))) quiet = c.reason;
+  }
+  const status = !v.is_customer ? "ignored" : quiet ? "no_action" : "open";
   await db.prepare(
     `UPDATE cs_tickets SET status = ?, category = ?, urgency = ?, order_ref = ?, summary = ?, triage = ?, store = ?, classified_at = ?, classify_note = ?, updated_at = ? WHERE id = ?`
-  ).bind(status, v.category, urgency, orderRef, v.summary, JSON.stringify(v), store, at, note, at, t.id).run();
+  ).bind(status, v.category, urgency, orderRef, v.summary, JSON.stringify(v), store, at, quiet ? clip(`no_action: ${quiet}`, 300) : note, at, t.id).run();
   await logEvent(db, {
-    actor: ACTOR, kind: v.is_customer ? "cs.ticket_classified" : "cs.ticket_ignored", store, at,
-    summary: v.is_customer
-      ? `${storeName(store) || "Unknown store"}: ${v.category.replace(/_/g, " ")}${orderRef ? ` (#${orderRef})` : ""}${urgency === "high" ? ", URGENT" : ""}: ${v.summary || clip(t.subject, 80)}`
-      : `Not a customer (AI): ticket ${t.id}. Listed on the CS page in case that's wrong.`,
-    data: { ticket: t.id, category: v.category },
+    actor: ACTOR, kind: !v.is_customer ? "cs.ticket_ignored" : quiet ? "cs.no_action" : "cs.ticket_classified", store, at,
+    summary: !v.is_customer
+      ? `Not a customer (AI): ticket ${t.id}. Listed on the CS page in case that's wrong.`
+      : quiet
+        ? `${storeName(store) || "Unknown store"}: ticket ${t.id} closed quietly, nothing to do (${v.summary || clip(t.subject, 80)}). Listed on the CS page under "No action needed".`
+        : `${storeName(store) || "Unknown store"}: ${v.category.replace(/_/g, " ")}${orderRef ? ` (#${orderRef})` : ""}${urgency === "high" ? ", URGENT" : ""}: ${v.summary || clip(t.subject, 80)}`,
+    data: { ticket: t.id, category: v.category, ...(quiet ? { no_action: quiet } : {}) },
   });
 }
 

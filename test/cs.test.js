@@ -11,6 +11,9 @@ import { validateTriage, orderRefFromText } from "../src/agents/cs/triage.js";
 import { b64urlEncode, b64urlDecode, stripQuoted } from "../src/agents/cs/gmail.js";
 import { findLedgerOrder } from "../src/agents/cs/orderContext.js";
 import { _resetTokenCacheForTests } from "../src/lib/storeGuard.js";
+import { noActionCheck } from "../src/agents/cs/noAction.js";
+import { escalateTickets } from "../src/agents/cs/escalation.js";
+import { listPending, createApproval } from "../src/lib/approvals.js";
 
 const NOW = Date.parse("2026-10-13T16:00:00Z"); // Tuesday, 12:00 Eastern
 const MIN = 60000;
@@ -889,4 +892,91 @@ test("order context: the live-Shopify path reads the size from the variant title
   assert.equal(sizeFromVariant("Navy / XL"), "XL");
   assert.equal(sizeFromVariant("Navy"), null);
   assert.equal(sizeFromVariant(null), null);
+});
+
+/* ---------- no_action: thank-yous never reach Reilly (live 2026-10-14) ---------- */
+
+const REAL_9 = "Customer replied 'Thankyou' to a shipping update notification for their order; no action or question raised.";
+const REAL_2 = "Customer thanks the store for a status update and says they will reply once the item is received. No action requested.";
+
+test("cs no_action: the two live thank-you summaries close; a question, a refund or a problem never does", () => {
+  const t = (summary, body, extra = {}) => ({ category: "other", urgency: "low", subject: "Re: A shipment from order #1253 is on the way", summary, body, triage: JSON.stringify({ category: "other", summary }), ...extra });
+  assert.equal(noActionCheck(t(REAL_9, "Thankyou")).close, true);
+  assert.equal(noActionCheck(t(REAL_2, "Thank you for the update. I will reply once I have received the item.")).close, true);
+  // The classifier saying "nothing asked" is overruled by a question mark.
+  const q = noActionCheck(t("Customer thanks the store. No action requested.", "thanks! when will it arrive?", { triage: JSON.stringify({ category: "other", no_action: true }) }));
+  assert.equal(q.close, false);
+  assert.match(q.reason, /question/);
+  for (const body of [
+    "Thanks, but the colour is wrong, I want a refund", "thank you. please send the tracking", "Thanks. It hasn't arrived yet",
+    "thanks for nothing, this is a scam", "Thanks, I'd like to return it", "ok thanks. need to change my address",
+  ]) assert.equal(noActionCheck(t(REAL_9, body)).close, false, body);
+  // Only "other" can be a bare thank-you; a real category always has something to do.
+  assert.equal(noActionCheck(t(REAL_9, "Thankyou", { category: "where_is_order" })).close, false);
+  // A bare thank-you closes even without the classifier's words; a long email doesn't.
+  assert.equal(noActionCheck(t("Customer thanks the store", "Thanks so much Jane!")).close, true);
+  assert.equal(noActionCheck(t("Customer thanks the store", "Thanks so much, the jacket looks lovely on my husband who wore it to the wedding on saturday in town")).close, false);
+});
+
+test("cs no_action: a thank-you is closed quietly (no flag, no draft, listed on the CS page); 'thanks! when will it arrive?' and a wrong-colour refund still reach Reilly", async () => {
+  const env = await setup();
+  await connect(env, "google", "reillyworking26@gmail.com", "rt-main");
+  await addOrder(env.DB, {});
+  const box = { messages: [
+    mail({ id: "n1", from: "Jane <jane@buyer.com>", subject: "Re: A shipment from order #1001 is on the way", body: "Thankyou" }),
+    mail({ id: "n2", from: "Jane <jane@buyer.com>", subject: "Re: Your order #1001", body: "thanks! when will it arrive?" }),
+    mail({ id: "n3", from: "Jane <jane@buyer.com>", subject: "Wrong colour #1001", body: "I got the wrong colour, I want a refund or return" }),
+  ] };
+  const w = world({ boxes: { "at-main": box }, triage: (u) => u.includes("Thankyou")
+    ? { category: "other", urgency: "low", summary: REAL_9, no_action: true }
+    : u.includes("when will it arrive") // the classifier gets it wrong; code must overrule it
+      ? { category: "other", urgency: "low", summary: "Customer thanks the store. No action requested.", no_action: true }
+      : { category: "return_refund", wants_refund: true, order_number: "1001", summary: "Wrong colour received; wants a refund or return" } });
+  await runCs(env, { nowMs: NOW, fetchImpl: w.fetchImpl });
+  await runCs(env, { nowMs: NOW + 25 * MIN, fetchImpl: w.fetchImpl });
+  const ts = await tickets(env.DB);
+  const by = (id) => ts.find((t) => t.gmail_id === id);
+  assert.equal(by("n1").status, "no_action");
+  assert.equal(by("n1").approval_id, null);
+  assert.equal(by("n1").draft_body, null);
+  assert.match(by("n1").classify_note, /^no_action: /);
+  assert.equal(by("n2").status, "needs_reilly");
+  assert.equal(by("n3").status, "needs_reilly");
+  assert.equal((await listPending(env.DB)).length, 2);
+  assert.equal((await evs(env.DB, "cs.no_action")).length, 1);
+  const st = await csState(env, { nowMs: NOW + 30 * MIN });
+  assert.deepEqual(st.no_action_needed.map((x) => x.id), [by("n1").id]);
+  assert.match(st.no_action_needed[0].why, /classifier said nothing was asked/);
+  assert.ok(!st.escalations.some((e) => e.id === by("n1").id));
+});
+
+test("cs no_action: open flags the classifier called 'no action requested/raised' are re-closed with the reason; the wrong-colour refund stays", async () => {
+  const env = await setup();
+  const DB = env.DB;
+  const at = new Date(NOW - 3600000).toISOString();
+  const add = async ({ id, summary, body, category = "other", urgency = "low", order = "#1253" }) => {
+    const ap = await createApproval(DB, { dept: "cs", requestedBy: "cs.escalation", store: "hc", title: `Holt & Crane: ${category} ${order} — ticket ${id}`, options: [{ id: "handled", label: "I'll handle it in Gmail", detail: summary }] });
+    await DB.prepare(`INSERT INTO cs_tickets (id, opened_at, updated_at, slot, gmail_id, thread_id, store, from_email, subject, body, via, status, category, urgency, summary, triage, context_at, order_name, escalated_at, approval_id)
+      VALUES (?, ?, ?, 'google:hc', ?, ?, 'hc', 'c@x.com', ?, ?, 'email', 'needs_reilly', ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .bind(id, at, at, `g${id}`, `T${id}`, `Re: order ${order}`, body, category, urgency, summary, JSON.stringify({ category, summary }), at, order, at, ap).run();
+    return ap;
+  };
+  const a9 = await add({ id: 9, summary: REAL_9, body: "Thankyou" });
+  const a2 = await add({ id: 2, summary: REAL_2, body: "Thank you for the update, I will get back to you once I receive the item.", order: "#1059" });
+  const a3 = await add({ id: 3, summary: "Received the wrong colour and wants a refund or return.", body: "Wrong colour arrived. I want a refund or a return.", category: "return_refund", urgency: "normal", order: "#1100" });
+  const nf = async () => new Response("{}", { status: 404 });
+  const out = await escalateTickets(env, { nowMs: NOW, fetchImpl: nf });
+  assert.equal(out.reclosed, 2);
+  assert.deepEqual((await listPending(DB)).map((a) => a.id), [a3]);
+  for (const id of [a9, a2]) {
+    const ap = await DB.prepare(`SELECT * FROM approvals WHERE id = ?`).bind(id).first();
+    assert.equal(ap.status, "expired");
+    assert.match(ap.note, /Closed by the brain .*not Reilly.*no action needed/);
+  }
+  const ts = await tickets(DB);
+  assert.deepEqual(ts.map((t) => [t.id, t.status]), [[2, "no_action"], [3, "needs_reilly"], [9, "no_action"]]);
+  assert.match(ts[0].classify_note, /re-closed flag/);
+  assert.equal((await evs(DB, "cs.no_action_reclosed")).length, 2);
+  // Running again changes nothing.
+  assert.equal((await escalateTickets(env, { nowMs: NOW + MIN, fetchImpl: nf })).reclosed, 0);
 });

@@ -108,7 +108,7 @@ export async function csState(env, { nowMs = Date.now() } = {}) {
     `SELECT c.id, c.store, c.order_store, c.order_name, c.category, c.urgency, c.summary, c.subject, c.from_name, c.from_email, c.escalated_at,
             c.approval_id, c.retention, a.status AS approval_status
        FROM cs_tickets c LEFT JOIN approvals a ON a.id = c.approval_id
-      WHERE c.escalated_at IS NOT NULL ORDER BY c.escalated_at DESC, c.id DESC LIMIT 20`
+      WHERE c.escalated_at IS NOT NULL AND c.status <> 'no_action' ORDER BY c.escalated_at DESC, c.id DESC LIMIT 20`
   )).map((t) => ({ ...t, store: storeName(t.order_store || t.store), retention: safeJson(t.retention, null) }));
 
   const soon = new Date(nowMs + 48 * 3600000).toISOString();
@@ -126,6 +126,12 @@ export async function csState(env, { nowMs = Date.now() } = {}) {
   const kfbAsks = await all(`SELECT id, created_at, store, ticket_id, order_name, kind, detail, shipped, status FROM cs_kfb_asks WHERE status = 'open' ORDER BY id DESC LIMIT 20`);
   const sizeComplaints = await all(`SELECT id, store, order_id, product_id, size_ordered, size_that_fits, said, at FROM size_complaints WHERE source LIKE 'gmail:%' ORDER BY id DESC LIMIT 10`);
   const ignoredByAi = await all(`SELECT id, store, subject, from_email, classified_at FROM cs_tickets WHERE status = 'ignored' ORDER BY id DESC LIMIT 10`);
+  // Thank-yous and acknowledgements closed quietly (noAction.js): listed so Reilly can check
+  // nothing real was closed. `why` is the guard's reason.
+  const noAction = (await all(
+    `SELECT id, store, order_store, order_name, order_ref, subject, summary, classify_note AS why, updated_at AS closed_at, approval_id
+       FROM cs_tickets WHERE status = 'no_action' ORDER BY id DESC LIMIT 20`
+  )).map((t) => ({ ...t, store: storeName(t.order_store || t.store), order_store: undefined, why: String(t.why || "").replace(/^no_action[^:]*:\s*/, "") }));
   const waiting = await db.prepare(`SELECT COUNT(*) AS n, MAX(classify_note) AS note FROM cs_tickets WHERE status = 'new'`).first();
   const jobs = await all(`SELECT job, last_run_at, last_result FROM job_runs WHERE job LIKE 'cs.%' ORDER BY job`);
 
@@ -148,6 +154,7 @@ export async function csState(env, { nowMs = Date.now() } = {}) {
     kfb_asks: kfbAsks,
     size_complaints: sizeComplaints,
     ignored_by_ai: ignoredByAi,
+    no_action_needed: noAction,
     jobs,
     not_wired: notWired,
     stale_gmail_drafts: staleGmailDrafts.map((r) => ({ ...r, store: storeName(r.store), note: "Stale draft in Gmail — delete it (the customer wrote again)" })),
