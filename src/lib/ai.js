@@ -38,7 +38,7 @@ export async function aiBudgetLeft(env, nowMs = Date.now()) {
 
 /**
  * @param {object} env
- * @param {{system:string,user:string,maxTokens?:number,actor:string,label:string,store?:string}} req
+ * @param {{system:string,user:string,image?:{media_type:string,data:string},maxTokens?:number,actor:string,label:string,store?:string}} req
  * @returns {{text:string,model:string,cost:number}|{skipped:string}}
  */
 export async function askClaude(env, req, { fetchImpl = fetch, nowMs = Date.now() } = {}) {
@@ -52,7 +52,9 @@ export async function askClaude(env, req, { fetchImpl = fetch, nowMs = Date.now(
     return { skipped: "daily AI budget reached" };
   }
   const at = nowIso(nowMs);
-  const r = await callClaude({ ...env, BRIEF_MODEL: env.AGENT_MODEL || env.BRIEF_MODEL }, { system: req.system, user: req.user }, {
+  const prompt = { system: req.system, user: req.user };
+  if (req.image) prompt.image = req.image; // optional {media_type, data}: one base64 image (size-chart intake)
+  const r = await callClaude({ ...env, BRIEF_MODEL: env.AGENT_MODEL || env.BRIEF_MODEL }, prompt, {
     fetchImpl,
     maxTokens: req.maxTokens,
     onUsage: async (m, u) => {

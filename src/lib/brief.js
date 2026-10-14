@@ -402,12 +402,17 @@ export class BriefAiError extends Error {}
  * (never with the key in it). `onUsage(model, usage, stop_reason)` is awaited as soon as a
  * response reports token usage, BEFORE the content is checked: an empty or malformed answer
  * is still paid for, and its cost must reach the ledger.
+ * `prompt` is {system, user} and may carry `image: {media_type, data}` (base64) for one image.
  */
 export async function callClaude(env, prompt, { fetchImpl = fetch, onUsage = null, maxTokens = null } = {}) {
   const model = String(env.BRIEF_MODEL || DEFAULT_BRIEF_MODEL).trim();
   const base = {
     model, max_tokens: Math.min(Number(maxTokens) || BRIEF_MAX_TOKENS, 4000), system: prompt.system,
-    messages: [{ role: "user", content: prompt.user }],
+    // An optional image (size-chart intake) goes in front of the text as one base64 image block;
+    // without one the request is exactly what it always was.
+    messages: [{ role: "user", content: prompt.image
+      ? [{ type: "image", source: { type: "base64", media_type: prompt.image.media_type, data: prompt.image.data } }, { type: "text", text: prompt.user }]
+      : prompt.user }],
   };
   // No up-front thinking (plain writing task, keeps tokens down) and low effort.
   const tuned = { ...base, thinking: { type: "between_tools" }, output_config: { effort: "low" } };

@@ -12,6 +12,9 @@
  *   GET  /api/vault/outbox               facts/decisions waiting to be copied to the Eagano vault (key required)
  *   POST /api/vault/outbox/copied        mark them copied, body {ids:[...]} (key required)
  *   POST /api/approvals/:id/decide       Reilly's decision (key OR a signed phone link)
+ *   POST /api/size-charts                add a factory size chart by hand {store, product_handle|product_id, unit, flat, rows} (key required; saved unchecked)
+ *   POST /api/size-charts/image          the brain reads a chart image {store, product_handle, image_base64, media_type} (key required; always unchecked)
+ *   POST /api/size-charts/:id/confirm    Reilly checked that chart (key required)
  *   POST /webhooks/shopify               Shopify webhooks (HMAC-verified per store)
  *   POST /webhooks/17track               17TRACK pushes (`sign` header verified; known numbers re-read from the API)
  *   POST /api/admin/check-stores         Store Guard check for every live store (key required)
@@ -77,6 +80,7 @@ import { runBrief, latestBrief, handleBriefPage, briefMode, rewriteBrief } from 
 import { runDepartmentSlot, departmentState, DEPARTMENTS_RUN, DEPT_CRON } from "./agents/index.js";
 import { funnelFor } from "./agents/pnl/index.js";
 import { vaultOutbox, markVaultCopied } from "./agents/core/librarian.js";
+import { addPastedChart, addChartFromImage, confirmChart } from "./agents/supplier/sizeIntake.js";
 
 export const VERSION = "0.2.0-eagano-llc";
 
@@ -257,6 +261,20 @@ export default {
       if (path === "/api/admin/connections" && request.method === "GET") {
         if (!hasKey(request, env)) return json({ ok: false, error: "unauthorized" }, 401);
         return json({ ok: true, secrets: secretPresence(env), google: await googleStatus(env.DB), mailboxes: await mailboxStatus(env) });
+      }
+      // Size-chart intake (Supplier): saved unchecked; nothing goes to KFB, a customer or the store.
+      if ((path === "/api/size-charts" || path === "/api/size-charts/image") && request.method === "POST") {
+        if (!hasKey(request, env)) return json({ ok: false, error: "unauthorized" }, 401);
+        const body = await request.json().catch(() => null);
+        if (!body || typeof body !== "object") return json({ ok: false, error: "JSON body required" }, 400);
+        const r = path.endsWith("/image") || body.image_base64 ? await addChartFromImage(env, body) : await addPastedChart(env, body);
+        return json(r, r.ok ? 200 : r.status || 400);
+      }
+      const sc = path.match(/^\/api\/size-charts\/(\d{1,12})\/confirm$/);
+      if (sc && request.method === "POST") {
+        if (!hasKey(request, env)) return json({ ok: false, error: "unauthorized" }, 401);
+        const r = await confirmChart(env, parseInt(sc[1], 10));
+        return json(r, r.ok ? 200 : r.status || 400);
       }
       const ap = path.match(/^\/approve\/(\d+)$/);
       if (ap && request.method === "GET") {
