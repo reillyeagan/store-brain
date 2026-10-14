@@ -5,7 +5,7 @@ import { makeD1 } from "./helpers/d1.js";
 import { runRisk, riskState, RISK_JOBS } from "../src/agents/risk/index.js";
 import { runChargebacks, reminderDue, approvalTitle, countdownAsOf, missingEvidence, gatherFacts, redactPii } from "../src/agents/risk/chargebacks.js";
 import { runFraud, screenOrder, shopifyLevel } from "../src/agents/risk/fraud.js";
-import { runAccountHealth, judgeHealth, mergeHealth } from "../src/agents/risk/accountHealth.js";
+import { runAccountHealth, judgeHealth, mergeHealth, smallSampleNote } from "../src/agents/risk/accountHealth.js";
 import { collectStore, classifyPending, claimSnippets, themeStrings } from "../src/agents/risk/claimsAudit.js";
 import { daysLeft } from "../src/agents/risk/shared.js";
 import { _resetTokenCacheForTests } from "../src/lib/storeGuard.js";
@@ -78,7 +78,8 @@ const emptyFor = (op) => ({
   RiskDisputes: { disputes: { nodes: [] } },
   RiskOrders: { orders: { nodes: [] } },
   RiskRates: { ordersCount: { count: 0, precision: "EXACT" }, disputes: { nodes: [], pageInfo: { hasNextPage: false } } },
-  RiskAccount: { shopifyPaymentsAccount: { activated: true, onboardable: false, payoutSchedule: { interval: "DAILY" }, payouts: { nodes: [] } } },
+  RiskAccount: { shopifyPaymentsAccount: { activated: true, onboardable: false, payouts: { nodes: [] } } },
+  RiskPayoutSchedule: { shopifyPaymentsAccount: { payoutSchedule: { interval: "DAILY" } } },
   RiskClaimsText: { themes: { nodes: [] }, products: { nodes: [] } },
   RiskPolicies: { shop: { shopPolicies: [] } },
 }[op] || {});
@@ -324,6 +325,64 @@ test("health: dispute rate from Shopify counts; refund rate null when the refund
   row = await DB.prepare(`SELECT * FROM risk_account_health WHERE store = 'mar'`).first();
   assert.equal(row.state, "bad");
   assert.equal((await evs(DB, "risk.health_worse")).length, 1);
+});
+
+test("health (live 2026-10-14): payout schedule 'not available for this account' → interval null with the reason, the rest read, no error loop", async () => {
+  const DB = makeD1();
+  const net = fakeNet({
+    shopify: (s, op) => op === "RiskPayoutSchedule"
+      ? { errors: [{ message: "Field inside method payout_schedule is not available for this account" }] }
+      : op === "RiskAccount"
+        ? { shopifyPaymentsAccount: { activated: true, onboardable: false, payouts: { nodes: [{ id: "p1", status: "FAILED" }] } } }
+        : emptyFor(op),
+  });
+  const env = { DB, ...CREDS };
+  for (let i = 0; i < 3; i++) await runAccountHealth(env, { nowMs: NOW + i * 3600000, fetchImpl: net.fetchImpl });
+  const row = await DB.prepare(`SELECT * FROM risk_account_health WHERE store = 'hc'`).first();
+  assert.equal(row.payments_activated, 1, "the rest of the Payments read survives");
+  assert.equal(row.failed_payouts, 1);
+  assert.equal(row.payout_interval, null);
+  assert.match(JSON.parse(row.detail).payout_interval_note, /not available to the Store Brain's app.*not available for this account/);
+  assert.equal((await evs(DB, "error.risk")).length, 0, "not an error");
+  assert.equal((await evs(DB, "risk.not_wired")).filter((e) => e.store === "hc").length, 1, "noted once a day, not every run");
+  const st = await riskState(env, { nowMs: NOW });
+  const hc = st.accountHealth.find((h) => h.store === "hc");
+  assert.equal(hc.payout_interval, null);
+  assert.match(hc.payout_interval_note, /not available/);
+
+  // A passing fault on the schedule keeps the last known interval (and isn't "not available").
+  const DB2 = makeD1();
+  let fail = false;
+  const net2 = fakeNet({ shopify: (s, op) => (op === "RiskPayoutSchedule" && fail ? { errors: [{ message: "Internal error" }] } : emptyFor(op)) });
+  await runAccountHealth({ DB: DB2, ...CREDS }, { nowMs: NOW, fetchImpl: net2.fetchImpl });
+  fail = true;
+  await runAccountHealth({ DB: DB2, ...CREDS }, { nowMs: NOW + DAY, fetchImpl: net2.fetchImpl });
+  assert.equal((await DB2.prepare(`SELECT payout_interval FROM risk_account_health WHERE store = 'hc'`).first()).payout_interval, "DAILY");
+});
+
+test("health (live 2026-10-14): Marlowe 1 WON dispute in 30 orders → rate stays 3.33% and 'bad', shown as 1 of 30 with a small-sample note", async () => {
+  const DB = makeD1();
+  const net = fakeNet({
+    shopify: only("mar", (s, op) => op === "RiskRates"
+      ? { ordersCount: { count: 30, precision: "EXACT" }, disputes: { nodes: [{ id: "d1001", status: "WON" }], pageInfo: { hasNextPage: false } } }
+      : emptyFor(op), emptyFor),
+  });
+  const env = { DB, ...CREDS };
+  await runAccountHealth(env, { nowMs: NOW, fetchImpl: net.fetchImpl });
+  const row = await DB.prepare(`SELECT * FROM risk_account_health WHERE store = 'mar'`).first();
+  assert.equal(row.dispute_rate, 1 / 30, "the rate itself is not hidden or softened");
+  assert.equal(row.state, "bad");
+  const reasons = JSON.parse(row.detail).reasons;
+  assert.ok(reasons.some((r) => /3\.33% \(1 of 30 orders\)/.test(r)), reasons.join(" | "));
+  assert.ok(reasons.some((r) => /Small sample: only 30 orders in 90 days, so each dispute moves the rate by 3\.33 points \(won 1\)/.test(r)));
+  const st = await riskState(env, { nowMs: NOW });
+  const mar = st.accountHealth.find((h) => h.store === "mar");
+  assert.equal(mar.disputes, "1 of 30 orders");
+  assert.equal(mar.dispute_outcomes, "won 1");
+  assert.match(mar.small_sample_note, /Small sample/);
+  assert.match((await evs(DB, "risk.health_checked"))[0].summary, /Marlowe Standard: bad, disputes 3\.33% \(1 of 30 orders\)/);
+  // 100+ orders: no small-sample note.
+  assert.equal(smallSampleNote({ orders_90d: 400, disputes_90d: 4 }), null);
 });
 
 /* ---------------- Claims Auditor ---------------- */

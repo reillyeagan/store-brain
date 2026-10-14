@@ -19,7 +19,7 @@ import { claimJob, noteJobResult, retrySoon } from "../../lib/jobRuns.js";
 import { STORES } from "../../config/stores.js";
 import { runChargebacks, needsResponse } from "./chargebacks.js";
 import { runFraud } from "./fraud.js";
-import { runAccountHealth, weeklyHealthSummary } from "./accountHealth.js";
+import { runAccountHealth, weeklyHealthSummary, disputeCount, outcomesText, smallSampleNote } from "./accountHealth.js";
 import { collectDue, classifyPending } from "./claimsAudit.js";
 import { daysLeft, logOnce, safeJson } from "./shared.js";
 
@@ -154,7 +154,20 @@ export async function riskState(env, { nowMs = Date.now() } = {}) {
       screenedLast7Days: screened7 ? screened7.n : 0,
       note: "Card-testing spike detection is not built yet (needs checkout data).",
     },
-    accountHealth: (health || []).map((h) => ({ ...h, storeName: storeName(h.store), detail: safeJson(h.detail, null) })),
+    accountHealth: (health || []).map((h) => {
+      const detail = safeJson(h.detail, null) || {};
+      const withOutcomes = { ...h, dispute_outcomes: detail.dispute_outcomes || null };
+      return {
+        ...h, storeName: storeName(h.store),
+        // The count next to the rate ("1 of 30 orders"), the outcomes, and the small-sample note.
+        disputes: disputeCount(h),
+        dispute_outcomes: outcomesText(detail.dispute_outcomes),
+        small_sample_note: smallSampleNote(withOutcomes),
+        // null with a reason, never a bare "—".
+        payout_interval_note: h.payout_interval ? null : (detail.payout_interval_note || "not read yet"),
+        detail,
+      };
+    }),
     claims: {
       risky: (claims || []).map((c) => ({ ...c, storeName: storeName(c.store) })),
       counts: Object.fromEntries((claimCounts || []).map((c) => [c.verdict, c.n])),
