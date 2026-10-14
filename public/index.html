@@ -141,6 +141,10 @@ a{color:inherit}
 .tbl tr.sel td{background:var(--panel2);color:var(--text);font-weight:500}
 .tblwrap{overflow:auto;max-height:520px}
 input[type=date]{background:var(--panel);border:1px solid var(--border);color:var(--text);border-radius:999px;padding:4px 10px;font:500 12px var(--font);color-scheme:dark}
+.fld{background:var(--panel);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:7px 10px;font:12.5px var(--font);color-scheme:dark;max-width:100%}
+textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;box-sizing:border-box}
+.scform{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px}
+.scform label{font-size:12px;color:var(--muted);display:flex;gap:6px;align-items:center}
 .funnel{display:grid;place-items:center;text-align:center;color:var(--muted);font-size:12.5px;line-height:1.6;padding:24px 10px}
 /* Brief */
 .brief-body h3,.brief-body h4{margin:14px 0 4px;font-size:13.5px;color:var(--accent)}
@@ -867,8 +871,77 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
     var c=deptCache[p];
     if(!c||Date.now()-c.at>30000){ loadDept(p); if(!c) return '<div class="empty">Loading…</div>'; }
     if(c.error) return '<div class="empty bad-t">Couldn\'t load this page ('+esc(c.error)+'). Retrying shortly.</div>';
-    return '<div class="note" style="margin:0 0 10px">Shadow mode: everything here is what the agents found or propose. Nothing was sent or changed.</div>'+jsonHtml(c.data,0);
+    return '<div class="note" style="margin:0 0 10px">Shadow mode: everything here is what the agents found or propose. Nothing was sent or changed.</div>'+(p==="supplier-agents"?sizeChartsHtml(c.data):"")+jsonHtml(c.data,0);
   }
+  /* ---- Size charts (Supplier page): charts needed, paste or image intake, confirm ---- */
+  function scSummary(rows){ return (rows||[]).map(function(r){ return r.size+" "+[r.chest,r.shoulder,r.length,r.sleeve].map(function(x){return x==null?"-":x}).join("/")+(r.waist!=null?" w"+r.waist:""); }).join(" · "); }
+  function sizeChartsHtml(st){
+    var sc=((st||{}).agents||{})["sup.size_charts"]||{}, need=sc.chartsNeeded||[], charts=sc.charts||[];
+    var h='<div class="box" id="sizeBox" style="background:var(--panel2);margin-bottom:12px"><div class="lab">Size charts</div>'+
+      '<div class="note">The size check needs the factory chart for each product (from KFB or 1688). Everything added here is saved as not yet checked until you press Confirm. Nothing is sent to KFB or a customer.</div>';
+    h+='<div class="lab" style="margin-top:12px">Charts needed · last 30 days, most order lines first</div>';
+    h+=need.length?need.map(function(n){ return '<div class="rowx"><span><b style="font-weight:500">'+esc(n.title||n.product_handle||n.product_id)+'</b></span><span class="meta"><span>'+esc(n.storeName||n.store)+'</span><span>'+esc(n.product_handle||"no handle")+'</span><span>'+esc(n.lines)+' line'+(n.lines===1?"":"s")+'</span><span>sizes '+esc(n.sizes)+'</span></span>'+
+      (n.product_handle?'<div class="btns"><button class="btn" data-scuse="'+esc(n.product_handle)+'" data-scstore="'+esc(n.store)+'">Add chart</button></div>':'')+'</div>'; }).join(""):'<div class="note">No sized orders without a chart in the last 30 days.</div>';
+    h+='<div class="lab" style="margin-top:14px">Add a chart</div><div class="scform">'+
+      '<select class="fld" id="scStore"><option value="hc">Holt &amp; Crane</option><option value="aub">Auberlane</option><option value="mar">Marlowe Standard</option></select>'+
+      '<input class="fld" id="scHandle" placeholder="product handle or link" style="min-width:220px">'+
+      '<select class="fld" id="scUnit"><option value="cm">cm</option><option value="in">inches</option></select>'+
+      '<label><input type="checkbox" id="scFlat"> measured flat (half chest)</label></div>'+
+      '<textarea class="fld" id="scRows" style="margin-top:8px" placeholder="M 110 48 80 60&#10;L 115 49 81 61&#10;XL 120 50 82 62"></textarea>'+
+      '<div class="note">One size per line. Column order: size chest shoulder length sleeve (add waist as a 6th number for dresses). Use - for a number the chart does not give.</div>'+
+      '<div class="btns"><button class="btn p" data-sc="paste">Save chart</button></div>'+
+      '<div class="scform" style="margin-top:12px"><span style="font-size:12px;color:var(--muted)">Or a chart image:</span><input class="fld" type="file" id="scImg" accept="image/png,image/jpeg,image/webp,image/gif"><button class="btn" data-sc="image">Read image</button></div>'+
+      '<div class="note">The brain reads the image once (a few cents of Claude). Check what it read before you confirm.</div><div id="scOut"></div>';
+    h+='<div class="lab" style="margin-top:14px">Recent charts</div>';
+    h+=charts.length?charts.map(function(c){
+      var cst=c.verified?'<span class="ok-t">confirmed by you</span>':!c.current?'<span style="color:var(--faint)">replaced</span>':'<span class="warn-t">not yet checked</span>';
+      return '<div class="rowx"><span><b style="font-weight:500">#'+esc(c.id)+' '+esc(c.title||c.product_handle||c.product_id)+'</b></span><div class="msg">'+esc(scSummary(c.rows))+'</div>'+
+        '<span class="meta"><span>'+esc(c.storeName||c.store)+'</span><span>'+esc(c.product_handle||c.product_id)+'</span><span>'+(c.kind==="image"?"read from an image":"pasted")+'</span><span>'+cst+'</span><span>'+esc(ago(c.created_at))+'</span>'+((c.notes||[]).length?'<span>'+esc(c.notes.join("; "))+'</span>':'')+'</span>'+
+        (!c.verified&&c.current?'<div class="btns"><button class="btn g" data-scconfirm="'+esc(c.id)+'">Confirm</button></div>':'')+'</div>';
+    }).join(""):'<div class="note">No charts added yet.</div>';
+    return h+'</div>';
+  }
+  /* Parse the textarea: "M 110 48 80 60" per line → {size, chest, shoulder, length, sleeve, waist}. */
+  function scParse(text){
+    var cols=["chest","shoulder","length","sleeve","waist"], rows=[];
+    String(text||"").split(/\n+/).forEach(function(line){
+      var t=line.trim().split(/[\s,;\t]+/).filter(Boolean); if(!t.length) return;
+      var r={size:t[0]}; cols.forEach(function(k,i){ var v=t[i+1]; r[k]=(v==null||v==="-"||v==="x")?null:v; }); rows.push(r);
+    });
+    return rows;
+  }
+  function scOut(ok,txt){ var o=$("#scOut"); if(o) o.innerHTML='<div class="note '+(ok?"ok-t":"bad-t")+'">'+esc(txt)+'</div>'; }
+  function scRefresh(){ busyUntil=0; delete deptCache["supplier-agents"]; loadDept("supplier-agents"); }
+  async function scPost(path,body,btn,okText){
+    btn.disabled=true; busyUntil=Date.now()+120000;
+    try{ var r=await api(path,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)}); var j=await r.json();
+      if(j.ok){ scOut(true,okText(j)); setTimeout(scRefresh,2500); } else { scOut(false,"Not saved: "+(j.error||("HTTP "+r.status))); btn.disabled=false; }
+    }catch(e){ scOut(false,"Could not reach the brain. Nothing was saved."); btn.disabled=false; }
+  }
+  document.addEventListener("focusin",function(e){ if(e.target&&e.target.closest&&e.target.closest("#sizeBox")) busyUntil=Date.now()+120000; });
+  document.addEventListener("click",function(e){
+    var b=e.target&&e.target.closest?e.target.closest("[data-sc],[data-scconfirm],[data-scuse]"):null; if(!b) return;
+    busyUntil=Date.now()+120000;
+    if(b.dataset.scuse){ $("#scStore").value=b.dataset.scstore; $("#scHandle").value=b.dataset.scuse; $("#scRows").focus(); return; }
+    if(b.dataset.scconfirm){ scPost("/api/size-charts/"+encodeURIComponent(b.dataset.scconfirm)+"/confirm",{},b,function(){return "Confirmed. The size check now treats this chart as checked."}); return; }
+    var store=$("#scStore").value, handle=$("#scHandle").value.trim();
+    if(!handle){ scOut(false,"Add the product handle (or paste the product link)."); return; }
+    var said=function(j){ var n=(j.rows||[]).length; return "Saved chart #"+j.id+" ("+n+" sizes, not yet checked)."+(j.resolved?"":" The handle is not in the catalog copy yet; it still matches orders by handle.")+(j.notes&&j.notes.length?" "+j.notes.join("; ")+".":""); };
+    if(b.dataset.sc==="paste"){
+      var rows=scParse($("#scRows").value);
+      if(rows.length<2){ scOut(false,"Add at least 2 sizes, one per line."); return; }
+      scPost("/api/size-charts",{store:store,product_handle:handle,unit:$("#scUnit").value,flat:$("#scFlat").checked,rows:rows},b,said);
+    } else if(b.dataset.sc==="image"){
+      var f=$("#scImg").files&&$("#scImg").files[0];
+      if(!f){ scOut(false,"Choose an image first."); return; }
+      if(f.size>5000000){ scOut(false,"That image is over 5 MB."); return; }
+      var rd=new FileReader();
+      rd.onload=function(){ var data=String(rd.result||"").replace(/^data:[^,]*,/,""); scOut(true,"Reading the chart…");
+        scPost("/api/size-charts/image",{store:store,product_handle:handle,image_base64:data,media_type:f.type},b,said); };
+      rd.onerror=function(){ scOut(false,"Could not read that file."); };
+      rd.readAsDataURL(f);
+    }
+  });
   async function loadDept(p){
     if(deptCache[p]&&deptCache[p].loading) return;
     deptCache[p]=Object.assign(deptCache[p]||{},{loading:true});

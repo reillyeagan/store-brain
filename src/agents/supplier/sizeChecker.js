@@ -9,34 +9,46 @@
  * Reilly, 2026-10-11: "if the customer orders a M and the chinese M looks more like a S, we
  * might want to send out a chinese L" · "check everything and make logical decisions" ·
  * "keep track of email info from customers who have complained about sizing ... and make note of that."
+ * Reilly, 2026-10-14: "we should have different size charts for different products right? like a
+ * womens sweater might have different size measurements than a womens coat or even a womens fitted blouse"
  *
- * Inputs:  order_lines + orders (Shopify, already in the ledger), size_charts (library, cm),
- *          size_complaints (from email; CS fills it), core_facts (optional overrides below).
+ * Inputs:  order_lines + orders (Shopify, already in the ledger), size_charts (library, cm;
+ *          filled by the chart intake in sizeIntake.js), size_complaints (from email; CS fills
+ *          it), core_facts (optional overrides below), the US reference library (sizeReferences.js).
  * Outputs: size_recommendations (one per line), kfb_size_asks (only when a different size
  *          should ship), events.
  *
  * Logic (size EQUIVALENCE, spec "Fit rule"):
- *  - For the garment type, the measurements that matter are compared: jacket chest+shoulder,
- *    sweater chest+length, shirt chest+shoulder. A Chinese size "is" the US size ordered on a
- *    measurement when it reaches the US reference for that size (minus a small tolerance).
+ *  - The line is matched to a US reference by (audience, garment, fit): e.g. women's coat,
+ *    regular fit. Each reference declares the measurements that matter (coat/blazer chest +
+ *    shoulder, women's knit chest only, men's knit chest + length, dress chest + waist, any
+ *    relaxed fit chest only). A Chinese size "is" the US size ordered on a measurement when it
+ *    reaches the reference for that size (minus a small tolerance).
  *  - Ship the smallest Chinese size that matches on EVERY measurement that matters. When the
- *    measurements disagree, the reason says which said what.
+ *    measurements disagree, the reason says which said what. The reason names the reference.
+ *  - Oversized / relaxed garments are compared ONLY against the relaxed reference, and are never
+ *    sized up just for being oversized: if the ordered Chinese size already reaches the REGULAR
+ *    chest, it ships as ordered.
  *  - Never above the factory's largest size: nothing fits → "no_fit" (customer message needed).
  *  - Customer complaints for the product → treated as running small even if the chart looks
  *    fine; the size-up is learned from what customers said fit.
- *  - No chart and no complaints → "no_chart", no guess. Bottoms (waist sizes) and women's
- *    items → "no_reference" until a reference exists.
+ *  - No chart and no complaints → "no_chart", no guess. Bottoms (waist sizes), numeric sizes
+ *    and kids' items → "no_reference".
  *  - Audience per store (Reilly, 2026-10-13: "H&C is mens and womens. Auberlane is womens.
  *    Marlowe is mens."): STORES[store].audience, overridable by a live Core fact
- *    `profile.audience`. "women" → no_reference. "men" → men's reference. "both" (H&C) →
- *    decided per product from its title, tags and product type; a product marked neither way
- *    is NOT assumed men's (that could size a women's line against the men's chart).
+ *    `profile.audience` only where config is silent. "women" → women's references. "men" →
+ *    men's. "both" (H&C) → decided per product from its title, tags and product type; a
+ *    product marked neither way is NOT assumed either way. A product marked against its
+ *    store's audience, or marked both ways, gets no reference (never guessed).
  *  - Runs large → still shipped as ordered (sizing DOWN is not automated; noted only).
  */
 import { LIVE_STORE_IDS, STORES } from "../../config/stores.js";
 import { logEvent } from "../../lib/eventlog.js";
 import { nowIso } from "../../lib/time.js";
 import { SIZE_ORDER, normSize, sizeIndex } from "./common.js";
+import {
+  referenceFor, referenceName, garmentOf as garmentFor, fitOf, librarySummary, LEGACY_GARMENT,
+} from "./sizeReferences.js";
 
 const ACTOR = "sup.size_charts";
 
@@ -48,40 +60,25 @@ export const MAX_LINES_PER_RUN = 100;
 export const RECHECK_HOURS = 6;
 
 /**
- * US garment reference, men's tops, in cm (garment measurements, not body).
- * LABELLED INFERENCE, not an observation: built from standard US men's body chest
- * (S 34–36", M 38–40", L 42–44", XL 46–48" ...) plus the house ~5" ease from the spec
- * ("Converts per listing (house scale, ~5" ease)"), and typical US garment shoulder/length/
- * sleeve. Override per garment with a Core fact: area "sizing", key
- * "sizing.us_reference:<garment>", value JSON {"M": {"chest":112, ...}, ...}.
+ * What the dashboard says about the references. Every table is a LABELLED INFERENCE (US body
+ * measurement + garment ease), see sizeReferences.js. Override one with a Core fact: area
+ * "sizing", key "sizing.us_reference:<audience>:<garment>" (or ...:<garment>:<fit>), value JSON
+ * {"M": {"chest":112, ...}, ...}. The old key "sizing.us_reference:<garment>" still means men's.
  */
-export const US_REFERENCE_MEN = Object.freeze({
-  S: { chest: 102, shoulder: 44, length: 70, sleeve: 62 },
-  M: { chest: 112, shoulder: 46, length: 72, sleeve: 63.5 },
-  L: { chest: 122, shoulder: 48, length: 74, sleeve: 65 },
-  XL: { chest: 132, shoulder: 50, length: 76, sleeve: 66 },
-  "2XL": { chest: 142, shoulder: 52, length: 78, sleeve: 67 },
-  "3XL": { chest: 152, shoulder: 54, length: 80, sleeve: 68 },
-  "4XL": { chest: 162, shoulder: 56, length: 82, sleeve: 69 },
-});
-export const REFERENCE_SOURCE = "brain's starting US reference (inference: US body chest + ~5\" house ease); refine via Core sizing facts and complaints";
+export const REFERENCE_SOURCE = `brain's starting US references (inference: US body chest/bust + garment ease, by audience, garment and fit): ${librarySummary()}. Refine via Core sizing facts and complaints; factory charts come from the chart intake`;
 
 /** How far under the reference still counts as the same size (cm). */
-export const TOLERANCE = Object.freeze({ chest: 3, shoulder: 1.5, length: 2, sleeve: 2 });
+export const TOLERANCE = Object.freeze({ chest: 3, shoulder: 1.5, length: 2, sleeve: 2, waist: 3 });
 
-/** Which measurements matter for which garment (spec: "chest + shoulder for a jacket, chest + length for a sweater"). */
-export const GARMENTS = Object.freeze({
-  jacket: { re: /\b(blazer|jacket|coat|overcoat|outerwear|parka|peacoat|trench|suit|gilet|vest)\b/i, key: ["chest", "shoulder"] },
-  sweater: { re: /\b(sweater|cardigan|knit|jumper|hoodie|sweatshirt|pullover|crewneck|turtleneck|quarter[- ]zip|zip[- ]up)\b/i, key: ["chest", "length"] },
-  shirt: { re: /\b(shirt|tee|t-shirt|polo|henley|oxford|flannel|overshirt|top)\b/i, key: ["chest", "shoulder"] },
-});
-const BOTTOMS_RE = /\b(pants|trousers|jeans|chinos?|shorts|joggers|slacks|skirt)\b/i;
 const WOMENS_RE = /\b(women'?s?|womens|ladies|her)\b/i;
 // Word boundaries matter: "women" contains "men" and "female" contains "male"; \bmen and
 // \bmale never match inside them. Any feminine marker counts (woman, womenswear, lady, girl...).
 const WOMEN_MARK_RE = /\b(wom[ae]n(?:'?s)?|womens|womenswear|lad(?:y|ies)(?:'?s)?|females?|girls?(?:'?s)?)\b/i;
 // Not the bare word "man": "Man-made fibres", "Man Made", "Isle of Man" say nothing about who it's for.
 const MEN_MARK_RE = /\b(men(?:'?s)?|menswear|males?)\b/i;
+// Children's sizes are a different system altogether: never sized against an adult reference.
+// Not "baby": "Baby Alpaca" is a yarn, not a size range.
+const KIDS_RE = /\b(girls?(?:'?s)?|boys?(?:'?s)?|kids?(?:'?s)?|child(?:ren)?(?:'?s)?|toddlers?|youth|infants?)\b/i;
 
 /** The reason a "both" store's unmarked product gets no size (only H&C is "both" today). */
 export const UNMARKED_BOTH_REASON = "H&C sells men's and women's; this product isn't marked either way";
@@ -111,14 +108,10 @@ export function productAudience({ title = null, tags = null, productType = null 
   return w ? "women" : m ? "men" : null;
 }
 
-export function garmentOf(title) {
-  const t = String(title || "");
-  if (BOTTOMS_RE.test(t)) return "bottoms";
-  for (const [g, d] of Object.entries(GARMENTS)) if (d.re.test(t)) return g;
-  return null;
-}
+/** The garment a title names for an audience (rules and their order: sizeReferences.js). */
+export function garmentOf(title, audience = "men") { return garmentFor(title, audience); }
 
-/** Read a chart's rows into {size: {chest, shoulder, length, sleeve}} with the size labels normalised. */
+/** Read a chart's rows into {size: {chest, shoulder, length, sleeve, waist}} with the size labels normalised. */
 export function chartFromRows(rows) {
   const chart = {}; const notes = [];
   for (const r of rows || []) {
@@ -128,12 +121,14 @@ export function chartFromRows(rows) {
     if (typeof m === "string") { try { m = JSON.parse(m); } catch { m = null; } }
     if (!m || typeof m !== "object") continue;
     const out = {};
-    for (const k of ["chest", "shoulder", "length", "sleeve"]) {
+    for (const k of ["chest", "shoulder", "length", "sleeve", "waist"]) {
       const v = Number(k === "chest" ? (m.chest ?? m.bust) : m[k]);
       if (Number.isFinite(v) && v > 0) out[k] = v;
     }
     // A chest under 75cm can't be a full adult circumference: it's a flat (half) measurement.
     if (out.chest && out.chest < 75) { out.chest *= 2; notes.push(`${s} chest looked like a flat measurement (×2)`); }
+    // Same for a waist under 50cm (charts saved through the intake are already full; older rows may not be).
+    if (out.waist && out.waist < 50) { out.waist *= 2; notes.push(`${s} waist looked like a flat measurement (×2)`); }
     chart[s] = out;
   }
   return { chart, notes: [...new Set(notes)] };
@@ -171,24 +166,99 @@ export function complaintShift(complaints) {
   return Math.max(1, shifts[Math.floor((shifts.length - 1) / 2)]); // median, at least one size
 }
 
+/** A Core override table with its size labels normalised, or null if it isn't a usable table. */
+function cleanTable(t) {
+  if (!t || typeof t !== "object" || Array.isArray(t)) return null;
+  const out = {};
+  for (const [k, v] of Object.entries(t)) { const s = normSize(k); if (s && v && typeof v === "object") out[s] = v; }
+  return Object.keys(out).length ? out : null;
+}
+
+/** A Core override for (audience, garment, fit): most specific key first; old one-word keys are men's. */
+function overrideFor(overrides, audience, garment, fit) {
+  const o = overrides || {};
+  const tries = [`${audience}:${garment}:${fit}`, `${audience}:${garment}`];
+  if (audience === "men") {
+    tries.push(garment);
+    for (const [old, now] of Object.entries(LEGACY_GARMENT)) if (now.includes(garment)) tries.push(old);
+  }
+  for (const k of tries) {
+    const t = cleanTable(o[k]);
+    if (t) return { key: k, table: t };
+  }
+  return null;
+}
+
+/**
+ * Which US reference one line is sized against: audience (store + product marks), garment
+ * (title, then product type), fit (title + tags). Pure.
+ * @returns {{none:string}|{audience, garment, fit, table, key, name, regularTable, notes:string[]}}
+ */
+export function referenceForLine({ title, audience = null, tags = null, productType = null, overrides = {} }) {
+  let tagList = tags;
+  if (typeof tagList === "string") { try { tagList = JSON.parse(tagList); } catch { tagList = [tagList]; } }
+  const allText = [title, productType, ...(Array.isArray(tagList) ? tagList : [])].filter(Boolean).map(String).join(" | ");
+  if (KIDS_RE.test(allText)) return { none: "children's item: no kids' US reference (never sized against an adult chart)" };
+  const marked = productAudience({ title, tags, productType });
+  if (marked === "mixed") return { none: MIXED_MARKS_REASON };
+  const womenMarked = marked === "women" || (marked == null && WOMENS_RE.test(String(title || "")));
+  let aud;
+  if (audience === "women") {
+    if (marked === "men") return { none: "product is marked men's but the store sells women's: no size reference (never guessed)" };
+    aud = "women";
+  } else if (audience === "men") {
+    if (womenMarked) return { none: "product is marked women's but the store sells men's: no size reference (never sized as men's)" };
+    aud = "men";
+  } else if (audience === "both") {
+    // A store that sells both: only a product marked one way gets that way's reference. Never assume.
+    if (womenMarked) aud = "women";
+    else if (marked === "men") aud = "men";
+    else return { none: UNMARKED_BOTH_REASON };
+  } else {
+    aud = womenMarked ? "women" : "men"; // store not described yet: the run adds "audience assumed"
+  }
+
+  const notes = [];
+  let garment = garmentFor(title, aud);
+  if (garment == null && productType) garment = garmentFor(productType, aud);
+  if (garment === "bottoms") return { none: "bottoms: no US waist/inseam reference yet" };
+  if (garment == null) {
+    garment = "knit";
+    notes.push("garment type unclear from the title: compared as a knit");
+  }
+  const { fit, mixed } = fitOf(title, tagList);
+  if (mixed) notes.push("the title says both fitted and relaxed: compared as regular fit");
+
+  const lib = referenceFor(aud, garment, fit);
+  if (!lib) return { none: `no US ${aud === "women" ? "women's" : "men's"} ${garment} reference` };
+  const ov = overrideFor(overrides, aud, garment, fit);
+  const regOv = fit === "relaxed" ? overrideFor(overrides, aud, garment, "regular") : null;
+  return {
+    audience: aud, garment, fit,
+    table: ov ? ov.table : lib.table,
+    key: lib.key,
+    name: ov ? `Core fact sizing.us_reference:${ov.key} (${fit} fit)` : referenceName(aud, garment, fit),
+    regularTable: fit === "relaxed" ? (regOv ? regOv.table : referenceFor(aud, garment, "regular").table) : null,
+    notes,
+  };
+}
+
 /**
  * Decide the size to send for one line. Pure.
- * @returns {{verdict, send_size, reason, conflict:boolean}}
+ * `overrides` are Core reference tables keyed "<audience>:<garment>[:<fit>]" (or the old "<garment>", men's).
+ * @returns {{verdict, send_size, reason, conflict:boolean, reference?:string}}
  */
-export function recommendSize({ title, orderedSize, chartRows, complaints = [], reference = US_REFERENCE_MEN, audience = null, productSizes = null, tags = null, productType = null }) {
+export function recommendSize({ title, orderedSize, chartRows, complaints = [], audience = null, productSizes = null, tags = null, productType = null, overrides = {} }) {
   const ordered = normSize(orderedSize);
-  const garment = garmentOf(title);
   const nComplaints = (complaints || []).length;
   const shift = complaintShift(complaints);
   if (!ordered) return { verdict: "no_reference", send_size: null, reason: `size "${orderedSize}" is not a letter size (waist/number sizes have no reference yet)`, conflict: false };
-  if (garment === "bottoms") return { verdict: "no_reference", send_size: null, reason: "bottoms: no US waist/inseam reference yet", conflict: false };
-  // Women's by store audience, by the title, or by the product's own tags/type (at any store).
-  const marked = productAudience({ title, tags, productType });
-  if (marked === "mixed") return { verdict: "no_reference", send_size: null, reason: MIXED_MARKS_REASON, conflict: false };
-  if (audience === "women" || WOMENS_RE.test(String(title || "")) || marked === "women") return { verdict: "no_reference", send_size: null, reason: "women's item: no women's US reference yet", conflict: false };
-  // A store that sells both: only a product marked men's gets the men's reference. Never assume.
-  if (audience === "both" && marked !== "men") return { verdict: "no_reference", send_size: null, reason: UNMARKED_BOTH_REASON, conflict: false };
-  if (!reference[ordered]) return { verdict: "no_reference", send_size: null, reason: `no US reference for size ${ordered}`, conflict: false };
+  const line = referenceForLine({ title, audience, tags, productType, overrides });
+  if (line.none) return { verdict: "no_reference", send_size: null, reason: line.none, conflict: false };
+  const reference = line.table;
+  if (!reference[ordered]) return { verdict: "no_reference", send_size: null, reason: `no ${line.name} reference for size ${ordered}`, conflict: false };
+  const vs = `vs ${line.name} reference`;
+  const garmentNote = line.notes.length ? ` (${line.notes.join("; ")})` : "";
 
   const { chart, notes } = chartFromRows(chartRows);
   const sizes = sortedSizes(chart);
@@ -207,10 +277,9 @@ export function recommendSize({ title, orderedSize, chartRows, complaints = [], 
       }
       return { verdict: "complaints_only", send_size: want, conflict: false, reason: `${base} (it comes in up to ${largestListed}; no chart to check the factory's sizes)` };
     }
-    return { verdict: "no_chart", send_size: null, reason: "no size chart in the library yet: no guess", conflict: false };
+    return { verdict: "no_chart", send_size: null, reason: `no size chart in the library yet: no guess (would compare ${vs})`, conflict: false };
   }
-  const key = (GARMENTS[garment] || GARMENTS.sweater).key;
-  const garmentNote = garment ? "" : " (garment type unclear from the title: compared as a sweater, chest + length)";
+  const key = line.key;
 
   // Per measurement that matters: the smallest Chinese size that reaches the US reference for the ordered size.
   const picks = {};
@@ -228,12 +297,28 @@ export function recommendSize({ title, orderedSize, chartRows, complaints = [], 
     said.push(`${m}: ${asOrdered}; US ${ordered} needs ~${need}cm → ${fit ? `Chinese ${fit}` : "no factory size reaches it"}`);
   }
   const measured = Object.keys(picks);
-  if (!measured.length) return { verdict: "no_chart", send_size: null, reason: `chart has none of the measurements that matter (${key.join(", ")})`, conflict: false };
+  if (!measured.length) return { verdict: "no_chart", send_size: null, reason: `chart has none of the measurements that matter ${vs} (${key.join(", ")})`, conflict: false };
+
+  // Oversized / relaxed: never sized up just for being an oversized cut. The extra room the
+  // relaxed reference expects is a style choice, so a size-up is capped at what the REGULAR-fit
+  // chest needs: if the ordered Chinese size reaches the regular chest it ships as ordered, and a
+  // chart that is genuinely small goes up only as far as the regular chest says.
+  let oversizeNote = "";
+  if (line.fit === "relaxed" && "chest" in picks && (picks.chest === null || sizeIndex(picks.chest) > sizeIndex(ordered))) {
+    const reg = line.regularTable && line.regularTable[ordered] && line.regularTable[ordered].chest;
+    const regPick = reg == null ? null : sizes.find((s) => chart[s].chest != null && chart[s].chest >= reg - TOLERANCE.chest);
+    if (regPick && (picks.chest === null || sizeIndex(regPick) < sizeIndex(picks.chest))) {
+      picks.chest = sizeIndex(regPick) < sizeIndex(ordered) ? ordered : regPick;
+      oversizeNote = picks.chest === ordered
+        ? `. Chinese ${ordered} chest ${chart[ordered] ? `${chart[ordered].chest}cm ` : ""}already reaches the regular-fit US ${ordered} (~${reg}cm): not sized up just for being an oversized cut`
+        : `. Capped at Chinese ${picks.chest}, the size that reaches the regular-fit US ${ordered} chest (~${reg}cm): never sized up further just for being an oversized cut`;
+    }
+  }
 
   const largest = sizes[sizes.length - 1];
   if (measured.some((m) => !picks[m])) {
-    return { verdict: "no_fit", send_size: null, conflict: false,
-      reason: `nothing up to the factory's largest (${largest}) fits a US ${ordered}: ${said.join("; ")}. Customer message needed.` };
+    return { verdict: "no_fit", send_size: null, conflict: false, reference: line.name,
+      reason: `${vs}: nothing up to the factory's largest (${largest}) fits a US ${ordered}: ${said.join("; ")}. Customer message needed.${garmentNote}` };
   }
   let sendIdx = Math.max(...measured.map((m) => sizeIndex(picks[m])));
   // Never send smaller than ordered: a chart that runs large is noted, not acted on.
@@ -241,7 +326,7 @@ export function recommendSize({ title, orderedSize, chartRows, complaints = [], 
   if (chartBelowOrdered) sendIdx = sizeIndex(ordered);
   const distinct = new Set(measured.map((m) => picks[m]));
   const conflict = distinct.size > 1;
-  let why = said.join("; ");
+  let why = `${vs}: ${said.join("; ")}${oversizeNote}`;
   if (conflict) why += `. Measurements disagree (${measured.map((m) => `${m} says ${picks[m]}`).join(", ")}): shipping ${SIZE_ORDER[sendIdx]} so it fits on all of them`;
 
   if (shift > 0) {
@@ -253,25 +338,26 @@ export function recommendSize({ title, orderedSize, chartRows, complaints = [], 
       why += `. ${nComplaints} sizing complaint${nComplaints === 1 ? "" : "s"} agree it runs small`;
     }
   }
+  const out = (o) => ({ ...o, reference: line.name });
   if (sendIdx > sizeIndex(largest)) {
-    return { verdict: "no_fit", send_size: null, conflict,
+    return out({ verdict: "no_fit", send_size: null, conflict,
       reason: chartBelowOrdered
-        ? `${why}. The chart says a smaller Chinese size would fit, but the factory's largest is ${largest} and the brain never sends smaller than ordered: customer message needed.`
-        : `${why}. That's above the factory's largest size (${largest}): customer message needed.` };
+        ? `${why}. The chart says a smaller Chinese size would fit, but the factory's largest is ${largest} and the brain never sends smaller than ordered: customer message needed.${garmentNote}`
+        : `${why}. That's above the factory's largest size (${largest}): customer message needed.${garmentNote}` });
   }
   if (notes.length) why += `. Note: ${notes.join("; ")}`;
   const send = SIZE_ORDER[sendIdx];
   if (send === ordered) {
     if (chartBelowOrdered) {
-      return { verdict: "runs_large", send_size: ordered, conflict, reason: `${why}. Runs large: shipped as ordered (the brain never sends smaller than ordered)${garmentNote}` };
+      return out({ verdict: "runs_large", send_size: ordered, conflict, reason: `${why}. Runs large: shipped as ordered (the brain never sends smaller than ordered)${garmentNote}` });
     }
     // Would one size smaller also match? Then it runs large: noted, still shipped as ordered.
     const smaller = sizes.filter((s) => sizeIndex(s) < sizeIndex(ordered)).pop();
-    const runsLarge = smaller && measured.every((m) => chart[smaller][m] != null && chart[smaller][m] >= reference[ordered][m] - TOLERANCE[m]);
-    if (runsLarge) return { verdict: "runs_large", send_size: ordered, conflict, reason: `${why}. Chinese ${smaller} would also fit: runs large, shipped as ordered (sizing down is not automated)${garmentNote}` };
-    return { verdict: "as_ordered", send_size: ordered, conflict, reason: `${why}. True to size: ship as ordered${garmentNote}` };
+    const runsLarge = !oversizeNote && smaller && measured.every((m) => chart[smaller][m] != null && reference[ordered][m] != null && chart[smaller][m] >= reference[ordered][m] - TOLERANCE[m]);
+    if (runsLarge) return out({ verdict: "runs_large", send_size: ordered, conflict, reason: `${why}. Chinese ${smaller} would also fit: runs large, shipped as ordered (sizing down is not automated)${garmentNote}` });
+    return out({ verdict: "as_ordered", send_size: ordered, conflict, reason: `${why}. True to size: ship as ordered${garmentNote}` });
   }
-  return { verdict: "size_up", send_size: send, conflict, reason: `${why}${garmentNote}` };
+  return out({ verdict: "size_up", send_size: send, conflict, reason: `${why}${garmentNote}` });
 }
 
 /** Letter sizes a product is listed in, from cat_products.variants JSON ([{title:"Navy / M"}, ...]). */
@@ -313,7 +399,8 @@ export async function coreSizing(db, store) {
         out.audienceConflict = `Core fact profile.audience "${String(f.value).slice(0, 60)}" disagrees with Reilly's recorded audience "${config}" (2026-10-13): Reilly's used`;
       }
     } else {
-      try { out.references[f.key.split(":")[1]] = JSON.parse(f.value); } catch { /* bad fact: ignored, default used */ }
+      // "sizing.us_reference:women:coat" → "women:coat"; the old "sizing.us_reference:jacket" → "jacket" (men's).
+      try { out.references[f.key.slice("sizing.us_reference:".length)] = JSON.parse(f.value); } catch { /* bad fact: ignored, default used */ }
     }
   }
   return out;
@@ -349,15 +436,13 @@ export async function runSizeChecker(env, { nowMs = Date.now() } = {}) {
     const { results: complaints } = await db.prepare(
       `SELECT size_ordered, size_that_fits, said FROM size_complaints WHERE store = ? AND product_id = ?`
     ).bind(l.store, l.product_id || "").all();
-    const garment = garmentOf(l.title);
-    const reference = (garment && core[l.store].references[garment]) || US_REFERENCE_MEN;
     // Catalog's copy of the product: its title/tags/type say men's or women's at a store that
     // sells both, and its sizes cap a complaints-only ask.
     const listing = await db.prepare(`SELECT title, tags, product_type, variants FROM cat_products WHERE store = ? AND product_id = ?`)
       .bind(l.store, l.product_id || "").first().catch(() => null);
     const productSizes = listedSizes(listing && listing.variants);
     const title = [l.title, listing && listing.title].filter(Boolean).join(" | ");
-    const rec = recommendSize({ title, orderedSize: l.size, chartRows, complaints, reference, audience: core[l.store].audience, productSizes,
+    const rec = recommendSize({ title, orderedSize: l.size, chartRows, complaints, overrides: core[l.store].references, audience: core[l.store].audience, productSizes,
       tags: listing && listing.tags, productType: listing && listing.product_type });
     let reason = rec.reason;
     if (rec.verdict !== "no_chart" && rec.verdict !== "no_reference" && !core[l.store].audience) reason += " (audience assumed men's: not in the Core yet)";

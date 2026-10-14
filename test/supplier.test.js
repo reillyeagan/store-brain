@@ -439,7 +439,11 @@ test("Size Checker: never above the factory's largest; no chart means no guess",
   assert.match(r.reason, /customer message/i);
   assert.equal(recommendSize({ title: "Cardigan", orderedSize: "M", chartRows: [] }).verdict, "no_chart");
   assert.equal(recommendSize({ title: "Slim Chinos", orderedSize: "32", chartRows: SMALL_CHART }).verdict, "no_reference");
-  assert.equal(recommendSize({ title: "Women's Cardigan", orderedSize: "M", chartRows: SMALL_CHART }).verdict, "no_reference");
+  // Women's now have references (2026-10-14): a women's cardigan is sized against the women's cardigan table.
+  const wc = recommendSize({ title: "Women's Cardigan", orderedSize: "M", chartRows: SMALL_CHART });
+  assert.equal(wc.verdict, "as_ordered");
+  assert.match(wc.reason, /vs US women's cardigan \(regular fit\) reference/);
+  assert.equal(recommendSize({ title: "Girls Cardigan", orderedSize: "M", chartRows: SMALL_CHART }).verdict, "no_reference", "kids' sizes: never an adult chart");
 });
 
 test("Size Checker: complaints size up even when the chart looks fine; complaints alone stay within the listed sizes", () => {
@@ -484,8 +488,8 @@ test("Size Checker: flat chest measurements are doubled; garment types", () => {
   const { chart, notes } = chartFromRows([{ size_label: "L", measurements: JSON.stringify({ chest: 56 }) }]);
   assert.equal(chart.L.chest, 112);
   assert.equal(notes.length, 1);
-  assert.equal(garmentOf("Wool Blazer"), "jacket");
-  assert.equal(garmentOf("Cable Knit Cardigan"), "sweater");
+  assert.equal(garmentOf("Wool Blazer"), "blazer");
+  assert.equal(garmentOf("Cable Knit Cardigan"), "cardigan");
   assert.equal(garmentOf("Linen Shirt"), "shirt");
 });
 
@@ -542,12 +546,13 @@ test("Size Checker run: records recommendations and one KFB ask per line, idempo
   assert.equal((await DB.prepare(`SELECT COUNT(*) AS n FROM kfb_size_asks`).first()).n, 1);
 });
 
-test("Size Checker audiences: women → no reference; men → men's chart, no 'assumed' note; both (H&C) → per product, never assumed", () => {
+test("Size Checker audiences: women → women's references; men → men's chart, no 'assumed' note; both (H&C) → per product, never assumed", () => {
   const base = { title: "Shawl Collar Cardigan", orderedSize: "M", chartRows: SMALL_CHART };
   // women (Auberlane)
   const w = recommendSize({ ...base, audience: "women" });
-  assert.equal(w.verdict, "no_reference");
-  assert.match(w.reason, /women's item: no women's US reference yet/);
+  assert.equal(w.verdict, "as_ordered", "the same chart is true to size against the women's cardigan reference");
+  assert.match(w.reason, /vs US women's cardigan \(regular fit\) reference/);
+  assert.doesNotMatch(w.reason, /no women's US reference/);
   // men (Marlowe)
   const m = recommendSize({ ...base, audience: "men" });
   assert.equal(m.verdict, "size_up");
@@ -560,13 +565,16 @@ test("Size Checker audiences: women → no reference; men → men's chart, no 'a
   assert.equal(recommendSize({ ...base, audience: "both", tags: JSON.stringify(["Mens"]) }).send_size, "L");
   assert.equal(recommendSize({ ...base, audience: "both", productType: "Men's Knitwear" }).send_size, "L");
   assert.equal(recommendSize({ ...base, audience: "both", title: "Men's Shawl Collar Cardigan" }).send_size, "L");
-  // both: a women's line is never sized against the men's chart ("women" contains "men")
-  for (const marks of [{ tags: ["Womens"] }, { tags: ["Women"] }, { productType: "Ladies Knitwear" }, { title: "Womens Shawl Cardigan" }, { tags: ["Mens", "Womens"] }]) {
+  // both: a women's line is never sized against the men's chart ("women" contains "men"): it gets the women's reference
+  for (const marks of [{ tags: ["Womens"] }, { tags: ["Women"] }, { productType: "Ladies Knitwear" }, { title: "Womens Shawl Cardigan" }]) {
     const r = recommendSize({ ...base, audience: "both", ...marks });
-    assert.equal(r.verdict, "no_reference", JSON.stringify(marks));
-    assert.equal(r.send_size, null);
-    assert.match(r.reason, /women's/);
+    assert.equal(r.verdict, "as_ordered", JSON.stringify(marks));
+    assert.match(r.reason, /US women's cardigan/);
+    assert.doesNotMatch(r.reason, /US men's/);
   }
+  const mixed = recommendSize({ ...base, audience: "both", tags: ["Mens", "Womens"] });
+  assert.equal(mixed.verdict, "no_reference");
+  assert.equal(mixed.send_size, null);
   // a women's tag blocks the men's chart even at a men's store
   assert.equal(recommendSize({ ...base, audience: "men", tags: ["Womens"] }).verdict, "no_reference");
 });
@@ -594,12 +602,12 @@ test("Size Checker audiences from config and the Core: H&C's unmarked line gets 
   assert.equal(hcUnmarked.verdict, "no_reference");
   assert.match(hcUnmarked.reason, /isn't marked either way/);
   const hcWomen = await rec(1402);
-  assert.equal(hcWomen.verdict, "no_reference");
-  assert.match(hcWomen.reason, /women's item/);
+  assert.equal(hcWomen.verdict, "as_ordered");
+  assert.match(hcWomen.reason, /vs US women's cardigan \(regular fit\) reference/);
   const mar = await rec(1403);
   assert.equal(mar.verdict, "size_up");
   assert.doesNotMatch(mar.reason, /assumed/);
-  assert.equal((await rec(1404)).verdict, "no_reference");
+  assert.equal((await rec(1404)).verdict, "no_chart", "Auberlane is women's: it has a reference now, just no chart");
   const asks = (await DB.prepare(`SELECT order_name FROM kfb_size_asks ORDER BY order_name`).all()).results.map((a) => a.order_name);
   assert.deepEqual(asks, ["#1403"], "only Marlowe's men's line gets a size ask");
 
@@ -646,8 +654,12 @@ test("Size Checker: every feminine marker is women's; a product marked both ways
     for (const marks of probes) {
       const r = recommendSize({ ...base, audience, ...marks });
       assert.notEqual(r.verdict, "size_up", `${audience} ${JSON.stringify(marks)}`);
-      assert.equal(r.verdict, "no_reference", `${audience} ${JSON.stringify(marks)}`);
-      assert.equal(r.send_size, null);
+      assert.doesNotMatch(r.reason, /US men's/, `${audience} ${JSON.stringify(marks)}: never the men's chart`);
+      // At a men's store, any feminine marker means no reference; at H&C a single women's marker
+      // gets the women's reference (2026-10-14), a mixed one or a kids' one gets none.
+      const single = !/Men|Male/.test(JSON.stringify(marks)) && !/Girls/.test(JSON.stringify(marks));
+      if (audience === "both" && single) assert.match(r.reason, /US women's cardigan/, JSON.stringify(marks));
+      else { assert.equal(r.verdict, "no_reference", `${audience} ${JSON.stringify(marks)}`); assert.equal(r.send_size, null); }
     }
   }
   assert.equal(productAudience({ tags: ["Mens", "Womenswear"] }), "mixed");

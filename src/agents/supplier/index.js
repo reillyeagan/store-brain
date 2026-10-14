@@ -27,6 +27,7 @@ import { ensureSupplierDecisions } from "./decisions.js";
 import { runSimilarQc, SIMILAR_RULE } from "./similarQc.js";
 import { runQuoteDesk, FX } from "./quotes.js";
 import { runSizeChecker, REFERENCE_SOURCE } from "./sizeChecker.js";
+import { chartsNeeded, recentCharts } from "./sizeIntake.js";
 import { runPreflight } from "./preflight.js";
 import { runClaims, creditAging } from "./claims.js";
 import { runScout } from "./scout.js";
@@ -107,6 +108,8 @@ export async function supplierState(env, { nowMs = Date.now() } = {}) {
     `SELECT store, order_name, title, ordered_size, send_size, verdict, reason, conflict, chart_verified, complaints, checked_at
        FROM size_recommendations ORDER BY checked_at DESC LIMIT 50`
   ).all();
+  const needed = await chartsNeeded(db, { nowMs });
+  const charts = await recentCharts(db);
   const chartCount = await db.prepare(`SELECT COUNT(DISTINCT store || '|' || product_id) AS n FROM size_charts`).first();
   const { results: flags } = await db.prepare(`SELECT * FROM supply_flags ORDER BY id DESC LIMIT 50`).all();
   const { results: credits } = await db.prepare(`SELECT * FROM kfb_credits WHERE status IN ('open','claimed') ORDER BY opened_at LIMIT 50`).all();
@@ -137,6 +140,8 @@ export async function supplierState(env, { nowMs = Date.now() } = {}) {
         status: "running on Shopify order lines",
         chartsInLibrary: chartCount ? chartCount.n : 0,
         reference: REFERENCE_SOURCE,
+        chartsNeeded: needed, // sized order lines in 30 days with no chart, most lines first (top 20)
+        charts, // latest charts added (paste or image), each unchecked until Reilly confirms it
         verdicts3d: data.sizeVerdicts3d,
         asksPending: asks || [],
         noFit: noFit || [],
