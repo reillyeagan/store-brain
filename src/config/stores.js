@@ -33,6 +33,22 @@ export const PARCEL_TRACKING_DECISION = Object.freeze({
 export const GUY_FEE = Object.freeze({ rate: 0.10, start: "2026-09-07" });
 
 /**
+ * Guy's END date, per store (`guyEnd` on each store below): the LAST day his fee is charged.
+ * null = still active (the fee runs on). Every end date is null on purpose: only Reilly's own
+ * words set one (rule 10). The vault says Auberlane's media buyer ended after 2026-10-13, but
+ * that comes from Reilly's P&L sheet (Auberlane SETUP!B11) and the Memory Log (2026-10-14),
+ * not from his words in chat, so it is ASKED (below), not assumed.
+ * When Reilly answers, set that store's guyEnd here and record his words in `decisions`.
+ */
+export const GUY_END_QUESTIONS = Object.freeze([
+  {
+    store: "aub",
+    title: "Auberlane's media buyer: did Guy stop after Oct 13? (your sheet says so). Reply to set the end date.",
+    source: "Auberlane P&L sheet SETUP!B11 and vault Memory Log 2026-10-14 (not Reilly's chat words)",
+  },
+]);
+
+/**
  * Spend alarm (media.spend_alarm): "money is going out and nothing is coming in", or "the
  * money stopped going out". Watch only: it raises one alarm per store per day, never touches
  * the ad account (Guy runs the ads). Numbers are in the ad account's currency (USD today).
@@ -96,6 +112,7 @@ export const STORES = Object.freeze({
     // Guy (media buyer) fee: see GUY_FEE below.
     guyFeeRate: GUY_FEE.rate,
     guyStart: GUY_FEE.start,
+    guyEnd: null, // still active until Reilly says otherwise (see GUY_END_QUESTIONS)
   },
   aub: {
     id: "aub",
@@ -110,6 +127,7 @@ export const STORES = Object.freeze({
     // Guy (media buyer) fee: see GUY_FEE below.
     guyFeeRate: GUY_FEE.rate,
     guyStart: GUY_FEE.start,
+    guyEnd: null, // still active until Reilly says otherwise (see GUY_END_QUESTIONS)
   },
   mar: {
     id: "mar",
@@ -124,6 +142,7 @@ export const STORES = Object.freeze({
     // Guy (media buyer) fee: see GUY_FEE below.
     guyFeeRate: GUY_FEE.rate,
     guyStart: GUY_FEE.start,
+    guyEnd: null, // still active until Reilly says otherwise (see GUY_END_QUESTIONS)
   },
   cc: {
     id: "cc",

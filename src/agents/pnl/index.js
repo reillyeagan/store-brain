@@ -8,7 +8,8 @@
  *
  * Cadence: funnel hourly (≤ 2 Shopify calls per live store) · COGS Matcher hourly (does
  * nothing until KFB bills exist) · calendar hourly (each reminder/trigger at most once a day)
- * · Analyst once a day, from 06:00 UTC (after the 05:00 UTC day close).
+ * · Analyst once a day, from 06:00 UTC (after the 05:00 UTC day close) · Guy's fee daily
+ * (end-date questions asked once, the fee check once a month per store).
  * All shadow: everything stays in the ledger. AI: one capped Analyst call a day at most.
  */
 import { claimJob } from "../../lib/jobRuns.js";
@@ -17,12 +18,15 @@ import { pullFunnel, funnelState } from "./funnel.js";
 import { matchBills, cogsState } from "./cogs.js";
 import { runCalendar, calendarState } from "./calendar.js";
 import { runAnalyst, analystState } from "./analyst.js";
+import { askGuyEndDates, monthlyGuyCheck } from "./guyFee.js";
 
 export const PNL_EXTRA_JOBS = Object.freeze({
   "pnl.funnel": 60,
   "pnl.cogs": 60,
   "pnl.calendar": 60,
   "pnl.analyst": 24 * 60,
+  // Guy's fee: end-date questions (asked once) + the monthly fee check (once a month per store).
+  "pnl.guy_fee": 24 * 60,
 });
 export const ANALYST_AFTER_UTC_HOUR = 6;
 
@@ -42,6 +46,9 @@ export async function runPnlExtras(env, { nowMs = Date.now(), fetchImpl = fetch 
   out.funnel = await step(env, "pnl.funnel", "pnl.pullers", nowMs, () => pullFunnel(env, { nowMs, fetchImpl }));
   out.cogs = await step(env, "pnl.cogs", "pnl.cogs", nowMs, () => matchBills(env.DB, { nowMs }));
   out.calendar = await step(env, "pnl.calendar", "pnl.calendar", nowMs, () => runCalendar(env, { nowMs }));
+  out.guyFee = await step(env, "pnl.guy_fee", "pnl.calendar", nowMs, async () => ({
+    asked: await askGuyEndDates(env.DB, { nowMs }), checks: await monthlyGuyCheck(env.DB, { nowMs }),
+  }));
   // The daily analysis waits for the day close, so "yesterday" is final-ish.
   out.analyst = new Date(nowMs).getUTCHours() >= ANALYST_AFTER_UTC_HOUR
     ? await step(env, "pnl.analyst", "pnl.analyst", nowMs, () => runAnalyst(env, { nowMs, fetchImpl }))
