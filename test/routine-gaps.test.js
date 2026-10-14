@@ -10,6 +10,7 @@ import { minusDays } from "../src/lib/adsSpend.js";
 import { SPEND_ALARM, spendAlarmConfig } from "../src/config/stores.js";
 import { judgeSpend, runSpendAlarm, normallySpending } from "../src/agents/media/spendAlarm.js";
 import { gatherBriefData } from "../src/lib/brief.js";
+import { checkNewProduct, NO_COMPARE_AT_DAYS } from "../src/agents/catalog/prepublish.js";
 import { runBilling, judgeBudget, judgeBilling, judgeAccount, isAccessGap, Q_ACCOUNT, Q_BILLING, Q_BUDGET } from "../src/agents/media/billing.js";
 
 const evs = async (DB, kind) => (await DB.prepare(`SELECT * FROM events WHERE kind = ? ORDER BY id`).bind(kind).all()).results;
@@ -242,4 +243,37 @@ test("billing: Google saying CUSTOMER_NOT_ENABLED is news about the account (red
   const r = await runBilling({ DB }, { storeId: "mar", session: s });
   assert.match(r, /FLAG account/);
   assert.equal(s.queries.length, 1);
+});
+
+/* ---------------- 5. no compare-at on new products ---------------- */
+
+const newProd = (publishedAt, compareAt, price = 64.95) => ({
+  product_id: "gid://shopify/Product/77", handle: "wool-coat", title: "Wool Coat", status: "ACTIVE", description_len: 40,
+  image_count: 3, option_names: ["Size"], seo_title: "x", seo_description: "y", created_at: publishedAt, published_at: publishedAt,
+  variants: [{ id: "v1", sku: "S1", title: "M", price, compareAt }],
+});
+const TIERS = { 0: 10, 10: 2, 20: 10, 30: 10, 40: 10 };
+
+test("new-product check: a new product WITH a compare-at is flagged high (GMC Playbook: none for the first 30-60 days)", () => {
+  const NOWP = Date.parse("2026-10-14T12:00:00Z");
+  assert.equal(NO_COMPARE_AT_DAYS, 30);
+  const r = checkNewProduct("hc", newProd("2026-10-13T12:00:00Z", 89.95), { cost: { usd: 20 }, hasSizeChart: true, handles: new Set(), tierCounts: TIERS, nowMs: NOWP });
+  const f = r.issues.find((i) => i.code === "compare_at_on_new_product");
+  assert.ok(f, JSON.stringify(r.issues));
+  assert.equal(f.severity, "high");
+  assert.equal(r.passed, false);
+  assert.equal(r.suggested_tier, null);
+});
+
+test("new-product check: never proposes a compare-at tier for a product younger than 30 days (or of unknown age); older ones keep the tier logic", () => {
+  const NOWP = Date.parse("2026-10-14T12:00:00Z");
+  const young = checkNewProduct("hc", newProd("2026-10-12T12:00:00Z", null), { cost: { usd: 20 }, hasSizeChart: true, handles: new Set(), tierCounts: TIERS, nowMs: NOWP });
+  assert.equal(young.suggested_tier, null);
+  assert.ok(!young.issues.some((i) => i.code === "tier_unassigned"));
+  assert.equal(young.passed, true, JSON.stringify(young.issues));
+  const unknown = checkNewProduct("hc", { ...newProd(null, null), created_at: null, published_at: null }, { cost: { usd: 20 }, hasSizeChart: true, handles: new Set(), tierCounts: TIERS, nowMs: NOWP });
+  assert.equal(unknown.suggested_tier, null);
+  const old = checkNewProduct("hc", newProd("2026-09-01T12:00:00Z", null), { cost: { usd: 20 }, hasSizeChart: true, handles: new Set(), tierCounts: TIERS, nowMs: NOWP });
+  assert.equal(old.suggested_tier, 10);
+  assert.ok(!old.issues.some((i) => i.code === "compare_at_on_new_product"));
 });
