@@ -21,7 +21,7 @@ import { proposeRetention } from "./retention.js";
 import { escalateTickets } from "./escalation.js";
 import { writeReplies, draftsLive } from "./replyWriter.js";
 import { checkThreads, flagOverdue } from "./obligations.js";
-import { closeKeptPromises, askOverduePromises } from "./promises.js";
+import { closeKeptPromises, askOverduePromises, evidenceFor } from "./promises.js";
 
 export async function runCs(env, { nowMs = Date.now(), fetchImpl = fetch } = {}) {
   const out = {};
@@ -121,11 +121,18 @@ export async function csState(env, { nowMs = Date.now() } = {}) {
   )).map((o) => ({ ...o, overdue: o.due_at < new Date(nowMs).toISOString() }));
 
   // Money and goods promises (refund / replacement / exchange) still open, oldest first.
-  const promisesOpen = (await all(
+  const promiseRows = await all(
     `SELECT id, store, kind, party, order_ref, order_id, due_at, note, approval_id, created_at FROM obligations
-      WHERE status = 'open' AND kind IN ('refund','replacement','exchange') ORDER BY due_at LIMIT 30`
-  )).map((o) => ({ ...o, store: storeName(o.store), overdue: o.due_at < new Date(nowMs).toISOString(),
-    verified_order: !!o.order_id, closes_when: o.kind === "refund" ? "a Shopify refund for this order" : "a replacement order (or KFB re-order)" }));
+      WHERE status = 'open' AND kind IN ('refund','replacement','exchange') ORDER BY due_at IS NULL, due_at LIMIT 30`
+  );
+  const promisesOpen = [];
+  for (const o of promiseRows) {
+    // "refund pending": Shopify has a PENDING refund for it (not closed until it succeeds).
+    const ev = o.kind === "refund" && o.order_id ? await evidenceFor(db, o) : null;
+    promisesOpen.push({ ...o, store: storeName(o.store), overdue: o.due_at != null && o.due_at < new Date(nowMs).toISOString(),
+      awaiting_return: o.due_at == null, refund_pending: !!(ev && ev.pending), pending_detail: ev && ev.pending ? ev.how : null,
+      verified_order: !!o.order_id, closes_when: o.kind === "refund" ? "a SUCCESS Shopify refund for this order" : "a replacement order (or a second KFB order) after the promise" });
+  }
 
   // A reply draft left in Gmail after the customer wrote again: Reilly should delete it.
   const staleGmailDrafts = await all(

@@ -1086,10 +1086,21 @@ test("cs promises: a refund promised in sent mail opens an obligation on the VER
   const q = (await listPending(env.DB)).filter((a) => a.requested_by === "cs.obligations");
   assert.equal(q.length, 1);
   assert.match(q[0].title, /Holt & Crane #1019: refund promised 2026-10-13 \(3 days ago\), no refund for that order in Shopify yet/);
-  // A FAILED refund doesn't count; a PENDING one does (rule 7).
+  // A FAILED refund doesn't count.
   await env.DB.prepare(`INSERT INTO refunds (store, refund_id, order_id, processed_at, amount, status, updated_at) VALUES ('hc', 'r0', 'gid://shopify/Order/1019', ?, 59.9, 'FAILURE', 'x')`).bind(new Date(LATER).toISOString()).run();
   assert.equal(await closeKeptPromises(env.DB, { nowMs: LATER }), 0);
+  // A PENDING one is shown as "refund pending" but keeps it open (it can still fail).
   await env.DB.prepare(`INSERT INTO refunds (store, refund_id, order_id, processed_at, amount, status, updated_at) VALUES ('hc', 'r1', 'gid://shopify/Order/1019', ?, 59.9, 'PENDING', 'x')`).bind(new Date(LATER).toISOString()).run();
+  assert.equal(await closeKeptPromises(env.DB, { nowMs: LATER }), 0);
+  const pendSt = await csState(env, { nowMs: LATER });
+  assert.equal(pendSt.promises_open[0].refund_pending, true);
+  assert.match(pendSt.promises_open[0].pending_detail, /refund pending/);
+  // The pending refund fails: still open.
+  await env.DB.prepare(`UPDATE refunds SET status = 'FAILURE' WHERE refund_id = 'r1'`).run();
+  assert.equal(await closeKeptPromises(env.DB, { nowMs: LATER }), 0);
+  assert.equal((await csState(env, { nowMs: LATER })).promises_open[0].refund_pending, false);
+  // Only SUCCESS closes it (rule 3: the system of record, completed).
+  await env.DB.prepare(`INSERT INTO refunds (store, refund_id, order_id, processed_at, amount, status, updated_at) VALUES ('hc', 'r2', 'gid://shopify/Order/1019', ?, 59.9, 'SUCCESS', 'x')`).bind(new Date(LATER).toISOString()).run();
   assert.equal(await closeKeptPromises(env.DB, { nowMs: LATER }), 1);
   assert.equal((await env.DB.prepare(`SELECT status FROM obligations WHERE kind = 'refund'`).first()).status, "done");
   assert.equal((await evs(env.DB, "cs.promise_kept")).length, 1);
@@ -1140,4 +1151,69 @@ test("cs promises: a replacement closes on a later $0 / 'replacement' order for 
   assert.equal(looksLikeReplacement({ total: 59.9, raw: JSON.stringify({ email: party, note: "Replacement for #1059" }) }, { originalName: "#1059", party }), true);
   assert.equal(looksLikeReplacement({ total: 59.9, raw: JSON.stringify({ email: party }) }, { originalName: "#1059", party }), false); // a new purchase
   assert.equal(looksLikeReplacement({ total: 0, raw: JSON.stringify({ email: "other@x.com" }) }, { originalName: "#1059", party }), false);
+});
+
+/* ---------------- review fixes (2026-10-14) ---------------- */
+
+test("cs promises: conditional promises are 'awaiting return'; 'resend' counts only for the goods", () => {
+  const one = (t) => findGoodsPromises(t)[0] || null;
+  for (const t of ["Once we receive the return, we'll refund you in full.", "We'll refund you as soon as it's back with us.", "I'll issue the refund when it arrives back at our warehouse."]) {
+    const p = one(t);
+    assert.equal(p && p.kind, "refund", t);
+    assert.equal(p.awaiting_return, true, t);
+  }
+  assert.equal(one("I'll issue a full refund today.").awaiting_return, false);
+  assert.deepEqual(findGoodsPromises("I'll resend the tracking link now.").map((p) => p.kind), []);
+  assert.deepEqual(findGoodsPromises("We'll resend the confirmation email.").map((p) => p.kind), []);
+  assert.deepEqual(findGoodsPromises("We'll resend the jacket in the right size this week.").map((p) => p.kind), ["replacement"]);
+});
+
+async function insertOb(DB, { id, kind = "replacement", note, status = "open", due = "2026-10-01T00:00:00Z", orderId = "gid://shopify/Order/1059", ref = "#1059", created = "2026-09-30T00:00:00Z" }) {
+  await DB.prepare(`INSERT INTO obligations (id, created_at, store, kind, party, order_ref, order_id, due_at, status, note) VALUES (?, ?, 'hc', ?, 'jane@buyer.com', ?, ?, ?, ?, ?)`)
+    .bind(id, created, kind, ref, orderId, due, status, note).run();
+}
+
+test("cs promises: the original order's KFB fulfilment never closes a replacement; only a SECOND KFB order after the promise does", async () => {
+  const env = await setup();
+  const DB = env.DB;
+  await insertOb(DB, { id: 1, note: `cs ticket 9 replacement: "We'll send a replacement." (sent 2026-10-05T12:00:00.000Z)` });
+  // The original KFB order for #1059, even if KFB dates it after the promise (late import).
+  await DB.prepare(`INSERT INTO kfb_orders (kfb_order_id, kfb_shop_code, order_ref, kfb_created_at, imported_at) VALUES ('K1', 'jmzjx1-it', '1059', '2026-10-05T13:00:00Z', 'x')`).run();
+  assert.equal(await closeKeptPromises(DB, { nowMs: NOW }), 0);
+  // A Shopify $0 order created just BEFORE the promise doesn't count either.
+  await DB.prepare(`INSERT INTO orders (store, order_id, name, created_at, local_day, total, raw, updated_at) VALUES ('hc', 'o-early', '#1100', '2026-10-05T11:00:00Z', '2026-10-05', 0, ?, 'x')`).bind(JSON.stringify({ email: "jane@buyer.com" })).run();
+  assert.equal(await closeKeptPromises(DB, { nowMs: NOW }), 0);
+  // A second KFB order for the same number, after the promise: kept.
+  await DB.prepare(`INSERT INTO kfb_orders (kfb_order_id, kfb_shop_code, order_ref, kfb_created_at, imported_at) VALUES ('K2', 'jmzjx1-it', '1059', '2026-10-07T09:00:00Z', 'x')`).run();
+  assert.equal(await closeKeptPromises(DB, { nowMs: NOW }), 1);
+  assert.match((await evs(DB, "cs.promise_kept"))[0].summary, /second KFB order K2/);
+});
+
+test("cs promises: a new promise after a closed one opens a new obligation; the same sent sentence never reopens", async () => {
+  const { env, w, box, cust, sent } = await promiseWorld();
+  await runCs(env, { nowMs: NOW + 3 * 60 * MIN, fetchImpl: w.fetchImpl });
+  await env.DB.prepare(`UPDATE obligations SET status = 'done' WHERE kind = 'refund'`).run();
+  // Re-reading the same thread later: the same sentence is not recorded again.
+  await env.DB.prepare(`UPDATE cs_tickets SET thread_checked_at = NULL, replied_at = NULL`).run(); // force a re-read of the thread
+  await runCs(env, { nowMs: NOW + 6 * 60 * MIN, fetchImpl: w.fetchImpl });
+  assert.equal((await env.DB.prepare(`SELECT COUNT(*) AS n FROM obligations WHERE kind = 'refund'`).first()).n, 1);
+  // A NEW refund promise later in the thread: a new obligation.
+  box.threads.TP = [cust, sent, mail({ id: "p3", threadId: "TP", from: "Reilly <reillyworking26@gmail.com>", labels: ["SENT"], body: "I'll refund the shipping cost too.", at: NOW + 7 * 60 * MIN })];
+  await env.DB.prepare(`UPDATE cs_tickets SET thread_checked_at = NULL, replied_at = NULL`).run(); // force a re-read of the thread
+  await runCs(env, { nowMs: NOW + 10 * 60 * MIN, fetchImpl: w.fetchImpl });
+  const rows = (await env.DB.prepare(`SELECT status FROM obligations WHERE kind = 'refund' ORDER BY id`).all()).results.map((r) => r.status);
+  assert.deepEqual(rows, ["done", "open"]);
+});
+
+test("cs promises: awaiting-return promises never go overdue; at most 10 promise questions wait on Reilly", async () => {
+  const env = await setup();
+  const DB = env.DB;
+  await insertOb(DB, { id: 1, kind: "refund", due: null, note: `cs ticket 1 refund: [awaiting return] "Once we receive it we'll refund." (sent 2026-09-01T00:00:00.000Z)` });
+  for (let i = 2; i <= 14; i++) await insertOb(DB, { id: i, kind: "refund", orderId: `gid://shopify/Order/${i}`, ref: `#${i}`, note: `cs ticket ${i} refund: "I'll refund you." (sent 2026-09-20T00:00:00.000Z)` });
+  assert.equal(await askOverduePromises(DB, { nowMs: NOW }), 5);
+  assert.equal(await askOverduePromises(DB, { nowMs: NOW }), 5);
+  assert.equal(await askOverduePromises(DB, { nowMs: NOW }), 0); // 10 waiting: the rest wait their turn
+  assert.equal((await DB.prepare(`SELECT approval_id FROM obligations WHERE id = 1`).first()).approval_id, null);
+  const st = await csState(env, { nowMs: NOW });
+  assert.equal(st.promises_open.find((o) => o.id === 1).awaiting_return, true);
 });
