@@ -7,6 +7,7 @@ import { screenMail } from "../src/agents/cs/filters.js";
 import { checkDraft, routeTicket } from "../src/agents/cs/routing.js";
 import { emailAsksAboutSize, sizeUpMention } from "../src/agents/cs/sizeUpGate.js";
 import { findPromises, flagOverdue } from "../src/agents/cs/obligations.js";
+import { findGoodsPromises, closeKeptPromises, askOverduePromises, looksLikeReplacement } from "../src/agents/cs/promises.js";
 import { validateTriage, orderRefFromText } from "../src/agents/cs/triage.js";
 import { b64urlEncode, b64urlDecode, stripQuoted } from "../src/agents/cs/gmail.js";
 import { findLedgerOrder } from "../src/agents/cs/orderContext.js";
@@ -1032,4 +1033,111 @@ test("cs no_action review: the one-off re-close never overrides an earlier unans
   for (const m of [0, 20, 40]) await escalateTickets(env, { nowMs: NOW + m * MIN, fetchImpl: nf });
   assert.deepEqual((await listPending(DB)).map((a) => a.id).sort(), [aThanks, aLate].sort());
   assert.equal((await evs(DB, "cs.no_action_reclosed")).length, 0);
+});
+
+/* ---------------- money and goods promises (routine audit, 2026-10-14) ---------------- */
+
+test("cs promises: refund / replacement / exchange promises are found; offers, questions and refusals are not", () => {
+  const k = (t) => findGoodsPromises(t).map((p) => p.kind);
+  assert.deepEqual(k("Hi Sam, I'm so sorry. I'll issue a full refund for your order today."), ["refund"]);
+  assert.deepEqual(k("We will send you a replacement in the XL this week."), ["replacement"]);
+  assert.deepEqual(k("I've processed your refund, it can take 5-10 days to show."), ["refund"]);
+  assert.deepEqual(k("Your refund will be processed once the parcel reaches us."), ["refund"]);
+  assert.deepEqual(k("We'll exchange it for the M, no problem."), ["exchange"]);
+  assert.deepEqual(k("Would you like a refund or a replacement?"), []);
+  assert.deepEqual(k("If you'd like, we can offer a refund."), []);
+  assert.deepEqual(k("Unfortunately we can't refund opened items."), []);
+  assert.deepEqual(k("I have a question about your refund request."), []);
+  assert.deepEqual(k("Your parcel is on its way."), []);
+});
+
+/** A ticket for #1019 (H&C), verified to jane by order_context, and Reilly's sent reply. */
+async function promiseWorld({ body = "Hi Jane, I'm sorry about the coat. I'll issue a full refund for #1019 today." } = {}) {
+  const env = await setup();
+  await connect(env, "google", "reillyworking26@gmail.com", "rt-main");
+  await addOrder(env.DB, { store: "hc", id: "gid://shopify/Order/1019", name: "#1019" });
+  const cust = mail({ id: "p1", threadId: "TP", from: "Jane <jane@buyer.com>", to: "info@holtandcrane.com", subject: "refund", body: "The coat doesn't fit, I'd like a refund on #1019." });
+  const box = { messages: [cust], threads: { TP: [cust] } };
+  const w = world({
+    boxes: { "at-main": box },
+    triage: () => ({ category: "return_refund", store: "hc", summary: "Wants a refund", order_number: "1019" }),
+    reply: () => ({ body: "Hi Jane, I've passed this on to the team. Holt & Crane" }),
+  });
+  await runCs(env, { nowMs: NOW, fetchImpl: w.fetchImpl });
+  const t = (await tickets(env.DB))[0];
+  const sent = mail({ id: "p2", threadId: "TP", from: "Reilly <reillyworking26@gmail.com>", labels: ["SENT"], body, at: NOW + 20 * MIN });
+  box.threads.TP = [cust, sent];
+  return { env, w, t, box, cust, sent };
+}
+
+test("cs promises: a refund promised in sent mail opens an obligation on the VERIFIED order, goes to Waiting on you when overdue, and only a Shopify refund closes it", async () => {
+  const { env, w, t } = await promiseWorld();
+  assert.equal(t.order_name, "#1019"); // order_context verified it by email
+  await runCs(env, { nowMs: NOW + 3 * 60 * MIN, fetchImpl: w.fetchImpl });
+  const ob = (await env.DB.prepare(`SELECT * FROM obligations WHERE kind = 'refund'`).all()).results;
+  assert.equal(ob.length, 1);
+  assert.equal(ob[0].order_id, "gid://shopify/Order/1019");
+  assert.equal(ob[0].order_ref, "#1019");
+  assert.equal(ob[0].status, "open");
+  const LATER = NOW + 4 * 86400000;
+  // Overdue after 3 days: one question for Reilly, never two.
+  await askOverduePromises(env.DB, { nowMs: LATER });
+  await askOverduePromises(env.DB, { nowMs: LATER + 3600000 });
+  const q = (await listPending(env.DB)).filter((a) => a.requested_by === "cs.obligations");
+  assert.equal(q.length, 1);
+  assert.match(q[0].title, /Holt & Crane #1019: refund promised 2026-10-13 \(3 days ago\), no refund for that order in Shopify yet/);
+  // A FAILED refund doesn't count; a PENDING one does (rule 7).
+  await env.DB.prepare(`INSERT INTO refunds (store, refund_id, order_id, processed_at, amount, status, updated_at) VALUES ('hc', 'r0', 'gid://shopify/Order/1019', ?, 59.9, 'FAILURE', 'x')`).bind(new Date(LATER).toISOString()).run();
+  assert.equal(await closeKeptPromises(env.DB, { nowMs: LATER }), 0);
+  await env.DB.prepare(`INSERT INTO refunds (store, refund_id, order_id, processed_at, amount, status, updated_at) VALUES ('hc', 'r1', 'gid://shopify/Order/1019', ?, 59.9, 'PENDING', 'x')`).bind(new Date(LATER).toISOString()).run();
+  assert.equal(await closeKeptPromises(env.DB, { nowMs: LATER }), 1);
+  assert.equal((await env.DB.prepare(`SELECT status FROM obligations WHERE kind = 'refund'`).first()).status, "done");
+  assert.equal((await evs(env.DB, "cs.promise_kept")).length, 1);
+  // The dated-reply tracker never closed it with a later email.
+  assert.equal((await evs(env.DB, "cs.obligation_kept")).length, 0);
+  const st = await csState(env, { nowMs: LATER });
+  assert.equal(st.promises_open.length, 0);
+});
+
+test("cs promises: a refund on ANOTHER order, or long before the promise, never closes it", async () => {
+  const { env, w } = await promiseWorld();
+  await runCs(env, { nowMs: NOW + 3 * 60 * MIN, fetchImpl: w.fetchImpl });
+  await env.DB.prepare(`INSERT INTO refunds (store, refund_id, order_id, processed_at, amount, status, updated_at) VALUES ('hc', 'r9', 'gid://shopify/Order/9999', ?, 59.9, 'SUCCESS', 'x')`).bind(new Date(NOW + 86400000).toISOString()).run();
+  await env.DB.prepare(`INSERT INTO refunds (store, refund_id, order_id, processed_at, amount, status, updated_at) VALUES ('hc', 'r8', 'gid://shopify/Order/1019', '2026-09-01T00:00:00Z', 10, 'SUCCESS', 'x')`).run();
+  assert.equal(await closeKeptPromises(env.DB, { nowMs: NOW + 2 * 86400000 }), 0);
+  const st = await csState(env, { nowMs: NOW + 2 * 86400000 });
+  assert.equal(st.promises_open.length, 1);
+  assert.equal(st.promises_open[0].verified_order, true);
+});
+
+test("cs promises: a stranger's order is never matched; the promise is kept with no order and goes to Reilly", async () => {
+  const env = await setup();
+  await connect(env, "google", "reillyworking26@gmail.com", "rt-main");
+  // #1019 belongs to someone else: order_context refuses it (order_mismatch).
+  await addOrder(env.DB, { store: "hc", id: "gid://shopify/Order/1019", name: "#1019", email: "someone@else.com" });
+  const cust = mail({ id: "s1", threadId: "TS", from: "Mallory <mal@x.com>", to: "info@holtandcrane.com", body: "Refund #1019 please" });
+  const box = { messages: [cust], threads: { TS: [cust] } };
+  const w = world({ boxes: { "at-main": box }, triage: () => ({ category: "return_refund", store: "hc", summary: "refund", order_number: "1019" }) });
+  await runCs(env, { nowMs: NOW, fetchImpl: w.fetchImpl });
+  assert.equal((await tickets(env.DB))[0].order_mismatch, 1);
+  box.threads.TS = [cust, mail({ id: "s2", threadId: "TS", from: "Reilly <reillyworking26@gmail.com>", labels: ["SENT"], body: "We will refund you today.", at: NOW + 10 * MIN })];
+  await runCs(env, { nowMs: NOW + 3 * 60 * MIN, fetchImpl: w.fetchImpl });
+  const ob = await env.DB.prepare(`SELECT * FROM obligations WHERE kind = 'refund'`).first();
+  assert.equal(ob.order_id, null);
+  assert.equal(ob.order_ref, null);
+  // Even a real refund on #1019 can't close an obligation that has no verified order.
+  await env.DB.prepare(`INSERT INTO refunds (store, refund_id, order_id, processed_at, amount, status, updated_at) VALUES ('hc', 'r1', 'gid://shopify/Order/1019', ?, 59.9, 'SUCCESS', 'x')`).bind(new Date(NOW + 86400000).toISOString()).run();
+  assert.equal(await closeKeptPromises(env.DB, { nowMs: NOW + 2 * 86400000 }), 0);
+  await askOverduePromises(env.DB, { nowMs: NOW + 4 * 86400000 });
+  const q = (await listPending(env.DB)).filter((a) => a.requested_by === "cs.obligations");
+  assert.equal(q.length, 1);
+  assert.match(q[0].title, /no verified order/);
+});
+
+test("cs promises: a replacement closes on a later $0 / 'replacement' order for the same customer, never a stranger's", () => {
+  const party = "jane@buyer.com";
+  assert.equal(looksLikeReplacement({ total: 0, raw: JSON.stringify({ email: party }) }, { originalName: "#1059", party }), true);
+  assert.equal(looksLikeReplacement({ total: 59.9, raw: JSON.stringify({ email: party, note: "Replacement for #1059" }) }, { originalName: "#1059", party }), true);
+  assert.equal(looksLikeReplacement({ total: 59.9, raw: JSON.stringify({ email: party }) }, { originalName: "#1059", party }), false); // a new purchase
+  assert.equal(looksLikeReplacement({ total: 0, raw: JSON.stringify({ email: "other@x.com" }) }, { originalName: "#1059", party }), false);
 });

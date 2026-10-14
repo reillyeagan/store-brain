@@ -11,6 +11,8 @@
  *      (rule 3: the system of record is the sent mail).
  *   3. A later sent reply in the same thread closes the promise (done). Open promises past their
  *      due date are flagged once each (event + listed on the CS page).
+ *   4. Refund / replacement / exchange promises in the same sent replies are opened too (see
+ *      promises.js): those close only when Shopify (or KFB) shows the thing happened.
  * Inputs: Gmail threads (read), cs_tickets, obligations. Outputs: obligations rows, flags, events.
  */
 import { getGoogleAccessToken } from "../../lib/google.js";
@@ -19,6 +21,7 @@ import { nowIso, localDay, endOfLocalDayMs } from "../../lib/time.js";
 import { CAPS, storeName } from "./config.js";
 import { getThread, bodyText, stripQuoted } from "./gmail.js";
 import { clip, logOnce } from "./util.js";
+import { findGoodsPromises, recordGoodsPromise } from "./promises.js";
 
 const ACTOR = "cs.obligations";
 const TZ = "America/New_York";
@@ -85,10 +88,10 @@ export async function checkThreads(env, { nowMs = Date.now(), fetchImpl = fetch,
     `SELECT * FROM cs_tickets t WHERE t.thread_id IS NOT NULL AND t.status IN ('open','drafted','needs_reilly','replied')
        AND (t.thread_checked_at IS NULL OR t.thread_checked_at < ?)
        AND ((t.replied_at IS NULL AND t.received_at >= ?)
-            OR EXISTS (SELECT 1 FROM obligations o WHERE o.status = 'open' AND o.note LIKE 'cs ticket ' || t.id || ':%'))
+            OR EXISTS (SELECT 1 FROM obligations o WHERE o.status = 'open' AND o.kind = 'reply' AND o.note LIKE 'cs ticket ' || t.id || ':%'))
      ORDER BY t.thread_checked_at IS NOT NULL, t.thread_checked_at, t.id LIMIT ?`
   ).bind(recheck, since, CAPS.threadChecksPerTick).all();
-  let checked = 0, replied = 0, promises = 0, closed = 0;
+  let checked = 0, replied = 0, promises = 0, closed = 0, goods = 0;
   const tokens = new Map();
   for (const t of results || []) {
     const at = nowIso(nowMs);
@@ -135,8 +138,14 @@ export async function checkThreads(env, { nowMs = Date.now(), fetchImpl = fetch,
         promises++;
         await logEvent(db, { actor: ACTOR, kind: "cs.obligation_recorded", store: t.store, at, summary: `Promise in a sent reply recorded (ticket ${t.id}${t.order_name ? `, ${t.order_name}` : ""}), due ${p.due_day}`, data: { ticket: t.id } });
       }
+      // Money and goods promises (refund / replacement / exchange): closed only by Shopify or
+      // KFB, never by another email (promises.js).
+      for (const g of findGoodsPromises(text)) {
+        if (await recordGoodsPromise(db, t, g, sentMs, nowMs)) goods++;
+      }
     }
-    const { results: open } = await db.prepare(`SELECT id, note FROM obligations WHERE status = 'open' AND note LIKE ?`).bind(`cs ticket ${t.id}:%`).all();
+    // Only dated REPLY promises are kept by a later reply; a refund is kept only by a refund.
+    const { results: open } = await db.prepare(`SELECT id, note FROM obligations WHERE status = 'open' AND kind = 'reply' AND note LIKE ?`).bind(`cs ticket ${t.id}:%`).all();
     for (const o of open || []) {
       const promisedAt = Date.parse(sentFromNote(o.note) || "");
       const later = sent.find((m) => Number(m.internalDate) > promisedAt);
@@ -148,7 +157,7 @@ export async function checkThreads(env, { nowMs = Date.now(), fetchImpl = fetch,
     }
     await db.prepare(`UPDATE cs_tickets SET thread_checked_at = ? WHERE id = ?`).bind(at, t.id).run();
   }
-  return { checked, replied, promises, closed };
+  return { checked, replied, promises, goods, closed };
 }
 
 /** Flag each CS promise that is past due, once. */
