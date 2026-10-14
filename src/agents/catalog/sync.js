@@ -27,6 +27,16 @@
  */
 import { shopifyGraphQLWithCost } from "../../lib/storeGuard.js";
 import { nowIso } from "../../lib/time.js";
+import { STORES } from "../../config/stores.js";
+import { logEventOnce } from "./common.js";
+
+/** The catalog reader's events go under the Pricing agent, as the sync errors already do. */
+const SYNC_ACTOR = "cat.pricing";
+const storeName = (id) => (STORES[id] ? STORES[id].name : id);
+/** This many paused runs in a row with nothing read → one Event Log line a day. */
+export const PAUSE_STREAK_ALERT = 3;
+/** A full pass must read at least this share of Shopify's EXACT count to replace the copy. */
+export const FULL_MIN_SHARE = 0.9;
 
 /** 10 products × (30 variants with inventoryItem + 3 collections + small objects) ≈ 720 requested
  *  cost per page: under Shopify's 1,000 single-query limit. */
@@ -265,8 +275,49 @@ export async function syncStore(env, storeId, { nowMs = Date.now(), fetchImpl = 
     const why = paused === "throttled"
       ? "Shopify said THROTTLED; resuming next run from the saved cursor"
       : "Shopify's query budget couldn't pay for another page; resuming next run from the saved cursor";
-    await db.prepare(`UPDATE cat_sync SET last_pause_reason = ?, last_pause_at = ? WHERE store = ?`).bind(why, at, storeId).run();
-    return { status: "ok", read, calls, completed: false, kind: s.pass_kind, paused };
+    // A pause that read nothing extends the streak; any progress resets it.
+    await db.prepare(`UPDATE cat_sync SET last_pause_reason = ?, last_pause_at = ?, pause_streak = CASE WHEN ? > 0 THEN 0 ELSE COALESCE(pause_streak, 0) + 1 END WHERE store = ?`)
+      .bind(why, at, read, storeId).run();
+    const streak = (await getSync(db, storeId)).pause_streak;
+    if (streak >= PAUSE_STREAK_ALERT) {
+      await logEventOnce(db, {
+        actor: SYNC_ACTOR, kind: "catalog.sync_stalled", store: storeId, target: "sys.shopify",
+        summary: `${storeName(storeId)}: product read paused by Shopify's rate limit ${streak} runs in a row without reading anything; the copy isn't getting fresher (${why}).`,
+        data: { streak, reason: paused },
+      }, nowMs, 24 * 60);
+    }
+    return { status: "ok", read, calls, completed: false, kind: s.pass_kind, paused, pause_streak: streak };
+  }
+  if (read > 0) await db.prepare(`UPDATE cat_sync SET pause_streak = 0 WHERE store = ?`).bind(storeId).run();
+
+  if (done && s.pass_kind === "full") {
+    // Sanity check before the delete: a "completed" full pass that read nothing while the copy
+    // has rows, or clearly less than Shopify's EXACT count, would wipe the copy and mark it
+    // fresh. That is the flattering direction (rule 5), so it is refused: no delete, no
+    // last_full_at, the pass ends as an error and the next run starts a new full pass.
+    const fin = await getSync(db, storeId);
+    const passRead = Number(fin.pass_read || 0);
+    const total = fin.pass_total == null ? null : Number(fin.pass_total);
+    const exact = fin.pass_total_precision === "EXACT";
+    const have = (await db.prepare(`SELECT COUNT(*) AS n FROM cat_products WHERE store = ?`).bind(storeId).first()).n;
+    let suspect = null;
+    if (passRead === 0 && have > 0 && !(exact && total === 0)) {
+      suspect = `full read finished with 0 products while the copy holds ${have}; copy kept, not marked fresh`;
+    } else if (exact && total > 0 && passRead < FULL_MIN_SHARE * total) {
+      suspect = `full read finished with ${passRead} products but Shopify counts ${total} (under ${Math.round(FULL_MIN_SHARE * 100)}%); copy kept, not marked fresh`;
+    }
+    if (suspect) {
+      await db.prepare(
+        `UPDATE cat_sync SET pass_kind = NULL, pass_query = NULL, pass_cursor = NULL, pass_started_at = NULL, pass_max_updated = NULL,
+           pass_read = 0, pass_total = NULL, pass_total_precision = NULL, last_error = ?, last_error_at = ? WHERE store = ?`
+      ).bind(suspect, at, storeId).run();
+      await logEventOnce(db, {
+        actor: SYNC_ACTOR, kind: "error.catalog", store: storeId, target: "sys.shopify",
+        summary: `${storeName(storeId)}: ${suspect}. A new full read starts next run.`,
+        data: { passRead, total, precision: fin.pass_total_precision, have },
+      }, nowMs, 60);
+      return { status: "ok", read, calls, completed: false, kind: "full", rejected: suspect };
+    }
   }
 
   if (done) {

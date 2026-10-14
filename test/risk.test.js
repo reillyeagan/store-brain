@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { makeD1 } from "./helpers/d1.js";
 
 import { runRisk, riskState, RISK_JOBS } from "../src/agents/risk/index.js";
-import { runChargebacks, reminderDue, approvalTitle, countdownAsOf, missingEvidence, gatherFacts, redactPii } from "../src/agents/risk/chargebacks.js";
+import { runChargebacks, reminderDue, approvalTitle, countdownAsOf, missingEvidence, gatherFacts, redactPii, buildCodeDraft, disputeFromNode } from "../src/agents/risk/chargebacks.js";
 import { runFraud, screenOrder, shopifyLevel } from "../src/agents/risk/fraud.js";
 import { runAccountHealth, judgeHealth, mergeHealth, smallSampleNote } from "../src/agents/risk/accountHealth.js";
 import { collectStore, classifyPending, claimSnippets, themeStrings } from "../src/agents/risk/claimsAudit.js";
@@ -593,7 +593,8 @@ test("live #1098: a failed AI attempt still leaves a code-written evidence draft
   assert.match(draft, /\$65\.95/);
   assert.match(draft, /product not received/);
   assert.match(draft, /YT2624500012345/);
-  assert.match(draft, /Shipped 2026-09-05/);
+  assert.match(draft, /Fulfilled in Shopify 2026-09-05/);
+  assert.match(draft, /Shipped to the address the customer gave at checkout \(Denver, CO, US\)/);
   assert.match(draft, /\[ADD: carrier\]/, "carrier 'Other' is called out");
   assert.match(draft, /\[ADD: carrier proof of delivery/);
   // Only this order's own data.
@@ -625,6 +626,36 @@ test("live #1098: a failed AI attempt still leaves a code-written evidence draft
   assert.match(open.evidence.submitted, /Reilly submits/);
   // Nothing was ever written to Shopify.
   assert.ok([...net.calls, ...net2.calls].filter((c) => c.kind === "shopify").every((c) => c.op === "RiskDisputes"));
+});
+
+/** Facts + draft for a #1098 variant, straight through the code path (no AI). */
+async function draftFor(order) {
+  const DB = makeD1();
+  const n = live1098();
+  const d = disputeFromNode({ ...n, order: { ...n.order, ...order } });
+  const f = await gatherFacts(DB, "hc", { ...d, order_snapshot: JSON.stringify(d.order_snapshot) });
+  return buildCodeDraft(f, missingEvidence(f)).draft;
+}
+
+test("review: an UNFULFILLED order's draft never claims a shipment; it asks for proof of shipment", async () => {
+  const draft = await draftFor({ displayFulfillmentStatus: "UNFULFILLED", fulfillments: [] });
+  assert.ok(draft);
+  assert.doesNotMatch(draft, /Shipped to|was shipped|delivered on/i);
+  assert.match(draft, /Shopify shows no fulfillment for this order \(status UNFULFILLED\)/);
+  assert.match(draft, /\[ADD: proof of shipment/);
+});
+
+test("review: a fulfilled order WITHOUT tracking doesn't claim a shipment; Shopify's deliveredAt is Shopify's word, not the carrier's", async () => {
+  const noTrack = await draftFor({ fulfillments: [{ createdAt: "2026-09-05T10:00:00Z", displayStatus: "FULFILLED", deliveredAt: null, trackingInfo: [] }] });
+  assert.doesNotMatch(noTrack, /Shipped to|was shipped/i);
+  assert.match(noTrack, /Fulfilled in Shopify 2026-09-05: no tracking number \[ADD: proof of shipment/);
+  assert.match(noTrack, /\[ADD: proof of shipment: Shopify has no fulfillment with a tracking number/);
+
+  const delivered = await draftFor({ fulfillments: [{ createdAt: "2026-09-05T10:00:00Z", displayStatus: "DELIVERED", deliveredAt: "2026-09-12T15:00:00Z",
+    trackingInfo: [{ number: "YT2624500012345", company: "YunExpress", url: "https://t.example/YT2624500012345" }] }] });
+  assert.match(delivered, /Shopify shows it delivered on 2026-09-12/);
+  assert.doesNotMatch(delivered, /carrier reports/i);
+  assert.match(delivered, /\[ADD: the carrier's own proof of delivery\]/);
 });
 
 test("live #1098: when no order is linked the state says exactly what is missing instead of an empty list", async () => {

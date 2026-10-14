@@ -382,6 +382,70 @@ test("sync: stops before a page Shopify's cost bucket can't pay for; a pass repo
   assert.ok(p.last_pause && /budget/.test(p.last_pause.reason));
 });
 
+/** One-page Shopify that says "no more pages" with the given nodes and productsCount. */
+function onePageShopify(nodes, productsCount) {
+  return async (url) => {
+    if (url.endsWith("/admin/oauth/access_token")) return new Response(JSON.stringify({ access_token: "tok", expires_in: 86400 }), { status: 200 });
+    return new Response(JSON.stringify({ data: { productsCount, products: { pageInfo: { hasNextPage: false, endCursor: null }, nodes } } }), { status: 200 });
+  };
+}
+
+test("review: a full pass that read nothing while the copy has rows doesn't wipe it or mark it fresh", async () => {
+  const env = await freshEnv();
+  const fake = fakeShopify(() => Array.from({ length: 15 }, (_, i) => product(i + 1)));
+  await syncStore(env, "hc", { nowMs: NOW, fetchImpl: fake.fetchImpl });
+  const before = await getSync(env.DB, "hc");
+  const later = NOW + 25 * 3600000;
+  const r = await syncStore(env, "hc", { nowMs: later, fetchImpl: onePageShopify([], null) });
+  assert.equal(r.completed, false);
+  assert.match(r.rejected, /0 products while the copy holds 15/);
+  assert.equal((await env.DB.prepare(`SELECT COUNT(*) AS n FROM cat_products`).first()).n, 15, "copy kept");
+  const s = await getSync(env.DB, "hc");
+  assert.equal(s.last_full_at, before.last_full_at, "not marked fresh");
+  assert.match(s.last_error, /copy kept, not marked fresh/);
+  assert.equal(s.pass_kind, null, "a new full pass starts next run");
+  assert.equal((await env.DB.prepare(`SELECT COUNT(*) AS n FROM events WHERE kind = 'error.catalog' AND store = 'hc'`).first()).n, 1);
+  // A store that really has 0 active/draft products (Shopify: EXACT 0) is allowed to empty.
+  const r2 = await syncStore(env, "hc", { nowMs: later + 3600000, fetchImpl: onePageShopify([], { count: 0, precision: "EXACT" }) });
+  assert.equal(r2.completed, true);
+  assert.equal((await env.DB.prepare(`SELECT COUNT(*) AS n FROM cat_products`).first()).n, 0);
+});
+
+test("review: a full pass well under Shopify's EXACT count is refused", async () => {
+  const env = await freshEnv();
+  const nodes = Array.from({ length: 10 }, (_, i) => product(i + 1));
+  const r = await syncStore(env, "hc", { nowMs: NOW, fetchImpl: onePageShopify(nodes, { count: 100, precision: "EXACT" }) });
+  assert.match(r.rejected, /10 products but Shopify counts 100/);
+  const s = await getSync(env.DB, "hc");
+  assert.equal(s.last_full_at, null);
+  assert.equal(cacheReady(s, NOW).ready, false);
+  // AT_LEAST isn't exact: not a reason to refuse.
+  const env2 = await freshEnv();
+  const r2 = await syncStore(env2, "hc", { nowMs: NOW, fetchImpl: onePageShopify(nodes, { count: 100, precision: "AT_LEAST" }) });
+  assert.equal(r2.completed, true);
+});
+
+test("review: a store throttled run after run with no progress gets ONE Event Log line a day", async () => {
+  const env = await freshEnv();
+  const throttled = async (url) => {
+    if (url.endsWith("/admin/oauth/access_token")) return new Response(JSON.stringify({ access_token: "tok", expires_in: 86400 }), { status: 200 });
+    return new Response(JSON.stringify({ errors: [{ message: "Throttled", extensions: { code: "THROTTLED" } }] }), { status: 200 });
+  };
+  const stalled = async () => (await env.DB.prepare(`SELECT COUNT(*) AS n FROM events WHERE kind = 'catalog.sync_stalled'`).first()).n;
+  for (let i = 0; i < 2; i++) await syncStore(env, "hc", { nowMs: NOW + i * 20 * 60000, fetchImpl: throttled });
+  assert.equal(await stalled(), 0, "two pauses: not yet");
+  for (let i = 2; i < 6; i++) await syncStore(env, "hc", { nowMs: NOW + i * 20 * 60000, fetchImpl: throttled });
+  assert.equal(await stalled(), 1, "once a day, not every run");
+  assert.equal((await getSync(env.DB, "hc")).pause_streak, 6);
+  assert.equal((await getSync(env.DB, "hc")).last_error, null, "still a pause, not an error");
+  // Progress resets the streak.
+  const fake = fakeShopify(() => Array.from({ length: 5 }, (_, i) => product(i + 1)));
+  await syncStore(env, "hc", { nowMs: NOW + 3 * 3600000, fetchImpl: fake.fetchImpl });
+  assert.equal((await getSync(env.DB, "hc")).pause_streak, 0);
+  for (let i = 0; i < 3; i++) await syncStore(env, "hc", { nowMs: NOW + 25 * 3600000 + i * 20 * 60000, fetchImpl: throttled });
+  assert.equal(await stalled(), 2, "a new day, a new line");
+});
+
 test("store guard: cost is exposed, shopifyGraphQL still returns data only, a throttle is a typed THROTTLED error", async () => {
   const env = await freshEnv();
   const cost = { requestedQueryCost: 12, actualQueryCost: 10, throttleStatus: { maximumAvailable: 1000, currentlyAvailable: 990, restoreRate: 50 } };
