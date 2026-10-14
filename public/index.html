@@ -940,7 +940,18 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
     var c=deptCache[p];
     if(!c||Date.now()-c.at>30000){ loadDept(p); if(!c) return '<div class="empty">Loading…</div>'; }
     if(c.error) return '<div class="empty bad-t">Couldn\'t load this page ('+esc(c.error)+'). Retrying shortly.</div>';
-    return '<div class="note" style="margin:0 0 10px">Shadow mode: everything here is what the agents found or propose. Nothing was sent or changed.</div>'+(p==="supplier-agents"?sizeChartsHtml(c.data):"")+jsonHtml(c.data,0);
+    return '<div class="note" style="margin:0 0 10px">Shadow mode: everything here is what the agents found or propose. Nothing was sent or changed.</div>'+(p==="supplier-agents"?sizeChartsHtml(c.data):"")+(p==="risk"?evidenceHtml(c.data):"")+jsonHtml(c.data,0);
+  }
+  /* ---- Risk page: each open dispute's evidence draft in full, readable and copyable ---- */
+  function evidenceHtml(st){
+    var open=(st&&st.disputes&&st.disputes.open)||[], h="";
+    open.forEach(function(d){
+      var e=d.evidence; if(!e) return;
+      h+='<div class="box" style="margin-bottom:12px"><div class="lab">Evidence draft · '+esc(d.storeName||d.store||"")+' '+esc(d.order||"")+' · '+esc(d.reason||"")+' · due '+esc(d.due?String(d.due).slice(0,10):"?")+'</div>'+
+        (e.draft?'<pre style="white-space:pre-wrap;font:12.5px/1.5 var(--font);color:var(--text);margin:8px 0 0">'+esc(e.draft)+'</pre>':'<div class="note">No draft yet'+(e.blocked?': '+esc(e.blocked):"")+'</div>')+
+        '<div class="note">Fill every [ADD] line, then submit it yourself in Shopify. The brain never submits.</div></div>';
+    });
+    return h;
   }
   /* ---- Size charts (Supplier page): charts needed, paste or image intake, confirm ---- */
   function scSummary(rows){ return (rows||[]).map(function(r){ return r.size+" "+[r.chest,r.shoulder,r.length,r.sleeve].map(function(x){return x==null?"-":x}).join("/")+(r.waist!=null?" w"+r.waist:""); }).join(" · "); }
