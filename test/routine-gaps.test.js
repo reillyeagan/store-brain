@@ -400,3 +400,33 @@ test("spend alarm: 'Google not connected' is logged at most once a week per stor
   assert.equal((await evs(DB, "media.spend_alarm_skipped")).length, 2); // day 0 and day 8 (not days 1-7)
   assert.match((await evs(DB, "media.spend_alarm_skipped"))[0].summary, /not wired/);
 });
+
+test("guy fee check: waits for the 2nd, claims the month only after its reads succeed, null ads = incomplete, empty sheet = not wired", async () => {
+  const DB = makeD1();
+  const { monthlyGuyCheck, sheetAmount } = await import("../src/agents/pnl/guyFee.js");
+  for (let d = 1; d <= 30; d++) {
+    const day = `2026-09-${String(d).padStart(2, "0")}`;
+    // H&C has one day with no ads number.
+    await DB.prepare(`INSERT INTO pnl_days (store, day, ads, guy_fee, status, updated_at) VALUES ('hc', ?, ?, ?, 'closed', 'x')`).bind(day, d === 20 ? null : 50, d === 20 ? null : 5).run();
+  }
+  await DB.prepare(`INSERT INTO core_facts (store, area, key, value, source, observed_at) VALUES ('hc', 'pnl', 'sheet:services:2026-09', '', 'Reilly sheet', 'x')`).run();
+  // The 1st: too early (the month's last day may still be closing).
+  assert.deepEqual(await monthlyGuyCheck(DB, { nowMs: Date.parse("2026-10-01T16:00:00Z") }), []);
+  // A read that fails: nothing claimed, so tomorrow retries.
+  const broken = { prepare: (sql) => (/FROM pnl_days/.test(sql) ? { bind: () => ({ first: async () => { throw new Error("D1 down"); } }) } : DB.prepare(sql)) };
+  await assert.rejects(() => monthlyGuyCheck(broken, { nowMs: Date.parse("2026-10-02T16:00:00Z") }), /D1 down/);
+  assert.equal((await DB.prepare(`SELECT COUNT(*) AS n FROM calendar_reminders WHERE key LIKE 'guy_check:%'`).first()).n, 0);
+  const r = await monthlyGuyCheck(DB, { nowMs: Date.parse("2026-10-02T16:00:00Z") });
+  const hc = r.find((x) => x.store === "hc");
+  assert.equal(hc.status, "sheet not wired"); // '' is not $0
+  const e = (await evs(DB, "pnl.guy_fee_check")).find((x) => x.store === "hc");
+  const d = JSON.parse(e.data);
+  assert.equal(d.ledger_fee, null);            // a day with null ads: incomplete, not the partial sum
+  assert.equal(d.ledger_fee_partial, 145); // 29 days x $5 (shown only as "at least")
+  assert.equal(d.sheet_services, null);
+  assert.match(e.summary, /incomplete/);
+  assert.equal(sheetAmount(""), null);
+  assert.equal(sheetAmount("  "), null);
+  assert.equal(sheetAmount("$1,234.50"), 1234.5);
+  assert.equal(sheetAmount("0"), 0);
+});
