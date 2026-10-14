@@ -882,3 +882,11 @@ test("cs size-up gate: 'my size' and a bare 'fits' don't open it; 'went up one' 
   assert.equal(sizeUpMention("Your L is on its way.", {}), null, "ordered size unknown: no comparison");
   assert.deepEqual(checkDraft("Hi Sam, your Shawl Cardigan in L is on its way. Holt & Crane Customer Care", { ctx, sizeAsked: true }).filter((x) => /larger than ordered/.test(x)), []);
 });
+
+test("order context: the live-Shopify path reads the size from the variant title", async () => {
+  const { sizeFromVariant } = await import("../src/agents/cs/orderContext.js");
+  assert.equal(sizeFromVariant("M / Navy"), "M");
+  assert.equal(sizeFromVariant("Navy / XL"), "XL");
+  assert.equal(sizeFromVariant("Navy"), null);
+  assert.equal(sizeFromVariant(null), null);
+});

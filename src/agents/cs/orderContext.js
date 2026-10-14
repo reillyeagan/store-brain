@@ -24,6 +24,7 @@ import { shopifyGraphQL } from "../../lib/storeGuard.js";
 import { LIVE_STORE_IDS } from "../../config/stores.js";
 import { CAPS, storeName } from "./config.js";
 import { safeJson, clip, logOnce, likeEscape } from "./util.js";
+import { normSize } from "../supplier/common.js";
 
 const ACTOR = "cs.order_context";
 const EMAIL_LOOKBACK_DAYS = 120;
@@ -146,9 +147,15 @@ export async function shopifyLookup(env, t, { fetchImpl, nowMs, name = null }) {
     express: sl ? expressFrom(sl.title, sl.code) : null, shipping_method: sl ? sl.title : null,
     fulfillment_status: n.displayFulfillmentStatus, cancelled_at: n.cancelledAt,
     shipped: shipments.length > 0 || (/FULFILLED/i.test(String(n.displayFulfillmentStatus || "")) && !/UNFULFILLED/i.test(String(n.displayFulfillmentStatus || ""))),
-    items: ((n.lineItems && n.lineItems.nodes) || []).map((l) => ({ product_id: l.product ? l.product.id : null, title: l.title, variant: l.variantTitle, size: null, color: null, qty: l.quantity })),
+    items: ((n.lineItems && n.lineItems.nodes) || []).map((l) => ({ product_id: l.product ? l.product.id : null, title: l.title, variant: l.variantTitle, size: sizeFromVariant(l.variantTitle), color: null, qty: l.quantity })),
     shipments, refunds: null, // refunds are read from the ledger's refund events only (rule 7)
   } };
+}
+
+/** The letter size in a variant title like "M / Navy" (first part that is a size), or null. */
+export function sizeFromVariant(v) {
+  for (const part of String(v || "").split("/")) { const s = normSize(part); if (s) return s; }
+  return null;
 }
 
 /** Order data older than this is re-read from Shopify before a where-is-my-order reply. */
