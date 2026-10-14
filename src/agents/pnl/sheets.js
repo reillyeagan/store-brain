@@ -596,6 +596,7 @@ export async function writeCells(env, wb, plan, { token, fetchImpl = fetch, nowM
   if (!plan.length) return { written: [], dropped: 0 };
   const before = (err) => (err instanceof SheetWriteError ? err : new SheetWriteError(String((err && err.message) || err), "before_write"));
   let keep, backups = {}, snapshot;
+  const drops = []; // planned cells not written, each with why: row_moved | filled_by_hand | now_formula | changed_by_hand
   try {
     // 1. Fresh look at exactly those rows (Reilly may have typed since the read).
     const rowKeys = [...new Set(plan.map((p) => `${p.tab}\u0000${p.row_no}`))].map((k) => { const [tab, row] = k.split("\u0000"); return { tab, row: Number(row) }; });
@@ -603,9 +604,10 @@ export async function writeCells(env, wb, plan, { token, fetchImpl = fetch, nowM
     const ranges = rowKeys.map((k) => a1(k.tab, `A${k.row}:${lastCol}${k.row}`));
     const [fmt, frm] = [await batchGet(wb.sheetId, ranges, "FORMATTED_VALUE", opts), await batchGet(wb.sheetId, ranges, "FORMULA", opts)];
     snapshot = rowKeys.map((k, i) => ({ tab: k.tab, row: k.row, range: ranges[i], formatted: (fmt[i] && fmt[i][0]) || [], formulas: (frm[i] && frm[i][0]) || [] }));
+    const drop = (p, reason) => { drops.push({ ...p, reason }); return false; };
     keep = plan.filter((p) => {
       const s = snapshot.find((x) => x.tab === p.tab && x.row === p.row_no);
-      if (!s) return false;
+      if (!s) return drop(p, "row_moved");
       const colIdx = p.cell.replace(/\d+$/, "").split("").reduce((n, c) => n * 26 + c.charCodeAt(0) - 64, 0) - 1;
       const fv = s.formatted[colIdx], fo = s.formulas[colIdx];
       const blank = (v) => v == null || String(v).trim() === "";
@@ -614,13 +616,17 @@ export async function writeCells(env, wb, plan, { token, fetchImpl = fetch, nowM
         const sameDayC = (parseSheetDate(s.formatted[0]) || parseSheetDate(s.formulas[0])) === p.day;
         const isFormula = typeof fo === "string" && fo.trim().startsWith("=");
         const cur = parseMoney(blank(fo) ? fv : fo);
-        return sameDayC && !isFormula && close(cur, p.expect);
+        if (!sameDayC) return drop(p, "row_moved");
+        return !isFormula && close(cur, p.expect) ? true : drop(p, "changed_by_hand");
       }
       // The row must still be that day (a row inserted above it would shift everything down).
       const sameDay = (parseSheetDate(s.formatted[0]) || parseSheetDate(s.formulas[0])) === p.day;
-      return sameDay && blank(fv) && blank(fo);
+      if (!sameDay) return drop(p, "row_moved");
+      if (typeof fo === "string" && fo.trim().startsWith("=")) return drop(p, "now_formula");
+      if (!blank(fv) || !blank(fo)) return drop(p, "filled_by_hand"); // a value Reilly typed
+      return true;
     });
-    if (!keep.length) return { written: [], dropped: plan.length };
+    if (!keep.length) return { written: [], dropped: plan.length, drops };
     // 2. Backup (rule 8): every affected row, values and formulas, per tab, checked before writing.
     for (const tab of [...new Set(keep.map((p) => p.tab))]) {
       const bk = await backup(env.BACKUPS, {
@@ -684,7 +690,7 @@ export async function writeCells(env, wb, plan, { token, fetchImpl = fetch, nowM
       data: { cells: bad.map((w) => ({ tab: w.tab, cell: w.cell, wrote: w.value, got: w.got })), backups }, at,
     });
   }
-  return { written, dropped: plan.length - keep.length, backups };
+  return { written, dropped: plan.length - keep.length, drops, backups };
 }
 
 /** The cells the brain would fill in one store workbook (closed days, blank inputs only). */
@@ -700,8 +706,9 @@ export async function planStore(db, wb, read, { nowMs = Date.now(), maxDays = PL
   // YESTERDAY FIRST, always, outside the caps (Reilly's morning fill); then older gaps.
   const rows = [];
   for (const m of read.months) for (const d of m.days) if (d.day < today) rows.push({ m, d });
-  rows.sort((p, q) => (p.d.day === yesterday ? -1 : q.d.day === yesterday ? 1 : p.d.day < q.d.day ? -1 : 1));
-  let days = 0, evaluated = 0, capped = false;
+  // Yesterday first, then older days NEWEST first, so the most recent gaps are filled first.
+  rows.sort((p, q) => (p.d.day === yesterday ? -1 : q.d.day === yesterday ? 1 : p.d.day < q.d.day ? 1 : -1));
+  let days = 0, capped = false;
   for (const { m, d } of rows) {
     const isY = d.day === yesterday;
     if (isY) { y.in_sheet = true; }
@@ -711,8 +718,9 @@ export async function planStore(db, wb, read, { nowMs = Date.now(), maxDays = PL
     if (!pnl) { bump("day not closed by the brain", fields.length); if (isY) y.skipped["yesterday not closed by the brain yet"] = fields.length; continue; }
     if (isY) y.closed = true;
     if (!isY && capped) { bump("more days next run (per-run limit)", fields.length); continue; }
-    // Bounded work: older days are only evaluated up to a limit per run.
-    if (!isY && ++evaluated > maxDays * 6) { capped = true; bump("more days next run (per-run limit)", fields.length); continue; }
+    // Bounded work: once the caps are reached nothing older is evaluated this run. Days whose
+    // blanks are all permanent skips never count toward them (the work they cost is bounded by
+    // the days in the sheet's month tabs).
     const cells = [];
     for (const f of fields) {
       const v = await brainValue(db, wb.store, d.day, f, { pnl, setup: read.setup, tz: wb.tz, today, dayOk, dayWhy });
@@ -779,7 +787,7 @@ export async function planEcom(db, read, { nowMs = Date.now() } = {}) {
   for (const r of all || []) { if (!byDay.has(r.day)) byDay.set(r.day, []); byDay.get(r.day).push(r); }
   const rows = [];
   for (const m of read.months) for (const d of m.days) if (d.day < today) rows.push({ m, d });
-  rows.sort((p, q) => (p.d.day === yesterday ? -1 : q.d.day === yesterday ? 1 : p.d.day < q.d.day ? -1 : 1));
+  rows.sort((p, q) => (p.d.day === yesterday ? -1 : q.d.day === yesterday ? 1 : p.d.day < q.d.day ? 1 : -1));
   for (const { m, d } of rows) {
     {
       const isY = d.day === yesterday;
@@ -950,8 +958,14 @@ export function yesterdayVerdict(wb, y, plan, r, storesWroteYesterday = []) {
   const done = (r.written || []).filter((w) => w.day === y.day && w.expect == null);
   const bad = done.filter((w) => !w.verified);
   if (bad.length) return { ok: false, why: `${bad.length} cell${bad.length === 1 ? "" : "s"} for ${y.day} not verified` };
-  // Cells not written were dropped because they were no longer blank (Reilly typed them): filled.
-  return { ok: true, why: `${y.day}: ${done.length} cell${done.length === 1 ? "" : "s"} written and verified${yPlan.length > done.length ? `, ${yPlan.length - done.length} already filled by hand` : ""}` };
+  const dropped = (r.drops || []).filter((d) => d.day === y.day && d.expect == null);
+  // A row that no longer shows the day (a row was inserted above it) is NOT filled: retry.
+  if (dropped.some((d) => d.reason === "row_moved")) return { ok: false, why: `row moved: ${y.day} is no longer on row ${dropped.find((d) => d.reason === "row_moved").row_no}` };
+  if (dropped.some((d) => d.reason === "now_formula")) return { ok: false, why: `a ${y.day} cell now holds a formula` };
+  const byHand = dropped.filter((d) => d.reason === "filled_by_hand").length;
+  // Every planned cell is accounted for: written + verified, or holding a value Reilly typed.
+  if (done.length + byHand < yPlan.length) return { ok: false, why: `${yPlan.length - done.length - byHand} cell${yPlan.length - done.length - byHand === 1 ? "" : "s"} for ${y.day} not written` };
+  return { ok: true, why: `${y.day}: ${done.length} cell${done.length === 1 ? "" : "s"} written and verified${byHand ? `, ${byHand} already filled by hand` : ""}` };
 }
 
 /* ---------------- the morning schedule ---------------- */

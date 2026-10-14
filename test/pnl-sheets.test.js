@@ -86,7 +86,7 @@ function parseA1(range) {
 }
 
 /** Google token + Sheets values API over in-memory workbooks. */
-function fakeGoogle(books, { failIds = [], onUpdate = null, tamper = null, failUpdate = false, failVerify = false, shopTz = "America/New_York" } = {}) {
+function fakeGoogle(books, { failIds = [], onUpdate = null, tamper = null, failUpdate = false, failVerify = false, shopTz = "America/New_York", onGet = null } = {}) {
   const log = { updates: [], gets: 0, calls: [], shop: 0 };
   const fetchImpl = async (url, init = {}) => {
     if (url === "https://oauth2.googleapis.com/token") return j({ access_token: "g", expires_in: 3600 });
@@ -112,6 +112,7 @@ function fakeGoogle(books, { failIds = [], onUpdate = null, tamper = null, failU
       log.gets++;
       const render = u.searchParams.get("valueRenderOption");
       if (failVerify && render === "UNFORMATTED_VALUE") return j({ error: { code: 503, status: "UNAVAILABLE", message: "try later" } }, 503);
+      if (onGet) onGet(id, u.searchParams.getAll("ranges"), render);
       return j({ valueRanges: u.searchParams.getAll("ranges").map((r) => {
         const a = parseA1(r);
         const grid = b.tabs[a.tab] || [];
@@ -1021,7 +1022,7 @@ test("sheets writer: planning is bounded per run (days and cells), the rest next
   const wb = workbooks().find((w) => w.store === "hc");
   const read = await readWorkbook(env, wb, { token: "g", fetchImpl: fakeGoogle(books).fetchImpl, nowMs: NOW });
   const p = await planStore(env.DB, wb, read, { nowMs: NOW, maxDays: 3 });
-  assert.deepEqual([...new Set(p.plan.map((x) => x.day))], ["2026-10-01", "2026-10-02", "2026-10-03"]);
+  assert.deepEqual([...new Set(p.plan.map((x) => x.day))], ["2026-10-09", "2026-10-08", "2026-10-07"], "most recent gaps first");
   assert.ok(p.skipped["more days next run (per-run limit)"] > 0);
 });
 
@@ -1186,7 +1187,7 @@ test("planning: yesterday is planned first and never crowded out by older gaps; 
   assert.equal(planned[0], "2026-10-13", "yesterday first");
   assert.ok(p.plan.filter((x) => x.day === "2026-10-13").length >= 2, "all of yesterday's writable cells, outside the cell cap");
   assert.ok(!planned.some((d) => d <= "2026-09-05"), "Sep 1-5 (sessions only, never written without the day basis) didn't count");
-  assert.deepEqual(planned.slice(1), ["2026-09-06"], "older gaps only within their own 2-cell cap (Sep 6: 1 cell; Sep 7 would make 3)");
+  assert.deepEqual(planned.slice(1), ["2026-09-12"], "older gaps newest first, within their own 2-cell cap (Sep 12: 2 cells)");
   assert.equal(p.yesterday.planned, p.plan.filter((x) => x.day === "2026-10-13").length);
 });
 
@@ -1218,4 +1219,68 @@ test("corrections: a cell the brain wrote in the last 3 days is updated when the
   await DB.prepare(`UPDATE pnl_days SET ads = 999 WHERE store = 'hc' AND day = '2026-10-11'`).run();
   await runSheets(env, { nowMs: etMs("2026-10-16", 7), fetchImpl: g.fetchImpl });
   assert.equal(at("D12"), 420.05);
+});
+
+
+test("planning: days whose blanks are all permanent skips never starve an older real gap (no evaluation cap on them)", async () => {
+  const { planStore, readWorkbook, workbooks } = await import("../src/agents/pnl/sheets.js");
+  const env = baseEnv();
+  const days = {};
+  // Sep 1: a real gap (ad spend blank). Sep 2 - Oct 12: closed, every cell filled except Sessions,
+  // which stays blank without the day-basis proof (a permanent skip).
+  const full = { revenue: 10, adspend: 5, services: 0.5, fee: 0.3, orders: 1, clicks: 1, cog_eur: 1 };
+  for (let t = Date.parse("2026-09-01T12:00:00Z"); t <= Date.parse("2026-10-12T12:00:00Z"); t += 86400000) {
+    const day = new Date(t).toISOString().slice(0, 10);
+    days[day] = day === "2026-09-01" ? { revenue: 10, orders: 1, fee: 0.3, clicks: 1, cog_eur: 1 } : full;
+    await closedDay(env.DB, "hc", day, { revenue: 10, orders: 1, ads: 5, guy_fee: 0.5, fees: 0.3 });
+  }
+  const sep = {}, oct = {};
+  for (const [d, v] of Object.entries(days)) (d < "2026-10-01" ? sep : oct)[d] = v;
+  const books = { [HC]: book("Holt & Crane P&L", { SEP: monthTab(2026, 9, sep), OCT: monthTab(2026, 10, oct), SETUP: setupTab() }) };
+  const wb = workbooks().find((w) => w.store === "hc");
+  const read = await readWorkbook(env, wb, { token: "g", fetchImpl: fakeGoogle(books).fetchImpl, nowMs: NOW });
+  const p = await planStore(env.DB, wb, read, { nowMs: NOW, maxDays: 1 });
+  assert.deepEqual(p.plan.map((x) => [x.day, x.field]), [["2026-09-01", "adspend"]], "41 newer permanent-skip days didn't use up anything");
+});
+
+test("verdict: a cell dropped because its row moved is NOT 'filled by hand' — retried, and 'not filled: row moved' after noon; only a typed value counts as filled by hand", async () => {
+  const { yesterdayVerdict, writeCells, runSheetsMorning, workbooks } = await import("../src/agents/pnl/sheets.js");
+  const wb = { store: "hc", name: "Holt & Crane P&L", sheetId: HC };
+  const y = { day: "2026-10-14", in_sheet: true, closed: true, planned: 2, skipped: {} };
+  const plan = [{ day: "2026-10-14", field: "adspend", cell: "D15", row_no: 15, value: 10 }, { day: "2026-10-14", field: "services", cell: "E15", row_no: 15, value: 1 }];
+  assert.match(yesterdayVerdict(wb, y, plan, { written: [], drops: plan.map((p) => ({ ...p, reason: "row_moved" })) }).why, /^row moved/);
+  assert.equal(yesterdayVerdict(wb, y, plan, { written: [], drops: plan.map((p) => ({ ...p, reason: "row_moved" })) }).ok, false);
+  assert.equal(yesterdayVerdict(wb, y, plan, { written: [], drops: plan.map((p) => ({ ...p, reason: "now_formula" })) }).ok, false);
+  assert.equal(yesterdayVerdict(wb, y, plan, { written: [], drops: [] }).ok, false, "unaccounted cells are not filled");
+  const hand = yesterdayVerdict(wb, y, plan, { written: [{ ...plan[0], verified: true }], drops: [{ ...plan[1], reason: "filled_by_hand" }] });
+  assert.deepEqual([hand.ok, /1 already filled by hand/.test(hand.why)], [true, true]);
+
+  // writeCells says why each cell was dropped.
+  const env = baseEnv();
+  const books = { [HC]: book("Holt & Crane P&L", { OCT: monthTab(2026, 10, { "2026-10-14": { services: 1.5 } }), SETUP: setupTab() }) };
+  const r = await writeCells(env, wb, [
+    { tab: "OCT", day: "2026-10-14", row_no: 16, field: "adspend", cell: "D16", value: 10 },  // row 16 is Oct 15: moved
+    { tab: "OCT", day: "2026-10-14", row_no: 15, field: "services", cell: "E15", value: 1 },  // Reilly typed 1.5
+  ], { token: "g", fetchImpl: fakeGoogle(books).fetchImpl, nowMs: NOW });
+  assert.deepEqual(r.drops.map((d) => d.reason), ["row_moved", "filled_by_hand"]);
+  assert.equal(r.written.length, 0);
+
+  // End to end: a row is inserted above yesterday's between the morning read and the write.
+  const m = await morningFixture();
+  let shifted = false;
+  const insertRowAbove = (id, ranges) => {
+    if (shifted || id !== HC || !ranges.some((x) => /^'OCT'!A15:Z15$/.test(x))) return;
+    shifted = true;
+    m.books[HC].tabs.OCT.splice(1, 0, [cell("NOTE")]); // everything below moves down one row
+  };
+  const g = fakeGoogle(m.books, { onGet: insertRowAbove });
+  const r1 = await runSheetsMorning(m.env, { nowMs: etMs("2026-10-15", 7), fetchImpl: g.fetchImpl });
+  assert.equal(shifted, true);
+  assert.match(r1.waiting_on.find((w) => w.store === "hc").why, /^row moved/);
+  assert.ok(!g.log.updates.some((u) => u.id === HC), "nothing written into the wrong row");
+  // Not fixed by noon: the noon slot records "not filled" with the reason, never "filled".
+  await runSheetsMorning(m.env, { nowMs: etMs("2026-10-15", 12), fetchImpl: g.fetchImpl });
+  const last = (await m.env.DB.prepare(`SELECT last_result FROM job_runs WHERE job = 'pnl.sheets.morning'`).first()).last_result;
+  assert.match(last, /^not filled: .*row moved/);
+  assert.equal(await m.env.DB.prepare(`SELECT last_result FROM job_runs WHERE job = 'pnl.sheets.done'`).first(), null);
 });
