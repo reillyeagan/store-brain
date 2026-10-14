@@ -11,7 +11,8 @@
  *             CUSTOMER_NOT_ENABLED for the account is the same news (deactivated).
  *   billing — billing_setup.status: no APPROVED setup in force (PENDING, CANCELLED,
  *             APPROVED_HELD) means Google may not be able to charge.
- *   budget  — account_budget (monthly-invoicing accounts only): approved spending limit vs
+ *   budget  — account_budget (monthly-invoicing accounts only), only the APPROVED one in force
+ *             (start <= now < end, or no end; old, future and pending ones ignored): approved spending limit vs
  *             amount served; 90%+ used is "nearly exhausted" (97%+ is bad). Card-paid accounts
  *             usually have no account budget: that is "none", not a problem.
  *   failed payment — the Google Ads API has no "last charge failed" field (payments history
@@ -36,7 +37,7 @@ export const FAILED_PAYMENT_NOT_WIRED = "the Google Ads API has no failed-charge
 
 export const Q_ACCOUNT = "SELECT customer.id, customer.status, customer.descriptive_name FROM customer";
 export const Q_BILLING = "SELECT billing_setup.id, billing_setup.status, billing_setup.payments_account, billing_setup.start_date_time, billing_setup.end_date_time FROM billing_setup";
-export const Q_BUDGET = "SELECT account_budget.id, account_budget.status, account_budget.approved_spending_limit_micros, account_budget.approved_spending_limit_type, account_budget.adjusted_spending_limit_micros, account_budget.amount_served_micros, account_budget.approved_end_date_time FROM account_budget";
+export const Q_BUDGET = "SELECT account_budget.id, account_budget.status, account_budget.approved_spending_limit_micros, account_budget.approved_spending_limit_type, account_budget.adjusted_spending_limit_micros, account_budget.amount_served_micros, account_budget.approved_start_date_time, account_budget.approved_end_date_time FROM account_budget";
 
 /** Google refused for lack of access / an unknown field: a wiring gap, not news about the account. */
 export const isAccessGap = (msg) => /PERMISSION_DENIED|authorizationError|USER_PERMISSION_DENIED|ACTION_NOT_PERMITTED|NOT_ALLOWLISTED|UNRECOGNIZED_FIELD|PROHIBITED_RESOURCE|queryError=/i.test(String(msg || ""));
@@ -61,10 +62,23 @@ export function judgeBilling(rows, nowMs) {
     summary: `no approved billing setup in force (${statuses.join(", ")})`, data: { statuses } };
 }
 
-export function judgeBudget(rows) {
-  const budgets = rows.map((r) => r.accountBudget).filter(Boolean).filter((b) => b.status !== "CANCELLED");
-  if (!budgets.length) return { status: "none", summary: "no account budget (normal for card-paid accounts)" };
-  const b = budgets[0];
+/** Google's "YYYY-MM-DD HH:MM:SS" (account time) compared as text with the same shape of now. */
+const gTime = (ms) => new Date(ms).toISOString().replace("T", " ").slice(0, 19);
+
+/**
+ * The budget IN FORCE: APPROVED, started (start <= now) and not ended (now < end, or no end).
+ * An expired, future, pending or cancelled budget says nothing about today's spending room.
+ */
+export function activeBudget(rows, nowMs = Date.now()) {
+  const now = gTime(nowMs);
+  return rows.map((r) => r.accountBudget).filter(Boolean).find((b) => b.status === "APPROVED"
+    && (!b.approvedStartDateTime || b.approvedStartDateTime <= now)
+    && (!b.approvedEndDateTime || now < b.approvedEndDateTime)) || null;
+}
+
+export function judgeBudget(rows, nowMs = Date.now()) {
+  const b = activeBudget(rows, nowMs);
+  if (!b) return { status: "none", summary: rows.length ? "no account budget in force today (none approved for now)" : "no account budget (normal for card-paid accounts)" };
   const limitMicros = b.adjustedSpendingLimitMicros ?? b.approvedSpendingLimitMicros;
   if (limitMicros == null || b.approvedSpendingLimitType === "INFINITE") return { status: "ok", summary: "account budget with no spending limit", data: { status: b.status } };
   const limit = micros(limitMicros), served = micros(b.amountServedMicros);
@@ -101,7 +115,7 @@ export async function runBilling(env, { storeId, session, nowMs = Date.now() }) 
     const b = await read(session, storeId, Q_BILLING);
     parts.billing = b.notWired || b.notEnabled ? { status: "not_wired", summary: `not wired: ${b.notWired || b.notEnabled}` } : judgeBilling(b.rows, nowMs);
     const g = await read(session, storeId, Q_BUDGET);
-    parts.budget = g.notWired || g.notEnabled ? { status: "not_wired", summary: `not wired: ${g.notWired || g.notEnabled}` } : judgeBudget(g.rows);
+    parts.budget = g.notWired || g.notEnabled ? { status: "not_wired", summary: `not wired: ${g.notWired || g.notEnabled}` } : judgeBudget(g.rows, nowMs);
   }
   parts.failed_payment = { status: "not_wired", summary: `not wired: ${FAILED_PAYMENT_NOT_WIRED}` };
 

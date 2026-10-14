@@ -357,3 +357,17 @@ test("channel check: the New-Product Check run saves it for the page and says it
   assert.equal(JSON.parse(run.summary).channel.not_on_online_store, 1);
   assert.match((await evs(DB, "catalog.new_product_digest"))[0].summary, /1 active not on the Online Store/);
 });
+
+test("billing: only the APPROVED budget in force today is judged (an expired, future or pending one is ignored)", () => {
+  const NOWB = Date.parse("2026-10-14T12:00:00Z");
+  const old = { accountBudget: { status: "APPROVED", approvedStartDateTime: "2026-08-01 00:00:00", approvedEndDateTime: "2026-09-30 23:59:59", approvedSpendingLimitMicros: "100000000", amountServedMicros: "100000000" } };
+  const future = { accountBudget: { status: "APPROVED", approvedStartDateTime: "2026-11-01 00:00:00", approvedSpendingLimitMicros: "100000000", amountServedMicros: "0" } };
+  const pending = { accountBudget: { status: "PENDING", approvedSpendingLimitMicros: "100000000", amountServedMicros: "99000000" } };
+  const current = { accountBudget: { status: "APPROVED", approvedStartDateTime: "2026-10-01 00:00:00", approvedSpendingLimitMicros: "1000000000", amountServedMicros: "200000000" } };
+  // The old, fully-spent budget used to be read first and raise a false "exhausted".
+  const r = judgeBudget([old, future, pending, current], NOWB);
+  assert.equal(r.status, "ok");
+  assert.equal(r.data.used, 0.2);
+  assert.equal(judgeBudget([old, future, pending], NOWB).status, "none");
+  assert.match(Q_BUDGET, /approved_start_date_time/);
+});
