@@ -72,8 +72,51 @@ export async function getAccessToken(env, storeId, { fetchImpl = fetch, nowMs = 
   return body.access_token;
 }
 
-/** Run one Admin GraphQL request against one specific store. */
+/**
+ * Shopify's query-cost report for one request (Admin GraphQL `extensions.cost`), or null when
+ * Shopify didn't send one. Shape: { requestedQueryCost, actualQueryCost,
+ * throttleStatus: { maximumAvailable, currentlyAvailable, restoreRate } } (numbers or null).
+ * Why: a caller that reads many pages in a row can stop BEFORE it runs the bucket dry,
+ * instead of finding out from a THROTTLED error.
+ */
+export function readQueryCost(body) {
+  const c = body && body.extensions && body.extensions.cost;
+  if (!c) return null;
+  const n = (x) => (x == null || !Number.isFinite(Number(x)) ? null : Number(x));
+  const t = c.throttleStatus || {};
+  return {
+    requestedQueryCost: n(c.requestedQueryCost),
+    actualQueryCost: n(c.actualQueryCost),
+    throttleStatus: {
+      maximumAvailable: n(t.maximumAvailable),
+      currentlyAvailable: n(t.currentlyAvailable),
+      restoreRate: n(t.restoreRate),
+    },
+  };
+}
+
+/** Shopify said "slow down": a GraphQL error with extensions.code THROTTLED, or HTTP 429. */
+function isThrottled(res, body) {
+  if (res.status === 429) return true;
+  const errs = body && Array.isArray(body.errors) ? body.errors : [];
+  return errs.some((e) => e && e.extensions && String(e.extensions.code || "").toUpperCase() === "THROTTLED");
+}
+
+/**
+ * Run one Admin GraphQL request against one specific store; returns `data` only.
+ * Behaviour for existing callers is unchanged, except a throttle now carries code "THROTTLED"
+ * (it used to be GRAPHQL_ERRORS / GRAPHQL_HTTP; no caller matched throttles on those codes).
+ */
 export async function shopifyGraphQL(env, storeId, query, variables = {}, opts = {}) {
+  return (await shopifyGraphQLWithCost(env, storeId, query, variables, opts)).data;
+}
+
+/**
+ * Same request, returning { data, cost } where cost = readQueryCost(...) (null if not reported).
+ * Throws StoreGuardError code "THROTTLED" (with err.cost) when Shopify throttles, so a paging
+ * caller can treat it as a pause, not a failure.
+ */
+export async function shopifyGraphQLWithCost(env, storeId, query, variables = {}, opts = {}) {
   const fetchImpl = opts.fetchImpl || fetch;
   const { store } = storeCredentials(env, storeId);
   const token = await getAccessToken(env, storeId, opts);
@@ -86,13 +129,22 @@ export async function shopifyGraphQL(env, storeId, query, variables = {}, opts =
     tokenCache.delete(storeId); // force a fresh mint next time
   }
   const body = await res.json().catch(() => null);
+  const cost = readQueryCost(body);
+  if (isThrottled(res, body)) {
+    const why = body && Array.isArray(body.errors) && body.errors.length
+      ? body.errors.map((e) => e.message).join("; ")
+      : `GraphQL HTTP ${res.status}`;
+    const err = new StoreGuardError(`${store.name}: ${why}`, "THROTTLED");
+    err.cost = cost;
+    throw err;
+  }
   if (!res.ok || !body) {
     throw new StoreGuardError(`${store.name}: GraphQL HTTP ${res.status}`, "GRAPHQL_HTTP");
   }
   if (body.errors && body.errors.length) {
     throw new StoreGuardError(`${store.name}: ${body.errors.map((e) => e.message).join("; ")}`, "GRAPHQL_ERRORS");
   }
-  return body.data;
+  return { data: body.data, cost };
 }
 
 /**

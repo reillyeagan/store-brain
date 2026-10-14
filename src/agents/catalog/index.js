@@ -16,7 +16,7 @@
 import { LIVE_STORE_IDS, STORES } from "../../config/stores.js";
 import { claimJob } from "../../lib/jobRuns.js";
 import { nowIso } from "../../lib/time.js";
-import { syncStore, getSync, cacheReady } from "./sync.js";
+import { syncStore, getSync, cacheReady, pagesForStore, passProgress, SYNC_PAGE_BUDGET } from "./sync.js";
 import { runPricingStore, AGENT as PRICING } from "./pricing.js";
 import { runMarginGuardStore, AGENT as MARGIN } from "./marginGuard.js";
 import { runStatusStore, AGENT as STATUS } from "./status.js";
@@ -59,9 +59,16 @@ export async function runCatalog(env, { nowMs = Date.now(), fetchImpl = fetch, f
   try { syncNow = force || (await claimJob(db, SYNC_JOB, SYNC_EVERY_MIN, nowMs)); }
   catch (err) { out.sync.error = String(err && err.message); }
   if (syncNow) {
-    for (const store of stores) {
+    // One page budget for the whole run (SYNC_PAGE_BUDGET, see sync.js for the subrequest
+    // arithmetic), shared so pages one store didn't need go to the next.
+    let budget = SYNC_PAGE_BUDGET;
+    for (const [i, store] of stores.entries()) {
+      const pages = pagesForStore(budget, stores.length - i);
+      if (!pages) { out.sync[store] = { status: "skipped", reason: "page budget for this run used up" }; continue; }
+      budget -= pages; // charged up front (a failing store may have used them); unused pages are given back below
       try {
-        const r = await syncStore(env, store, { nowMs, fetchImpl });
+        const r = await syncStore(env, store, { nowMs, fetchImpl, pages });
+        if (Number.isFinite(r.calls)) budget += pages - r.calls;
         out.sync[store] = r;
         if (r.status === "not_wired") {
           await logEventOnce(db, { actor: PRICING, kind: "catalog.not_wired", store, target: "sys.shopify",
@@ -150,7 +157,9 @@ export async function catalogState(env, { nowMs = Date.now() } = {}) {
         read: (counts && counts.n) || 0, active: (counts && counts.active) || 0,
         fresh: ready.ready, not_fresh_reason: ready.reason,
         last_full_at: sync ? sync.last_full_at : null, last_read_at: sync ? sync.last_pass_at : null,
-        pass_in_progress: sync && sync.pass_kind ? { kind: sync.pass_kind, read: sync.pass_read, started_at: sync.pass_started_at } : null,
+        // Products read so far in the pass, its size and an estimate of time to completion.
+        pass_in_progress: passProgress(sync, nowMs),
+        reads: "active and draft products only (archived ones drop out on the next full read)",
         last_error: sync && sync.last_error ? { message: sync.last_error, at: sync.last_error_at } : null,
       },
       pricing: agents[PRICING], margin: agents[MARGIN], status: agents[STATUS], new_products: agents[PREPUBLISH], merchant_center: agents[FEED],

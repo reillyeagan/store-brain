@@ -1,12 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { makeD1 } from "./helpers/d1.js";
-import { _resetTokenCacheForTests } from "../src/lib/storeGuard.js";
+import { _resetTokenCacheForTests, shopifyGraphQL, shopifyGraphQLWithCost, StoreGuardError } from "../src/lib/storeGuard.js";
 import { encryptToken, _resetGoogleCacheForTests } from "../src/lib/google.js";
 import { EUR_USD_ESTIMATE } from "../src/lib/pnl.js";
 
 import * as R from "../src/agents/catalog/pricingRules.js";
-import { syncStore, getSync, cacheReady, PAGE_SIZE, PAGES_PER_TICK, PRODUCTS_QUERY } from "../src/agents/catalog/sync.js";
+import { syncStore, getSync, cacheReady, passProgress, pagesForStore, PAGE_SIZE, PRODUCTS_QUERY, MAX_PAGES_PER_TICK, SYNC_PAGE_BUDGET } from "../src/agents/catalog/sync.js";
 import { checkProduct, SHADOW_NOTE, runPricingStore } from "../src/agents/catalog/pricing.js";
 import { judgeProduct, contributionPerDollar } from "../src/agents/catalog/marginGuard.js";
 import { statusProposals } from "../src/agents/catalog/status.js";
@@ -222,7 +222,7 @@ function product(n, { price = 64.95, compareAt = null, status = "ACTIVE", update
 }
 
 /** Fake Shopify for H&C: token mint + cursor-paged products, filter by updated_at when asked. */
-function fakeShopify(getAll, { failOnCall = null } = {}) {
+function fakeShopify(getAll, { failOnCall = null, throttleOnCall = null, costFor = null } = {}) {
   const calls = [];
   let n = 0;
   const fetchImpl = async (url, init) => {
@@ -233,13 +233,24 @@ function fakeShopify(getAll, { failOnCall = null } = {}) {
     calls.push(body);
     n++;
     if (failOnCall === n) return new Response("bad gateway", { status: 502 });
+    if (throttleOnCall === n) {
+      // Shopify's real throttle answer: HTTP 200 with a THROTTLED error.
+      return new Response(JSON.stringify({ errors: [{ message: "Throttled", extensions: { code: "THROTTLED" } }],
+        extensions: { cost: { requestedQueryCost: 722, actualQueryCost: null, throttleStatus: { maximumAvailable: 1000, currentlyAvailable: 40, restoreRate: 50 } } } }), { status: 200 });
+    }
     let all = [...getAll()].sort((a, b) => a.updatedAt.localeCompare(b.updatedAt));
-    const m = /updated_at:>='([^']+)'/.exec(body.variables.query || "");
+    const q = body.variables.query || "";
+    // Shopify's status filter: "status:active,draft" keeps only those statuses.
+    const st = /status:([a-z,]+)/i.exec(q);
+    if (st) { const keep = st[1].toUpperCase().split(","); all = all.filter((p) => keep.includes(p.status)); }
+    const m = /updated_at:>='([^']+)'/.exec(q);
     if (m) all = all.filter((p) => p.updatedAt >= m[1]);
     const start = body.variables.after ? Number(body.variables.after.slice(2)) : 0;
     const nodes = all.slice(start, start + body.variables.first);
     const end = start + nodes.length;
-    return new Response(JSON.stringify({ data: { products: { pageInfo: { hasNextPage: end < all.length, endCursor: `c:${end}` }, nodes } } }), { status: 200 });
+    const out = { data: { productsCount: { count: all.length, precision: "EXACT" }, products: { pageInfo: { hasNextPage: end < all.length, endCursor: `c:${end}` }, nodes } } };
+    if (costFor) out.extensions = { cost: costFor(n) };
+    return new Response(JSON.stringify(out), { status: 200 });
   };
   return { fetchImpl, calls };
 }
@@ -259,14 +270,17 @@ test("sync: full read spreads over ticks with a saved cursor, then deltas use th
   const fake = fakeShopify(() => catalog);
   assert.match(PRODUCTS_QUERY, /updatedAt/);
 
-  const r1 = await syncStore(env, "hc", { nowMs: NOW, fetchImpl: fake.fetchImpl });
-  assert.equal(r1.read, PAGES_PER_TICK * PAGE_SIZE);
+  const P = 4; // pages per tick for this test (the run's budget decides it live)
+  const r1 = await syncStore(env, "hc", { nowMs: NOW, fetchImpl: fake.fetchImpl, pages: P });
+  assert.equal(r1.read, P * PAGE_SIZE);
   assert.equal(r1.completed, false);
   assert.equal(cacheReady(await getSync(env.DB, "hc"), NOW).ready, false, "not trusted before the first full read completes");
-  const r2 = await syncStore(env, "hc", { nowMs: NOW + 15 * 60000, fetchImpl: fake.fetchImpl });
+  assert.match(cacheReady(await getSync(env.DB, "hc"), NOW).reason, /40 of 45 active\/draft/);
+  const r2 = await syncStore(env, "hc", { nowMs: NOW + 15 * 60000, fetchImpl: fake.fetchImpl, pages: P });
   assert.equal(r2.completed, true);
   assert.equal(r2.kind, "full");
-  assert.equal(fake.calls[PAGES_PER_TICK].variables.after, `c:${PAGES_PER_TICK * PAGE_SIZE}`, "resumed from the saved cursor");
+  assert.equal(fake.calls[P].variables.after, `c:${P * PAGE_SIZE}`, "resumed from the saved cursor");
+  assert.equal(fake.calls[0].variables.query, "status:active,draft", "the full pass reads active + draft only");
   let s = await getSync(env.DB, "hc");
   assert.equal(s.watermark, "2026-10-09T00:00:00Z");
   assert.ok(cacheReady(s, NOW + 20 * 60000).ready);
@@ -277,7 +291,7 @@ test("sync: full read spreads over ticks with a saved cursor, then deltas use th
   const before = fake.calls.length;
   const r3 = await syncStore(env, "hc", { nowMs: NOW + 30 * 60000, fetchImpl: fake.fetchImpl });
   assert.equal(r3.kind, "delta");
-  assert.equal(fake.calls[before].variables.query, "updated_at:>='2026-10-09T00:00:00Z'");
+  assert.equal(fake.calls[before].variables.query, "status:active,draft AND updated_at:>='2026-10-09T00:00:00Z'");
   assert.ok(r3.read < 45);
   const row = await env.DB.prepare(`SELECT variants FROM cat_products WHERE product_id = 'gid://shopify/Product/1'`).first();
   assert.equal(JSON.parse(row.variants)[0].price, 39.95);
@@ -287,8 +301,116 @@ test("sync: full read spreads over ticks with a saved cursor, then deltas use th
   // A day later: full read again; a product deleted in Shopify leaves the copy.
   catalog = catalog.slice(1);
   const later = NOW + 25 * 3600000;
-  for (let i = 0; i < 3; i++) await syncStore(env, "hc", { nowMs: later + i * 15 * 60000, fetchImpl: fake.fetchImpl });
+  for (let i = 0; i < 3; i++) await syncStore(env, "hc", { nowMs: later + i * 15 * 60000, fetchImpl: fake.fetchImpl, pages: P });
   assert.equal((await env.DB.prepare(`SELECT COUNT(*) AS n FROM cat_products`).first()).n, 44);
+});
+
+test("sync: only active + draft are read; a store full of archived products completes and becomes fresh; archived drop out", async () => {
+  const env = await freshEnv();
+  // 30 active, 10 draft, 200 archived (the live stores' shape: many old archived products).
+  let catalog = [
+    ...Array.from({ length: 30 }, (_, i) => product(i + 1)),
+    ...Array.from({ length: 10 }, (_, i) => product(100 + i, { status: "DRAFT" })),
+    ...Array.from({ length: 200 }, (_, i) => product(1000 + i, { status: "ARCHIVED" })),
+  ];
+  const fake = fakeShopify(() => catalog);
+  const r = await syncStore(env, "hc", { nowMs: NOW, fetchImpl: fake.fetchImpl });
+  assert.equal(r.completed, true, "40 products = 4 pages: done in one run");
+  assert.equal(r.read, 40);
+  assert.ok(fake.calls.every((c) => /^status:active,draft\b/.test(c.variables.query)), "every page carries the status filter");
+  const s = await getSync(env.DB, "hc");
+  assert.ok(cacheReady(s, NOW + 60000).ready, "fresh");
+  assert.equal((await env.DB.prepare(`SELECT COUNT(*) AS n FROM cat_products WHERE status = 'ARCHIVED'`).first()).n, 0);
+
+  // A product archived later drops out on the next full read (it is no longer seen).
+  catalog = catalog.map((p) => (p.id === "gid://shopify/Product/1" ? { ...p, status: "ARCHIVED", updatedAt: "2026-10-13T20:00:00Z" } : p));
+  const later = NOW + 25 * 3600000;
+  await syncStore(env, "hc", { nowMs: later, fetchImpl: fake.fetchImpl });
+  assert.equal((await env.DB.prepare(`SELECT COUNT(*) AS n FROM cat_products WHERE product_id = 'gid://shopify/Product/1'`).first()).n, 0);
+});
+
+test("sync: a pass started before the status filter (unfiltered, live 2026-10-14) restarts with the filter", async () => {
+  const env = await freshEnv();
+  await env.DB.prepare(`INSERT INTO cat_sync (store, pass_kind, pass_query, pass_cursor, pass_started_at, pass_read) VALUES ('hc', 'full', NULL, 'c:760', ?, 760)`)
+    .bind(new Date(NOW - 20 * 3600000).toISOString()).run();
+  const fake = fakeShopify(() => Array.from({ length: 15 }, (_, i) => product(i + 1)));
+  const r = await syncStore(env, "hc", { nowMs: NOW, fetchImpl: fake.fetchImpl });
+  assert.equal(fake.calls[0].variables.after, null, "the old cursor belongs to another list: not reused");
+  assert.equal(fake.calls[0].variables.query, "status:active,draft");
+  assert.equal(r.completed, true);
+  assert.ok(cacheReady(await getSync(env.DB, "hc"), NOW + 60000).ready);
+});
+
+test("sync: a THROTTLED page stops the tick cleanly (no error, cursor kept) and the next run resumes", async () => {
+  const env = await freshEnv();
+  const fake = fakeShopify(() => Array.from({ length: 45 }, (_, i) => product(i + 1)), { throttleOnCall: 3 });
+  const r1 = await syncStore(env, "hc", { nowMs: NOW, fetchImpl: fake.fetchImpl });
+  assert.equal(r1.status, "ok");
+  assert.equal(r1.paused, "throttled");
+  assert.equal(r1.read, 20, "two pages read before the throttle");
+  assert.equal(r1.completed, false);
+  let s = await getSync(env.DB, "hc");
+  assert.equal(s.pass_cursor, "c:20", "cursor kept");
+  assert.equal(s.last_error, null, "a throttle is a pause, not an error");
+  assert.match(s.last_pause_reason, /THROTTLED/);
+  const r2 = await syncStore(env, "hc", { nowMs: NOW + 20 * 60000, fetchImpl: fake.fetchImpl });
+  assert.equal(fake.calls[3].variables.after, "c:20", "resumed where it paused");
+  assert.equal(r2.completed, true);
+  s = await getSync(env.DB, "hc");
+  assert.ok(cacheReady(s, NOW + 21 * 60000).ready);
+  assert.equal((await env.DB.prepare(`SELECT COUNT(*) AS n FROM cat_products`).first()).n, 45);
+});
+
+test("sync: stops before a page Shopify's cost bucket can't pay for; a pass reports size, pace and an ETA", async () => {
+  const env = await freshEnv();
+  // Bucket drains: after call 2 only 300 points are left for a 722-point page.
+  const costFor = (n) => ({ requestedQueryCost: 722, actualQueryCost: 300,
+    throttleStatus: { maximumAvailable: 1000, currentlyAvailable: n >= 2 ? 300 : 900, restoreRate: 50 } });
+  const fake = fakeShopify(() => Array.from({ length: 95 }, (_, i) => product(i + 1)), { costFor });
+  const r = await syncStore(env, "hc", { nowMs: NOW, fetchImpl: fake.fetchImpl });
+  assert.equal(r.paused, "cost");
+  assert.equal(r.calls, 2, "no third call was sent");
+  assert.equal(r.read, 20);
+  const s = await getSync(env.DB, "hc");
+  assert.equal(s.last_error, null);
+  assert.equal(s.pass_total, 95);
+  const p = passProgress(s, NOW + 30 * 60000); // 20 read in 30 minutes → 40 an hour, 75 left
+  assert.equal(p.read, 20);
+  assert.equal(p.total, 95);
+  assert.equal(p.products_per_hour, 40);
+  assert.equal(p.eta_hours, 1.9);
+  assert.ok(p.last_pause && /budget/.test(p.last_pause.reason));
+});
+
+test("store guard: cost is exposed, shopifyGraphQL still returns data only, a throttle is a typed THROTTLED error", async () => {
+  const env = await freshEnv();
+  const cost = { requestedQueryCost: 12, actualQueryCost: 10, throttleStatus: { maximumAvailable: 1000, currentlyAvailable: 990, restoreRate: 50 } };
+  let mode = "ok";
+  const fetchImpl = async (url) => {
+    if (url.endsWith("/admin/oauth/access_token")) return new Response(JSON.stringify({ access_token: "tok", expires_in: 86400 }), { status: 200 });
+    if (mode === "throttled") return new Response(JSON.stringify({ errors: [{ message: "Throttled", extensions: { code: "THROTTLED" } }], extensions: { cost } }), { status: 200 });
+    if (mode === "other") return new Response(JSON.stringify({ errors: [{ message: "Field 'x' doesn't exist" }] }), { status: 200 });
+    return new Response(JSON.stringify({ data: { shop: { name: "H&C" } }, extensions: { cost } }), { status: 200 });
+  };
+  const r = await shopifyGraphQLWithCost(env, "hc", "{ shop { name } }", {}, { fetchImpl });
+  assert.deepEqual(r.data, { shop: { name: "H&C" } });
+  assert.equal(r.cost.requestedQueryCost, 12);
+  assert.equal(r.cost.throttleStatus.currentlyAvailable, 990);
+  assert.deepEqual(await shopifyGraphQL(env, "hc", "{ shop { name } }", {}, { fetchImpl }), { shop: { name: "H&C" } }, "unchanged for existing callers");
+  mode = "throttled";
+  await assert.rejects(shopifyGraphQL(env, "hc", "{ shop { name } }", {}, { fetchImpl }),
+    (e) => e instanceof StoreGuardError && e.code === "THROTTLED" && e.cost.throttleStatus.currentlyAvailable === 990);
+  mode = "other";
+  await assert.rejects(shopifyGraphQL(env, "hc", "{ shop { name } }", {}, { fetchImpl }), (e) => e.code === "GRAPHQL_ERRORS");
+});
+
+test("sync: the run's page budget is shared across stores and stays within the subrequest limit", () => {
+  assert.equal(SYNC_PAGE_BUDGET, 30);
+  assert.equal(pagesForStore(30, 3), 10);
+  assert.equal(pagesForStore(27, 2), 12, "pages a finished store didn't use go to the next (capped at 12)");
+  assert.equal(pagesForStore(0, 1), 0);
+  assert.ok(MAX_PAGES_PER_TICK <= 12);
+  assert.ok(SYNC_PAGE_BUDGET + 3 /* token mints */ + 7 /* Merchant Center */ <= 50, "fits the strictest Worker subrequest limit");
 });
 
 test("sync: not wired is reported, never thrown; a failed page keeps the cursor and the error", async () => {
