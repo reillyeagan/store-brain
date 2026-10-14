@@ -73,7 +73,7 @@ export const PRODUCTS_QUERY = `query CatalogProducts($first: Int!, $after: Strin
   products(first: $first, after: $after, query: $query, sortKey: UPDATED_AT) {
     pageInfo { hasNextPage endCursor }
     nodes {
-      id handle title status productType tags createdAt updatedAt publishedAt
+      id handle title status productType tags createdAt updatedAt publishedAt onlineStoreUrl
       description(truncateAt: 120)
       seo { title description }
       mediaCount { count }
@@ -109,6 +109,9 @@ export function rowFromNode(storeId, n, readAt) {
     tracks_inventory: n.tracksInventory == null ? null : (n.tracksInventory ? 1 : 0),
     total_inventory: n.totalInventory == null ? null : Number(n.totalInventory),
     collections_count: ((n.collections && n.collections.nodes) || []).length,
+    // Online Store channel: Shopify gives a URL only when the product is published there.
+    // Absent from the answer (older copy) → null, unknown; never read as "not published".
+    on_online_store: n.onlineStoreUrl === undefined ? null : (n.onlineStoreUrl ? 1 : 0),
     variants_count: n.variantsCount ? Number(n.variantsCount.count) : variants.length,
     variants: JSON.stringify(variants),
     read_at: readAt,

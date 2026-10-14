@@ -9,6 +9,8 @@
  *   images, a size option, a size chart in the library, cost on file, title and description,
  *   SEO title/description, no duplicate handle ("name-1" next to "name"), and the Supplier's
  *   Supply Pre-flight (preflightProduct: a confirmed KFB supply line, quoted and not denied).
+ *   Plus, over EVERY active product: the post-publish channel check (channelCheck: on the
+ *   Online Store channel, in at least one collection).
  * Inputs: `cat_products` (fresh copy), Core costs (per variant), `size_charts`, Pricing's tier
  *   spread, Supplier `kfb_quotes` via preflightProduct.
  * Outputs: a `cat_runs` row (per-product checklist) and one digest event per store per day.
@@ -136,6 +138,36 @@ export async function supplyCheck(db, storeId, p) {
   }
 }
 
+/**
+ * Post-publish channel check (vault: 08 System/Blueprints/Post-Publish Verification SOP — the
+ * publish switches: status, the product's channel, and its collection). Over EVERY active
+ * product, from the read-only copy:
+ *   - not on the Online Store channel (Shopify's onlineStoreUrl is null): active but invisible;
+ *   - in no collection: not reachable from the store's navigation / collection pages.
+ * Unknown stays unknown: a product read before the channel field existed is counted as
+ * "not read yet", never as unpublished. Whether each COLLECTION is itself published to the
+ * Online Store is not checked (needs a collections read the catalog reader doesn't do yet).
+ */
+export const CHANNEL_LIST_CAP = 50;
+export function channelCheck(products) {
+  const active = products.filter((p) => p.status === "ACTIVE");
+  const list = [];
+  let notOnline = 0, noCollection = 0, unknown = 0;
+  for (const p of active) {
+    const issues = [];
+    if (p.on_online_store === 0) { issues.push("not published to the Online Store channel"); notOnline++; }
+    else if (p.on_online_store == null) unknown++;
+    if (p.collections_count === 0) { issues.push("in no collection"); noCollection++; }
+    if (issues.length) list.push({ product_id: p.product_id, handle: p.handle, title: p.title, issues });
+  }
+  return {
+    checked: active.length, not_on_online_store: notOnline, no_collection: noCollection, online_store_unknown: unknown,
+    online_store_note: unknown ? `${unknown} active product(s) not read since the channel check was added: unknown until the next full read` : null,
+    collection_published: "not wired: whether each collection is itself published to the Online Store isn't read yet",
+    products: list.slice(0, CHANNEL_LIST_CAP), products_total: list.length,
+  };
+}
+
 export async function runPrepublishStore(env, storeId, products, { nowMs, day }) {
   const db = env.DB;
   const days = newDays(env);
@@ -168,14 +200,18 @@ export async function runPrepublishStore(env, storeId, products, { nowMs, day })
   const rank = { high: 3, medium: 2, low: 1, info: 0 };
   results.sort((a, b) => rank[b.severity] - rank[a.severity]);
   const failed = results.filter((r) => !r.passed).length;
-  const summary = { window_days: days, new_products: results.length, passed: results.length - failed, flagged: failed };
+  const channel = channelCheck(products);
+  const summary = { window_days: days, new_products: results.length, passed: results.length - failed, flagged: failed, channel };
   await saveRun(db, { agent: AGENT, store: storeId, day, nowMs, status: "ok", summary, findings: results });
+  const ch = channel.not_on_online_store || channel.no_collection
+    ? ` Channel check: ${channel.not_on_online_store} active not on the Online Store, ${channel.no_collection} in no collection.`
+    : channel.online_store_unknown ? ` Channel check: ${channel.online_store_unknown} active product(s) not read for the channel yet.` : " Channel check: every active product is on the Online Store and in a collection.";
   await logEvent(db, {
     actor: AGENT, kind: "catalog.new_product_digest", store: storeId, at: nowIso(nowMs),
-    summary: results.length
-      ? `${STORES[storeId].name}: ${results.length} product(s) published in the last ${days} days; ${failed} flagged, ${results.length - failed} pass. Flags only.`
-      : `${STORES[storeId].name}: no products published in the last ${days} days.`,
-    data: summary,
+    summary: (results.length
+      ? `${STORES[storeId].name}: ${results.length} product(s) published in the last ${days} days; ${failed} flagged, ${results.length - failed} pass.`
+      : `${STORES[storeId].name}: no products published in the last ${days} days.`) + `${ch} Flags only.`,
+    data: { ...summary, channel: { ...channel, products: undefined } },
   });
   return { status: "ok", ...summary };
 }

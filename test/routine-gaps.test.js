@@ -10,7 +10,8 @@ import { minusDays } from "../src/lib/adsSpend.js";
 import { SPEND_ALARM, spendAlarmConfig } from "../src/config/stores.js";
 import { judgeSpend, runSpendAlarm, normallySpending } from "../src/agents/media/spendAlarm.js";
 import { gatherBriefData } from "../src/lib/brief.js";
-import { checkNewProduct, NO_COMPARE_AT_DAYS } from "../src/agents/catalog/prepublish.js";
+import { checkNewProduct, NO_COMPARE_AT_DAYS, channelCheck, runPrepublishStore } from "../src/agents/catalog/prepublish.js";
+import { PRODUCTS_QUERY, rowFromNode } from "../src/agents/catalog/sync.js";
 import { hygieneReport, runHygieneStore } from "../src/agents/catalog/hygiene.js";
 import { runBilling, judgeBudget, judgeBilling, judgeAccount, isAccessGap, Q_ACCOUNT, Q_BILLING, Q_BUDGET } from "../src/agents/media/billing.js";
 
@@ -323,4 +324,36 @@ test("feed hygiene: a store run saves the state section and one monthly event; z
   const run = await DB.prepare(`SELECT * FROM cat_runs WHERE agent = 'cat.hygiene' AND store = 'hc'`).first();
   assert.equal(JSON.parse(run.summary).month, "2026-10");
   assert.equal((await evs(DB, "catalog.hygiene_report")).length, 2);
+});
+
+/* ---------------- 8. post-publish channel check ---------------- */
+
+test("channel check: the reader records the Online Store channel from onlineStoreUrl; absent field = unknown, never 'not published'", () => {
+  const node = (extra) => ({ id: "gid://shopify/Product/1", handle: "h", title: "T", status: "ACTIVE", variants: { nodes: [] }, ...extra });
+  assert.match(PRODUCTS_QUERY, /onlineStoreUrl/);
+  assert.equal(rowFromNode("hc", node({ onlineStoreUrl: "https://holtandcrane.com/products/h" }), "t").on_online_store, 1);
+  assert.equal(rowFromNode("hc", node({ onlineStoreUrl: null }), "t").on_online_store, 0);
+  assert.equal(rowFromNode("hc", node({}), "t").on_online_store, null);
+});
+
+test("channel check: active products not on the Online Store or in no collection are listed; drafts and unknowns are not flagged", () => {
+  const p = (n, on, cols, status = "ACTIVE") => ({ product_id: `p${n}`, handle: `h${n}`, title: `T${n}`, status, on_online_store: on, collections_count: cols });
+  const r = channelCheck([p(1, 1, 2), p(2, 0, 1), p(3, 1, 0), p(4, null, 1), p(5, 0, 0, "DRAFT")]);
+  assert.equal(r.checked, 4);
+  assert.equal(r.not_on_online_store, 1);
+  assert.equal(r.no_collection, 1);
+  assert.equal(r.online_store_unknown, 1);
+  assert.deepEqual(r.products.map((x) => [x.product_id, x.issues]), [["p2", ["not published to the Online Store channel"]], ["p3", ["in no collection"]]]);
+  assert.match(r.collection_published, /not wired/);
+});
+
+test("channel check: the New-Product Check run saves it for the page and says it in the daily digest", async () => {
+  const DB = makeD1();
+  const products = [
+    { product_id: "p1", handle: "h1", title: "T1", status: "ACTIVE", on_online_store: 0, collections_count: 1, variants: [{ price: 64.95 }], option_names: [], published_at: "2026-06-01T00:00:00Z" },
+  ];
+  await runPrepublishStore({ DB }, "hc", products, { nowMs: Date.parse("2026-10-14T12:00:00Z"), day: "2026-10-14" });
+  const run = await DB.prepare(`SELECT summary FROM cat_runs WHERE agent = 'cat.prepublish' AND store = 'hc'`).first();
+  assert.equal(JSON.parse(run.summary).channel.not_on_online_store, 1);
+  assert.match((await evs(DB, "catalog.new_product_digest"))[0].summary, /1 active not on the Online Store/);
 });

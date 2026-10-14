@@ -27,3 +27,8 @@ CREATE TABLE IF NOT EXISTS risk_personal_hits (
   UNIQUE (store, source, pattern)
 );
 CREATE INDEX IF NOT EXISTS idx_risk_personal_open ON risk_personal_hits(store, cleared_at);
+
+-- Catalog post-publish channel check: is the product on the Online Store sales channel?
+-- From Shopify's Product.onlineStoreUrl (null = not published there), read with read_products.
+-- 1 = yes, 0 = no, NULL = not read since this column was added (unknown, never "no").
+ALTER TABLE cat_products ADD COLUMN on_online_store INTEGER;
