@@ -7,7 +7,7 @@ import {
   guyFeeFor, breakevenRoas, cogsRate, parseRate, FALLBACK_COGS_RATE, pnlHistory, fillMissingDays, FILL_PER_TICK,
 } from "../src/lib/pnl.js";
 import {
-  runBrief, unverifiedNumbers, briefHtml, handleBriefPage, verifyBriefSig, aiCostUsd, plainBrief, gatherBriefData,
+  runBrief, unverifiedNumbers, briefHtml, handleBriefPage, verifyBriefSig, aiCostUsd, plainBrief, gatherBriefData, dollarsIn as dollarsInT,
 } from "../src/lib/brief.js";
 import { upsertOrder, upsertRefund } from "../src/lib/shopifyWebhooks.js";
 import { ensureFeeds, markFeedOk } from "../src/lib/freshness.js";
@@ -1035,6 +1035,10 @@ test("brief: a chargeback amount and a restatement's before/after/change are num
   // loss written as a gain still fails.
   assert.deepEqual(unverifiedNumbers("- #1098 chargeback $65.00; profit moved by $14.60", data), ["$65.00", "$14.60"]);
   assert.deepEqual(unverifiedNumbers("- H&C profit $61.29", data), ["$61.29"]);
+  // A title that states a loss can't make a wrong-sign "profit $52" pass.
+  data.waiting.approvals.push({ id: 999, title: "Ongoing problem: H&C lost $52 on 2026-10-12 (profit $-52.00)", amounts_in_title: dollarsInT("Ongoing problem: H&C lost $52 on 2026-10-12 (profit $-52.00)") });
+  assert.deepEqual(data.waiting.approvals.at(-1).amounts_in_title, []);
+  assert.deepEqual(unverifiedNumbers("- H&C profit $52", data), ["$52"]);
 
   // End to end, including Reilly's "Rewrite now".
   const { rewriteBrief } = await import("../src/lib/brief.js");
@@ -1053,7 +1057,12 @@ test("brief: a chargeback amount and a restatement's before/after/change are num
 test("brief: the prompt forbids computing differences or splits; payout checks and per-store pending refunds come computed", async () => {
   const { SYSTEM_PROMPT, dollarsIn } = await import("../src/lib/brief.js");
   assert.match(SYSTEM_PROMPT, /Never work out a difference, total, average or per-store split yourself/);
-  assert.deepEqual(dollarsIn("profit $-61.29 → $-47.23, fee -$1,200.50 and $3"), [-61.29, -47.23, -1200.5, 3]);
+  // Title amounts are positive magnitudes only: signed or loss-worded ones are left out, and a
+  // range's dash is not a minus sign.
+  assert.deepEqual(dollarsIn("profit $-61.29 → $-47.23, fee -$1,200.50 and $3"), [3]);
+  assert.deepEqual(dollarsIn("Chargeback #1098 · $65.95 · evidence due Oct 31"), [65.95]);
+  assert.deepEqual(dollarsIn("prices $10-$20, or $10 - $20"), [10, 20, 10, 20]);
+  assert.deepEqual(dollarsIn("H&C lost $52 yesterday"), []);
   const DB = makeD1();
   const nowMs = Date.parse("2026-10-14T12:05:00Z");
   await allFresh(DB, nowMs);

@@ -258,9 +258,18 @@ const round2 = (n) => Math.round(Number(n) * 100) / 100;
  */
 export function dollarsIn(text) {
   const out = [];
-  for (const m of String(text || "").matchAll(/([-−]?)\$\s?([-−]?)(\d[\d,]*(?:\.\d+)?)/g)) {
+  const s = String(text || "");
+  for (const m of s.matchAll(/([-−]?)\$\s?([-−]?)(\d[\d,]*(?:\.\d+)?)/g)) {
     const v = Number(m[3].replace(/,/g, ""));
-    if (Number.isFinite(v)) out.push(m[1] || m[2] ? -v : v);
+    if (!Number.isFinite(v)) continue;
+    const before = s.slice(Math.max(0, m.index - 30), m.index);
+    // "$10-$20" is a range: the dash after a number is not a minus sign.
+    const rangeDash = m[1] && /\d\s*$/.test(before);
+    // Positive magnitudes only. An amount the title signs as a loss ("$-52", "-$52",
+    // "lost $52") is left out entirely: as +52 it would let a wrong-sign "profit $52" pass,
+    // and the brief must not quote a loss from a title anyway (rule 5).
+    if ((m[1] && !rangeDash) || m[2] || LOSS_BEFORE.test(before)) continue;
+    out.push(v);
   }
   return out;
 }

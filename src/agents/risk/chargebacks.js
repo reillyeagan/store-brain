@@ -535,7 +535,7 @@ export async function evidenceSummary(db) {
 /** A pending approval for a dispute that no longer needs a response is closed as expired. */
 async function expireApproval(db, storeId, d, nowMs) {
   if (!d.approval_id || d.approval_id < 0) return;
-  const res = await db.prepare(`UPDATE approvals SET status = 'expired', decided_at = ?, note = ? WHERE id = ? AND status = 'pending'`)
+  const res = await db.prepare(`UPDATE approvals SET status = 'expired', decided_at = ?, result = ? WHERE id = ? AND status = 'pending'`)
     .bind(nowIso(nowMs), `Closed by the brain: Shopify now shows this dispute as ${d.status}`, d.approval_id).run();
   if (res.meta && res.meta.changes === 1) {
     await logEvent(db, { actor: ACTOR, kind: "approval.expired", store: storeId, target: "core.approvals",

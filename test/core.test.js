@@ -126,6 +126,26 @@ test("librarian: only like with like — a fact stating floor AND ceiling is rea
   assert.deepEqual(of(502), []);
 });
 
+test("librarian review: '$1,500' is 1500; camelCase and joined keys are read or reported unparsed, never skipped", async () => {
+  const { readPriceFact, retailPriceKinds } = await import("../src/agents/core/priceFacts.js");
+  assert.deepEqual(readPriceFact({ store: "hc", key: "pricing.price_ceiling", value: "$1,500" }).claims, [{ kind: "ceiling", store: "hc", value: 1500 }]);
+  assert.deepEqual(readPriceFact({ store: "hc", key: "pricing.price_ceiling", value: "ceiling $1,500.00" }).claims, [{ kind: "ceiling", store: "hc", value: 1500 }]);
+  assert.deepEqual(retailPriceKinds("pricing.priceCeiling"), ["ceiling"]);
+  assert.deepEqual(retailPriceKinds("pricing.maxprice"), ["ceiling"]);
+  assert.deepEqual(retailPriceKinds("pricing.minPrice"), ["floor"]);
+  assert.deepEqual(retailPriceKinds("pricing.pricefloorceiling"), ["floor", "ceiling"]);
+  assert.deepEqual(retailPriceKinds("pricing.priceLimit"), ["unknown"]);
+  assert.equal(retailPriceKinds("kfb.price_tier_supply_ceiling"), null);
+  const at = "2026-10-01T00:00:00Z";
+  const f = checkFacts([
+    { id: 1, store: "hc", key: "pricing.priceCeiling", value: "150", observed_at: at },
+    { id: 2, store: "mar", key: "pricing.maxprice", value: "$1,500", observed_at: at },
+    { id: 3, store: null, key: "pricing.priceLimit", value: "144.95", observed_at: at },
+  ], T0);
+  assert.deepEqual(f.filter((x) => x.kind === "contradicts_spec").map((x) => [x.fact_id, x.found]), [[1, 150], [2, 1500]]);
+  assert.deepEqual(f.filter((x) => x.fact_id === 3).map((x) => x.kind), ["unparsed"]);
+});
+
 test("librarian: the vault outbox queues decisions, new facts and briefs once each; vault-sourced facts are not sent back", async () => {
   const DB = makeD1();
   await recordDecision(DB, { topic: "t", words: "do it" }, { nowMs: T0 });
@@ -158,6 +178,11 @@ test("vault outbox: every item comes with its vault path and full markdown (Reil
   assert.match(by("fact").markdown, /"usd": 44\.95/);
   assert.equal(by("brief").vault_path, "03 Areas/Business/Store Brain/Briefs/2026-10-14 Morning brief.md");
   assert.match(by("brief").markdown, /## Yesterday's money\n- fine/);
+  // A ``` inside a fact can't close the note's code block early.
+  const { vaultEntry, fenceFor } = await import("../src/agents/core/librarian.js");
+  assert.equal(fenceFor("a ``` b ```` c"), "`````");
+  const md = vaultEntry({ id: 1, kind: "fact", ref_id: "9", created_at: "t", body: { id: 9, key: "k", value: "x\n```\n# not a heading\n```" } }).markdown;
+  assert.match(md, /\n````\nx\n```\n# not a heading\n```\n````\n/);
 
   // Through the worker, with the key, the way the dashboard calls it.
   const worker = (await import("../src/index.js")).default;

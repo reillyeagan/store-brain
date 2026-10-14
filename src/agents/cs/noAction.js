@@ -4,18 +4,23 @@
  * Mail like that is closed quietly as `no_action` (logged, listed on the CS page under its own
  * heading), never escalated and never drafted.
  *
- * Two parts, both needed to close a ticket:
- *   1. A positive sign that the email is only an acknowledgement: the classifier said
- *      no_action, OR its summary says "no action requested/raised/needed" / "no question", OR
- *      the email itself is a short thank-you with nothing else in it.
- *   2. The fail-safe, which always wins: a question mark, an order problem, a request, anger,
- *      or a money/refund/return word anywhere in the subject or body means it is NOT
- *      no_action, whatever the classifier said. A wrong close hides a customer from Reilly; a
- *      wrong escalation only costs him a glance, so every doubt goes to Reilly.
+ * Code decides, never the model alone (review 2026-10-14: the classifier's flag closed
+ * "Gracias, pero el pedido no llegó"; a problem-word list missed "the zipper broke"):
+ *   - The email (HTML stripped to text) must be an ALLOWLISTED acknowledgement: after the
+ *     greeting ("Hi Jane,"), the sign-off/name line and "Sent from my iPhone" are set aside,
+ *     every remaining word must be on the acknowledgement list. One other word, in any
+ *     language, and this path does not close. A problem list always misses something; an
+ *     allowlist can't.
+ *   - On top, the fail-safe vetoes (question mark, request, problem, anger, money/refund/
+ *     return word) and the classifier's own anger/refund flags keep it open.
+ *   - Only category "other" can close.
+ * The classifier's no_action flag and its "no action requested" summary are recorded as
+ * supporting signs only. A wrong close hides a customer from Reilly; a wrong escalation only
+ * costs him a glance, so every doubt goes to Reilly.
  */
 import { safeJson } from "./util.js";
 
-/** The classifier's own words for "nothing asked". */
+/** The classifier's own words for "nothing asked" (a supporting sign, never enough alone). */
 export const SUMMARY_NO_ACTION = /\bno (?:further )?(?:action|question|request)s?(?: or (?:action|question|request)s?)?(?: (?:is|was|were|being))? (?:requested|raised|needed|required|asked|made)\b|\bnothing (?:requested|asked)\b|\bno reply needed\b/i;
 
 /** The fail-safe vetoes. Each one alone keeps the ticket with the normal flow. */
@@ -29,43 +34,95 @@ const VETOES = [
   ["anger", /\b(scam\w*|fraud\w*|fake|ridiculous|unacceptable|terrible|awful|worst|disgust\w*|angry|furious|upset|disappoint\w*|unhappy|not happy|complain\w*|report(ing)? you|bbb|lawyer|legal|police|never (again|order\w*))\b|!!/i],
 ];
 
-/** Words a thank-you/acknowledgement is made of (anything else = not a bare thank-you). */
-const ACK_WORDS = new Set(("thank thanks thankyou thx ty tysm many much so very you u a lot lots great " +
-  "ok okay okey k cool perfect awesome amazing wonderful lovely brilliant nice good excellent appreciate appreciated " +
-  "it this that the for your update updates info information message email note noted received got " +
-  "will i ll i'll we we'll reply respond get back to once when item items order parcel package arrives arrive " +
-  "comes come is in here have has had receive receiving it's its all sounds sound looks look fine well " +
-  "hi hello hey dear team sir madam best regards kind cheers sincerely sent from my iphone android phone mobile " +
-  "and again too also just really yes yep sure").split(" "));
+/**
+ * The ONLY words a closable email may contain (after greeting / sign-off / name line are set
+ * aside). Deliberately small: no "but", "not", "no", "too", adjectives that could describe a
+ * fault, or anything about the item's condition. A word missing here only sends a harmless
+ * thank-you to Reilly.
+ */
+const ACK_WORDS = new Set((
+  "thank thanks thankyou thx ty tysm many much so very you a lot great ok okay cool perfect awesome amazing " +
+  "wonderful lovely brilliant nice excellent appreciate appreciated appreciation noted " +
+  "for the your this that it it's its update updates info information " +
+  "i i'll will reply respond get back to you once when have has received receive arrives arrived item order " +
+  "all good sounds again yes"
+).split(" "));
+/** At least one of these must be there: it is a thank-you / acknowledgement at all. */
+const THANKS = /^(thank|thanks|thankyou|thx|ty|tysm|appreciate|appreciated|noted|ok|okay)$/;
 
-/** The customer's words only: quoted history and sign-off lines dropped, lower-case. */
-function words(text) {
-  return String(text || "").toLowerCase().replace(/[^a-z' ]+/g, " ").split(/\s+/).filter(Boolean);
+// A greeting may address the store, never an arbitrary capitalised word ("Hi Broken").
+const GREETING = /^\s*(?:hi|hello|hey|dear|good (?:morning|afternoon|evening))(?:\s+(?:there|team|all|holt\s*(?:&|and)\s*crane|auberlane|marlowe(?:\s+standard)?)(?:\s+team)?)?\s*[,!.:-]*\s*/i;
+const SIGNOFF_WORDS = /^(?:(?:best|kind|warm|warmest)\s+regards|regards|best|cheers|sincerely|warmly|thanks|thank you|many thanks|xx?)$/i;
+const DEVICE_LINE = /^(?:sent from my\b.*|get outlook for\b.*|sent via\b.*)$/i;
+
+/**
+ * A sign-off / name line: "Best," / "Cheers, Jane" / "Jane Doe". A name counts only when
+ * every word of it is in the sender's own name (from the From header), so "Thanks\nZipper
+ * Broke" can't pass a problem off as a signature.
+ */
+function isSignoffLine(line, fromName) {
+  const l = line.replace(/\s+/g, " ").replace(/[.!]+$/, "").trim();
+  const nameWords = new Set(String(fromName || "").toLowerCase().split(/[^a-z'-]+/).filter(Boolean));
+  const isName = (s) => {
+    const w = s.toLowerCase().split(/\s+/).filter(Boolean);
+    return w.length > 0 && w.length <= 3 && w.every((x) => nameWords.has(x));
+  };
+  if (SIGNOFF_WORDS.test(l.replace(/,$/, ""))) return true;
+  const m = /^([^,]+),\s*(.+)$/.exec(l);
+  if (m && SIGNOFF_WORDS.test(m[1].trim()) && isName(m[2])) return true;
+  return isName(l);
 }
 
-/** True when the email is nothing but a short thank-you / acknowledgement. */
-export function isBareThanks(body) {
-  const w = words(body);
-  if (!w.length || w.length > 40) return false;
-  if (!w.some((x) => /^(thank|thanks|thankyou|thx|ty|tysm|appreciate|appreciated|noted|cheers|great|perfect|ok|okay)$/.test(x))) return false;
-  // Names in a greeting or sign-off are fine; anything else that isn't an ack word is not.
-  const unknown = w.filter((x) => !ACK_WORDS.has(x));
-  return unknown.length <= 3;
+/** HTML to plain text: tags dropped, style/script removed, breaks kept, entities decoded. */
+export function htmlToText(s) {
+  let t = String(s == null ? "" : s);
+  if (!/<[a-z!/][^>]*>|&[a-z#0-9]+;/i.test(t)) return t;
+  t = t.replace(/<(style|script|head)\b[\s\S]*?<\/\1\s*>/gi, " ")
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<\s*(br|\/p|\/div|\/li|\/tr|\/h\d)\b[^>]*>/gi, "\n")
+    .replace(/<[^>]*>/g, " ");
+  const named = { nbsp: " ", amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", rsquo: "'", lsquo: "'", ldquo: '"', rdquo: '"' };
+  t = t.replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCodePoint(parseInt(n, 16)))
+    .replace(/&([a-z]+);/gi, (m, n) => (named[n.toLowerCase()] ?? m));
+  return t.replace(/[ \t]+/g, " ");
+}
+
+/** The customer's own lines: quoted history, device footers and blank lines dropped. */
+function ownLines(text) {
+  return htmlToText(text).split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith(">") && !DEVICE_LINE.test(l));
+}
+
+/**
+ * True only when the email is nothing but a thank-you / acknowledgement: every word, after the
+ * greeting and the sign-off/name line, is on ACK_WORDS. Zero exceptions.
+ */
+export function isBareThanks(body, { fromName = null } = {}) {
+  const lines = ownLines(body);
+  if (!lines.length) return false;
+  // The sign-off / name line(s) at the end ("Best, Jane" / "Jane Doe"), never the only line.
+  while (lines.length > 1 && isSignoffLine(lines[lines.length - 1], fromName)) lines.pop();
+  lines[0] = lines[0].replace(GREETING, "");
+  const w = lines.join(" ").toLowerCase().replace(/[’‘]/g, "'").replace(/[^a-z0-9' ]+/g, " ").split(/\s+/).filter(Boolean)
+    .map((x) => x.replace(/^'+|'+$/g, ""));
+  if (!w.length || w.length > 30) return false;
+  if (!w.some((x) => THANKS.test(x))) return false;
+  return w.every((x) => ACK_WORDS.has(x));
 }
 
 /** The first fail-safe that fires, or null. Checks the customer's own subject and words. */
 export function noActionVeto({ subject = "", body = "" } = {}) {
-  // "Re: Your order is on the way" / "Order #1253 shipped" are the store's own subjects:
-  // only the customer's body is checked for questions and problems, plus a subject that
-  // the customer typed (no Re:/Fwd: prefix).
-  const subj = /^\s*(re|fw|fwd)\s*:/i.test(String(subject)) ? "" : String(subject);
-  const text = `${subj}\n${body || ""}`;
+  // "Re: Your order is on the way" is the store's own subject: only a subject the customer
+  // typed (no Re:/Fwd: prefix) is checked, plus the body.
+  const subj = /^\s*(re|fw|fwd)\s*:/i.test(String(subject)) ? "" : htmlToText(subject);
+  const text = `${subj}\n${htmlToText(body)}`;
   for (const [why, re] of VETOES) if (re.test(text)) return why;
   return null;
 }
 
 /**
- * Should this ticket be closed quietly as no_action?
+ * Should this ticket be closed quietly as no_action? Code decides: the allowlist check must
+ * pass, whatever the classifier said.
  * @param t       the cs_tickets row (subject, body, summary, triage JSON)
  * @param triage  the validated classification (optional; read from t.triage when absent)
  * @returns {{close:boolean, reason:string}}
@@ -78,11 +135,13 @@ export function noActionCheck(t, triage = null) {
   const cat = (t && t.category) || tri.category || "other";
   // Only "other" can be a bare acknowledgement; every real category has something to do.
   if (cat !== "other") return { close: false, reason: `not closed: category ${cat}` };
+  if (!isBareThanks(t && t.body, { fromName: t && t.from_name })) return { close: false, reason: "not closed: the email has words beyond a plain thank-you" };
   const summary = String((t && t.summary) || tri.summary || "");
-  if (tri.no_action === true) return { close: true, reason: "the classifier said nothing was asked, and no question, request, problem or refund word is in the email" };
-  if (SUMMARY_NO_ACTION.test(summary)) return { close: true, reason: `the classifier's summary says so ("${summary.slice(0, 120)}"), and no question, request, problem or refund word is in the email` };
-  if (isBareThanks(t && t.body)) return { close: true, reason: "the email is only a thank-you, with no question, request, problem or refund word" };
-  return { close: false, reason: "not closed: no sign it is only an acknowledgement" };
+  const signs = [
+    tri.no_action === true ? "the classifier said nothing was asked" : null,
+    SUMMARY_NO_ACTION.test(summary) ? `its summary says "${summary.slice(0, 120)}"` : null,
+  ].filter(Boolean);
+  return { close: true, reason: `the email is only a thank-you (every word is an acknowledgement; no question, request, problem or refund word)${signs.length ? `; ${signs.join("; ")}` : ""}` };
 }
 
 /**

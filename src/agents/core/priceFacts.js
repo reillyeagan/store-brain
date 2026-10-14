@@ -33,17 +33,29 @@ const STORE_RX = [
 const ALL_RX = /\b(?:all\s+(?:\d+\s+|three\s+|the\s+)?stores?|every\s+store|each\s+store|all\s+(?:3|three))\b/i;
 const LABEL_RX = /\b(floor|min(?:imum)?|lowest|ceiling|max(?:imum)?|cap(?:ped)?|highest)\b/gi;
 
-const keyTokens = (key) => String(key || "").toLowerCase().split(/[^a-z]+/).filter(Boolean);
+/** Key words, camelCase split too ("priceCeiling" -> price, ceiling). */
+const keyTokens = (key) => String(key || "").replace(/([a-z0-9])([A-Z])/g, "$1 $2").toLowerCase().split(/[^a-z]+/).filter(Boolean);
 
-/** Is this fact key about a store's retail price floor and/or ceiling? Returns the kinds it names. */
+/** Which rule a key word names, also inside joined words ("maxprice", "pricefloor"). */
+function tokenKinds(x) {
+  const out = [];
+  if (FLOOR_WORDS.has(x) || /floor|minimum|lowest/.test(x) || /^min(?=pric)|pric\w*min$/.test(x)) out.push("floor");
+  if (CEIL_WORDS.has(x) || /ceiling|maximum|highest/.test(x) || /^(?:max|cap)(?=pric)|pric\w*(?:max|cap)$/.test(x)) out.push("ceiling");
+  return out;
+}
+
+/**
+ * Is this fact key about a store's retail price floor and/or ceiling? Returns the kinds it
+ * names, null when it isn't about that at all, or ["unknown"] when it looks like a floor /
+ * ceiling key but which one can't be told (reported as unparsed, never silently skipped).
+ */
 export function retailPriceKinds(key) {
   const k = String(key || "").toLowerCase();
   if (!/pric/.test(k) || NOT_RETAIL.test(k)) return null;
-  const t = keyTokens(k);
-  const kinds = [];
-  if (t.some((x) => FLOOR_WORDS.has(x))) kinds.push("floor");
-  if (t.some((x) => CEIL_WORDS.has(x))) kinds.push("ceiling");
-  return kinds.length ? kinds : null;
+  const found = new Set(keyTokens(key).flatMap(tokenKinds));
+  const kinds = ["floor", "ceiling"].filter((x) => found.has(x));
+  if (kinds.length) return kinds;
+  return /floor|ceil|max|min|cap|lowest|highest|limit/.test(k) ? ["unknown"] : null;
 }
 
 const labelKind = (word) => (FLOOR_WORDS.has(word.toLowerCase().replace(/ped$/, "")) ? "floor" : "ceiling");
@@ -69,9 +81,10 @@ function storeMentions(text) {
 function segmentNumbers(seg, labelLen) {
   const out = [];
   // The number right after the label, past filler words ("min price 44.95", "ceiling: 150").
-  const near = /^[\s:=\-–]*(?:(?:retail|price|prices|is|of|at|set|to|now|usd|of|=|:)[\s:=]+){0,3}\$?\s?(\d+(?:\.\d+)?)\b/i.exec(seg.slice(labelLen));
-  if (near) out.push({ at: labelLen + near.index + near[0].length - near[1].length, value: Number(near[1]) });
-  for (const m of seg.matchAll(/\$\s?(\d[\d,]*(?:\.\d+)?)|\b(\d{1,5}\.\d{2})\b/g)) {
+  const near = /^[\s:=\-–]*(?:(?:retail|price|prices|is|of|at|set|to|now|usd|of|=|:)[\s:=]+){0,3}\$?\s?(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\b/i.exec(seg.slice(labelLen));
+  // "$1,500" is 1500: thousands separators are part of the number.
+  if (near) out.push({ at: labelLen + near.index + near[0].length - near[1].length, value: Number(near[1].replace(/,/g, "")) });
+  for (const m of seg.matchAll(/\$\s?(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)|\b(\d{1,3}(?:,\d{3})+\.\d{2}|\d{1,5}\.\d{2})\b/g)) {
     const at = m.index + m[0].length - (m[1] || m[2]).length;
     if (out.some((o) => o.at === at)) continue;
     out.push({ at, value: Number(String(m[1] || m[2]).replace(/,/g, "")) });
@@ -87,6 +100,7 @@ function segmentNumbers(seg, labelLen) {
 export function readPriceFact(fact) {
   const kinds = retailPriceKinds(fact && fact.key);
   if (!kinds) return null;
+  if (kinds[0] === "unknown") return { unparsed: `the key "${fact.key}" looks like a price limit, but not which one (floor or ceiling)` };
   const own = fact.store && LIVE_STORE_IDS.includes(fact.store) ? fact.store : null;
   if (fact.store && !own) return { unparsed: `fact belongs to ${fact.store}, which is not a live store` };
   let v = fact.value;
@@ -113,7 +127,9 @@ function readValue(v, kinds, own) {
     const claims = [];
     for (const [k, x] of Object.entries(v)) {
       const t = keyTokens(k);
-      const kind = t.some((w) => FLOOR_WORDS.has(w)) ? "floor" : t.some((w) => CEIL_WORDS.has(w)) ? "ceiling" : null;
+      const ks = [...new Set(t.flatMap(tokenKinds))];
+      if (ks.length > 1) return { unparsed: `"${k}" names both a floor and a ceiling` };
+      const kind = ks[0] || null;
       if (!kind) continue;
       const n = typeof x === "number" ? x : Number(String(x).replace(/[$,\s]/g, ""));
       if (!okPrice(n)) return { unparsed: `"${k}" is not a price` };
