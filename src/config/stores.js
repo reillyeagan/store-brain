@@ -33,6 +33,34 @@ export const PARCEL_TRACKING_DECISION = Object.freeze({
 export const GUY_FEE = Object.freeze({ rate: 0.10, start: "2026-09-07" });
 
 /**
+ * P&L SHEETS: Reilly's Google Sheets P&L workbooks (owner reillyworking26@gmail.com). Sheet ids
+ * are identifiers, not credentials. Each store's id sits on the store below (`pnlSheetId`); the
+ * combined "Ecom P&L" (the three stores summed day by day, with its own input cells) is here.
+ * The P&L Sheets agent (src/agents/pnl/sheets.js) reads them and fills BLANK input cells only.
+ */
+export const ECOM_PNL_SHEET_ID = "1xL1Nbv0I1rztGx_a--1LJPg_YnjrdRkR04oLbIHDFw4";
+
+/** Reilly, 2026-10-14. The brain writes the workbooks by default; env SHEETS_WRITE = "0" stops every write. */
+export const SHEETS_WRITE_DECISION = Object.freeze({
+  at: "2026-10-14T12:00:00Z",
+  topic: "pnl.sheets_write",
+  words: "make sure things like the google drive P&L sheets are all updated by the brain automatically",
+});
+/** Reilly, 2026-10-14, on the P&L page's empty days. */
+export const SHEETS_FILL_DECISION = Object.freeze({
+  at: "2026-10-14T12:00:00Z",
+  topic: "pnl.sheets_fill",
+  words: "why are there so many days missing info, use the spreadsheets to fill in accurate data for every single day we have",
+});
+
+/**
+ * The earliest day the brain's history reaches back to (order history extension and the
+ * Google Ads history backfill): the first day of the oldest month tab in the workbooks
+ * (H&C: first ad spend 2026-07-13, first order 2026-08-15).
+ */
+export const HISTORY_FROM = "2026-07-01";
+
+/**
  * Who each store sells to (`audience` on each store below): "men", "women", "both", or null
  * when unknown (null is "not told", never a default). The Size Checker reads it.
  * Reilly, 2026-10-13: "H&C is mens and womens. Auberlane is womens. Marlowe is mens."
@@ -50,6 +78,7 @@ export const STORES = Object.freeze({
     domain: "jmzjx1-it.myshopify.com",
     kfbShopCode: "jmzjx1-it",
     adsCustomerId: "710-814-3649",
+    pnlSheetId: "12ywpdKCoWx9ACaJ_pLqO_usHGOPWedazgXQI7iXzPXg", // "Holt & Crane P&L" (see P&L SHEETS above)
     // The store's own customer-service Gmail, connected separately (Reilly, 2026-10-11:
     // "it has its own gmail, we need to connect it. also, eventually all the stores will have their own gmails").
     mailbox: "info@holtandcrane.com",
@@ -67,6 +96,7 @@ export const STORES = Object.freeze({
     domain: "3as2ya-dw.myshopify.com",
     kfbShopCode: "3as2ya-dw",
     adsCustomerId: "148-187-2496",
+    pnlSheetId: "1_Bpg8G1Ztt8QTs3Bus0MGXmQi7wKOTqvKaAtHdDmD_8", // "Auberlane P&L"
     audience: "women", // see AUDIENCE_DECISION
     live: true,
     timezone: "America/New_York",
@@ -81,6 +111,7 @@ export const STORES = Object.freeze({
     domain: "806080-g8.myshopify.com",
     kfbShopCode: "806080-g8",
     adsCustomerId: "774-220-2674",
+    pnlSheetId: "1hQPdzPDkJbX9uC1jjrKc2vrA2PUq-cmC-ziBqeUiCkg", // "Marlowe Standard P&L"
     audience: "men", // see AUDIENCE_DECISION
     live: true,
     timezone: "America/New_York",

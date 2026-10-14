@@ -148,6 +148,28 @@ export function parseSpendRows(rows, { from, to }) {
   return out;
 }
 
+/**
+ * Store one API day. The API is the authority: it replaces a row that only had the sheet's
+ * figure (source 'sheet' → 'api'), and every API row says so.
+ */
+export async function upsertSpendDay(db, storeId, d, { currency, tz, at }) {
+  await db.prepare(
+    `INSERT INTO ad_spend_days (store, day, cost, clicks, impressions, conv_value, currency, account_tz, fetched_at, source)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'api')
+     ON CONFLICT(store, day) DO UPDATE SET cost = excluded.cost, clicks = excluded.clicks,
+       impressions = excluded.impressions, conv_value = excluded.conv_value, currency = excluded.currency,
+       account_tz = excluded.account_tz, fetched_at = excluded.fetched_at, source = 'api'`
+  ).bind(storeId, d.day, d.cost, d.clicks, d.impressions, d.conv_value, currency, tz, at).run();
+}
+
+/** The ad account's timezone and currency (one small call). */
+export async function accountInfo(env, cid, { token, fetchImpl = fetch } = {}) {
+  const acct = await adsQuery(env, cid, "SELECT customer.id, customer.time_zone, customer.currency_code FROM customer", { token, fetchImpl });
+  const c = acct[0] && acct[0].customer;
+  if (!c || !c.timeZone) throw new AdsError(`Google Ads account ${cid} returned no timezone`, "ADS_NO_TZ");
+  return { tz: c.timeZone, currency: c.currencyCode || null };
+}
+
 /** Pull and restate one store. Throws on any API problem (caller decides how to record it). */
 export async function pullStoreSpend(env, storeId, { token, fetchImpl = fetch, nowMs = Date.now() } = {}) {
   const store = STORES[storeId];
@@ -168,19 +190,14 @@ export async function pullStoreSpend(env, storeId, { token, fetchImpl = fetch, n
   const days = parseSpendRows(rows, { from, to });
   const at = nowIso(nowMs);
   const restated = [];
-  const had = await env.DB.prepare(`SELECT COUNT(*) AS n FROM ad_spend_days WHERE store = ?`).bind(storeId).first();
+  const had = await env.DB.prepare(`SELECT COUNT(*) AS n FROM ad_spend_days WHERE store = ? AND source = 'api'`).bind(storeId).first();
   for (const d of days) {
-    const before = await env.DB.prepare(`SELECT cost FROM ad_spend_days WHERE store = ? AND day = ?`).bind(storeId, d.day).first();
-    await env.DB.prepare(
-      `INSERT INTO ad_spend_days (store, day, cost, clicks, impressions, conv_value, currency, account_tz, fetched_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(store, day) DO UPDATE SET cost = excluded.cost, clicks = excluded.clicks,
-         impressions = excluded.impressions, conv_value = excluded.conv_value, currency = excluded.currency,
-         account_tz = excluded.account_tz, fetched_at = excluded.fetched_at`
-    ).bind(storeId, d.day, d.cost, d.clicks, d.impressions, d.conv_value, currency, tz, at).run();
+    const before = await env.DB.prepare(`SELECT cost, source FROM ad_spend_days WHERE store = ? AND day = ?`).bind(storeId, d.day).first();
+    await upsertSpendDay(env.DB, storeId, d, { currency, tz, at });
     // Today moves all day; that's expected. A change to a PAST day is worth a line,
-    // because a restated day changes a P&L that may already have been read.
-    if (before && d.day < to && Math.abs(Number(before.cost) - d.cost) >= 0.01) {
+    // because a restated day changes a P&L that may already have been read. A day that only
+    // had the sheet's figure is not a Google restatement: the P&L Sheets agent compares those.
+    if (before && before.source !== "sheet" && d.day < to && Math.abs(Number(before.cost) - d.cost) >= 0.01) {
       restated.push({ day: d.day, before: Number(before.cost), after: d.cost });
     }
   }

@@ -52,6 +52,12 @@ Shopify refunds ──────► Refund Reconciler ┘                    �
 | **Does** | Writes each store's daily row (revenue, COG, ads, services, fees, profit, orders, clicks, sessions) + refunds/chargebacks cells + SUMMARY, then the **Ecom** group sheet. Cross-foots group = Σ stores to the cent. Restates the last 2–3 days. Writes estimate notes into SETUP. **Creates next month's tab automatically** (31/30/28-day geometry) — no more missing OCT tab. |
 | **Rules** | Every write goes through Sheets Writer + Write-Verifier (read back). Any day with COG% outside 28–50% = coverage gap until proven otherwise. Backup Vault snapshot before any restatement. |
 
+### 4b. P&L Sheets (`pnl.sheets`) · CODE · L1 — BUILT 2026-10-14
+Reilly, 2026-10-14: "make sure things like the google drive P&L sheets are all updated by the brain automatically" and "use the spreadsheets to fill in accurate data for every single day we have". This is the first, narrower version of the Ledger Keeper's sheet writing above:
+- **Reads** the 3 store workbooks + Ecom P&L hourly (header names, not positions). Fills the brain only where it has nothing (ad spend days, fees, COG from the KFB ledger at the SETUP FX rate, marked as such) and only when the sheet's day provably is the brain's day. Differences → `pnl.sheet_mismatch`, once per store/day/field. Never overwrites system-of-record data.
+- **Writes** only BLANK, non-formula input cells of days the brain has CLOSED; Reilly's typed numbers always win. No refunds (no per-day cell), **no tab creation** (one event a day asks Reilly), no restatements, no SETUP notes. R2 backup before every batch, re-read after. Kill switch `SHEETS_WRITE = "0"`.
+- Day-based numbers (revenue, orders, fees, COG) are written only when SETUP's timezone is the brain's store timezone. On 2026-10-14 every workbook said CDT and the brain counts in Eastern, so until that is settled only ad spend, services, clicks and sessions are written.
+
 ### 5. Analyst · AI · L2 (reports)
 | | |
 |---|---|

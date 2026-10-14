@@ -70,11 +70,14 @@ export const AGENTS = Object.freeze([
   a("pnl.pullers", "pnl", "Data Pullers", "code", "L2", "built"),
   a("pnl.cogs", "pnl", "COGS Matcher", "code", "L2", "built"),
   a("pnl.refunds", "pnl", "Refund Reconciler", "code", "L2", "built"),
-  // Daily P&L rows in the ledger (pnl_days). Sheets writing comes later, after the shadow gate.
+  // Daily P&L rows in the ledger (pnl_days). The workbooks are written by pnl.sheets.
   a("pnl.ledger", "pnl", "Ledger Keeper", "code", "L2", "built"),
   a("pnl.analyst", "pnl", "Analyst", "ai", "L2", "built"),
   a("pnl.money_map", "pnl", "Money Map", "code", "L2", "built"),
   a("pnl.calendar", "pnl", "Tax, Admin & Triggers", "code", "L1", "built"),
+  // Built 2026-10-14 on Reilly's word ("make sure things like the google drive P&L sheets are all
+  // updated by the brain automatically"): writes BLANK input cells only; SHEETS_WRITE = "0" stops it.
+  a("pnl.sheets", "pnl", "P&L Sheets", "code", "L1", "built"),
 
   // Risk
   a("risk.chargebacks", "risk", "Chargeback Agent", "ai", "L0", "built"),
@@ -111,7 +114,7 @@ export const SERVICES = Object.freeze([
   { id: "svc.write_verifier", name: "Write-Verifier", status: "built" },
   { id: "svc.freshness", name: "Freshness Sentinel", status: "built" },
   { id: "svc.backup_vault", name: "Backup Vault", status: "built" },
-  { id: "svc.sheets_writer", name: "Sheets Writer", status: "planned" },
+  { id: "svc.sheets_writer", name: "Sheets Writer", status: "built" }, // inside pnl.sheets (src/agents/pnl/sheets.js)
   { id: "svc.kfb_session", name: "KFB Morning Session", status: "planned" },
   { id: "svc.event_log", name: "Event Log", status: "built" },
 ]);
@@ -177,6 +180,7 @@ export const AGENT_DOES = Object.freeze({
   "pnl.analyst": "Explains why profit moved.",
   "pnl.money_map": "Tracks Shopify payouts, balances and fees.",
   "pnl.calendar": "Tracks tax, admin deadlines and money triggers.",
+  "pnl.sheets": "Reads the Google Sheets P&L workbooks to fill the brain's missing days, flags where they disagree, and fills the sheets' blank cells from closed days.",
   "risk.chargebacks": "Prepares chargeback evidence before the deadline.",
   "risk.account_health": "Watches Shopify Payments health, the 90-day dispute rate and the refund rate.",
   "risk.claims_audit": "Checks storefront promises (delivery times, returns, origin, urgency) against reality.",

@@ -12,7 +12,7 @@
  */
 import { logEvent } from "../../lib/eventlog.js";
 import { nowIso } from "../../lib/time.js";
-import { PARCEL_TRACKING_DECISION, AUDIENCE_DECISION } from "../../config/stores.js";
+import { PARCEL_TRACKING_DECISION, AUDIENCE_DECISION, SHEETS_WRITE_DECISION, SHEETS_FILL_DECISION } from "../../config/stores.js";
 
 const ACTOR = "core.decisions";
 
@@ -97,6 +97,12 @@ export const SEED_DECISIONS = Object.freeze([
     words: "1098 turned into a chargeback and the shipping status still isnt updating" },
   { at: OPEN_QS_AT, topic: "cs.review_requests", scope: "all", source: OPEN_QS,
     words: "off turn them off on all stores please" },
+  // P&L workbooks, chat 2026-10-14. Wired: the P&L Sheets agent (src/agents/pnl/sheets.js),
+  // kill switch env SHEETS_WRITE = "0".
+  { at: SHEETS_WRITE_DECISION.at, topic: SHEETS_WRITE_DECISION.topic, scope: "all", source: "chat 2026-10-14 — wired: pnl.sheets writes blank input cells, SHEETS_WRITE=0 stops it",
+    words: SHEETS_WRITE_DECISION.words },
+  { at: SHEETS_FILL_DECISION.at, topic: SHEETS_FILL_DECISION.topic, scope: "all", source: "chat 2026-10-14 — wired: pnl.sheets fills days the brain is missing from the workbooks",
+    words: SHEETS_FILL_DECISION.words },
 ]);
 
 /** Latest (unsuperseded) decision on a topic, or null. */

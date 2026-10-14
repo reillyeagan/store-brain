@@ -22,7 +22,8 @@ export async function moneyState(db, feeds, nowMs = Date.now()) {
     const tz = store.timezone || "America/New_York";
 
     // Ads: days are the ad account's days, so "today" is worked out in account_tz.
-    const acct = await db.prepare(`SELECT account_tz, currency FROM ad_spend_days WHERE store = ? ORDER BY fetched_at DESC LIMIT 1`).bind(id).first();
+    // From the API's own rows: a day filled from the sheet carries no account facts of its own.
+    const acct = await db.prepare(`SELECT account_tz, currency FROM ad_spend_days WHERE store = ? AND source = 'api' ORDER BY fetched_at DESC LIMIT 1`).bind(id).first();
     let ads = null;
     if (acct) {
       const today = localDay(nowMs, acct.account_tz || tz);

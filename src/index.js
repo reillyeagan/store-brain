@@ -68,6 +68,7 @@ import { localDay } from "./lib/time.js";
 import { checkStores, registerWebhooks } from "./lib/setup.js";
 import { reconcileOrders } from "./lib/reconcile.js";
 import { runOrderBackfill } from "./lib/orderBackfill.js";
+import { runHistoryExtension } from "./lib/historyExtend.js";
 import { runMoneyJobs } from "./lib/moneyJobs.js";
 import { moneyState } from "./lib/moneyState.js";
 import { startGoogleConnect, handleGoogleCallback, googleStatus, mailboxStatus, secretPresence } from "./lib/google.js";
@@ -356,6 +357,16 @@ export default {
           await logEvent(env.DB, {
             actor: "pnl.pullers", kind: "error.orders_backfill", target: "sys.shopify",
             summary: `Order history check failed to start; it will try again in 15 minutes (${String(err && err.message).slice(0, 200)})`,
+          }).catch(() => {});
+        }
+        // Older history (to 2026-07-01): orders created before the first pass's start, then the
+        // matching refunds. Moves coverage back only once each gap is read to the end.
+        try {
+          await runHistoryExtension(env);
+        } catch (err) {
+          await logEvent(env.DB, {
+            actor: "pnl.pullers", kind: "error.history_extension", target: "sys.shopify",
+            summary: `Older order history read failed to start; it will try again in 15 minutes (${String(err && err.message).slice(0, 200)})`,
           }).catch(() => {});
         }
         // Money feeds: throttled (15 min / hourly) and isolated from each other inside.

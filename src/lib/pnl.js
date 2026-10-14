@@ -207,6 +207,47 @@ export async function actualCosts(db, storeId, day) {
   return map;
 }
 
+/* ---------------- Reilly's P&L sheet: gap filler ---------------- */
+
+/** A sheet read older than this is not used (rule 4); it is re-read hourly. */
+export const SHEET_MAX_AGE_MIN = 24 * 60;
+/** Sheet revenue may differ from the brain's by this much and still be "the same day". */
+export const SHEET_DAY_MATCH_USD = 1;
+
+const ended0 = (day, tz, nowMs) => nowMs >= endOfLocalDayMs(day, tz);
+
+/**
+ * The sheet row for a store-day, and whether its COG and fee may fill a gap.
+ * A sheet value is used only when ALL of these hold:
+ *  - the sheet was read within SHEET_MAX_AGE_MIN,
+ *  - the agent marked the value usable when it read it (not an estimate named in SETUP, not a
+ *    $0 COG or fee on a day with orders, not a too-recent day: see sheets.js trustRow),
+ *  - the sheet's day is provably the brain's day: same order count and revenue within
+ *    SHEET_DAY_MATCH_USD (the sheet counts days in its own timezone; a mismatch means its
+ *    COG/fee belong to a different set of orders, so using them could flatter or hide a cost).
+ */
+export async function sheetDay(db, storeId, day, { nowMs = Date.now(), revenue = null, orders = null } = {}) {
+  const out = { row: null, use: { cog: false, fee: false }, why: { cog: null, fee: null } };
+  // Freshness is the workbook's: its last complete read (a row only changes when the sheet did).
+  const row = await db.prepare(
+    `SELECT s.*, w.last_ok_at AS wb_ok_at FROM sheet_pnl_days s LEFT JOIN sheet_workbooks w ON w.store = s.store WHERE s.store = ? AND s.day = ?`
+  ).bind(storeId, day).first().catch(() => null);
+  if (!row) { out.why.cog = out.why.fee = "no sheet row"; return out; }
+  out.row = row;
+  let block = null;
+  if (!row.wb_ok_at || nowMs - Date.parse(row.wb_ok_at) > SHEET_MAX_AGE_MIN * 60000) block = "sheet read is older than 24 h";
+  else if (revenue == null || orders == null) block = "the brain's revenue for the day is unknown";
+  else if (row.orders == null || row.revenue == null) block = "the sheet's revenue or orders are blank";
+  else if (Number(row.orders) !== orders || Math.abs(Number(row.revenue) - revenue) > Math.max(SHEET_DAY_MATCH_USD, 0.01 * revenue)) {
+    block = `the sheet's day doesn't match the brain's (orders ${row.orders} vs ${orders}, revenue $${Number(row.revenue).toFixed(2)} vs $${Number(revenue).toFixed(2)})`;
+  }
+  out.why.cog = block || (row.cog_ok ? null : row.cog_why || "not usable");
+  out.why.fee = block || (row.fee_ok ? null : row.fee_why || "not usable");
+  out.use.cog = !block && !!row.cog_ok && row.cog_eur != null && Number(row.fx_rate) > 0;
+  out.use.fee = !block && !!row.fee_ok && row.fee != null;
+  return out;
+}
+
 /* ---------------- freshness of each input ---------------- */
 
 /**
@@ -327,12 +368,17 @@ export async function computeStoreDay(db, storeId, day, { nowMs = Date.now(), fe
     refunds = r2(refundsPending + refundsSuccess);
   } else why.refunds = notUsable("refunds");
 
+  // --- Reilly's P&L sheet for this day (fills gaps only, see sheetDay) ---
+  const sheet = await sheetDay(db, storeId, day, { nowMs, revenue, orders: orderCount });
+
   // --- Ads + Guy ---
-  const adRow = await db.prepare(`SELECT cost, clicks, account_tz, currency FROM ad_spend_days WHERE store = ? AND day = ?`).bind(storeId, day).first();
+  const adRow = await db.prepare(`SELECT cost, clicks, account_tz, currency, source FROM ad_spend_days WHERE store = ? AND day = ?`).bind(storeId, day).first();
   let ads = null;
   if (!fresh.ads.usable) why.ads = notUsable("ads");
   else if (!adRow) why.ads = "no ad spend row for that day";
   else ads = r2(adRow.cost);
+  // A day the Google Ads API never answered for, filled from the sheet (src/agents/pnl/sheets.js).
+  if (adRow && adRow.source === "sheet") notes.ads_source = "sheet";
   if (adRow && adRow.account_tz && adRow.account_tz !== tz) notes.ads_tz = `ad account days are ${adRow.account_tz}, store days are ${tz}`;
   if (adRow && adRow.currency && adRow.currency !== "USD") notes.ads_currency = adRow.currency;
   const guyFee = guyFeeFor(storeId, day, ads);
@@ -351,6 +397,12 @@ export async function computeStoreDay(db, storeId, day, { nowMs = Date.now(), fe
     ).bind(storeId, `${minusDays(day, 1)}T00:00:00`, `${minusDays(day, -2)}T00:00:00`).all();
     fees = r2((txns || []).filter((t) => t.date && localDay(t.date, tz) === day).reduce((s, t) => s + (Number(t.fee) || 0), 0));
   } else why.fees = notUsable("payouts");
+  // Fees the payouts feed never read (before its first balance transaction): the sheet's
+  // per-order Shopify Payments fees, only when the sheet's day is provably the brain's day.
+  if (fees == null && ended0(day, tz, nowMs)) {
+    if (sheet.use.fee) { fees = r2(sheet.row.fee); delete why.fees; notes.fees_source = "sheet"; }
+    else if (sheet.row && sheet.row.fee != null) why.fees = `${why.fees || "unknown"}; sheet fee not used: ${sheet.why.fee}`;
+  }
 
   // --- COGS: actual where the COGS Matcher has a real KFB cost, estimate for the rest ---
   const rate = await cogsRate(db, storeId);
@@ -380,16 +432,33 @@ export async function computeStoreDay(db, storeId, day, { nowMs = Date.now(), fe
   cogsEst = revenue != null ? r2(cogsEst) : null;
   if (cogsEst == null) why.cogs = "revenue unknown";
   // Actual KFB costs (COGS Matcher), only for orders counted in revenue; null when none matched.
-  const cogsActual = revenue != null && byActual ? r2(actualSum) : null;
-  const cogs = cogsEst == null ? null : r2(cogsEst + (cogsActual || 0));
-  const estOrders = perProduct + byRate;
-  const cogsSource = cogs == null || orderCount === 0 ? null : byActual ? (estOrders ? "mixed" : "actual") : "estimate";
-  const cogsShare = cogs ? r4(cogsEst / cogs) : null;
+  let cogsActual = revenue != null && byActual ? r2(actualSum) : null;
+  let estOrders = perProduct + byRate;
+  let cogsSource = cogsEst == null || orderCount === 0 ? null : byActual ? (estOrders ? "mixed" : "actual") : "estimate";
   const cogsBasis = {
     rate: rate.rate, rate_source: rate.source, rate_assumed: rate.assumed, rate_stale: !!rate.stale,
     orders_by_product_cost: perProduct, orders_by_rate: byRate, orders_actual: byActual,
   };
-  if (rate.assumed && byRate > 0) notes.cogs_assumed = `COGS uses an ASSUMED ${Math.round(FALLBACK_COGS_RATE * 100)}% rate for ${byRate} order${byRate === 1 ? "" : "s"}`;
+  // No KFB bill matched for any order of the day: the sheet's COG (EUR) is the exact KFB
+  // charge per order (KungFuBuy balance ledger), so it replaces the whole-day estimate. The
+  // EUR→USD rate is the sheet's SETUP rate, which is itself an estimate and stays marked so.
+  if (cogsSource === "estimate" && sheet.use.cog) {
+    const fx = Number(sheet.row.fx_rate);
+    cogsActual = r2(Number(sheet.row.cog_eur) * fx);
+    cogsEst = 0;
+    estOrders = 0;
+    cogsSource = `sheet (KFB ledger, EUR at ${fx})`;
+    cogsBasis.sheet = { cog_eur: Number(sheet.row.cog_eur), fx_rate: fx, fx_estimate: true, tab: sheet.row.tab, read_at: sheet.row.wb_ok_at };
+    cogsBasis.orders_by_product_cost = 0;
+    cogsBasis.orders_by_rate = 0;
+    cogsBasis.orders_sheet = counted.length;
+    notes.cogs_fx = `COGS from the P&L sheet: EUR ${Number(sheet.row.cog_eur).toFixed(2)} at the sheet's ${fx} EUR→USD, an estimated rate`;
+  } else if (cogsSource === "estimate" && sheet.row && sheet.row.cog_eur != null) {
+    notes.cogs_sheet_unused = sheet.why.cog;
+  }
+  const cogs = cogsEst == null ? null : r2(cogsEst + (cogsActual || 0));
+  const cogsShare = cogs ? r4(cogsEst / cogs) : null;
+  if (rate.assumed && byRate > 0 && !cogsBasis.sheet) notes.cogs_assumed = `COGS uses an ASSUMED ${Math.round(FALLBACK_COGS_RATE * 100)}% rate for ${byRate} order${byRate === 1 ? "" : "s"}`;
 
   // --- Profit ---
   const parts = { revenue, refunds, cogs, ads, guy_fee: guyFee, fees };
@@ -427,8 +496,10 @@ export async function computeStoreDay(db, storeId, day, { nowMs = Date.now(), fe
     freshness: fresh, notes,
     sources: {
       revenue: "orders (store-day of order time, original totals)", refunds: "refunds (processed day)",
-      ads: "ad_spend_days", fees: "balance_txns CHARGE fees",
-      cogs: byActual ? `actual KFB cost for ${byActual} order${byActual === 1 ? "" : "s"} (cogs_matches), estimate for ${estOrders}` : "estimate (no KFB bill matched yet)",
+      ads: adRow && adRow.source === "sheet" ? "P&L sheet (no Google Ads API row for that day)" : "ad_spend_days",
+      fees: notes.fees_source === "sheet" ? "P&L sheet (Shopify Payments fee per order)" : "balance_txns CHARGE fees",
+      cogs: cogsBasis.sheet ? `P&L sheet: KFB ledger EUR ${cogsBasis.sheet.cog_eur.toFixed(2)} at ${cogsBasis.sheet.fx_rate} (estimated FX)`
+        : byActual ? `actual KFB cost for ${byActual} order${byActual === 1 ? "" : "s"} (cogs_matches), estimate for ${estOrders}` : "estimate (no KFB bill matched yet)",
       order_coverage: cov.covered_from,
       guy: STORES[storeId] ? { rate: STORES[storeId].guyFeeRate || 0, start: STORES[storeId].guyStart || null } : null,
     },
@@ -719,6 +790,12 @@ export async function pnlHistory(db, store = "all", { nowMs = Date.now() } = {})
     const sum = sumRows(list, day);
     sum.day = day;
     sum.per_store = list.map((r) => ({ store: r.store, revenue: r.revenue, profit: r.profit, ads: r.ads, roas: r.roas, complete: !!r.complete }));
+    // Where the day's numbers came from, so the page can say so (rule 5: never pass a sheet
+    // figure or an estimate off as the system of record).
+    sum.cogs_sources = [...new Set(list.map((r) => r.cogs_source).filter(Boolean))];
+    sum.ads_sheet = list.some((r) => r.notes && r.notes.ads_source === "sheet");
+    sum.fees_sheet = list.some((r) => r.notes && r.notes.fees_source === "sheet");
+    sum.open_why = Object.assign({}, ...list.map((r) => (r.notes && r.notes.missing_why) || {}));
     // A store "should" have a row from its coverage start on; before that it simply wasn't
     // being tracked yet (e.g. a store that went live later), which isn't a gap.
     sum.missing_stores = ids.filter((id) => firstDay[id] && firstDay[id] <= day && !list.some((r) => r.store === id));

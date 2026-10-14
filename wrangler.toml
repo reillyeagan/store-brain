@@ -47,6 +47,9 @@ GOOGLE_ADS_API_VERSION = "v25"
 # BRIEF_PHONE_LIVE is NOT set here: the brief stays shadow (Mission Control only) until
 # Reilly sets BRIEF_PHONE_LIVE = "1" in the Cloudflare dashboard.
 BRIEF_MODEL = "claude-sonnet-5-5"
+# P&L Sheets agent: writes blank input cells of the Google Sheets P&L workbooks (Reilly asked
+# for it on 2026-10-14, so it is ON when unset). To stop every write, uncomment this and redeploy:
+# SHEETS_WRITE = "0"
 # Shopify app Client IDs are identifiers, not passwords, so they live here where a
 # deploy can never wipe them. The matching Client SECRETS stay Cloudflare secrets.
 SB_HC_CLIENT_ID = "91f62305f583acc7ac4dcaf6641590c1"

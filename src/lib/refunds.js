@@ -59,7 +59,8 @@ export function refundFromNode(orderId, n) {
 
 const watermarkJob = (storeId) => `refunds.${storeId}`;
 
-async function storeRefunds(env, storeId, nodes, ctx) {
+/** Store every refund on these order nodes (also used by the order history extension). */
+export async function storeRefunds(env, storeId, nodes, ctx) {
   const { tz, at, initial, store } = ctx;
   for (const o of nodes) {
     if (!o || !Array.isArray(o.refunds)) continue;
