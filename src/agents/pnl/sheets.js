@@ -46,6 +46,7 @@ import { computeStoreDay, writePnlRow, storeTz, SHEET_MAX_AGE_MIN } from "../../
 import { orderCoverage } from "../../lib/orderBackfill.js";
 import { r2, safeJson } from "../core/shared.js";
 import { unlimited } from "../../lib/callBudget.js";
+import { shopifyGraphQL } from "../../lib/storeGuard.js";
 
 const ACTOR = "pnl.sheets";
 export const WRITE_EVERY_MIN = 60;
@@ -407,16 +408,102 @@ async function revenueMatchesDefinition(db, storeId, day) {
   return null;
 }
 
+/* ---------------- day basis: is the sheet's "day" the brain's "day"? ---------------- */
+
+export const SHOP_TZ_EVERY_MIN = 24 * 60;
+export const DAY_BASIS_EVERY_MIN = 24 * 60;
+export const DAY_BASIS_DAYS = 10;
+export const DAY_BASIS_MIN_MATCH = 8;
+const SHOP_TZ_QUERY = `{ shop { ianaTimezone } }`;
+
+/**
+ * The store's timezone as SHOPIFY reports it (the authority for what a store day is), read-only
+ * through Store Guard and cached for a day in sheet_workbooks. If it differs from stores.js,
+ * every brain day is cut at the wrong hour: an alarm, and no day-based cell is written.
+ * Returns { ok, tz, why }.
+ */
+export async function shopTimezone(env, storeId, { nowMs = Date.now(), fetchImpl = fetch, budget = null } = {}) {
+  const db = env.DB;
+  const cfg = storeTz(storeId);
+  const w = await db.prepare(`SELECT shop_tz, shop_tz_at FROM sheet_workbooks WHERE store = ?`).bind(storeId).first().catch(() => null);
+  let tz = w && w.shop_tz;
+  if (!tz || !w.shop_tz_at || nowMs - Date.parse(w.shop_tz_at) > SHOP_TZ_EVERY_MIN * 60000) {
+    if (budget && !budget.has(2)) return tz ? judgeTz(tz, cfg) : { ok: false, tz: null, why: "Shopify timezone not checked yet (call budget)" };
+    try {
+      const data = await shopifyGraphQL(env, storeId, SHOP_TZ_QUERY, {}, { fetchImpl });
+      const got = data && data.shop && data.shop.ianaTimezone;
+      if (!got) throw new Error("Shopify returned no ianaTimezone");
+      tz = got;
+      await db.prepare(`UPDATE sheet_workbooks SET shop_tz = ?, shop_tz_at = ? WHERE store = ?`).bind(tz, nowIso(nowMs), storeId).run();
+    } catch (err) {
+      // A failed probe is evidence about the probe (rule 6): keep a cached answer if there is one.
+      if (!tz) return { ok: false, tz: null, why: `Shopify timezone not confirmed (${String((err && err.message) || err).slice(0, 80)})` };
+    }
+  }
+  const j = judgeTz(tz, cfg);
+  if (!j.ok) {
+    const seen = await db.prepare(`SELECT id FROM events WHERE kind = 'error.store_timezone' AND store = ? AND at >= ? LIMIT 1`).bind(storeId, nowIso(nowMs - 20 * 3600000)).first().catch(() => null);
+    if (!seen) {
+      await logEvent(db, {
+        actor: ACTOR, kind: "error.store_timezone", store: storeId, target: "sys.shopify",
+        summary: `${STORES[storeId].name}: Shopify says the store runs on ${tz} but the brain counts days in ${cfg} (stores.js). Every P&L day is cut at the wrong hour; no day-based sheet cell is written until stores.js is fixed`,
+        data: { shopify: tz, config: cfg }, at: nowIso(nowMs),
+      });
+    }
+  }
+  return j;
+}
+const judgeTz = (tz, cfg) => (tz === cfg ? { ok: true, tz, why: null } : { ok: false, tz, why: `Shopify says ${tz}, stores.js says ${cfg}` });
+
+/**
+ * Pure: do the sheet's hand-filled days use the brain's day basis? The last DAY_BASIS_DAYS
+ * closed days where both have revenue and orders: proven when at least DAY_BASIS_MIN_MATCH of
+ * them match (orders exactly, revenue within $1). Days the brain itself wrote are not evidence.
+ */
+export function judgeDayBasis(pairs) {
+  const last = [...pairs].sort((a, b) => (a.day < b.day ? 1 : -1)).slice(0, DAY_BASIS_DAYS);
+  const bad = last.filter((p) => Number(p.sheet_orders) !== Number(p.brain_orders) || Math.abs(Number(p.sheet_revenue) - Number(p.brain_revenue)) > 1);
+  const matched = last.length - bad.length;
+  const ok = matched >= DAY_BASIS_MIN_MATCH;
+  const mism = bad.map((p) => `${p.day} (orders ${p.sheet_orders} vs ${p.brain_orders}, revenue $${Number(p.sheet_revenue).toFixed(2)} vs $${Number(p.brain_revenue).toFixed(2)})`);
+  return {
+    ok, checked: last.length, matched,
+    mismatching_days: mism,
+    why: ok ? null : last.length < DAY_BASIS_MIN_MATCH
+      ? `only ${last.length} closed day${last.length === 1 ? "" : "s"} to compare (need ${DAY_BASIS_MIN_MATCH} matching)`
+      : `the sheet's days don't match the brain's: ${matched} of ${last.length} match; differing: ${mism.join(", ")}`,
+  };
+}
+
+/** The day-basis proof for one store workbook, re-evaluated once a day (cached in sheet_workbooks). */
+export async function dayBasis(db, storeId, { nowMs = Date.now() } = {}) {
+  const w = await db.prepare(`SELECT day_basis, day_basis_at FROM sheet_workbooks WHERE store = ?`).bind(storeId).first().catch(() => null);
+  if (w && w.day_basis && w.day_basis_at && nowMs - Date.parse(w.day_basis_at) < DAY_BASIS_EVERY_MIN * 60000) return safeJson(w.day_basis, { ok: false, why: "unreadable" });
+  const { results } = await db.prepare(
+    `SELECT s.day, s.revenue AS sheet_revenue, s.orders AS sheet_orders, p.revenue AS brain_revenue, p.orders AS brain_orders
+       FROM sheet_pnl_days s JOIN pnl_days p ON p.store = s.store AND p.day = s.day
+      WHERE s.store = ? AND p.complete = 1 AND s.revenue IS NOT NULL AND s.orders IS NOT NULL AND p.revenue IS NOT NULL AND p.orders IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM sheet_writes x WHERE x.store = s.store AND x.day = s.day AND x.field IN ('revenue', 'orders'))
+      ORDER BY s.day DESC LIMIT ?`
+  ).bind(storeId, DAY_BASIS_DAYS).all();
+  const out = { ...judgeDayBasis(results || []), at: nowIso(nowMs) };
+  await db.prepare(`UPDATE sheet_workbooks SET day_basis = ?, day_basis_at = ? WHERE store = ?`).bind(JSON.stringify(out), out.at, storeId).run();
+  return out;
+}
+
+/** "store timezone (CDT)" → "CDT"; for the label-conflict note. */
+const tzLabel = (text) => { const m = /\b([CEMP][DS]T)\b|\b(central|eastern|pacific|mountain)\b/i.exec(String(text || "")); return m ? (m[1] || m[2]) : null; };
+
 /**
  * The value the brain would put in one blank cell of a closed day, or { skip: reason }.
- * Day-based numbers (revenue, orders, fees, COG) are only written when the sheet's timezone
- * (SETUP) is the brain's store timezone: otherwise "a day" is a different set of orders.
+ * Day-based numbers (revenue, orders, fees, COG, sessions) are only written when `dayOk`:
+ * Shopify's own timezone equals stores.js AND the sheet's hand-filled days are proven to use
+ * the brain's day basis (dayBasis). A SETUP timezone label alone neither allows nor blocks it.
  */
-export async function brainValue(db, storeId, day, field, { pnl, setup, tz, today = null }) {
+export async function brainValue(db, storeId, day, field, { pnl, setup, tz, today = null, dayOk = false, dayWhy = null }) {
   const notes = safeJson(pnl.notes, {}) || {};
-  // Fail closed: day-based numbers only when SETUP NAMES a timezone and it is the store's.
-  const tzOk = !!setup.revenue_tz && setup.revenue_tz === tz;
-  const tzWhy = setup.revenue_tz ? `the sheet counts days in ${setup.revenue_tz} (SETUP), the brain in ${tz}` : "SETUP names no timezone for the sheet's days";
+  const tzOk = dayOk === true;
+  const tzWhy = dayWhy || "the sheet's day basis is not proven";
   // Google keeps adjusting the last days: ad numbers are written once they have settled.
   const adsSettled = !today || day <= minusDays(today, ADS_COMPARE_AFTER_DAYS);
   const adsWhy = `ad numbers settle after ${ADS_COMPARE_AFTER_DAYS} days`;
@@ -573,7 +660,7 @@ export async function writeCells(env, wb, plan, { token, fetchImpl = fetch, nowM
 }
 
 /** The cells the brain would fill in one store workbook (closed days, blank inputs only). */
-export async function planStore(db, wb, read, { nowMs = Date.now(), maxDays = PLAN_DAYS_PER_RUN, maxCells = PLAN_CELLS_PER_RUN } = {}) {
+export async function planStore(db, wb, read, { nowMs = Date.now(), maxDays = PLAN_DAYS_PER_RUN, maxCells = PLAN_CELLS_PER_RUN, dayOk = false, dayWhy = null } = {}) {
   const today = localDay(nowMs, wb.tz);
   const plan = [], skipped = {};
   // Every closed day of the store in one query (not one per day): bounded D1 work per run.
@@ -590,7 +677,7 @@ export async function planStore(db, wb, read, { nowMs = Date.now(), maxDays = PL
       if (days >= maxDays || plan.length >= maxCells) { skipped["more days next run (per-run limit)"] = (skipped["more days next run (per-run limit)"] || 0) + fields.length; continue; }
       days++;
       for (const f of fields) {
-        const v = await brainValue(db, wb.store, d.day, f, { pnl, setup: read.setup, tz: wb.tz, today });
+        const v = await brainValue(db, wb.store, d.day, f, { pnl, setup: read.setup, tz: wb.tz, today, dayOk, dayWhy });
         if (v.skip) { skipped[v.skip] = (skipped[v.skip] || 0) + 1; continue; }
         if (v.value == null || !Number.isFinite(Number(v.value))) continue;
         plan.push({ tab: m.tab, day: d.day, row_no: d.row_no, field: f, cell: d.cells[f], value: v.value });
@@ -713,7 +800,15 @@ export async function runSheets(env, { fetchImpl = fetch, nowMs = Date.now(), ca
     if (!budget.has(WRITE_CALLS)) { out.written[wb.store] = "call budget for this run used up"; continue; }
     if (!(await claimJob(db, `pnl.sheets.write.${wb.store}`, WRITE_EVERY_MIN, nowMs))) { out.written[wb.store] = "not due"; continue; }
     try {
-      const { plan, skipped } = wb.store === "all" ? await planEcom(db, read, { nowMs }) : await planStore(db, wb, read, { nowMs });
+      let gate = { dayOk: false, dayWhy: null };
+      if (wb.store !== "all") {
+        // Day-based cells need BOTH: Shopify's timezone = stores.js, and the sheet's own days proven.
+        const shop = await shopTimezone(env, wb.store, { nowMs, fetchImpl, budget });
+        const basis = shop.ok ? await dayBasis(db, wb.store, { nowMs }) : null;
+        gate = { dayOk: !!(shop.ok && basis && basis.ok), dayWhy: !shop.ok ? shop.why : basis && !basis.ok ? basis.why : null };
+        if (!budget.has(WRITE_CALLS)) { out.written[wb.store] = "call budget for this run used up"; continue; }
+      }
+      const { plan, skipped } = wb.store === "all" ? await planEcom(db, read, { nowMs }) : await planStore(db, wb, read, { nowMs, ...gate });
       const r = await writeCells(env, wb, plan, { token, fetchImpl, nowMs });
       const ok = (r.written || []).filter((w) => w.verified).length;
       out.written[wb.store] = ok;
@@ -756,7 +851,16 @@ export async function sheetsState(env, { nowMs = Date.now() } = {}) {
       fx_rate: w.fx_rate ?? null,
       sheet_timezone: w.revenue_tz || null,
       brain_timezone: wb.store === "all" ? null : wb.tz,
-      timezone_note: w.revenue_tz && wb.store !== "all" && w.revenue_tz !== wb.tz ? `sheet days are ${w.revenue_tz}, brain days ${wb.tz}: revenue, orders, fees and COG are not written` : null,
+      shopify_timezone: w.shop_tz || null,
+      // One note per workbook when the SETUP label disagrees with Shopify: Reilly fixes the label
+      // (the brain never edits SETUP). The label alone does not block writing.
+      timezone_note: (() => {
+        if (wb.store === "all" || !w.revenue_tz || !w.shop_tz || w.revenue_tz === w.shop_tz) return null;
+        const label = tzLabel((safeJson(w.setup, {}) || {}).revenue) || w.revenue_tz;
+        const shopName = /New_York/.test(w.shop_tz) ? "Eastern" : /Chicago/.test(w.shop_tz) ? "Central" : w.shop_tz;
+        return `SETUP says ${label} but Shopify says ${shopName} (${w.shop_tz}); please fix the label in SETUP (the brain never edits SETUP)`;
+      })(),
+      day_basis: safeJson(w.day_basis, null),
       services_ended: w.services_ended || null,
       missing_tab: w.last_ok_at && !tabForMonth(monthTabs(tabs), today) ? monthAbbrev(today) : null,
     };

@@ -41,6 +41,8 @@ CREATE TABLE IF NOT EXISTS sheet_pnl_days (
 );
 
 -- One row per workbook: what was read, the SETUP facts the brain uses, and the last write.
+-- shop_tz = the store's timezone as Shopify reports it (the authority, re-checked daily).
+-- day_basis = JSON proof that the sheet's hand-filled days match the brain's days (daily).
 CREATE TABLE IF NOT EXISTS sheet_workbooks (
   store          TEXT PRIMARY KEY,
   sheet_id       TEXT NOT NULL,
@@ -55,7 +57,11 @@ CREATE TABLE IF NOT EXISTS sheet_workbooks (
   last_error     TEXT,
   full_read_at   TEXT,
   last_write_at  TEXT,
-  last_write     TEXT
+  last_write     TEXT,
+  shop_tz        TEXT,
+  shop_tz_at     TEXT,
+  day_basis      TEXT,
+  day_basis_at   TEXT
 );
 
 -- A disagreement between the sheet and the brain, logged once per store, day and field.

@@ -86,10 +86,19 @@ function parseA1(range) {
 }
 
 /** Google token + Sheets values API over in-memory workbooks. */
-function fakeGoogle(books, { failIds = [], onUpdate = null, tamper = null, failUpdate = false, failVerify = false } = {}) {
-  const log = { updates: [], gets: 0, calls: [] };
+function fakeGoogle(books, { failIds = [], onUpdate = null, tamper = null, failUpdate = false, failVerify = false, shopTz = "America/New_York" } = {}) {
+  const log = { updates: [], gets: 0, calls: [], shop: 0 };
   const fetchImpl = async (url, init = {}) => {
     if (url === "https://oauth2.googleapis.com/token") return j({ access_token: "g", expires_in: 3600 });
+    // Shopify (read only): the store's own timezone, through Store Guard.
+    if (/myshopify\.com\/admin\/oauth\/access_token$/.test(url)) return j({ access_token: "tok", expires_in: 86400 });
+    if (/myshopify\.com\/admin\/api\//.test(url)) {
+      const body = JSON.parse(init.body);
+      assert.match(body.query, /shop \{ ianaTimezone \}/);
+      assert.ok(!/mutation/.test(body.query), "read only");
+      log.shop++;
+      return j({ data: { shop: { ianaTimezone: shopTz } } });
+    }
     assert.ok(url.startsWith(SHEETS_API), `only the Sheets API: ${url}`);
     const u = new URL(url);
     const parts = u.pathname.split("/");
@@ -455,10 +464,20 @@ test("sheets: cross-check — revenue, orders, services and fees vs closed brain
 
 /* ---------------- the writer ---------------- */
 
-async function writerFixture(envExtra = {}, { tz = "EDT", oct = null } = {}) {
-  const env = baseEnv(envExtra);
+async function writerFixture(envExtra = {}, { tz = "EDT", oct = null, basisMatch = 8 } = {}) {
+  _resetTokenCacheForTests();
+  const env = baseEnv({ SB_HC_CLIENT_ID: "hc-id", SB_HC_CLIENT_SECRET: "hc-secret", ...envExtra });
   await connectGoogle(env);
   const DB = env.DB;
+  // Oct 1-8: days Reilly filled by hand, all closed in the brain. `basisMatch` of them agree
+  // with the brain (orders exact, revenue within $1); the rest are cut on another day basis.
+  const handFilled = {};
+  for (let d = 1; d <= 8; d++) {
+    const day = `2026-10-0${d}`;
+    const agree = d <= basisMatch;
+    await closedDay(DB, "hc", day, { revenue: 100 + d, orders: 2, ads: 50, guy_fee: 5, fees: 3 });
+    handFilled[day] = { revenue: agree ? 100 + d : 160 + d, orders: agree ? 2 : 3, adspend: 50, services: 5, fee: 3, clicks: 60, sessions: 70, cog_eur: 30 };
+  }
   // Oct 11 closed in the brain (3 days old, so its ad numbers have settled): 2 orders, $100, no shipping or tax.
   await order(DB, "hc", { id: 11, created_at: "2026-10-11T15:00:00Z", total: 60 });
   await order(DB, "hc", { id: 12, created_at: "2026-10-11T16:00:00Z", total: 40 });
@@ -469,6 +488,7 @@ async function writerFixture(envExtra = {}, { tz = "EDT", oct = null } = {}) {
   const books = { [HC]: book("Holt & Crane P&L", {
     SUMMARY: [[cell("HOLT & CRANE — P&L")]],
     OCT: oct || monthTab(2026, 10, {
+      ...handFilled,
       // Reilly typed Oct 12 by hand (revenue differs from the brain's): his numbers win.
       "2026-10-12": { revenue: 236.8, adspend: 394.42, services: 39.44, fee: 7.89, orders: 4, clicks: 547, sessions: 709, cog_eur: 61.9 },
       // Oct 11: Reilly has only typed Clicks so far.
@@ -573,16 +593,71 @@ test("sheets writer: the kill switch SHEETS_WRITE=0 stops every write; default i
   assert.ok(AGENT_DOES["pnl.sheets"]);
 });
 
-test("sheets writer: a sheet that counts days in another timezone gets no day-based numbers (revenue, orders, fees, COG)", async () => {
+test("sheets writer: Shopify's timezone is the authority — a stale SETUP label (CDT) doesn't block writing once the sheet's own days prove the same day basis; the label conflict is noted", async () => {
   const { env, books } = await writerFixture({}, { tz: "CDT" });
   const g = fakeGoogle(books);
   await runSheets(env, { nowMs: NOW, fetchImpl: g.fetchImpl });
   const cells = g.log.updates.map((u) => u.range).sort();
-  assert.deepEqual(cells, ["'OCT'!D12", "'OCT'!E12"], "ad spend and services only (ad-account days); no sessions, revenue, orders, fees");
+  assert.deepEqual(cells, ["'OCT'!B12", "'OCT'!D12", "'OCT'!E12", "'OCT'!G12", "'OCT'!O12", "'OCT'!Q12"]);
+  assert.equal(g.log.shop, 1, "Shopify asked once (cached for the day)");
   const st = await sheetsState(env, { nowMs: NOW });
-  assert.match(st.workbooks.find((w) => w.store === "hc").timezone_note, /America\/Chicago.*America\/New_York/);
-  const last = st.workbooks.find((w) => w.store === "hc").last_write;
-  assert.ok(Object.keys(last.skipped).some((k) => /counts days in America\/Chicago/.test(k)));
+  const hc = st.workbooks.find((w) => w.store === "hc");
+  assert.equal(hc.shopify_timezone, "America/New_York");
+  assert.equal(hc.timezone_note, "SETUP says CDT but Shopify says Eastern (America/New_York); please fix the label in SETUP (the brain never edits SETUP)");
+  assert.equal(hc.day_basis.ok, true);
+  assert.equal(hc.day_basis.checked, 9);
+  assert.equal(hc.day_basis.matched, 8);
+  assert.ok(!g.log.updates.some((u) => /SETUP/.test(u.range)), "SETUP is never edited");
+  assert.match(books[HC].tabs.SETUP.find((r) => r[0] && r[0].f === "Revenue")[1].f, /\(CDT\)/, "the label is left for Reilly");
+});
+
+test("sheets writer: day basis NOT proven (fewer than 8 of the last 10 hand-filled days match) → no revenue, orders, fees, COG or sessions, and it says which days differ", async () => {
+  const { env, books } = await writerFixture({}, { basisMatch: 5 });
+  const g = fakeGoogle(books);
+  await runSheets(env, { nowMs: NOW, fetchImpl: g.fetchImpl });
+  assert.deepEqual(g.log.updates.map((u) => u.range).sort(), ["'OCT'!D12", "'OCT'!E12"], "ad-account numbers only");
+  const st = await sheetsState(env, { nowMs: NOW });
+  const hc = st.workbooks.find((w) => w.store === "hc");
+  assert.equal(hc.day_basis.ok, false);
+  assert.match(hc.day_basis.why, /5 of 9 match/);
+  assert.ok(hc.day_basis.mismatching_days.some((d) => /^2026-10-06 \(orders 3 vs 2/.test(d)));
+  assert.ok(Object.keys(hc.last_write.skipped).some((k) => /don't match the brain's/.test(k)));
+});
+
+test("sheets writer: Shopify's timezone differs from stores.js → alarm, and no day-based cell is written", async () => {
+  const { env, DB, books } = await writerFixture();
+  const g = fakeGoogle(books, { shopTz: "America/Chicago" });
+  await runSheets(env, { nowMs: NOW, fetchImpl: g.fetchImpl });
+  assert.deepEqual(g.log.updates.map((u) => u.range).sort(), ["'OCT'!D12", "'OCT'!E12"]);
+  const ev = await evs(DB, "error.store_timezone");
+  assert.equal(ev.length, 1);
+  assert.match(ev[0].summary, /Shopify says the store runs on America\/Chicago but the brain counts days in America\/New_York/);
+});
+
+test("sheets: the day-basis proof is pure, cached for a day, then re-evaluated", async () => {
+  const { judgeDayBasis, dayBasis } = await import("../src/agents/pnl/sheets.js");
+  const pair = (day, so, bo, sr, br) => ({ day, sheet_orders: so, brain_orders: bo, sheet_revenue: sr, brain_revenue: br });
+  const ten = Array.from({ length: 10 }, (_, i) => pair(`2026-10-${String(i + 1).padStart(2, "0")}`, 2, 2, 100, 100.5));
+  assert.equal(judgeDayBasis(ten).ok, true);
+  ten[0] = pair("2026-10-01", 3, 2, 100, 100); ten[1] = pair("2026-10-02", 2, 2, 100, 102); ten[2] = pair("2026-10-03", 2, 2, 90, 100);
+  const r = judgeDayBasis(ten);
+  assert.deepEqual([r.ok, r.matched, r.checked], [false, 7, 10]);
+  assert.equal(r.mismatching_days.length, 3);
+  assert.equal(judgeDayBasis(ten.slice(5)).ok, false, "too few days to prove anything");
+  // Only the LAST 10 days count.
+  const old = [pair("2026-09-01", 9, 1, 0, 50), ...Array.from({ length: 10 }, (_, i) => pair(`2026-10-${String(i + 1).padStart(2, "0")}`, 1, 1, 10, 10))];
+  assert.equal(judgeDayBasis(old).ok, true);
+  // Cached a day.
+  const DB = makeD1();
+  await DB.prepare(`INSERT INTO sheet_workbooks (store, sheet_id) VALUES ('hc', 'x')`).run();
+  const a = await dayBasis(DB, "hc", { nowMs: NOW });
+  assert.equal(a.ok, false);
+  for (let d = 1; d <= 8; d++) {
+    await closedDay(DB, "hc", `2026-10-0${d}`, { revenue: 10, orders: 1, ads: 1, guy_fee: 0.1, fees: 0.3 });
+    await DB.prepare(`INSERT INTO sheet_pnl_days (store, day, sheet_id, tab, row_no, revenue, orders, read_at) VALUES ('hc', ?, 'x', 'OCT', 2, 10, 1, 't')`).bind(`2026-10-0${d}`).run();
+  }
+  assert.equal((await dayBasis(DB, "hc", { nowMs: NOW + 3600000 })).ok, false, "cached until tomorrow");
+  assert.equal((await dayBasis(DB, "hc", { nowMs: NOW + 25 * 3600000 })).ok, true, "re-evaluated daily");
 });
 
 test("sheets writer: a missing month tab is never created — one event a day asks Reilly", async () => {
@@ -844,7 +919,7 @@ test("history extension: WITHOUT read_all_orders refund coverage is not moved ba
   assert.ok(shop.queries.length > n);
 });
 
-test("sheets writer: fail-closed timezone, settled ads, and no $0 services before the media buyer started", async () => {
+test("sheets writer: fail-closed day basis, settled ads, and no $0 services before the media buyer started", async () => {
   const { brainValue } = await import("../src/agents/pnl/sheets.js");
   const DB = makeD1();
   const tz = "America/New_York";
@@ -854,10 +929,11 @@ test("sheets writer: fail-closed timezone, settled ads, and no $0 services befor
   const noTz = { revenue_tz: null, services_ended: null };
   for (const f of ["revenue", "orders", "fee", "sessions", "cog_eur"]) {
     const v = await brainValue(DB, "hc", "2026-10-01", f, { pnl, setup: noTz, tz, today: "2026-10-14" });
-    assert.match(v.skip || "", /names no timezone/, `${f} fails closed without a SETUP timezone`);
+    assert.match(v.skip || "", /day basis is not proven/, `${f} fails closed without proof`);
   }
-  assert.match((await brainValue(DB, "hc", "2026-10-01", "sessions", { pnl, setup: { revenue_tz: "America/Chicago" }, tz, today: "2026-10-14" })).skip, /America\/Chicago/);
-  assert.equal((await brainValue(DB, "hc", "2026-10-01", "sessions", { pnl, setup: { revenue_tz: tz }, tz, today: "2026-10-14" })).value, 500);
+  assert.match((await brainValue(DB, "hc", "2026-10-01", "sessions", { pnl, setup: noTz, tz, today: "2026-10-14", dayOk: false, dayWhy: "Shopify says America/Chicago, stores.js says America/New_York" })).skip, /America\/Chicago/);
+  // A SETUP label alone neither allows nor blocks: only the proof does.
+  assert.equal((await brainValue(DB, "hc", "2026-10-01", "sessions", { pnl, setup: { revenue_tz: "America/Chicago" }, tz, today: "2026-10-14", dayOk: true })).value, 500);
   // Ad numbers wait 3 days.
   for (const f of ["adspend", "clicks", "services"]) {
     assert.match((await brainValue(DB, "hc", "2026-10-12", f, { pnl, setup: noTz, tz, today: "2026-10-14" })).skip, /settle/, f);
