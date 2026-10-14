@@ -10,8 +10,8 @@ ALTER TABLE cat_sync ADD COLUMN last_pause_reason TEXT;
 ALTER TABLE cat_sync ADD COLUMN last_pause_at TEXT;
 
 -- Chargeback evidence: a draft written by CODE from this order's own facts, so a draft exists
--- even when the AI rebuttal can't be written; how many AI attempts were made (a failed attempt
--- is retried a few times, spaced out, instead of never); and, when no draft can be built at
+-- even when the AI rebuttal can't be written, how many AI attempts were made (a failed attempt
+-- is retried a few times, spaced out, instead of never), and, when no draft can be built at
 -- all, exactly what is missing.
 ALTER TABLE risk_evidence_packs ADD COLUMN code_draft TEXT;
 ALTER TABLE risk_evidence_packs ADD COLUMN ai_attempts INTEGER NOT NULL DEFAULT 0;
