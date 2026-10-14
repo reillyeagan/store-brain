@@ -98,7 +98,12 @@ const LINE_SELECT = `SELECT l.*, COALESCE(l.kfb_shop_code, b.kfb_shop_code) AS c
 async function changedBills(db) {
   // Built in code from rows in a fixed order (bill, line number), so the same bill always gives
   // the same signature (SQL GROUP_CONCAT has no guaranteed order and caused spurious re-matching).
-  const { results: bills } = await db.prepare(`SELECT bill_id, matched_sig, usd_charged, total_eur, kfb_shop_code FROM kfb_bills ORDER BY bill_id`).all();
+  // A bill the morning import flagged incomplete (the read stopped mid-bill) waits: matching
+  // it now would book an order part-billed, in the flattering direction (rule 5).
+  const { results: bills } = await db.prepare(
+    `SELECT bill_id, matched_sig, usd_charged, total_eur, kfb_shop_code FROM kfb_bills
+      WHERE bill_id NOT IN (SELECT bill_id FROM kfb_bill_flags WHERE incomplete = 1) ORDER BY bill_id`
+  ).all();
   const { results: lines } = await db.prepare(
     `SELECT bill_id, line_no, kfb_shop_code, order_ref, cost_eur, fees_eur, shipping_eur FROM kfb_bill_lines ORDER BY bill_id, line_no`
   ).all();

@@ -18,9 +18,9 @@
  * numbers for the store are read once into a set, so the check costs no query per order.
  * Matching is by KFB shop code + order number, never the number alone (numbers are shared
  * across stores). Days counted from the Shopify order time, never KFB's.
- * Inputs: orders, kfb_orders (filled by the KFB morning session: not built yet), the
+ * Inputs: orders, kfb_orders (filled by the KFB morning import, src/lib/kfbImport.js), the
  * `kfb.morning_sweep` feed. Outputs: order_watch rows, events.
- * Today: no KFB session → nothing can be checked, so nothing is flagged ("waiting on KFB session").
+ * Before the first import: nothing can be checked, so nothing is flagged ("waiting on KFB session").
  */
 import { LIVE_STORE_IDS, STORES } from "../../config/stores.js";
 import { evaluateFeeds } from "../../lib/freshness.js";
@@ -57,6 +57,12 @@ export async function runOrderWatch(env, { nowMs = Date.now() } = {}) {
   const sweep = await sweepStatus(db, nowMs);
   if (!sweep.usable) return { status: "waiting", reason: sweep.reason, checked: 0, flagged: 0 };
   const sweepMs = Date.parse(sweep.at);
+  // A KFB morning import whose orders read was cut off (page limit) only covers the newest
+  // orders: an absence from it says nothing (rule 6). Found orders still count; nothing is
+  // marked missing and ful.not_in_kfb is never raised from it.
+  const imp = await db.prepare(`SELECT sections FROM kfb_imports WHERE fetched_at = ? ORDER BY id DESC LIMIT 1`).bind(sweep.at).first().catch(() => null);
+  const impOrders = imp ? (safeJson(imp.sections, {}) || {}).orders : null;
+  const noMiss = !!(impOrders && impOrders.truncated);
   const latestOrder = nowIso(sweepMs - hours(env) * 3600000);
   const earliest = nowIso(nowMs - LOOKBACK_DAYS * 86400000);
   let checked = 0, suspect = 0, flagged = 0, found = 0, cancelled = 0, writes = 0;
@@ -65,8 +71,14 @@ export async function runOrderWatch(env, { nowMs = Date.now() } = {}) {
     const code = STORES[id].kfbShopCode;
     if (!code) { skippedStores.push({ store: id, reason: "no KFB shop code" }); continue; }
     // Rule 6: did this sweep read anything for this store at all?
-    const seen = await db.prepare(`SELECT COUNT(*) AS n FROM kfb_orders WHERE kfb_shop_code = ? AND imported_at >= ?`)
-      .bind(code, nowIso(sweepMs - SWEEP_IMPORT_WINDOW_H * 3600000)).first();
+    // New rows from this sweep, or (KFB morning import) the import read orders for this shop:
+    // an unchanged order is not rewritten, so its imported_at alone can't show it was seen.
+    const since = nowIso(sweepMs - SWEEP_IMPORT_WINDOW_H * 3600000);
+    const seen = await db.prepare(
+      `SELECT (SELECT COUNT(*) FROM kfb_orders WHERE kfb_shop_code = ? AND imported_at >= ?)
+            + (SELECT COUNT(*) FROM kfb_import_shops s JOIN kfb_imports i ON i.id = s.import_id
+                WHERE s.kfb_shop_code = ? AND s.section = 'orders' AND s.rows > 0 AND i.fetched_at >= ?) AS n`
+    ).bind(code, since, code, since).first();
     if (!seen || !seen.n) { skippedStores.push({ store: id, reason: "the latest KFB sweep read no orders for this store" }); continue; }
     const { results: kfbRows } = await db.prepare(`SELECT order_ref FROM kfb_orders WHERE kfb_shop_code = ?`).bind(code).all();
     const inKfb = new Set((kfbRows || []).map((r) => normRef(r.order_ref)));
@@ -101,6 +113,7 @@ export async function runOrderWatch(env, { nowMs = Date.now() } = {}) {
         }
         continue;
       }
+      if (noMiss) continue;
       if (!row) {
         await db.prepare(`INSERT INTO order_watch (store, order_id, order_name, created_at, state, first_missing_at, checked_at, sweep_at) VALUES (?, ?, ?, ?, 'suspect', ?, ?, ?)`)
           .bind(id, o.order_id, o.name, o.created_at, at, at, sweep.at).run();
@@ -118,7 +131,8 @@ export async function runOrderWatch(env, { nowMs = Date.now() } = {}) {
       }
     }
   }
-  return { status: "checked", sweep_at: sweep.at, checked, suspect, flagged, found, cancelled, skipped_stores: skippedStores };
+  return { status: "checked", sweep_at: sweep.at, checked, suspect, flagged, found, cancelled, skipped_stores: skippedStores,
+    ...(noMiss ? { partial_read: "the KFB orders read was cut off: absences not counted" } : {}) };
 }
 
 export async function orderWatchState(env, { nowMs = Date.now() } = {}) {

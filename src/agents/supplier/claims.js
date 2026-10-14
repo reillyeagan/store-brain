@@ -8,8 +8,8 @@
  * Reilly, 2026-10-11: "i never return things to KFB." So a claim is always for a CREDIT, never
  * a return: there is no "return" kind, and the claim text never proposes sending goods back.
  *
- * Inputs:  kfb_credits (addCredit() by hand / CS / the COGS Matcher later; markCredited() when a
- *          credit shows on a KFB bill).
+ * Inputs:  kfb_credits (addCredit() by hand / CS; detectCancelledBilled() from KFB bill lines of
+ *          orders cancelled in Shopify; markCredited() when a credit shows on a KFB bill).
  * Outputs: aging in supplierState, flag events.
  * Unknown amounts stay null ("not known yet"), never 0.
  */
@@ -66,9 +66,61 @@ export function creditAging(rows, nowMs = Date.now()) {
   return { buckets, totals, unknownAmount, oldestDays };
 }
 
+/** KFB bills older than this are not scanned for cancelled orders (an old one is history, not a claim). */
+export const CANCELLED_BILLED_LOOKBACK_DAYS = 60;
+
+/**
+ * Cancelled-but-billed (spec: "#1174, €18.15"): a KFB bill line for an order that is
+ * cancelled in Shopify is money KFB owes back. One credit per order (kfb_credits UNIQUE, so
+ * re-running adds nothing), amount = every line for that order, EUR. Store by KFB shop code,
+ * never by order number. Reads the ledger only; nothing goes to KFB (Relay carries claims later).
+ */
+export async function detectCancelledBilled(db, { nowMs = Date.now() } = {}) {
+  const since = nowIso(nowMs - CANCELLED_BILLED_LOOKBACK_DAYS * 86400000);
+  const { results: lines } = await db.prepare(
+    `SELECT COALESCE(l.kfb_shop_code, b.kfb_shop_code) AS code, trim(replace(l.order_ref, '#', '')) AS ref,
+            SUM(COALESCE(l.cost_eur,0) + COALESCE(l.fees_eur,0) + COALESCE(l.shipping_eur,0)) AS eur, GROUP_CONCAT(DISTINCT l.bill_id) AS bills,
+            GROUP_CONCAT(DISTINCT f.cost_basis) AS basis
+       FROM kfb_bill_lines l JOIN kfb_bills b ON b.bill_id = l.bill_id LEFT JOIN kfb_bill_flags f ON f.bill_id = l.bill_id
+      WHERE l.order_ref IS NOT NULL AND (b.billed_at IS NULL OR b.billed_at >= ?)
+      GROUP BY code, ref`
+  ).bind(since).all();
+  if (!lines || !lines.length) return 0;
+  let opened = 0;
+  for (const id of Object.keys(STORES)) {
+    const s = STORES[id];
+    if (!s.live || !s.kfbShopCode) continue;
+    const mine = lines.filter((l) => l.code === s.kfbShopCode && l.ref);
+    if (!mine.length) continue;
+    // Cancelled orders of this store, read once (webhook cancelled_at / GraphQL cancelledAt).
+    const { results: orders } = await db.prepare(`SELECT order_id, name, raw FROM orders WHERE store = ? AND raw LIKE '%ancel%'`).bind(id).all();
+    const cancelled = new Map();
+    for (const o of orders || []) {
+      let raw = null; try { raw = JSON.parse(o.raw); } catch { raw = null; }
+      if (raw && (raw.cancelled_at || raw.cancelledAt || raw.cancelled === true)) cancelled.set(String(o.name).replace(/^#/, ""), o);
+    }
+    for (const l of mine) {
+      const o = cancelled.get(String(l.ref));
+      if (!o) continue;
+      const eur = Math.round(Number(l.eur) * 100) / 100;
+      const credit = await addCredit(db, {
+        store: id, kind: "cancelled_billed", order_name: o.name, order_id: o.order_id,
+        amount: eur > 0 ? eur : null, currency: "EUR",
+        // KFB's bill cost field isn't confirmed (the import records which field it used), so
+        // the amount is an estimate until Reilly checks it on the bill.
+        note: `cancelled in Shopify but on KFB bill ${l.bills}; amount is an ESTIMATE` +
+          (l.basis ? ` (KFB cost field not confirmed: ${l.basis})` : " (KFB cost field not confirmed)"),
+      }, { source: "kfb_bill", nowMs });
+      if (credit) opened++;
+    }
+  }
+  return opened;
+}
+
 export async function runClaims(env, { nowMs = Date.now() } = {}) {
   const db = env.DB;
   const at = nowIso(nowMs);
+  const opened = await detectCancelledBilled(db, { nowMs });
   const old = nowIso(nowMs - FLAG_AFTER_DAYS * 86400000);
   const reflag = nowIso(nowMs - REFLAG_EVERY_DAYS * 86400000);
   const { results } = await db.prepare(
@@ -82,5 +134,5 @@ export async function runClaims(env, { nowMs = Date.now() } = {}) {
       data: { creditId: c.id, days } });
     await db.prepare(`UPDATE kfb_credits SET last_flagged_at = ? WHERE id = ?`).bind(at, c.id).run();
   }
-  return { flagged: (results || []).length };
+  return { flagged: (results || []).length, opened };
 }

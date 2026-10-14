@@ -210,6 +210,7 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
   </main>
 </div>
 
+<script src="/kfb-bookmarklet.js"></script>
 <script>
 (function(){
   "use strict";
@@ -250,7 +251,8 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
       if(!r.ok) throw new Error("HTTP "+r.status);
       state=await r.json();
       $("#gate").hidden=true; $("#loading").hidden=true; $("#app").hidden=false;
-      if(Date.now()>busyUntil&&!selecting()) render();
+      /* The import page holds what the bookmarklet handed over: it is redrawn on its own events, not every 10 s. */
+      if(Date.now()>busyUntil&&!selecting()&&!(route.p==="import"&&$("#kfbImp"))) render();
     }catch(err){
       $("#status").innerHTML='<span class="bad">Can\'t reach the brain: '+esc(err.message)+'</span>';
       if(!$("#loading").hidden) $("#loadMsg").innerHTML='<span class="bad-t">Can\'t reach the brain ('+esc(err.message)+'). Retrying…</span>';
@@ -262,7 +264,7 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
   /* ---------------- routing ---------------- */
   function parseRoute(){
     var h=location.hash.replace(/^#\/?/,"").split("/");
-    var p=["home","pnl","brief","agents"].indexOf(h[0])>=0?h[0]:"home";
+    var p=["home","pnl","brief","agents","import"].indexOf(h[0])>=0?h[0]:"home";
     return {p:p,a:h[1]?decodeURIComponent(h[1]):null,b:h[2]?decodeURIComponent(h[2]):null};
   }
   window.addEventListener("hashchange",function(){ if(/key=/.test(location.hash)) return; var prev=route.p; route=parseRoute(); busyUntil=0; if(state){ render(); if(prev!==route.p||route.p==="agents") window.scrollTo(0,0); } });
@@ -312,6 +314,7 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
       var nm=$("#map"); if(oldMap&&nm&&oldMap.dataset.k===nm.dataset.k) nm.replaceWith(oldMap); }
     else if(route.p==="pnl") { pg.innerHTML=pnlShell(); loadPnl(); }
     else if(route.p==="brief") pg.innerHTML=briefPage();
+    else if(route.p==="import") pg.innerHTML=importPage();
     else pg.innerHTML=agentsPage();
     wire();
     restoreScroll(keep);
@@ -533,6 +536,9 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
   function etDay(ms){ return new Date(ms).toLocaleDateString("en-CA",{timeZone:"America/New_York"}); }
   function needs(allStores){
     var out=[], st=allStores?"all":store, since=etDay(Date.now()-86400000);
+    /* Until a KFB import lands today, the KFB agents work from yesterday (or nothing). */
+    var ki=state.kfbImport;
+    if(ki&&!ki.doneToday) out.push({kind:"kfbimport",title:"KFB import not done today",who:"KFB Morning Session",detail:(ki.lastAt?"Last import "+ago(ki.lastAt):"Never imported")+" · log in to KungFuBuy, then click the KFB → Store Brain bookmark",color:PAL.sup,href:"#/import/kfb"});
     (state.approvals||[]).forEach(function(a){ if(st!=="all"&&a.store&&a.store!==st) return;
       out.push({kind:"approval",id:a.id,title:a.title,who:actorName(a.requested_by),detail:(a.store?storeName(a.store)+" · ":"")+ago(a.created_at),color:colorOf(a.requested_by),a:a}); });
     var sup=state.supplier||{kfbMessages:[]};
@@ -590,6 +596,7 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
       return '<div class="card" style="border-left-color:'+x.color+'"><div class="t">KFB message ready<span>Relay</span></div><div class="d">'+esc(x.detail)+' · copy it into WhatsApp, then mark it sent</div><div class="msg">'+esc(m.body)+'</div>'+
         '<div class="btns"><button class="btn g" data-copy="'+esc(m.id)+'">Copy</button><button class="btn" data-sent="'+esc(m.id)+'">Mark sent</button></div></div>';
     }
+    if(x.kind==="kfbimport") return '<a href="#/import/kfb" style="text-decoration:none"><div class="card" style="border-left-color:'+x.color+'"><div class="t">'+esc(x.title)+'<span>'+esc(x.who)+'</span></div><div class="d">'+esc(x.detail)+'</div><div class="d" style="color:var(--blue)">Open the KFB import page →</div></div></a>';
     if(x.kind==="flaggroup") return '<a href="'+x.href+'" style="text-decoration:none"><div class="card" style="border-left-color:'+x.color+'"><div class="t">'+esc(x.title)+'<span>'+esc(x.who)+'</span></div><div class="d">'+esc(x.detail)+'</div><div class="d" style="color:var(--blue)">Open the Shipping page →</div></div></a>';
     return '<div class="card" style="border-left-color:'+x.color+'"><div class="t">'+esc(x.title)+'<span>'+esc(x.who)+'</span></div><div class="d">'+esc(x.detail)+'</div></div>';
   }
@@ -1048,7 +1055,9 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
   }
   function supplierHtml(){
     var sup=state.supplier||{kfbMessages:[],expressToday:[],mode:"shadow"};
-    var h='<div class="lab">Express orders today</div>';
+    var ki=state.kfbImport||{};
+    var h='<div class="rowx'+(ki.doneToday?"":" alarm")+'"><a href="#/import/kfb" style="color:var(--blue)">KFB morning import →</a><span class="meta"><span>'+(ki.doneToday?"done today":"not done today")+'</span><span>'+(ki.lastAt?"last "+esc(ago(ki.lastAt)):"never imported")+'</span></span></div>';
+    h+='<div class="lab" style="margin-top:10px">Express orders today</div>';
     h+=sup.expressToday.length?sup.expressToday.filter(inStore).map(function(o){ return '<div class="rowx"><span>'+esc(storeName(o.store))+' '+esc(o.name)+'</span><span class="meta"><span>'+esc(o.shipping_title||"express")+'</span><span>'+(o.asked_in?"in KFB message "+esc(o.asked_in):"not asked yet")+'</span><span>'+esc(ago(o.created_at))+'</span></span></div>'; }).join(""):'<div class="empty">No express orders today.</div>';
     h+='<div class="lab" style="margin-top:10px">KFB messages · '+(sup.mode==="live"?"live (to your phone)":"shadow (drafts only)")+'</div>';
     h+=sup.kfbMessages.length?sup.kfbMessages.map(function(m){
@@ -1099,9 +1108,160 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
       '<div class="rowx"><b style="font-weight:500">5 · Store inboxes and connections</b><div id="outConn"><span class="meta">Checking…</span></div></div>';
   }
 
+  /* ---------------- KFB MORNING IMPORT (#/import/kfb) ----------------
+     The bookmarklet (kfb-bookmarklet.js) reads KFB in Reilly's own logged-in tab, view only,
+     and hands the rows over by postMessage. Only the exact KFB origins below are listened to,
+     and only from the tab that opened this one. Nothing leaves this page until Import is
+     pressed, and then only to this brain with the normal key. No key is in the bookmark. */
+  var KFB_ORIGINS=["https://www.kungfubuy.com","https://kungfubuy.com"];
+  var kfbIn={payload:null,from:null,ignored:{},error:null,result:null,busy:false};
+  function kfbShape(p){
+    if(!p||typeof p!=="object"||Array.isArray(p)) return "not a JSON object";
+    if(p.kind!=="kfb-import"||p.version!==1) return "not a KFB import (kind or version)";
+    if(KFB_ORIGINS.indexOf(p.origin)<0) return "origin "+String(p.origin)+" is not KungFuBuy";
+    if(isNaN(Date.parse(p.fetched_at))) return "no read time";
+    if(!p.sections||typeof p.sections!=="object") return "no sections";
+    var ks=Object.keys(p.sections), any=false;
+    for(var i=0;i<ks.length;i++){
+      if(["quotes","orders","bills"].indexOf(ks[i])<0) return "unknown section "+ks[i];
+      var s=p.sections[ks[i]];
+      if(!s||typeof s.ok!=="boolean") return ks[i]+": no ok flag";
+      if(s.ok){ if(!Array.isArray(s.rows)) return ks[i]+": rows is not a list"; if(s.rows.some(function(r){return !r||typeof r!=="object"||Array.isArray(r)})) return ks[i]+": a row is not an object"; any=true; }
+    }
+    return any?null:"no section was read";
+  }
+  /* The KFB tab this page answers: the one that opened it, or (a reused tab whose opener is an
+     older KFB tab) the KFB tab that said hello. */
+  var kfbPeer=null;
+  function kfbTrusted(ev){ return KFB_ORIGINS.indexOf(ev.origin)>=0&&!!ev.source&&(ev.source===window.opener||ev.source===kfbPeer); }
+  window.addEventListener("message",function(ev){
+    var d=ev.data;
+    if(!d||typeof d!=="object") return;
+    if(d.type==="sb-kfb-hello"){
+      if(KFB_ORIGINS.indexOf(ev.origin)<0||!ev.source) return;
+      kfbPeer=ev.source;
+      try{ ev.source.postMessage({type:"sb-kfb-ready"},ev.origin); }catch(e){}
+      return;
+    }
+    if(d.type!=="sb-kfb-data") return;
+    if(!kfbTrusted(ev)){ kfbIn.ignored[String(ev.origin)]=1; drawImport(); return; }
+    var err=kfbShape(d.payload);
+    if(!err&&d.payload.origin!==ev.origin) err="the data names "+d.payload.origin+" but came from "+ev.origin;
+    if(err){ kfbIn.error="Refused what the bookmark sent: "+err; drawImport(); return; }
+    kfbIn.payload=d.payload; kfbIn.from=ev.origin; kfbIn.error=null; kfbIn.result=null;
+    try{ ev.source.postMessage({type:"sb-kfb-received"},ev.origin); }catch(e){}
+    drawImport();
+  });
+  /* Handshake: say "ready" to the KFB tab that opened this one, every second for a minute (the
+     bookmark may still be reading). A message to a tab on another origin is simply dropped. */
+  (function(){
+    if(!/^#\/import\/kfb/.test(location.hash)||!window.opener) return;
+    var n=0;
+    function hello(){ KFB_ORIGINS.forEach(function(o){ try{ window.opener.postMessage({type:"sb-kfb-ready"},o); }catch(e){} }); }
+    hello();
+    var t=setInterval(function(){ if(kfbIn.payload||++n>60||!window.opener){ clearInterval(t); return; } hello(); },1000);
+  })();
+  function kfbCode(r){
+    var v=r&&(r.un_shop_url||r.shop_url||r.shop_code||(Array.isArray(r.items)&&r.items[0]&&r.items[0].un_shop_url));
+    return v?String(v).toLowerCase().trim().replace(/^https?:\/\//,"").replace(/\/.*$/,"").replace(/\.myshopify\.com$/,""):null;
+  }
+  var KFB_LINE_KEYS=["details","detail","bill_details","lines","list","items","children","sub_orders","suborders","order_list","orders"];
+  function kfbFlat(section,rows){
+    if(section!=="bills") return rows;
+    var out=[]; rows.forEach(function(r){ var k=KFB_LINE_KEYS.find(function(x){return Array.isArray(r[x])&&r[x].length&&typeof r[x][0]==="object"});
+      if(k) r[k].forEach(function(l){ out.push(kfbCode(l)?l:Object.assign({un_shop_url:kfbCode(r)},l)); }); else out.push(r); });
+    return out;
+  }
+  var KFB_DATE_KEYS=["shopify_create_at","bill_time","quote_time","update_time","create_time","create_at","un_create_at","order_time","created_at"];
+  function kfbRange(rows){
+    var lo=null, hi=null;
+    rows.forEach(function(r){ KFB_DATE_KEYS.forEach(function(k){ var v=r&&r[k]; if(typeof v!=="string"||!/^\d{4}-\d{2}-\d{2}/.test(v)) return; v=v.slice(0,10); if(!lo||v<lo) lo=v; if(!hi||v>hi) hi=v; }); });
+    return lo?(lo===hi?lo:lo+" → "+hi):"no dates";
+  }
+  function kfbShopName(code){
+    var s=(state.stores||[]).find(function(x){return x.kfbShopCode&&x.kfbShopCode===code});
+    return s?storeName(s.id)+(s.live?"":" (not live: skipped)"):null;
+  }
+  function kfbSummary(p){
+    var secs=[["quotes","Quotations"],["orders","Orders"],["bills","Bill lines"]], split={};
+    var h='<div class="lab" style="margin-top:12px">Received from '+esc(kfbIn.from||p.origin)+' · read '+esc(ago(p.fetched_at))+'</div>';
+    h+='<table class="tbl" style="font-size:12.5px"><thead><tr><th>Section</th><th>Rows</th><th>Dates</th><th style="text-align:left">Endpoint / problem</th></tr></thead><tbody>';
+    secs.forEach(function(x){ var s=p.sections[x[0]];
+      if(!s){ h+='<tr><td>'+x[1]+'</td><td>—</td><td>—</td><td style="text-align:left">not sent</td></tr>'; return; }
+      if(!s.ok){ h+='<tr><td>'+x[1]+'</td><td class="bad-t">not read</td><td>—</td><td style="text-align:left" class="bad-t">'+esc(s.error||"failed")+'</td></tr>'; return; }
+      var rows=kfbFlat(x[0],s.rows);
+      rows.forEach(function(r){ var c=kfbCode(r)||"(no shop code)"; split[c]=split[c]||{quotes:0,orders:0,bills:0}; split[c][x[0]]++; });
+      h+='<tr><td>'+x[1]+'</td><td'+(s.truncated?' class="warn-t"':'')+'>'+esc(rows.length)+(s.truncated?" of "+esc(s.total==null?"more":s.total)+" (cut off)":"")+'</td><td>'+esc(kfbRange(rows))+'</td><td style="text-align:left">'+esc(s.endpoint||"")+'</td></tr>';
+    });
+    h+='</tbody></table><div class="lab" style="margin-top:12px">By store (KFB shop code)</div><table class="tbl" style="font-size:12.5px"><thead><tr><th>Store</th><th>Quotes</th><th>Orders</th><th>Bill lines</th></tr></thead><tbody>';
+    Object.keys(split).sort().forEach(function(c){ var nm=kfbShopName(c);
+      h+='<tr><td'+(nm?'':' class="bad-t"')+'>'+esc(nm?nm+" · "+c:"Unknown shop "+c+": will be refused")+'</td><td>'+split[c].quotes+'</td><td>'+split[c].orders+'</td><td>'+split[c].bills+'</td></tr>'; });
+    return h+'</tbody></table>';
+  }
+  function kfbResult(r){
+    if(!r.ok) return '<div class="rowx alarm">Not imported: '+esc(r.error||"error")+'</div>';
+    if(r.duplicate) return '<div class="rowx"><span class="ok-t">Already imported today: nothing changed.</span></div>';
+    var c=r.counts||{}, q=c.quotes||{}, o=c.orders||{}, b=c.bills||{}, tp=b.to_pay||{};
+    var refused=function(m){ var k=Object.keys(m||{}); return k.length?k.map(function(x){return m[x]+" × "+x}).join("; "):"none"; };
+    return '<div class="rowx"><b class="ok-t" style="font-weight:500">Imported</b>'+
+      kvx("Quotes",esc(q.inserted||0)+" new · "+esc(q.unchanged||0)+" already known"+(q.similar_recorded?" · "+esc(q.similar_recorded)+" similar offers":""))+
+      kvx("Orders",esc(o.inserted||0)+" new · "+esc(o.updated||0)+" changed · "+esc(o.unchanged||0)+" unchanged")+
+      kvx("Bills",esc(b.inserted||0)+" new · "+esc(b.updated||0)+" changed · "+esc(b.unchanged||0)+" unchanged · "+esc(b.lines||0)+" lines")+
+      kvx("Bills to pay",esc(tp.inserted||0)+" new · "+esc(tp.updated||0)+" changed"+(tp.paid_state_unknown?' · <span class="warn-t">'+esc(tp.paid_state_unknown)+" paid state unknown</span>":"")+
+        (tp.no_amount?' · <span class="warn-t">'+esc(tp.no_amount)+" with no amount (not listed, check in KFB)</span>":"")+
+        (tp.incomplete?' · <span class="warn-t">'+esc(tp.incomplete)+" cut off by the read (not listed yet)</span>":""))+
+      kvx("Refused",esc(refused(q.refused))+" | "+esc(refused(o.refused))+" | "+esc(refused(b.refused_lines)))+
+      ((c.unknown_shops||[]).length?'<div class="note bad-t">Unknown KFB shops refused: '+esc(c.unknown_shops.join(", "))+'</div>':'')+'</div>';
+  }
+  function kfbBookmarkHref(){ var f=window.SB_KFB_BOOKMARKLET; return typeof f==="function"?"javascript:"+encodeURIComponent("("+f.toString()+")()"):null; }
+  function importInner(){
+    var ki=state.kfbImport||{}, h="", p=kfbIn.payload;
+    h+='<div class="rowx'+(ki.doneToday?"":" alarm")+'"><b style="font-weight:500">'+(ki.doneToday?"Imported today":"KFB import not done today")+'</b><span class="meta"><span>'+(ki.lastAt?"last import "+esc(ago(ki.lastAt)):"never imported")+'</span><span>9:00 phone reminder: '+(ki.reminder==="live"?"on":"shadow (not sent)")+'</span></span></div>';
+    var ign=Object.keys(kfbIn.ignored);
+    if(ign.length) h+='<div class="note warn-t">Ignored data from '+esc(ign.join(", "))+': not KungFuBuy, or not the tab that opened this page.</div>';
+    if(kfbIn.error) h+='<div class="rowx alarm">'+esc(kfbIn.error)+'</div>';
+    if(!p) h+='<div class="empty">'+(window.opener?"Waiting for the KungFuBuy tab to hand over what it read…":"Nothing received yet. On KungFuBuy (logged in), click the bookmark below, or paste the saved JSON.")+'</div>';
+    else h+=kfbSummary(p)+'<div class="btns" style="margin-top:10px"><button class="btn p" id="kfbGo"'+(kfbIn.busy?" disabled":"")+'>'+(kfbIn.busy?"Importing…":"Import")+'</button><button class="btn" id="kfbClear">Discard</button></div>';
+    if(kfbIn.result) h+='<div style="margin-top:10px">'+kfbResult(kfbIn.result)+'</div>';
+    var href=kfbBookmarkHref();
+    h+='<div class="lab" style="margin-top:16px">The bookmark</div>'+(href?'<div class="rowx"><div><a class="btn p" id="kfbBm" href="'+esc(href)+'">KFB → Store Brain</a></div><span style="color:var(--muted)">Drag this button to your bookmarks bar once. Each morning, on KungFuBuy and logged in, click it: it reads quotations, orders and bills (view only) and opens this page.</span></div>':'<div class="empty">The bookmark file did not load. Reload this page.</div>');
+    h+='<div class="lab" style="margin-top:16px">Paste JSON (when the bookmark saved a file instead)</div><textarea class="fld" id="kfbPaste" placeholder="Paste the kfb-import JSON here"></textarea><div class="scform"><button class="btn" id="kfbUse">Use pasted JSON</button><label>or a file <input type="file" id="kfbFile" accept="application/json,.json" class="fld"></label></div>';
+    return h;
+  }
+  function importPage(){
+    return '<div class="box"><div style="font:600 20px var(--font)">KFB morning import</div><div class="note">Reads quotations, orders and bills from KungFuBuy in your own logged-in tab (view only) and files them for the Quote Desk, Denial Sync, Similar QC, COGS Matcher, Order Watcher and Claims. Nothing is ever written to KungFuBuy.</div></div><div class="box" id="kfbImp" style="margin-top:12px">'+importInner()+'</div>';
+  }
+  function drawImport(){ if(state&&route.p==="import"&&$("#kfbImp")){ $("#kfbImp").innerHTML=importInner(); wireImport(); } }
+  function kfbTake(text,from){
+    var p=null; try{ p=JSON.parse(text); }catch(e){ kfbIn.error="That is not valid JSON."; drawImport(); return; }
+    var err=kfbShape(p); if(err){ kfbIn.error="Refused the pasted data: "+err; drawImport(); return; }
+    kfbIn.payload=p; kfbIn.from=from; kfbIn.error=null; kfbIn.result=null; drawImport();
+  }
+  async function kfbImport(){
+    if(!kfbIn.payload||kfbIn.busy) return;
+    kfbIn.busy=true; drawImport();
+    try{
+      var r=await api("/api/import/kfb",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({payload:kfbIn.payload})});
+      var j=await r.json().catch(function(){return {ok:false,error:"HTTP "+r.status}});
+      if(r.status===401) j={ok:false,error:"the dashboard key was refused. Reload the page and enter it again."};
+      kfbIn.result=j;
+    }catch(e){ kfbIn.result={ok:false,error:"could not reach the brain. Nothing was imported."}; }
+    kfbIn.busy=false;
+    if(kfbIn.result.ok) await load();
+    drawImport();
+  }
+  function wireImport(){
+    var go=$("#kfbGo"); if(go) go.addEventListener("click",kfbImport);
+    var cl=$("#kfbClear"); if(cl) cl.addEventListener("click",function(){ kfbIn.payload=null; kfbIn.result=null; drawImport(); });
+    var bm=$("#kfbBm"); if(bm) bm.addEventListener("click",function(e){ e.preventDefault(); bm.textContent="Drag me to the bookmarks bar"; });
+    var use=$("#kfbUse"); if(use) use.addEventListener("click",function(){ kfbTake($("#kfbPaste").value,"pasted JSON"); });
+    var f=$("#kfbFile"); if(f) f.addEventListener("change",function(){ var file=f.files&&f.files[0]; if(!file) return; var rd=new FileReader(); rd.onload=function(){ kfbTake(String(rd.result),file.name); }; rd.readAsText(file); });
+  }
+
   /* ---------------- actions ---------------- */
   function wire(){
     if(route.p==="pnl") wirePnl();
+    if(route.p==="import") wireImport();
     document.querySelectorAll("button[data-ap]").forEach(function(b){ b.addEventListener("click",function(){ decide(b.dataset.ap,b.dataset.choice,b) }) });
     document.querySelectorAll("button[data-copy]").forEach(function(b){ b.addEventListener("click",function(){
       var m=((state.supplier||{}).kfbMessages||[]).find(function(x){return String(x.id)===b.dataset.copy});

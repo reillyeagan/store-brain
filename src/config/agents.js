@@ -116,7 +116,7 @@ export const SERVICES = Object.freeze([
   { id: "svc.freshness", name: "Freshness Sentinel", status: "built" },
   { id: "svc.backup_vault", name: "Backup Vault", status: "built" },
   { id: "svc.sheets_writer", name: "Sheets Writer", status: "built" }, // inside pnl.sheets (src/agents/pnl/sheets.js)
-  { id: "svc.kfb_session", name: "KFB Morning Session", status: "planned" },
+  { id: "svc.kfb_session", name: "KFB Morning Session", status: "built" }, // the one-click import (src/lib/kfbImport.js)
   { id: "svc.event_log", name: "Event Log", status: "built" },
 ]);
 

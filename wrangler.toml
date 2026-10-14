@@ -46,6 +46,8 @@ GOOGLE_ADS_API_VERSION = "v25"
 # newest Sonnet on 2026-10-11 ($2 / $10 per million tokens). Change it here and redeploy.
 # BRIEF_PHONE_LIVE is NOT set here: the brief stays shadow (Mission Control only) until
 # Reilly sets BRIEF_PHONE_LIVE = "1" in the Cloudflare dashboard.
+# KFB_REMINDER_LIVE is NOT set here either: the 9:00 "KFB import not done today" phone
+# reminder stays shadow (logged only) until Reilly sets KFB_REMINDER_LIVE = "1".
 BRIEF_MODEL = "claude-sonnet-5-5"
 # P&L Sheets agent: writes blank input cells of the Google Sheets P&L workbooks (Reilly asked
 # for it on 2026-10-14, so it is ON when unset). To stop every write, uncomment this and redeploy:

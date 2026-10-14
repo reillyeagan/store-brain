@@ -6,8 +6,9 @@
  * is separate and unchanged; it can pick up the size asks from `kfb_size_asks` later.
  *
  * KFB has no API and a CAPTCHA login: quotes, bills and "similar" offers arrive only through
- * the planned KFB Morning Session service (or an import). Until then those agents idle and
- * the page says "waiting on KFB session". What works today from Shopify / the ledger:
+ * the KFB morning import (Reilly logs in, clicks the bookmarklet: src/lib/kfbImport.js). Until
+ * the first import those agents idle and the page says "waiting on KFB session". What works
+ * from Shopify / the ledger alone:
  * Size-Chart Checker (order lines + size library + complaints), Supply Pre-flight, Claims.
  *
  * Cadence (the Worker cron fires every 15 min; each job self-throttles via job_runs):
@@ -151,7 +152,7 @@ export async function supplierState(env, { nowMs = Date.now() } = {}) {
       "sup.preflight": { lastRun: lastRun["sup.preflight"] || null, status: "running on Shopify order lines", flags: flags || [] },
       "sup.claims": {
         lastRun: lastRun["sup.claims"] || null,
-        status: "running (credits added by hand / CS until KFB bills are read)",
+        status: data.bills ? "running: KFB bills checked for cancelled-but-billed orders, plus credits added by hand / CS" : "running (credits added by hand / CS until KFB bills are read)",
         rule: "credits only: \"i never return things to KFB\"",
         aging: creditAging(credits || [], nowMs), open: credits || [],
       },

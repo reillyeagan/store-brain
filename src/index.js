@@ -15,6 +15,7 @@
  *   POST /api/size-charts                add a factory size chart by hand {store, product_handle|product_id, unit, flat, rows} (key required; saved unchecked)
  *   POST /api/size-charts/image          the brain reads a chart image {store, product_handle, image_base64, media_type} (key required; always unchecked)
  *   POST /api/size-charts/:id/confirm    Reilly checked that chart (key required)
+ *   POST /api/import/kfb                 the KFB morning import the bookmarklet read (key required; ≤ 5 MB; nothing goes to KFB)
  *   POST /webhooks/shopify               Shopify webhooks (HMAC-verified per store)
  *   POST /webhooks/17track               17TRACK pushes (`sign` header verified; known numbers re-read from the API)
  *   POST /api/admin/check-stores         Store Guard check for every live store (key required)
@@ -33,6 +34,7 @@
  *   every 15 min  reconciliation pull → orders backfill (history for the P&L) → money feeds (Ads spend and refunds every
  *                 15 min, payouts hourly; throttled in job_runs) → tracking (collect hourly, 17TRACK polls as due, checks)
  *                 → P&L recompute (last 3 days + a few missing history days, every tick) → morning brief (once per day after 08:00 ET)
+ *                 → KFB import reminder (once per day from 09:00 ET, only when no import landed)
  *                 → KFB composer (once per day after 18:45 ET) → Freshness Sentinel
  *   every 5 min   (minutes 1, 6, 11, ... 56) one department agent run, in rotation (src/agents/index.js)
  *   daily 05:00Z  P&L day close (01:00 EDT / 00:00 EST: "yesterday" is always the day that just ended)
@@ -54,6 +56,7 @@
  *   PUBLIC_BASE_URL        this worker's https address, for links in phone notifications sent by crons
  *   BRIEF_MODEL            Claude model id for the morning brief (wrangler.toml)
  *   BRIEF_PHONE_LIVE       "1" = the 8:00 brief also goes to the phone; anything else = shadow (Reilly flips it)
+ *   KFB_REMINDER_LIVE      "1" = the 9:00 "KFB import not done today" reminder goes to the phone; else shadow (Reilly flips it)
  *   SB_<STORE>_CLIENT_ID / SB_<STORE>_CLIENT_SECRET   per-store Shopify app credentials
  */
 import { STORES, LIVE_STORE_IDS } from "./config/stores.js";
@@ -82,6 +85,8 @@ import { runDepartmentSlot, departmentState, DEPARTMENTS_RUN, DEPT_CRON } from "
 import { funnelFor } from "./agents/pnl/index.js";
 import { vaultOutbox, markVaultCopied } from "./agents/core/librarian.js";
 import { addPastedChart, addChartFromImage, confirmChart } from "./agents/supplier/sizeIntake.js";
+import { handleKfbImport, runKfbReminder, kfbReminderMode } from "./lib/kfbImport.js";
+import { kfbImportStatus } from "./lib/kfbReads.js";
 
 export const VERSION = "0.2.0-eagano-llc";
 
@@ -128,11 +133,11 @@ async function handleState(env) {
     shippingState(env),
   ]);
   const money = await moneyState(env.DB, feeds);
-  const [pnl, brief] = await Promise.all([pnlState(env.DB), latestBrief(env.DB)]);
+  const [pnl, brief, kfbImport] = await Promise.all([pnlState(env.DB), latestBrief(env.DB), kfbImportStatus(env.DB)]);
   return json({
     version: VERSION,
     now: new Date().toISOString(),
-    stores: Object.values(STORES).map(({ id, name, live }) => ({ id, name, live })),
+    stores: Object.values(STORES).map(({ id, name, live, kfbShopCode }) => ({ id, name, live, kfbShopCode })),
     departments: DEPARTMENTS,
     agents: AGENTS.map((a) => ({ ...a, does: AGENT_DOES[a.id] || null })),
     retired: RETIRED_AGENTS,
@@ -150,6 +155,8 @@ async function handleState(env) {
     shipping,
     pnl,
     brief: { mode: briefMode(env), latest: brief },
+    // KFB morning import: "not done today" shows in Waiting on you until one lands.
+    kfbImport: { ...kfbImport, reminder: kfbReminderMode(env) },
   });
 }
 
@@ -270,6 +277,11 @@ export default {
         if (!body || typeof body !== "object") return json({ ok: false, error: "JSON body required" }, 400);
         const r = path.endsWith("/image") || body.image_base64 ? await addChartFromImage(env, body) : await addPastedChart(env, body);
         return json(r, r.ok ? 200 : r.status || 400);
+      }
+      // KFB morning import (the bookmarklet's rows, posted by the dashboard). Read-only towards KFB.
+      if (path === "/api/import/kfb" && request.method === "POST") {
+        if (!hasKey(request, env)) return json({ ok: false, error: "unauthorized" }, 401);
+        return await handleKfbImport(request, env);
       }
       const sc = path.match(/^\/api\/size-charts\/(\d{1,12})\/confirm$/);
       if (sc && request.method === "POST") {
@@ -394,6 +406,15 @@ export default {
           await logEvent(env.DB, {
             actor: "core.briefer", kind: "error.brief",
             summary: `Morning brief failed; it will try again in 15 minutes (${String(err && err.message).slice(0, 200)})`,
+          }).catch(() => {});
+        }
+        // One phone reminder from 09:00 Eastern when no KFB import has landed today.
+        try {
+          await runKfbReminder(env);
+        } catch (err) {
+          await logEvent(env.DB, {
+            actor: "svc.kfb_session", kind: "error.kfb_reminder", target: "sys.phone",
+            summary: `KFB import reminder failed; it will try again in 15 minutes (${String(err && err.message).slice(0, 200)})`,
           }).catch(() => {});
         }
         // Before the composer, so tonight's KFB message sees the latest parcel statuses.
