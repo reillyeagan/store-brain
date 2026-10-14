@@ -186,7 +186,7 @@ export const AGENT_DOES = Object.freeze({
   "pnl.analyst": "Explains why profit moved.",
   "pnl.money_map": "Tracks Shopify payouts, balances and fees.",
   "pnl.calendar": "Tracks tax, admin deadlines and money triggers.",
-  "pnl.sheets": "Reads the Google Sheets P&L workbooks to fill the brain's missing days, flags where they disagree, and fills the sheets' blank cells from closed days.",
+  "pnl.sheets": "Every morning from 07:00 fills yesterday's row in the Google Sheets P&L workbooks (blank cells only), corrects its own recent cells, and fills the brain's missing days from the sheets.",
   "risk.chargebacks": "Prepares chargeback evidence before the deadline.",
   "risk.account_health": "Watches Shopify Payments health, the 90-day dispute rate and the refund rate.",
   "risk.claims_audit": "Checks storefront promises (delivery times, returns, origin, urgency) against reality.",

@@ -103,6 +103,9 @@ export const SEED_DECISIONS = Object.freeze([
     words: SHEETS_WRITE_DECISION.words },
   { at: SHEETS_FILL_DECISION.at, topic: SHEETS_FILL_DECISION.topic, scope: "all", source: "chat 2026-10-14 — wired: pnl.sheets fills days the brain is missing from the workbooks",
     words: SHEETS_FILL_DECISION.words },
+  // Wired: pnl.sheets runs once a day from 07:00 New York and fills yesterday (sheets.js runSheetsMorning).
+  { at: "2026-10-14T23:03:00Z", topic: "pnl.sheets_schedule", scope: "all", source: "chat 2026-10-14",
+    words: "P&L sheets only have to update once per day, in the monring, it should fill in yesterdays P&L. does not need to be hourly for the google sheets" },
 ]);
 
 /** Latest (unsuperseded) decision on a topic, or null. */

@@ -431,11 +431,11 @@ test("sheets: the P&L uses the sheet's COG and fee only where the brain has none
   assert.equal(row.cogs_source, "estimate");
   assert.match(row.notes.missing_why.fees, /sheet's day doesn't match the brain's \(orders 3 vs 2/);
 
-  // A sheet read older than 24 h is not used (rule 4).
-  await sheetRow(day, { revenue: 150, orders: 2, fee: 5.2, cog_eur: 40, cog_ok: 1, fee_ok: 1, read_at: iso(NOW - 25 * 3600000) });
+  // A sheet read older than 26 h (it is read every morning) is not used (rule 4).
+  await sheetRow(day, { revenue: 150, orders: 2, fee: 5.2, cog_eur: 40, cog_ok: 1, fee_ok: 1, read_at: iso(NOW - 27 * 3600000) });
   row = await computeStoreDay(DB, "hc", day, { nowMs: NOW });
   assert.equal(row.fees, null);
-  assert.match(row.notes.missing_why.fees, /older than 24 h/);
+  assert.match(row.notes.missing_why.fees, /older than 26 h/);
 
   // The brain's own fee wins: Oct 2 is covered by payouts, so the sheet's fee is ignored.
   await order(DB, "hc", { id: 3, created_at: "2026-10-02T15:00:00Z", total: 80 });
@@ -944,23 +944,20 @@ test("sheets writer: fail-closed day basis, settled ads, and no $0 services befo
   assert.equal((await brainValue(DB, "hc", "2026-09-07", "services", { pnl, setup: noTz, tz, today: "2026-10-14" })).value, 5);
 });
 
-test("sheets: older month tabs are re-read once a day (not hourly) and their rows count as fresh only from their own tab's read", async () => {
-  const { readWorkbook, storeRead, workbooks, FULL_READ_EVERY_MIN } = await import("../src/agents/pnl/sheets.js");
+test("sheets: the once-a-day read covers every month tab; rows stay fresh until the next morning (26 h)", async () => {
+  const { readWorkbook, storeRead, workbooks } = await import("../src/agents/pnl/sheets.js");
   const env = baseEnv();
   const books = { [HC]: book("Holt & Crane P&L", { AUG: monthTab(2026, 8, { "2026-08-20": { revenue: 60, orders: 1 } }), SEP: monthTab(2026, 9, {}), OCT: monthTab(2026, 10, {}), SETUP: setupTab() }) };
   const g = fakeGoogle(books);
   const wb = workbooks().find((w) => w.store === "hc");
-  let read = await readWorkbook(env, wb, { token: "g", fetchImpl: g.fetchImpl, nowMs: NOW });
-  assert.deepEqual(read.months.map((m) => m.tab), ["AUG", "SEP", "OCT"]);
-  await storeRead(env.DB, wb, read, NOW, { rows: 500 });
-  read = await readWorkbook(env, wb, { token: "g", fetchImpl: g.fetchImpl, nowMs: NOW + 3600000 });
-  assert.deepEqual(read.months.map((m) => m.tab), ["OCT", "SEP"], "hourly: current and previous month");
-  await storeRead(env.DB, wb, read, NOW + 3600000, { rows: 500 });
-  const seen = async (day) => (await env.DB.prepare(`SELECT seen_at FROM sheet_pnl_days WHERE store = 'hc' AND day = ?`).bind(day).first()).seen_at;
-  assert.equal(await seen("2026-08-20"), iso(NOW), "AUG was not re-read: its rows keep the older time");
-  assert.equal(await seen("2026-10-01"), iso(NOW + 3600000));
-  read = await readWorkbook(env, wb, { token: "g", fetchImpl: g.fetchImpl, nowMs: NOW + (FULL_READ_EVERY_MIN + 1) * 60000 });
-  assert.equal(read.full, true, "every tab again after the daily interval");
+  for (const t of [NOW, NOW + 24 * 3600000]) {
+    const read = await readWorkbook(env, wb, { token: "g", fetchImpl: g.fetchImpl, nowMs: t });
+    assert.deepEqual(read.months.map((m) => m.tab), ["AUG", "SEP", "OCT"], "every month tab, every (daily) run");
+    await storeRead(env.DB, wb, read, t, { rows: 500 });
+  }
+  assert.equal((await env.DB.prepare(`SELECT seen_at FROM sheet_pnl_days WHERE store = 'hc' AND day = '2026-08-20'`).first()).seen_at, iso(NOW + 24 * 3600000));
+  const { SHEET_MAX_AGE_MIN } = await import("../src/lib/pnl.js");
+  assert.equal(SHEET_MAX_AGE_MIN, 26 * 60);
 });
 
 test("sheets writer: intended cells are recorded as pending BEFORE the write; a failed write call says its outcome is unknown; a failed re-read marks them unverified", async () => {
@@ -1047,4 +1044,91 @@ test("ads history: a day the hourly pull already had is re-read, and a changed f
   const ev = (await evs(env.DB, "ads.restated")).filter((e) => e.store === "hc");
   assert.equal(ev.length, 1);
   assert.match(ev[0].summary, /2026-10-05 300\.00 → 305\.40/);
+});
+
+
+/* ---------------- once a day, in the morning (decision pnl.sheets_schedule) ---------------- */
+
+const etMs = (day, hh, mm = 36) => Date.parse(`${day}T${String(hh + 4).padStart(2, "0")}:${String(mm).padStart(2, "0")}:00Z`); // EDT = UTC-4
+
+test("schedule: once a day from 07:00 New York; retried each slot until noon while yesterday isn't closed; a missed morning still runs once that day", async () => {
+  const { sheetsDue, runSheetsMorning, sheetsSchedule } = await import("../src/agents/pnl/sheets.js");
+  const DB = makeD1();
+  const env = { DB };
+  assert.deepEqual(await sheetsDue(DB, etMs("2026-10-15", 6, 36)), { due: false, why: "before 07:00 New York" });
+  assert.equal((await sheetsSchedule(DB, etMs("2026-10-15", 6, 36))).next_run, "2026-10-15T11:00:00.000Z", "07:00 EDT");
+  // 07:36: due. Google isn't connected here, so yesterday can't be filled: not done.
+  const r1 = await runSheetsMorning(env, { nowMs: etMs("2026-10-15", 7) });
+  assert.equal(r1.ran, true);
+  assert.ok(r1.waiting_on.length === LIVE_STORE_IDS.length);
+  assert.equal((await sheetsDue(DB, etMs("2026-10-15", 8))).why, "retry: yesterday was not closed yet");
+  await runSheetsMorning(env, { nowMs: etMs("2026-10-15", 8) });
+  assert.deepEqual(await sheetsDue(DB, etMs("2026-10-15", 12)), { due: false, why: "retries stop at noon; next run tomorrow 07:00" });
+  assert.equal((await runSheetsMorning(env, { nowMs: etMs("2026-10-15", 13) })).ran, false);
+  assert.equal((await sheetsSchedule(DB, etMs("2026-10-15", 13))).next_run, "2026-10-16T11:00:00.000Z");
+  // A morning missed entirely (nothing ran before noon) still gets ONE run that day.
+  assert.equal((await sheetsDue(DB, etMs("2026-10-16", 15))).due, true);
+  await runSheetsMorning(env, { nowMs: etMs("2026-10-16", 15) });
+  assert.equal((await sheetsDue(DB, etMs("2026-10-16", 16))).due, false);
+  // Done for the day → not due again until tomorrow.
+  await DB.prepare(`INSERT INTO job_runs (job, last_run_at, last_result) VALUES ('pnl.sheets.done', ?, 'ran; yesterday filled')`).bind(iso(etMs("2026-10-17", 7))).run();
+  assert.equal((await sheetsDue(DB, etMs("2026-10-17", 8))).why, "done for today");
+  assert.equal((await sheetsDue(DB, etMs("2026-10-18", 7))).due, true);
+  const st = await sheetsSchedule(DB, etMs("2026-10-17", 9));
+  assert.equal(st.decision, "pnl.sheets_schedule");
+  assert.ok(st.last_run_at && st.last_done_at);
+  // Reilly's words, verbatim.
+  const seed = SEED_DECISIONS.find((x) => x.topic === "pnl.sheets_schedule");
+  assert.equal(seed.words, "P&L sheets only have to update once per day, in the monring, it should fill in yesterdays P&L. does not need to be hourly for the google sheets");
+  assert.equal(seed.at, "2026-10-14T23:03:00Z");
+  assert.equal(seed.source, "chat 2026-10-14");
+});
+
+test("schedule: the morning run is done once yesterday is closed for every store and every workbook was read; it fills yesterday", async () => {
+  const { runSheetsMorning, sheetsDue } = await import("../src/agents/pnl/sheets.js");
+  const env = baseEnv();
+  await connectGoogle(env);
+  const books = {};
+  for (const id of LIVE_STORE_IDS) {
+    books[STORES[id].pnlSheetId] = book(`${STORES[id].name} P&L`, { OCT: monthTab(2026, 10, {}), SETUP: setupTab({ store: `${STORES[id].name} (${STORES[id].domain})` }) });
+    await closedDay(env.DB, id, "2026-10-14", { revenue: 0, orders: 0, ads: 10, guy_fee: 1, fees: 0 });
+  }
+  const g = fakeGoogle(books);
+  const r = await runSheetsMorning(env, { nowMs: etMs("2026-10-15", 7), fetchImpl: g.fetchImpl });
+  assert.deepEqual(r.waiting_on, []);
+  assert.equal((await sheetsDue(env.DB, etMs("2026-10-15", 8))).why, "done for today");
+  // Yesterday's ad spend and services went in this morning (no 3-day wait for yesterday).
+  const yRow = 15; // Oct 14
+  assert.ok(g.log.updates.some((u) => u.range === `'OCT'!D${yRow}` && u.value === 10));
+  assert.ok(g.log.updates.some((u) => u.range === `'OCT'!E${yRow}` && u.value === 1));
+});
+
+test("corrections: a cell the brain wrote in the last 3 days is updated when the brain's value changed (ads restated) and the cell still holds the brain's value; a cell Reilly changed is never touched", async () => {
+  const { env, DB, books } = await writerFixture();
+  // Yesterday (Oct 13) closed: written this morning without the 3-day wait.
+  await closedDay(DB, "hc", "2026-10-13", { revenue: 50, orders: 1, ads: 300, guy_fee: 30, fees: 1.5 });
+  await DB.prepare(`INSERT INTO ad_spend_days (store, day, cost, clicks, impressions, conv_value, currency, account_tz, fetched_at, source) VALUES ('hc', '2026-10-13', 300, 400, 900, 0, 'USD', 'America/Chicago', ?, 'api')`).bind(iso(NOW)).run();
+  const g = fakeGoogle(books);
+  await runSheets(env, { nowMs: NOW, fetchImpl: g.fetchImpl });
+  const at = (cell) => books[HC].tabs.OCT[Number(cell.slice(1)) - 1][cell.charCodeAt(0) - 65].raw;
+  assert.equal(at("D14"), 300);
+  assert.equal(at("E14"), 30);
+  assert.equal(at("P14"), 400);
+  // Google restates Oct 13; Reilly meanwhile types his own clicks over the brain's.
+  await DB.prepare(`UPDATE pnl_days SET ads = 310, guy_fee = 31 WHERE store = 'hc' AND day = '2026-10-13'`).run();
+  await DB.prepare(`UPDATE ad_spend_days SET cost = 310, clicks = 410 WHERE store = 'hc' AND day = '2026-10-13'`).run();
+  books[HC].tabs.OCT[13][15] = cell("405", 405);
+  const next = etMs("2026-10-15", 7);
+  await runSheets(env, { nowMs: next, fetchImpl: g.fetchImpl });
+  assert.equal(at("D14"), 310, "ad spend corrected");
+  assert.equal(at("E14"), 31, "services corrected");
+  assert.equal(at("P14"), 405, "Reilly's clicks stay");
+  const ev = await evs(DB, "pnl.sheet_corrected");
+  assert.equal(ev.length, 1);
+  assert.match(ev[0].summary, /2026-10-13 adspend 300 → 310/);
+  assert.ok(JSON.parse(ev[0].data).backups.OCT, "backed up first");
+  // Older than 3 days: never re-checked.
+  await DB.prepare(`UPDATE pnl_days SET ads = 999 WHERE store = 'hc' AND day = '2026-10-11'`).run();
+  await runSheets(env, { nowMs: etMs("2026-10-16", 7), fetchImpl: g.fetchImpl });
+  assert.equal(at("D12"), 420.05);
 });

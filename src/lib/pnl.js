@@ -216,8 +216,11 @@ export async function actualCosts(db, storeId, day) {
 
 /* ---------------- Reilly's P&L sheet: gap filler ---------------- */
 
-/** A sheet read older than this is not used (rule 4); it is re-read hourly. */
-export const SHEET_MAX_AGE_MIN = 24 * 60;
+/**
+ * A sheet read older than this is not used (rule 4). The sheets are read once a day, in the
+ * morning run (decision pnl.sheets_schedule): a read stays good until the next morning, with slack.
+ */
+export const SHEET_MAX_AGE_MIN = 26 * 60;
 /** Sheet revenue may differ from the brain's by this much and still be "the same day". */
 export const SHEET_DAY_MATCH_USD = 1;
 /** A sheet COG under this share of the brain's own estimate is treated as partial (not used). */
@@ -243,7 +246,7 @@ export async function sheetDay(db, storeId, day, { nowMs = Date.now(), revenue =
   if (!row) { out.why.cog = out.why.fee = "no sheet row"; return out; }
   out.row = row;
   let block = null;
-  if (!row.seen_at || nowMs - Date.parse(row.seen_at) > SHEET_MAX_AGE_MIN * 60000) block = "sheet read is older than 24 h";
+  if (!row.seen_at || nowMs - Date.parse(row.seen_at) > SHEET_MAX_AGE_MIN * 60000) block = "sheet read is older than 26 h (it is read every morning)";
   else if (revenue == null || orders == null) block = "the brain's revenue for the day is unknown";
   else if (row.orders == null || row.revenue == null) block = "the sheet's revenue or orders are blank";
   else if (Number(row.orders) !== orders || Math.abs(Number(row.revenue) - revenue) > Math.max(SHEET_DAY_MATCH_USD, 0.01 * revenue)) {

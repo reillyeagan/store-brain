@@ -54,8 +54,19 @@ export const MISMATCH_EVENTS_PER_RUN = 15;
 export const RECOMPUTE_PER_RUN = 12;
 /** Sheet rows stored per run at most (a first full read of four workbooks is ~450 rows). */
 export const STORE_ROWS_PER_RUN = 200;
-/** Every month tab is re-read this often; the current and previous month every run. */
-export const FULL_READ_EVERY_MIN = 20 * 60;
+/**
+ * SCHEDULE. Reilly, 2026-10-14 (decision pnl.sheets_schedule): "P&L sheets only have to update
+ * once per day, in the monring, it should fill in yesterdays P&L. does not need to be hourly for
+ * the google sheets". So the read + write runs ONCE a day, from 07:00 New York (after the 05:00
+ * UTC day close, before the 08:00 brief). If yesterday isn't closed in the brain yet, it writes
+ * what is closed and tries again at each P&L slot until noon. A morning that was missed entirely
+ * still gets one run later that day.
+ */
+export const MORNING_TZ = "America/New_York";
+export const MORNING_FROM_HOUR = 7;
+export const MORNING_RETRY_UNTIL_HOUR = 12;
+/** How many days back the brain re-checks the cells it wrote (Google restates recent days). */
+export const CORRECT_DAYS = 3;
 /** Write planning per workbook per run (D1 work stays bounded; the rest next run). */
 export const PLAN_DAYS_PER_RUN = 10;
 export const PLAN_CELLS_PER_RUN = 40;
@@ -122,13 +133,11 @@ export async function readWorkbook(env, wb, { token, fetchImpl = fetch, nowMs = 
   const meta = await sheetMeta(wb.sheetId, opts);
   const setupTab = meta.tabs.find((t) => /^setup$/i.test(String(t).trim()));
   const months = monthTabs(meta.tabs);
-  const prev = await env.DB.prepare(`SELECT full_read_at FROM sheet_workbooks WHERE store = ?`).bind(wb.store).first().catch(() => null);
   const today = localDay(nowMs, wb.tz);
-  // Every month tab once a day (older months still get corrected by hand); the current and
-  // previous month every run.
-  const full = !(prev && prev.full_read_at) || nowMs - Date.parse(prev.full_read_at) > FULL_READ_EVERY_MIN * 60000;
-  const wanted = full ? months : [tabForMonth(months, today), tabForMonth(months, `${minusDays(`${today.slice(0, 7)}-01`, 1)}`)].filter(Boolean);
-  const tabs = [...new Set(wanted)];
+  // The run is once a day (Reilly, 2026-10-14), so every run reads EVERY month tab: one read
+  // costs the same 3 calls whatever the number of tabs. Freshness lasts until the next morning.
+  const full = true;
+  const tabs = [...new Set(months)];
   const ranges = [...(setupTab ? [a1(setupTab, "A1:B60")] : []), ...tabs.map((t) => a1(t, "A1:Z45"))];
   const formatted = await batchGet(wb.sheetId, ranges, "FORMATTED_VALUE", opts);
   const formulas = await batchGet(wb.sheetId, ranges, "FORMULA", opts);
@@ -500,12 +509,14 @@ const tzLabel = (text) => { const m = /\b([CEMP][DS]T)\b|\b(central|eastern|paci
  * Shopify's own timezone equals stores.js AND the sheet's hand-filled days are proven to use
  * the brain's day basis (dayBasis). A SETUP timezone label alone neither allows nor blocks it.
  */
-export async function brainValue(db, storeId, day, field, { pnl, setup, tz, today = null, dayOk = false, dayWhy = null }) {
+export async function brainValue(db, storeId, day, field, { pnl, setup, tz, today = null, dayOk = false, dayWhy = null, recentOk = false }) {
   const notes = safeJson(pnl.notes, {}) || {};
   const tzOk = dayOk === true;
   const tzWhy = dayWhy || "the sheet's day basis is not proven";
   // Google keeps adjusting the last days: ad numbers are written once they have settled.
-  const adsSettled = !today || day <= minusDays(today, ADS_COMPARE_AFTER_DAYS);
+  // Yesterday is filled the morning after (Reilly's schedule): its later restatements are put
+  // right by the correction pass (CORRECT_DAYS). Other recent days wait until they settle.
+  const adsSettled = !today || recentOk || day === minusDays(today, 1) || day <= minusDays(today, ADS_COMPARE_AFTER_DAYS);
   const adsWhy = `ad numbers settle after ${ADS_COMPARE_AFTER_DAYS} days`;
   switch (field) {
     case "revenue": {
@@ -598,6 +609,13 @@ export async function writeCells(env, wb, plan, { token, fetchImpl = fetch, nowM
       const colIdx = p.cell.replace(/\d+$/, "").split("").reduce((n, c) => n * 26 + c.charCodeAt(0) - 64, 0) - 1;
       const fv = s.formatted[colIdx], fo = s.formulas[colIdx];
       const blank = (v) => v == null || String(v).trim() === "";
+      // A correction: only if the cell still holds EXACTLY what the brain wrote (Reilly didn't touch it).
+      if (p.expect != null) {
+        const sameDayC = (parseSheetDate(s.formatted[0]) || parseSheetDate(s.formulas[0])) === p.day;
+        const isFormula = typeof fo === "string" && fo.trim().startsWith("=");
+        const cur = parseMoney(blank(fo) ? fv : fo);
+        return sameDayC && !isFormula && close(cur, p.expect);
+      }
       // The row must still be that day (a row inserted above it would shift everything down).
       const sameDay = (parseSheetDate(s.formatted[0]) || parseSheetDate(s.formulas[0])) === p.day;
       return sameDay && blank(fv) && blank(fo);
@@ -643,11 +661,21 @@ export async function writeCells(env, wb, plan, { token, fetchImpl = fetch, nowM
   }
   await runBatch(db, written.map((w) => db.prepare(`UPDATE sheet_writes SET verified = ?, status = ? WHERE id = ?`).bind(w.verified ? 1 : 0, w.verified ? "verified" : "unverified", w.id)));
   const ok = written.filter((w) => w.verified), bad = written.filter((w) => !w.verified);
-  await logEvent(db, {
-    actor: ACTOR, kind: "pnl.sheet_written", store: wb.store === "all" ? null : wb.store, target: "sys.sheets",
-    summary: `${wb.name}: filled ${ok.length} blank cell${ok.length === 1 ? "" : "s"} (${[...new Set(ok.map((w) => w.day))].sort().join(", ")}), each confirmed by a re-read; backup ${Object.values(backups).join(", ")}`,
-    data: { cells: ok.map((w) => ({ tab: w.tab, cell: w.cell, day: w.day, field: w.field, value: w.value })), backups }, at,
-  });
+  const filled = ok.filter((w) => w.expect == null), corrected = ok.filter((w) => w.expect != null);
+  if (filled.length || !corrected.length) {
+    await logEvent(db, {
+      actor: ACTOR, kind: "pnl.sheet_written", store: wb.store === "all" ? null : wb.store, target: "sys.sheets",
+      summary: `${wb.name}: filled ${filled.length} blank cell${filled.length === 1 ? "" : "s"} (${[...new Set(filled.map((w) => w.day))].sort().join(", ")}), each confirmed by a re-read; backup ${Object.values(backups).join(", ")}`,
+      data: { cells: filled.map((w) => ({ tab: w.tab, cell: w.cell, day: w.day, field: w.field, value: w.value })), backups }, at,
+    });
+  }
+  if (corrected.length) {
+    await logEvent(db, {
+      actor: ACTOR, kind: "pnl.sheet_corrected", store: wb.store === "all" ? null : wb.store, target: "sys.sheets",
+      summary: `${wb.name}: corrected ${corrected.length} cell${corrected.length === 1 ? "" : "s"} the brain wrote earlier (${corrected.map((w) => `${w.day} ${w.field} ${w.expect} → ${w.value}`).join(", ")}), each still untouched by hand and confirmed by a re-read; backup ${Object.values(backups).join(", ")}`,
+      data: { cells: corrected.map((w) => ({ tab: w.tab, cell: w.cell, day: w.day, field: w.field, before: w.expect, after: w.value })), backups }, at,
+    });
+  }
   if (bad.length) {
     const readFailed = bad.some((w) => w.read_failed);
     await logEvent(db, {
@@ -685,6 +713,35 @@ export async function planStore(db, wb, read, { nowMs = Date.now(), maxDays = PL
     }
   }
   return { plan, skipped };
+}
+
+/**
+ * Corrections: cells the BRAIN wrote for the last CORRECT_DAYS days whose brain value has since
+ * changed (e.g. Google restated the ad spend). Planned with `expect` = what the brain wrote, so
+ * writeCells only changes a cell that still holds exactly that (Reilly's edits always win).
+ */
+export async function planCorrections(db, wb, read, { nowMs = Date.now(), dayOk = false, dayWhy = null } = {}) {
+  const today = localDay(nowMs, wb.tz);
+  const since = minusDays(today, CORRECT_DAYS);
+  const { results } = await db.prepare(
+    `SELECT tab, cell, day, field, value, id FROM sheet_writes WHERE store = ? AND status = 'verified' AND day >= ? AND day < ? ORDER BY id DESC`
+  ).bind(wb.store, since, today).all();
+  const latest = new Map();
+  for (const w of results || []) if (!latest.has(`${w.tab}|${w.cell}`)) latest.set(`${w.tab}|${w.cell}`, w);
+  const plan = [];
+  for (const w of latest.values()) {
+    const m = read.months.find((x) => x.tab === w.tab);
+    const d = m && m.days.find((x) => x.day === w.day);
+    if (!d || d.cells[w.field] !== w.cell) continue;
+    // What the sheet holds now (from this morning's read): only cells still equal to the brain's write.
+    if (!close(d.values[w.field], w.value) || (d.formulas || []).includes(w.field)) continue;
+    const pnl = await db.prepare(`SELECT * FROM pnl_days WHERE store = ? AND day = ? AND complete = 1`).bind(wb.store, w.day).first();
+    if (!pnl) continue;
+    const v = await brainValue(db, wb.store, w.day, w.field, { pnl, setup: read.setup, tz: wb.tz, today, dayOk, dayWhy, recentOk: true });
+    if (v.skip || v.value == null || close(v.value, w.value)) continue;
+    plan.push({ tab: w.tab, day: w.day, row_no: d.row_no, field: w.field, cell: w.cell, value: v.value, expect: Number(w.value) });
+  }
+  return plan;
 }
 
 /** Ecom P&L: blank inputs get the sum of the three store sheets; filled ones are checked against it. */
@@ -809,6 +866,8 @@ export async function runSheets(env, { fetchImpl = fetch, nowMs = Date.now(), ca
         if (!budget.has(WRITE_CALLS)) { out.written[wb.store] = "call budget for this run used up"; continue; }
       }
       const { plan, skipped } = wb.store === "all" ? await planEcom(db, read, { nowMs }) : await planStore(db, wb, read, { nowMs, ...gate });
+      // Same write batch: corrections of the brain's own recent cells (one backup, one write, one re-read).
+      if (wb.store !== "all") plan.push(...(await planCorrections(db, wb, read, { nowMs, ...gate })));
       const r = await writeCells(env, wb, plan, { token, fetchImpl, nowMs });
       const ok = (r.written || []).filter((w) => w.verified).length;
       out.written[wb.store] = ok;
@@ -830,6 +889,81 @@ export async function runSheets(env, { fetchImpl = fetch, nowMs = Date.now(), ca
     }
   }
   return out;
+}
+
+/* ---------------- the morning schedule ---------------- */
+
+const hourIn = (ms, tz) => Number(new Intl.DateTimeFormat("en-US", { timeZone: tz, hour: "numeric", hourCycle: "h23" }).format(new Date(ms)));
+const lastRun = async (db, job) => (await db.prepare(`SELECT last_run_at, last_result FROM job_runs WHERE job = ?`).bind(job).first().catch(() => null)) || null;
+
+/**
+ * Is the morning run due? Once a day from 07:00 New York. "pnl.sheets.morning" = last attempt,
+ * "pnl.sheets.done" = the day yesterday was filled (every live store's yesterday closed and the
+ * run finished). Before noon an unfinished morning is retried at each P&L slot; after noon only a
+ * day with NO attempt yet gets its one run.
+ */
+export async function sheetsDue(db, nowMs = Date.now()) {
+  const today = localDay(nowMs, MORNING_TZ);
+  const hour = hourIn(nowMs, MORNING_TZ);
+  if (hour < MORNING_FROM_HOUR) return { due: false, why: "before 07:00 New York" };
+  const done = await lastRun(db, "pnl.sheets.done");
+  if (done && done.last_run_at && localDay(done.last_run_at, MORNING_TZ) === today) return { due: false, why: "done for today" };
+  const tried = await lastRun(db, "pnl.sheets.morning");
+  const triedToday = !!(tried && tried.last_run_at && localDay(tried.last_run_at, MORNING_TZ) === today);
+  if (triedToday && hour >= MORNING_RETRY_UNTIL_HOUR) return { due: false, why: "retries stop at noon; next run tomorrow 07:00" };
+  return { due: true, why: triedToday ? "retry: yesterday was not closed yet" : "morning run" };
+}
+
+const mark = (db, job, at, result) => db.prepare(
+  `INSERT INTO job_runs (job, last_run_at, last_result) VALUES (?, ?, ?) ON CONFLICT(job) DO UPDATE SET last_run_at = excluded.last_run_at, last_result = excluded.last_result`
+).bind(job, at, String(result).slice(0, 300)).run();
+
+/** The P&L slot's entry point: runs runSheets only when the morning run is due, and records it. */
+export async function runSheetsMorning(env, { fetchImpl = fetch, nowMs = Date.now(), calls = null } = {}) {
+  const db = env.DB;
+  const due = await sheetsDue(db, nowMs);
+  if (!due.due) return { ran: false, reason: due.why };
+  const at = nowIso(nowMs);
+  await mark(db, "pnl.sheets.morning", at, due.why);
+  const out = await runSheets(env, { fetchImpl, nowMs, calls });
+  // Done when every live store with a workbook has yesterday CLOSED in the brain (so its row
+  // could be filled) and its workbook was read this run. Otherwise: retry next slot, until noon.
+  const stores = LIVE_STORE_IDS.filter((id) => STORES[id].pnlSheetId);
+  const open = [];
+  for (const id of stores) {
+    const y = minusDays(localDay(nowMs, storeTz(id)), 1);
+    const row = await db.prepare(`SELECT complete FROM pnl_days WHERE store = ? AND day = ?`).bind(id, y).first();
+    if (!row || !row.complete || !(out.read || []).includes(id)) open.push(`${id} ${y}`);
+  }
+  const result = open.length ? `ran; waiting on ${open.join(", ")}` : "ran; yesterday filled";
+  await db.prepare(`UPDATE job_runs SET last_result = ? WHERE job = 'pnl.sheets.morning'`).bind(result).run();
+  if (!open.length) await mark(db, "pnl.sheets.done", at, result);
+  return { ran: true, ...out, waiting_on: open };
+}
+
+/** When the next morning run will be, in words and as an ISO time when it is a fixed time. */
+export async function sheetsSchedule(db, nowMs = Date.now()) {
+  const due = await sheetsDue(db, nowMs);
+  const morning = await lastRun(db, "pnl.sheets.morning");
+  const done = await lastRun(db, "pnl.sheets.done");
+  const hour = hourIn(nowMs, MORNING_TZ);
+  const today = localDay(nowMs, MORNING_TZ);
+  const at7 = (day) => {
+    // 07:00 New York on `day`, as a UTC instant (EDT/EST handled by the formatter).
+    for (let h = 10; h <= 13; h++) { const ms = Date.parse(`${day}T${String(h).padStart(2, "0")}:00:00Z`); if (hourIn(ms, MORNING_TZ) === MORNING_FROM_HOUR) return new Date(ms).toISOString(); }
+    return null;
+  };
+  let next;
+  if (due.due) next = "at the next P&L slot (within the hour)";
+  else if (hour < MORNING_FROM_HOUR) next = at7(today);
+  else next = at7(minusDays(today, -1));
+  return {
+    rule: "once a day from 07:00 New York (after the 05:00 UTC day close, before the 08:00 brief): fills yesterday, retries until noon if yesterday isn't closed yet",
+    decision: "pnl.sheets_schedule",
+    last_run_at: morning ? morning.last_run_at : null, last_result: morning ? morning.last_result : null,
+    last_done_at: done ? done.last_run_at : null,
+    next_run: next, status: due.why,
+  };
 }
 
 /* ---------------- state for /api/dept/pnl ---------------- */
@@ -870,6 +1004,7 @@ export async function sheetsState(env, { nowMs = Date.now() } = {}) {
   return {
     mode: sheetsWriteOn(env) ? WRITER_MODE : "off: SHEETS_WRITE kill switch set (reads and cross-checks continue)",
     write: sheetsWriteOn(env) ? "on (SHEETS_WRITE=0, false or off stops it)" : "off (SHEETS_WRITE kill switch)",
+    schedule: await sheetsSchedule(db, nowMs),
     workbooks: books,
     cells_written_today: await n(`SELECT COUNT(*) AS n FROM sheet_writes WHERE written_at >= ? AND status = 'verified'`, `${since}T00:00:00`),
     cells_written_total: await n(`SELECT COUNT(*) AS n FROM sheet_writes WHERE status = 'verified'`),

@@ -10,8 +10,10 @@
  * nothing until KFB bills exist) · calendar hourly (each reminder/trigger at most once a day)
  * · Analyst once a day, from 06:00 UTC (after the 05:00 UTC day close) · Guy's fee daily
  * (end-date questions asked once, the fee check once a month per store)
- * · Google Ads history backfill hourly until done (≤ 3 calls per store) · P&L Sheets hourly
- *   (reads the workbooks, fills the brain's gaps, cross-checks, then fills blank sheet cells).
+ * · Google Ads history backfill hourly until done (≤ 3 calls per store) · P&L Sheets ONCE A DAY
+ *   from 07:00 New York (decision pnl.sheets_schedule): reads the workbooks, fills the brain's
+ *   gaps, cross-checks, fills yesterday's row and corrects the brain's own recent cells; retried
+ *   at each slot until noon while yesterday isn't closed (sheets.js runSheetsMorning).
  * Shadow: everything stays in the ledger, except the P&L Sheets writes, which Reilly asked for
  * directly (2026-10-14) and which SHEETS_WRITE = "0" stops. AI: one capped Analyst call a day at most.
  */
@@ -21,7 +23,7 @@ import { pullFunnel, funnelState } from "./funnel.js";
 import { matchBills, cogsState } from "./cogs.js";
 import { runCalendar, calendarState } from "./calendar.js";
 import { runAnalyst, analystState } from "./analyst.js";
-import { runSheets, sheetsState } from "./sheets.js";
+import { runSheetsMorning, sheetsState } from "./sheets.js";
 import { runAdsHistory, adsHistoryState } from "../../lib/adsHistory.js";
 import { historyExtensionState } from "../../lib/historyExtend.js";
 import { callBudget } from "../../lib/callBudget.js";
@@ -33,7 +35,6 @@ export const PNL_EXTRA_JOBS = Object.freeze({
   "pnl.calendar": 60,
   "pnl.analyst": 24 * 60,
   "pnl.ads_history": 60,
-  "pnl.sheets": 60,
   // Guy's fee: end-date questions (asked once) + the monthly fee check (once a month per store).
   "pnl.guy_fee": 24 * 60,
 });
@@ -74,7 +75,8 @@ export async function runPnlExtras(env, { nowMs = Date.now(), fetchImpl = fetch 
     : "not due";
   // Ads history before the sheets, so the sheet cross-check sees the API's rows as soon as they land.
   out.ads_history = await step(env, "pnl.ads_history", "pnl.pullers", nowMs, () => runAdsHistory(env, { nowMs, fetchImpl, calls }));
-  out.sheets = await step(env, "pnl.sheets", "pnl.sheets", nowMs, () => runSheets(env, { nowMs, fetchImpl, calls }));
+  // Once a day in the morning: its own daily claim (job_runs pnl.sheets.morning / pnl.sheets.done).
+  out.sheets = await guarded(env.DB, "pnl.sheets", "pnl_sheets", nowMs, () => runSheetsMorning(env, { nowMs, fetchImpl, calls }));
   out.calls_used = calls.used;
   return out;
 }
