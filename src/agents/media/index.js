@@ -14,6 +14,7 @@
  *   media.products.<store>      daily      (1 Ads call)
  *   media.season.<store>        daily      (1 Ads call)
  *   media.conversions.<store>   every 6h   (D1 only)
+ *   media.spend_alarm.<store>   hourly     (D1 only: spend vs orders, stopped spending)
  *   media.budget                daily      (D1 only + at most 1 Claude call)
  * At most MEDIA_MAX_ADS_CALLS (default 6) Google Ads requests per run; what doesn't fit runs
  * in the next hourly run. A job is claimed only when it can run whole. Capacity: 6 calls an
@@ -38,6 +39,7 @@ import { runProducts } from "./products.js";
 import { runSeason } from "./season.js";
 import { runConversions } from "./conversions.js";
 import { runBudget, trackRecord } from "./budget.js";
+import { runSpendAlarm } from "./spendAlarm.js";
 import { latestRead } from "./reads.js";
 
 export const DEFAULT_MAX_ADS_CALLS = 6;
@@ -50,6 +52,8 @@ export const STORE_AGENTS = Object.freeze([
   { agent: "media.search_terms", everyMin: 1440, ads: true, run: runSearchTerms },
   { agent: "media.products", everyMin: 1440, ads: true, run: runProducts },
   { agent: "media.season", everyMin: 1440, ads: true, run: runSeason },
+  // D1 only. 55 min so it judges on every hourly Media run (the claim is only an overlap guard).
+  { agent: "media.spend_alarm", everyMin: 55, ads: false, run: runSpendAlarm },
 ]);
 export const BUDGET_JOB = Object.freeze({ agent: "media.budget", job: "media.budget", everyMin: 1440 });
 
@@ -189,6 +193,8 @@ export async function mediaState(env, { nowMs = Date.now() } = {}) {
       pnl_roas: cost && pnl && Number(pnl.n) ? r2(Number(pnl.rev) / cost) : null, // Shopify revenue (all channels) / ad spend
       breakeven: be.breakeven, breakeven_estimated: be.estimated, breakeven_label: breakevenLabel(be), breakeven_note: be.reason, revenue_cap: cap,
       flagged_campaigns: await openFindings(db, id, "media.performance", 10),
+      // Spend alarm: today's alarm (one a day at most) or why it can't check.
+      spend_alarm: await openFindings(db, id, "media.spend_alarm", 3),
       wasted_terms: (wasted || []).map((w) => ({ title: w.title, ...(parse(w.detail) || {}) })),
       product_burners: await openFindings(db, id, "media.products", 10),
       season: await openFindings(db, id, "media.season", 10),

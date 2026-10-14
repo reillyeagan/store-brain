@@ -33,6 +33,42 @@ export const PARCEL_TRACKING_DECISION = Object.freeze({
 export const GUY_FEE = Object.freeze({ rate: 0.10, start: "2026-09-07" });
 
 /**
+ * Spend alarm (media.spend_alarm): "money is going out and nothing is coming in", or "the
+ * money stopped going out". Watch only: it raises one alarm per store per day, never touches
+ * the ad account (Guy runs the ads). Numbers are in the ad account's currency (USD today).
+ * Why each threshold (none came from Reilly; change them here, per store if needed):
+ *  - noOrdersMinSpend 40: about two-thirds of a normal day's spend on one store (H&C ran ~$60/day
+ *    in Aug-Sep, Vault Brain State 08-28). $40 gone with not one order is not noise.
+ *  - noOrdersFromHour 15: "by mid-afternoon" in the STORE's timezone. Mornings are thin; by 3 pm
+ *    a store spending $40+ has nearly always had an order.
+ *  - usualMultiple 2 + usualDays 14: today's spend already over 2x a normal FULL day (median of
+ *    the last 14 closed days) with no orders is an alarm at any hour: a budget doubled or a
+ *    campaign ran away (Auberlane spent 85-95 clicks/day with 0 orders on 10-11/12, Memory Log 10-13).
+ *  - stoppedMinUsual 15 + stoppedNormalDays 5 of 7: an account counts as "normally spending"
+ *    when its median closed day is $15+ and at least 5 of the last 7 closed days spent anything.
+ *    Then a closed day at $0, or $0 so far today after stoppedFromHour (13, account time), is an
+ *    alarm: billing failed or a campaign was paused (Auberlane stopped spending 09-27 unnoticed).
+ * A stale ads feed (or orders feed, for the zero-orders checks) is never judged: the alarm says
+ * "can't check" instead (rule 4). Zero orders from a stale feed is not a claim.
+ */
+export const SPEND_ALARM = Object.freeze({
+  noOrdersMinSpend: 40,
+  noOrdersFromHour: 15,
+  usualMultiple: 2,
+  usualDays: 14,
+  stoppedMinUsual: 15,
+  stoppedNormalDays: 5,
+  stoppedWindow: 7,
+  stoppedFromHour: 13,
+  perStore: {}, // e.g. { aub: { noOrdersMinSpend: 25 } } — overrides for one store only
+});
+/** The alarm thresholds for one store (defaults + that store's overrides). */
+export function spendAlarmConfig(storeId) {
+  const { perStore, ...base } = SPEND_ALARM;
+  return { ...base, ...((perStore && perStore[storeId]) || {}) };
+}
+
+/**
  * Who each store sells to (`audience` on each store below): "men", "women", "both", or null
  * when unknown (null is "not told", never a default). The Size Checker reads it.
  * Reilly, 2026-10-13: "H&C is mens and womens. Auberlane is womens. Marlowe is mens."

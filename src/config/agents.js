@@ -43,6 +43,7 @@ export const AGENTS = Object.freeze([
   a("media.season", "media", "Keyword & Season", "ai", "L2", "built"),
   a("media.guy_monitor", "media", "Guy Monitor", "code", "L1", "built"),
   a("media.conversions", "media", "Conversion Integrity", "code", "L0", "built"),
+  a("media.spend_alarm", "media", "Spend Alarm", "code", "L2", "built"),
 
   // Customer service
   a("cs.triage", "cs", "Inbox Triage", "ai", "L2", "built"),
@@ -155,6 +156,7 @@ export const AGENT_DOES = Object.freeze({
   "media.season": "Watches keywords and seasonal demand.",
   "media.guy_monitor": "Watches what Guy changes in the ad accounts and logs it.",
   "media.conversions": "Checks that conversion tracking matches real orders.",
+  "media.spend_alarm": "Raises one alarm a day when a store spends with no orders, or an account that normally spends stops (watch only).",
   "cs.triage": "Reads every store inbox and sorts each email by what it needs.",
   "cs.order_context": "Matches each email to its order, tracking and history.",
   "cs.reply_writer": "Drafts replies into Gmail for Reilly to review and send.",
