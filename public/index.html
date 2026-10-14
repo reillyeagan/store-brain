@@ -886,7 +886,8 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
       '<select class="fld" id="scStore"><option value="hc">Holt &amp; Crane</option><option value="aub">Auberlane</option><option value="mar">Marlowe Standard</option></select>'+
       '<input class="fld" id="scHandle" placeholder="product handle or link" style="min-width:220px">'+
       '<select class="fld" id="scUnit"><option value="cm">cm</option><option value="in">inches</option></select>'+
-      '<label><input type="checkbox" id="scFlat"> measured flat (half chest)</label></div>'+
+      '<label><input type="checkbox" id="scFlat"> measured flat (half chest)</label>'+
+      '<label title="Only needed when you already confirmed a chart for this product"><input type="checkbox" id="scReplace"> Replace confirmed chart</label></div>'+
       '<textarea class="fld" id="scRows" style="margin-top:8px" placeholder="M 110 48 80 60&#10;L 115 49 81 61&#10;XL 120 50 82 62"></textarea>'+
       '<div class="note">One size per line. Column order: size chest shoulder length sleeve (add waist as a 6th number for dresses). Use - for a number the chart does not give.</div>'+
       '<div class="btns"><button class="btn p" data-sc="paste">Save chart</button></div>'+
@@ -926,18 +927,18 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
     if(b.dataset.scconfirm){ scPost("/api/size-charts/"+encodeURIComponent(b.dataset.scconfirm)+"/confirm",{},b,function(){return "Confirmed. The size check now treats this chart as checked."}); return; }
     var store=$("#scStore").value, handle=$("#scHandle").value.trim();
     if(!handle){ scOut(false,"Add the product handle (or paste the product link)."); return; }
-    var said=function(j){ var n=(j.rows||[]).length; return "Saved chart #"+j.id+" ("+n+" sizes, not yet checked)."+(j.resolved?"":" The handle is not in the catalog copy yet; it still matches orders by handle.")+(j.notes&&j.notes.length?" "+j.notes.join("; ")+".":""); };
+    var said=function(j){ var n=(j.rows||[]).length; return "Saved chart #"+j.id+" ("+n+" sizes, not yet confirmed: no KFB size ask is made from it until you press Confirm)."+(j.resolved?"":" The handle is not in the catalog copy yet; it still matches orders by handle.")+(j.notes&&j.notes.length?" "+j.notes.join("; ")+".":""); };
     if(b.dataset.sc==="paste"){
       var rows=scParse($("#scRows").value);
       if(rows.length<2){ scOut(false,"Add at least 2 sizes, one per line."); return; }
-      scPost("/api/size-charts",{store:store,product_handle:handle,unit:$("#scUnit").value,flat:$("#scFlat").checked,rows:rows},b,said);
+      scPost("/api/size-charts",{store:store,product_handle:handle,unit:$("#scUnit").value,flat:$("#scFlat").checked,replace:$("#scReplace").checked,rows:rows},b,said);
     } else if(b.dataset.sc==="image"){
       var f=$("#scImg").files&&$("#scImg").files[0];
       if(!f){ scOut(false,"Choose an image first."); return; }
-      if(f.size>5000000){ scOut(false,"That image is over 5 MB."); return; }
+      if(f.size>3932160){ scOut(false,"That image is over 3.75 MB (the limit once it is encoded). Crop it to the chart or save it smaller."); return; }
       var rd=new FileReader();
       rd.onload=function(){ var data=String(rd.result||"").replace(/^data:[^,]*,/,""); scOut(true,"Reading the chart…");
-        scPost("/api/size-charts/image",{store:store,product_handle:handle,image_base64:data,media_type:f.type},b,said); };
+        scPost("/api/size-charts/image",{store:store,product_handle:handle,image_base64:data,media_type:f.type,replace:$("#scReplace").checked},b,said); };
       rd.onerror=function(){ scOut(false,"Could not read that file."); };
       rd.readAsDataURL(f);
     }

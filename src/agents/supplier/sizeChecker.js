@@ -20,15 +20,19 @@
  *
  * Logic (size EQUIVALENCE, spec "Fit rule"):
  *  - The line is matched to a US reference by (audience, garment, fit): e.g. women's coat,
- *    regular fit. Each reference declares the measurements that matter (coat/blazer chest +
+ *    regular fit. Each reference declares the measurements compared (coat/blazer chest +
  *    shoulder, women's knit chest only, men's knit chest + length, dress chest + waist, any
  *    relaxed fit chest only). A Chinese size "is" the US size ordered on a measurement when it
  *    reaches the reference for that size (minus a small tolerance).
- *  - Ship the smallest Chinese size that matches on EVERY measurement that matters. When the
- *    measurements disagree, the reason says which said what. The reason names the reference.
+ *  - The CHEST decides: ship the smallest Chinese size whose chest reaches the reference. A wrong
+ *    size-up is the costly error (the customer gets a too-big item), so shoulder, length, sleeve
+ *    and waist shortfalls are notes (conflict=1), never a size-up on their own. The reason says
+ *    which measurement said what, and names the reference.
  *  - Oversized / relaxed garments are compared ONLY against the relaxed reference, and are never
- *    sized up just for being oversized: if the ordered Chinese size already reaches the REGULAR
- *    chest, it ships as ordered.
+ *    sized up just for being oversized: a size-up is capped at what the REGULAR-fit chest needs.
+ *  - Only a CONFIRMED chart (or the complaints logic) makes a KFB ask; an unconfirmed chart's
+ *    size-up is recorded as "pending your chart confirm". A pending ask that no longer holds is
+ *    withdrawn, never deleted.
  *  - Never above the factory's largest size: nothing fits → "no_fit" (customer message needed).
  *  - Customer complaints for the product → treated as running small even if the chart looks
  *    fine; the size-up is learned from what customers said fit.
@@ -297,14 +301,20 @@ export function recommendSize({ title, orderedSize, chartRows, complaints = [], 
     said.push(`${m}: ${asOrdered}; US ${ordered} needs ~${need}cm → ${fit ? `Chinese ${fit}` : "no factory size reaches it"}`);
   }
   const measured = Object.keys(picks);
-  if (!measured.length) return { verdict: "no_chart", send_size: null, reason: `chart has none of the measurements that matter ${vs} (${key.join(", ")})`, conflict: false };
+  // The CHEST decides the size (review of 1e5fd64: a wrong size-up is the costly error, so it
+  // needs strong evidence). Shoulder, length, sleeve and waist are reported as notes, and never
+  // force a size-up on their own.
+  if (!("chest" in picks)) {
+    return { verdict: "no_chart", send_size: null, conflict: false,
+      reason: `chart has no chest measurement ${vs}: the chest decides the size, so no guess${said.length ? ` (${said.join("; ")})` : ""}` };
+  }
 
   // Oversized / relaxed: never sized up just for being an oversized cut. The extra room the
   // relaxed reference expects is a style choice, so a size-up is capped at what the REGULAR-fit
   // chest needs: if the ordered Chinese size reaches the regular chest it ships as ordered, and a
   // chart that is genuinely small goes up only as far as the regular chest says.
   let oversizeNote = "";
-  if (line.fit === "relaxed" && "chest" in picks && (picks.chest === null || sizeIndex(picks.chest) > sizeIndex(ordered))) {
+  if (line.fit === "relaxed" && (picks.chest === null || sizeIndex(picks.chest) > sizeIndex(ordered))) {
     const reg = line.regularTable && line.regularTable[ordered] && line.regularTable[ordered].chest;
     const regPick = reg == null ? null : sizes.find((s) => chart[s].chest != null && chart[s].chest >= reg - TOLERANCE.chest);
     if (regPick && (picks.chest === null || sizeIndex(regPick) < sizeIndex(picks.chest))) {
@@ -316,18 +326,22 @@ export function recommendSize({ title, orderedSize, chartRows, complaints = [], 
   }
 
   const largest = sizes[sizes.length - 1];
-  if (measured.some((m) => !picks[m])) {
+  if (!picks.chest) {
     return { verdict: "no_fit", send_size: null, conflict: false, reference: line.name,
-      reason: `${vs}: nothing up to the factory's largest (${largest}) fits a US ${ordered}: ${said.join("; ")}. Customer message needed.${garmentNote}` };
+      reason: `${vs}: no chest up to the factory's largest (${largest}) fits a US ${ordered}: ${said.join("; ")}. Customer message needed.${garmentNote}` };
   }
-  let sendIdx = Math.max(...measured.map((m) => sizeIndex(picks[m])));
+  let sendIdx = sizeIndex(picks.chest);
   // Never send smaller than ordered: a chart that runs large is noted, not acted on.
   const chartBelowOrdered = sendIdx < sizeIndex(ordered);
   if (chartBelowOrdered) sendIdx = sizeIndex(ordered);
-  const distinct = new Set(measured.map((m) => picks[m]));
-  const conflict = distinct.size > 1;
+  // Other measurements that fall short of the size the chest chose: a conflict, noted only.
+  const short = measured.filter((m) => m !== "chest" && (picks[m] === null || sizeIndex(picks[m]) > sendIdx));
+  const conflict = short.length > 0;
   let why = `${vs}: ${said.join("; ")}${oversizeNote}`;
-  if (conflict) why += `. Measurements disagree (${measured.map((m) => `${m} says ${picks[m]}`).join(", ")}): shipping ${SIZE_ORDER[sendIdx]} so it fits on all of them`;
+  if (conflict) {
+    why += `. Measurements disagree (chest says ${SIZE_ORDER[sendIdx]}, ${short.map((m) => `${m} says ${picks[m] || "none fits"}`).join(", ")}): ` +
+      `the chest decides (${SIZE_ORDER[sendIdx]}); the ${short.join(" and ")} shortfall is noted only, never a size-up on its own`;
+  }
 
   if (shift > 0) {
     const fromComplaints = sizeIndex(ordered) + shift;
@@ -351,9 +365,9 @@ export function recommendSize({ title, orderedSize, chartRows, complaints = [], 
     if (chartBelowOrdered) {
       return out({ verdict: "runs_large", send_size: ordered, conflict, reason: `${why}. Runs large: shipped as ordered (the brain never sends smaller than ordered)${garmentNote}` });
     }
-    // Would one size smaller also match? Then it runs large: noted, still shipped as ordered.
+    // Would one size smaller also match on the chest? Then it runs large: noted, still shipped as ordered.
     const smaller = sizes.filter((s) => sizeIndex(s) < sizeIndex(ordered)).pop();
-    const runsLarge = !oversizeNote && smaller && measured.every((m) => chart[smaller][m] != null && reference[ordered][m] != null && chart[smaller][m] >= reference[ordered][m] - TOLERANCE[m]);
+    const runsLarge = !oversizeNote && smaller && chart[smaller].chest != null && chart[smaller].chest >= reference[ordered].chest - TOLERANCE.chest;
     if (runsLarge) return out({ verdict: "runs_large", send_size: ordered, conflict, reason: `${why}. Chinese ${smaller} would also fit: runs large, shipped as ordered (sizing down is not automated)${garmentNote}` });
     return out({ verdict: "as_ordered", send_size: ordered, conflict, reason: `${why}. True to size: ship as ordered${garmentNote}` });
   }
@@ -406,9 +420,40 @@ export async function coreSizing(db, store) {
   return out;
 }
 
+/** How an unconfirmed chart is named in a reason, from where its rows came from. */
+export function chartStatusNote(chartRows) {
+  const src = (chartRows || []).map((r) => String(r.source || "")).join(" ");
+  if (/from an image/i.test(src)) return "chart read by the brain from an image, not yet confirmed";
+  if (/pasted/i.test(src)) return "chart pasted by Reilly, not yet confirmed";
+  return "chart not yet confirmed by Reilly";
+}
+
 /**
- * Check new order lines. Bounded per run; a line is decided once, except "no_chart" /
- * "no_reference" lines, which are re-checked while recent (a chart may have arrived).
+ * Make a product's recent lines (last LOOKBACK_DAYS, every verdict) due again, so the next run
+ * re-decides them. Used when a chart is saved, replaced or confirmed: fixing a chart must undo
+ * what the wrong chart decided.
+ */
+export async function markProductDue(db, { store, productIds = [], handle = null, nowMs = Date.now() }) {
+  const since = nowIso(nowMs - LOOKBACK_DAYS * 86400000);
+  const ids = productIds.length ? productIds : [""];
+  const marks = ids.map(() => "?").join(",");
+  const r = await db.prepare(
+    `UPDATE size_recommendations SET checked_at = '' WHERE store = ?
+       AND (product_id IN (${marks}) OR (product_handle IS NOT NULL AND product_handle = ?))
+       AND line_id IN (SELECT l.line_id FROM order_lines l JOIN orders o ON o.store = l.store AND o.order_id = l.order_id
+                        WHERE l.store = ? AND o.created_at >= ?)`
+  ).bind(store, ...ids, handle || "", store, since).run();
+  return (r.meta && r.meta.changes) || 0;
+}
+
+/**
+ * Check new order lines. Bounded per run; a line is decided once, except: "no_chart" /
+ * "no_reference" lines are re-checked while recent (a chart may have arrived), and any line made
+ * due by markProductDue (checked_at = '') is re-decided whatever its verdict.
+ *
+ * KFB asks: only a CONFIRMED chart (or the complaints logic) makes one. A size-up read from an
+ * unconfirmed chart is recorded as "pending your chart confirm". A pending ask that no longer
+ * holds is withdrawn (status 'withdrawn', reason appended to `why`), never deleted.
  */
 export async function runSizeChecker(env, { nowMs = Date.now() } = {}) {
   const db = env.DB;
@@ -422,16 +467,16 @@ export async function runSizeChecker(env, { nowMs = Date.now() } = {}) {
        LEFT JOIN size_recommendations r ON r.store = l.store AND r.line_id = l.line_id
       WHERE l.store IN (${marks}) AND o.created_at >= ? AND l.size IS NOT NULL
         AND COALESCE(o.financial_status, '') NOT IN ('refunded', 'voided')
-        AND (r.line_id IS NULL OR (r.verdict IN ('no_chart', 'no_reference') AND r.checked_at < ?))
+        AND (r.line_id IS NULL OR r.checked_at = '' OR (r.verdict IN ('no_chart', 'no_reference') AND r.checked_at < ?))
       ORDER BY (r.line_id IS NULL) DESC, o.created_at LIMIT ?`
   ).bind(...LIVE_STORE_IDS, since, nowIso(nowMs - RECHECK_HOURS * 3600000), MAX_LINES_PER_RUN).all();
 
   const core = {};
-  const counts = {}; let asks = 0; let changed = 0;
+  const counts = {}; let asks = 0; let changed = 0; let withdrawn = 0; let updatedAsks = 0;
   for (const l of lines || []) {
     core[l.store] = core[l.store] || await coreSizing(db, l.store);
     const { results: chartRows } = await db.prepare(
-      `SELECT size_label, measurements, verified FROM size_charts WHERE store = ? AND (product_id = ? OR (product_handle IS NOT NULL AND product_handle = ?))`
+      `SELECT size_label, measurements, verified, source FROM size_charts WHERE store = ? AND (product_id = ? OR (product_handle IS NOT NULL AND product_handle = ?))`
     ).bind(l.store, l.product_id || "", l.product_handle || "").all();
     const { results: complaints } = await db.prepare(
       `SELECT size_ordered, size_that_fits, said FROM size_complaints WHERE store = ? AND product_id = ?`
@@ -442,13 +487,32 @@ export async function runSizeChecker(env, { nowMs = Date.now() } = {}) {
       .bind(l.store, l.product_id || "").first().catch(() => null);
     const productSizes = listedSizes(listing && listing.variants);
     const title = [l.title, listing && listing.title].filter(Boolean).join(" | ");
-    const rec = recommendSize({ title, orderedSize: l.size, chartRows, complaints, overrides: core[l.store].references, audience: core[l.store].audience, productSizes,
-      tags: listing && listing.tags, productType: listing && listing.product_type });
+    const input = { title, orderedSize: l.size, chartRows, complaints, overrides: core[l.store].references, audience: core[l.store].audience, productSizes,
+      tags: listing && listing.tags, productType: listing && listing.product_type };
+    const rec = recommendSize(input);
     let reason = rec.reason;
     if (rec.verdict !== "no_chart" && rec.verdict !== "no_reference" && !core[l.store].audience) reason += " (audience assumed men's: not in the Core yet)";
     if (core[l.store].audienceConflict) reason += ` (conflict: ${core[l.store].audienceConflict})`;
     const verified = chartRows && chartRows.length ? (chartRows.every((r) => r.verified) ? 1 : 0) : null;
-    if (verified === 0) reason += " (chart read by the brain, not yet checked)";
+    const ordered = normSize(l.size);
+
+    // What, if anything, KFB should be asked to ship instead.
+    let askSize = null, askWhy = null;
+    if (rec.verdict === "complaints_only" && rec.send_size && rec.send_size !== ordered) {
+      askSize = rec.send_size; askWhy = reason;
+    } else if (rec.verdict === "size_up" && rec.send_size && rec.send_size !== ordered) {
+      if (verified === 1) {
+        askSize = rec.send_size; askWhy = `runs small: ${reason}`;
+      } else {
+        // An unconfirmed chart never makes a KFB ask on its own; complaints still can.
+        const alt = recommendSize({ ...input, chartRows: [] });
+        if (alt.verdict === "complaints_only" && alt.send_size && alt.send_size !== ordered) {
+          askSize = alt.send_size; askWhy = `customer complaints (the chart is pending your confirm): ${alt.reason}`;
+        }
+        reason += `. Pending your chart confirm: no KFB ask from an unconfirmed chart${askSize ? ` (the complaints alone ask for ${askSize})` : ""}`;
+      }
+    }
+    if (verified === 0) reason += ` (${chartStatusNote(chartRows)})`;
 
     const prev = await db.prepare(`SELECT verdict FROM size_recommendations WHERE store = ? AND line_id = ?`).bind(l.store, l.line_id).first();
     await db.prepare(
@@ -461,25 +525,45 @@ export async function runSizeChecker(env, { nowMs = Date.now() } = {}) {
       rec.verdict, reason.slice(0, 1500), rec.conflict ? 1 : 0, verified, (complaints || []).length, at).run();
     if (!prev || prev.verdict !== rec.verdict) { changed++; counts[rec.verdict] = (counts[rec.verdict] || 0) + 1; }
 
-    if ((rec.verdict === "size_up" || rec.verdict === "complaints_only") && rec.send_size && rec.send_size !== normSize(l.size)) {
-      const why = rec.verdict === "complaints_only" ? reason : `runs small: ${reason}`;
-      const r = await db.prepare(
-        `INSERT OR IGNORE INTO kfb_size_asks (store, order_id, line_id, order_name, title, ordered_size, send_size, why, created_at)
-         VALUES (?,?,?,?,?,?,?,?,?)`
-      ).bind(l.store, l.order_id, l.line_id, l.order_name, l.title, normSize(l.size), rec.send_size, why.slice(0, 1500), at).run();
-      if (r.meta && r.meta.changes) asks++;
+    // Keep the KFB ask in step with the decision. Never deleted: history stays in `why`.
+    const ask = await db.prepare(`SELECT id, status, send_size, why FROM kfb_size_asks WHERE store = ? AND line_id = ?`).bind(l.store, l.line_id).first();
+    if (askSize) {
+      if (!ask) {
+        const r = await db.prepare(
+          `INSERT OR IGNORE INTO kfb_size_asks (store, order_id, line_id, order_name, title, ordered_size, send_size, why, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?)`
+        ).bind(l.store, l.order_id, l.line_id, l.order_name, l.title, ordered, askSize, askWhy.slice(0, 1500), at).run();
+        if (r.meta && r.meta.changes) asks++;
+      } else if ((ask.status === "pending" || ask.status === "withdrawn") && (ask.send_size !== askSize || ask.status === "withdrawn")) {
+        await db.prepare(`UPDATE kfb_size_asks SET status = 'pending', send_size = ?, why = ? WHERE id = ?`)
+          .bind(askSize, `${askWhy} [earlier: ${ask.status} ${ask.send_size}, changed ${at}]`.slice(0, 1500), ask.id).run();
+        updatedAsks++;
+      } else if (ask.status === "included" && ask.send_size !== askSize) {
+        await logEvent(db, { actor: ACTOR, kind: "sizes.ask_conflict", store: l.store, target: "sup.relay", at,
+          summary: `${l.order_name}: KFB was already asked for ${ask.send_size}; the brain now says ${askSize}. Your call (nothing sent)` });
+      }
+    } else if (ask && ask.status === "pending") {
+      const now = `now ${rec.verdict.replace(/_/g, " ")}${rec.send_size ? ` ${rec.send_size}` : ""}${verified === 0 ? `, ${chartStatusNote(chartRows)}` : ""}`;
+      await db.prepare(`UPDATE kfb_size_asks SET status = 'withdrawn', why = ? WHERE id = ?`)
+        .bind(`${ask.why} | withdrawn ${at}: no longer holds (${now})`.slice(0, 2000), ask.id).run();
+      withdrawn++;
+    } else if (ask && ask.status === "included") {
+      await logEvent(db, { actor: ACTOR, kind: "sizes.ask_conflict", store: l.store, target: "sup.relay", at,
+        summary: `${l.order_name}: KFB was already asked for ${ask.send_size}, but the brain no longer recommends it (${rec.verdict.replace(/_/g, " ")}). Your call (nothing sent)` });
     }
   }
-  if (changed) {
+  if (changed || withdrawn || updatedAsks) {
     const parts = Object.entries(counts).map(([k, n]) => `${n} ${k.replace(/_/g, " ")}`);
     await logEvent(db, {
       actor: ACTOR, kind: "sizes.checked", target: asks ? "sup.relay" : null, at,
-      summary: `Size check: ${changed} order line${changed === 1 ? "" : "s"} (${parts.join(", ")})` +
-        (asks ? `; ${asks} size ask${asks === 1 ? "" : "s"} ready for the KFB message` : "") + " (shadow: nothing sent)",
-      data: { counts, asks },
+      summary: `Size check: ${changed} order line${changed === 1 ? "" : "s"}${parts.length ? ` (${parts.join(", ")})` : ""}` +
+        (asks ? `; ${asks} size ask${asks === 1 ? "" : "s"} ready for the KFB message` : "") +
+        (updatedAsks ? `; ${updatedAsks} ask${updatedAsks === 1 ? "" : "s"} changed` : "") +
+        (withdrawn ? `; ${withdrawn} ask${withdrawn === 1 ? "" : "s"} withdrawn (no longer hold)` : "") + " (shadow: nothing sent)",
+      data: { counts, asks, updatedAsks, withdrawn },
     });
   }
-  return { checked: (lines || []).length, changed, asks, counts };
+  return { checked: (lines || []).length, changed, asks, updatedAsks, withdrawn, counts };
 }
 
 /** For the store name in messages. */

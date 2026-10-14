@@ -21,10 +21,11 @@
  *   men's coat/outerwear +16–20 (18) · men's shirt +10 · men's knit +12.
  *   Fit: relaxed adds +6–10 (8 used); fitted takes 4 off.
  *
- * Which measurements MATTER per (garment, fit) is declared here too (`key`), so the checker
- * compares a coat on chest + shoulder, a women's knit on chest only, and so on. A relaxed fit
- * is chest only, always: a boxy, cropped or drop-shoulder cut must never read as "runs small"
- * because its shoulder or length differs from a regular garment.
+ * Which measurements are COMPARED per (garment, fit) is declared here too (`key`). The CHEST
+ * always decides the size; the others (coat shoulder, men's knit length, dress waist ...) are
+ * reported as notes and never force a size-up on their own (a wrong size-up is the costly
+ * error). A relaxed fit is chest only: a boxy, cropped or drop-shoulder cut is never judged on
+ * its shoulder or length.
  */
 
 export const REF_SIZES = Object.freeze(["XS", "S", "M", "L", "XL", "2XL", "3XL", "4XL"]);
@@ -84,15 +85,18 @@ export const GARMENT_SPECS = Object.freeze({
     coat: G("coat/outerwear", 18, { shoulderAdd: 1, lengthM: 82, lengthStep: 2, key: ["chest", "shoulder"] }),
   },
   women: {
-    // One "top" garment covers the brief's two rows: fitted blouse/top (+5–8 → 6.5, the
-    // fitted fit) and relaxed shirt/blouse (+10, the regular fit). Relaxed fit adds 8 more.
-    top: G("blouse/top", 10, { ease: { fitted: 6.5 }, lengthM: 64, key: ["chest", "shoulder"] }),
+    // One "top" garment covers the brief's two rows. A blouse with no fit word is held to the
+    // fitted-blouse ease (+5–8 → 6.5): holding it to the relaxed-shirt allowance made a true-size
+    // blouse read as "runs small" (review of 1e5fd64). Only a title that says relaxed/oversized/
+    // boxy gets the relaxed shirt/blouse allowance (+10).
+    top: G("blouse/top", 6.5, { ease: { fitted: 6.5, regular: 6.5, relaxed: 10 }, lengthM: 64, key: ["chest", "shoulder"] }),
     knit: G("knit/sweater", 10, { lengthM: 62, key: ["chest"] }),
     // Women's cardigan: knit ease (inference); chest only, length informational (crops vary).
     cardigan: G("cardigan", 10, { lengthM: 64, key: ["chest"] }),
     blazer: G("blazer/jacket", 9, { shoulderAdd: 0.5, lengthM: 68, key: ["chest", "shoulder"] }),
     coat: G("coat/outerwear", 14, { shoulderAdd: 1, lengthM: 85, key: ["chest", "shoulder"] }),
-    // Dress: +6 bust and waist ease at regular (inference; bodycon/fitted −4 = +2).
+    // Dress: +6 bust and waist ease at regular (inference; bodycon/fitted −4 = +2). Sized on the
+    // chest only: the waist is a note (smocked / elastic waists stretch).
     dress: G("dress", 6, { lengthM: 95, sleeve: false, waistEase: 6, key: ["chest", "waist"] }),
   },
 });

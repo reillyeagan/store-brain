@@ -14,9 +14,9 @@
  * Both go through the same validation (validateChart). Reilly confirms a chart with
  * POST /api/size-charts/:id/confirm, which marks exactly that chart's rows verified.
  *
- * After a chart is saved, recent "no chart" / "no reference" lines for that product are made
- * due and the Size Checker runs once, so the new chart is used straight away (the regular
- * 15-minute run would reach them within RECHECK_HOURS anyway).
+ * After a chart is saved, replaced or confirmed, every recent line for that product (last
+ * LOOKBACK_DAYS, all verdicts) is re-decided at once. Only a CONFIRMED chart makes KFB asks;
+ * a pending ask that no longer holds is withdrawn (never deleted). See runSizeChecker.
  *
  * Never sends anything to KFB or a customer; never touches the store.
  */
@@ -25,7 +25,7 @@ import { logEvent } from "../../lib/eventlog.js";
 import { nowIso } from "../../lib/time.js";
 import { askJson, AiError } from "../../lib/ai.js";
 import { normSize, sizeIndex, handleFrom } from "./common.js";
-import { runSizeChecker } from "./sizeChecker.js";
+import { runSizeChecker, markProductDue } from "./sizeChecker.js";
 import { garmentOf } from "./sizeReferences.js";
 
 const ACTOR = "sup.size_charts";
@@ -35,25 +35,31 @@ export const RANGES_CM = Object.freeze({ chest: [60, 200], shoulder: [25, 80], l
 export const MAX_ROWS = 12;
 /** "Charts needed" looks back this far for sized order lines. */
 export const NEEDED_DAYS = 30;
-/** ~5 MB decoded: the Claude API's per-image limit. */
-export const MAX_IMAGE_BASE64 = 7_000_000;
+/** 5 MB of base64 (~3.75 MB raw image): the Claude API's per-image limit is on the encoded size. */
+export const MAX_IMAGE_BASE64 = 5_242_880;
+export const IMAGE_TOO_BIG = "image is too large: the limit is about 3.75 MB (5,242,880 base64 characters). Crop it to the chart or save it smaller";
+/** The one question asked when chest numbers could be inches or half (flat) measurements. */
+export const UNCLEAR_UNIT = "unclear: inches or a flat (half) measurement? say which (set the unit, and tick flat only if the chart is measured laid flat)";
 export const IMAGE_TYPES = Object.freeze(["image/jpeg", "image/png", "image/webp", "image/gif"]);
 export const IMAGE_SOURCE = "read by the brain from an image, not yet checked by Reilly";
-export const PASTE_SOURCE = "pasted on the dashboard, not yet confirmed by Reilly";
+export const PASTE_SOURCE = "pasted by Reilly on the dashboard, not yet confirmed";
 
 const fail = (status, error) => ({ ok: false, status, error });
 const r1 = (x) => Math.round(x * 10) / 10;
 
 /**
  * Validate and normalise a chart to cm. Pure.
- * - inches → cm; `flat` doubles chest and waist; a chest under 75cm is read as flat and doubled
- *   (as chartFromRows does), with a note.
+ * - inches → cm; `flat: true` doubles chest and waist.
+ * - A chest under 75cm (after conversion) is never silently doubled: an inch chart typed as cm
+ *   and a flat cm chart look the same. Unless the unit was given AND flat was explicitly true,
+ *   the chart is refused with UNCLEAR_UNIT. `unit` undefined means "not given".
  * - sizes normalised ("XXL" → "2XL"), strictly ascending as given; measurements never shrink as size grows.
  * - every row needs a chest; chest 60–200cm after conversion; at least 2 sizes.
  * @returns {{ok:true, rows:[{size, chest, ...}], notes:string[]}|{ok:false, status:400, error:string}}
  */
-export function validateChart({ unit = "cm", flat = false, rows } = {}) {
-  const u = String(unit || "cm").toLowerCase();
+export function validateChart({ unit, flat, rows } = {}) {
+  const unitGiven = unit != null && unit !== "";
+  const u = String(unitGiven ? unit : "cm").toLowerCase();
   if (u !== "cm" && u !== "in") return fail(400, `unit must be "cm" or "in" (got "${String(unit).slice(0, 20)}")`);
   if (!Array.isArray(rows)) return fail(400, "rows must be a list of sizes");
   if (rows.length < 2) return fail(400, "a chart needs at least 2 sizes");
@@ -61,7 +67,7 @@ export function validateChart({ unit = "cm", flat = false, rows } = {}) {
   const k = u === "in" ? 2.54 : 1;
   const notes = [];
   if (u === "in") notes.push("converted from inches (×2.54)");
-  if (flat) notes.push("chest/waist given flat (×2)");
+  if (flat === true) notes.push("chest/waist given flat (×2)");
   const out = [];
   for (const [i, raw] of rows.entries()) {
     if (!raw || typeof raw !== "object") return fail(400, `row ${i + 1} is not a size row`);
@@ -76,14 +82,10 @@ export function validateChart({ unit = "cm", flat = false, rows } = {}) {
       row[m] = v * k;
     }
     if (row.chest == null) return fail(400, `${size}: chest is required`);
-    if (flat) {
+    if (row.chest < 75 && !(flat === true && unitGiven)) return fail(400, `${size} chest ${r1(row.chest)}cm: ${UNCLEAR_UNIT}`);
+    if (flat === true) {
       row.chest *= 2;
       if (row.waist != null) row.waist *= 2;
-    } else if (row.chest < 75) {
-      // A full adult chest can't be under 75cm: this row was measured flat.
-      row.chest *= 2;
-      if (row.waist != null) row.waist *= 2;
-      notes.push("chest under 75cm read as a flat measurement (×2)");
     }
     for (const m of MEASURES) {
       if (row[m] == null) continue;
@@ -153,17 +155,38 @@ function checkStore(store) {
  * Save a validated chart: one intake row, then its sizes in size_charts (verified=0), replacing
  * the product's earlier rows. A chart Reilly already confirmed is only replaced with replace:true.
  */
+const CONFIRMED_EXISTS = "Reilly already confirmed a chart for this product: tick \"Replace confirmed chart\" (replace:true) to replace it. Nothing saved";
+
+/** The size_charts product ids a chart for this product may live under (the id, and its handle placeholder). */
+function chartIds(product) {
+  const ids = [product.productId];
+  if (product.handle && product.productId !== `handle:${product.handle}`) ids.push(`handle:${product.handle}`);
+  return ids;
+}
+
+async function confirmedChartExists(db, store, product) {
+  const ids = chartIds(product);
+  const r = await db.prepare(`SELECT 1 AS y FROM size_charts WHERE store = ? AND verified = 1 AND product_id IN (${ids.map(() => "?").join(",")}) LIMIT 1`)
+    .bind(store, ...ids).first();
+  return !!r;
+}
+
+/** Re-decide a product's recent lines (every verdict) now: a fixed chart undoes the wrong chart's decisions. */
+async function redecideProduct(env, { store, ids, handle, nowMs }) {
+  const due = await markProductDue(env.DB, { store, productIds: ids, handle, nowMs });
+  let recheck = null;
+  try { recheck = await runSizeChecker(env, { nowMs }); } catch (err) { recheck = { error: String(err && err.message).slice(0, 200) }; }
+  return { due, ...recheck };
+}
+
 async function saveChart(env, { store, product, rows, notes, kind, unit, flat, source, replace = false }, nowMs) {
   const db = env.DB;
   const at = nowIso(nowMs);
-  const ids = [product.productId];
-  if (product.handle && product.productId !== `handle:${product.handle}`) ids.push(`handle:${product.handle}`);
+  const ids = chartIds(product);
   const marks = ids.map(() => "?").join(",");
   const { results: old } = await db.prepare(`SELECT product_id, size_label, measurements, source, verified FROM size_charts WHERE store = ? AND product_id IN (${marks})`)
     .bind(store, ...ids).all();
-  if ((old || []).some((r) => r.verified) && !replace) {
-    return fail(409, "Reilly already confirmed a chart for this product: send replace:true to replace it (nothing saved)");
-  }
+  if ((old || []).some((r) => r.verified) && !replace) return fail(409, CONFIRMED_EXISTS);
   const allNotes = [...notes];
   if ((old || []).length) allNotes.push(`replaced ${old.length} earlier size row${old.length === 1 ? "" : "s"}`);
   const ins = await db.prepare(
@@ -171,14 +194,16 @@ async function saveChart(env, { store, product, rows, notes, kind, unit, flat, s
      VALUES (?,?,?,?,?,?,?,?,?,?,0,?)`
   ).bind(store, product.productId, product.handle, product.title, kind, unit, flat ? 1 : 0, JSON.stringify(rows), JSON.stringify(allNotes), source, at).run();
   const id = ins.meta.last_row_id;
-  // The library holds one chart per product: the intake row above keeps the history.
-  await db.prepare(`DELETE FROM size_charts WHERE store = ? AND product_id IN (${marks})`).bind(store, ...ids).run();
+  // The library holds one chart per product: the intake row above keeps the history. The delete
+  // and the inserts go in ONE batch (all or nothing), so a failure never leaves half a chart.
+  const stmts = [db.prepare(`DELETE FROM size_charts WHERE store = ? AND product_id IN (${marks})`).bind(store, ...ids)];
   for (const r of rows) {
     const { size, ...m } = r;
-    await db.prepare(
+    stmts.push(db.prepare(
       `INSERT INTO size_charts (store, product_id, product_handle, size_label, measurements, source, verified, checked_at) VALUES (?,?,?,?,?,?,0,NULL)`
-    ).bind(store, product.productId, product.handle, size, JSON.stringify(m), `intake:${id} · ${source}`.slice(0, 300)).run();
+    ).bind(store, product.productId, product.handle, size, JSON.stringify(m), `intake:${id} · ${source}`.slice(0, 300)));
   }
+  await db.batch(stmts);
   const sizes = rows.map((r) => r.size).join(", ");
   await logEvent(db, {
     actor: ACTOR, kind: "size_chart.added", store, at,
@@ -186,14 +211,9 @@ async function saveChart(env, { store, product, rows, notes, kind, unit, flat, s
     data: { intake: id, product_id: product.productId, handle: product.handle, kind, sizes: rows.length, notes: allNotes, replaced: old || [] },
   });
 
-  // Recent lines for this product that had no chart (or no reference) are made due now, and the
-  // checker runs once so the new chart is used straight away.
-  await db.prepare(
-    `UPDATE size_recommendations SET checked_at = '' WHERE store = ? AND verdict IN ('no_chart', 'no_reference')
-       AND (product_id IN (${marks}) OR (product_handle IS NOT NULL AND product_handle = ?))`
-  ).bind(store, ...ids, product.handle || "").run();
-  let recheck = null;
-  try { recheck = await runSizeChecker(env, { nowMs }); } catch (err) { recheck = { error: String(err && err.message).slice(0, 200) }; }
+  // Every recent line for this product is re-decided now, whatever its verdict (a replaced chart
+  // must undo what the old one decided; pending KFB asks that no longer hold are withdrawn).
+  const recheck = await redecideProduct(env, { store, ids, handle: product.handle, nowMs });
   return { ok: true, id, store, product_id: product.productId, product_handle: product.handle, resolved: product.resolved, verified: 0, rows, notes: allNotes, recheck };
 }
 
@@ -202,11 +222,12 @@ export async function addPastedChart(env, body, { nowMs = Date.now() } = {}) {
   const b = body && typeof body === "object" ? body : {};
   const bad = checkStore(b.store);
   if (bad) return bad;
-  const v = validateChart({ unit: b.unit, flat: !!b.flat, rows: b.rows });
+  // Flat counts as said only when it is ticked (true); anything else is "not said".
+  const v = validateChart({ unit: b.unit, flat: b.flat === true ? true : undefined, rows: b.rows });
   if (!v.ok) return v;
   const product = await resolveProduct(env.DB, b.store, { product_handle: b.product_handle, product_id: b.product_id });
   if (!product.ok) return product;
-  return saveChart(env, { store: b.store, product, rows: v.rows, notes: v.notes, kind: "paste", unit: String(b.unit || "cm").toLowerCase(), flat: !!b.flat, source: PASTE_SOURCE, replace: b.replace === true }, nowMs);
+  return saveChart(env, { store: b.store, product, rows: v.rows, notes: v.notes, kind: "paste", unit: String(b.unit || "cm").toLowerCase(), flat: b.flat === true, source: PASTE_SOURCE, replace: b.replace === true }, nowMs);
 }
 
 const IMAGE_SYSTEM = `You read garment size charts from clothing factories (often Chinese, usually in cm) and copy the numbers exactly.
@@ -226,11 +247,12 @@ export async function addChartFromImage(env, body, { fetchImpl = fetch, nowMs = 
   if (!IMAGE_TYPES.includes(mediaType)) return fail(400, `media_type must be one of ${IMAGE_TYPES.join(", ")}`);
   let data = String(b.image_base64 || "").replace(/^data:[^,]*,/, "").replace(/\s+/g, "");
   if (!data) return fail(400, "image_base64 is required");
-  if (data.length > MAX_IMAGE_BASE64) return fail(400, "image is too large (5 MB max)");
+  if (data.length > MAX_IMAGE_BASE64) return fail(400, IMAGE_TOO_BIG);
   if (!/^[A-Za-z0-9+/]+={0,2}$/.test(data)) return fail(400, "image_base64 is not base64");
-  // Resolve the product before spending money on the call.
+  // Resolve the product, and refuse a confirmed chart without replace:true, BEFORE the paid call.
   const product = await resolveProduct(env.DB, b.store, { product_handle: b.product_handle, product_id: b.product_id });
   if (!product.ok) return product;
+  if (b.replace !== true && (await confirmedChartExists(env.DB, b.store, product))) return fail(409, CONFIRMED_EXISTS);
   let r;
   try {
     r = await askJson(env, {
@@ -243,10 +265,13 @@ export async function addChartFromImage(env, body, { fetchImpl = fetch, nowMs = 
   if (r.skipped) return fail(503, `image reading is ${r.skipped}: paste the numbers instead`);
   const j = r.json || {};
   if (!Array.isArray(j.rows) || !j.rows.length) return fail(422, `no chart read from the image${j.unreadable ? `: ${String(j.unreadable).slice(0, 200)}` : ""}`);
+  // The unit is never assumed: no explicit "cm" or "in" from the model → refused, nothing saved.
+  const unit = String(j.unit || "").toLowerCase();
+  if (unit !== "cm" && unit !== "in") return fail(422, `the image does not say the unit: ${UNCLEAR_UNIT}`);
   // The same validation as a paste. The model's flat flag is used only when it is a clear true.
-  const v = validateChart({ unit: j.unit || "cm", flat: j.flat === true, rows: j.rows });
+  const v = validateChart({ unit, flat: j.flat === true ? true : undefined, rows: j.rows });
   if (!v.ok) return fail(422, `the chart read from the image didn't pass the checks: ${v.error}`);
-  return saveChart(env, { store: b.store, product, rows: v.rows, notes: v.notes, kind: "image", unit: String(j.unit || "cm").toLowerCase(), flat: j.flat === true, source: IMAGE_SOURCE, replace: b.replace === true }, nowMs);
+  return saveChart(env, { store: b.store, product, rows: v.rows, notes: v.notes, kind: "image", unit, flat: j.flat === true, source: IMAGE_SOURCE, replace: b.replace === true }, nowMs);
 }
 
 /** POST /api/size-charts/:id/confirm: Reilly checked the chart. Marks exactly that chart's rows verified. */
@@ -266,7 +291,12 @@ export async function confirmChart(env, id, { nowMs = Date.now() } = {}) {
     summary: `Size chart #${it.id} for ${STORES[it.store] ? STORES[it.store].name : it.store} ${it.product_handle || it.product_id}: confirmed by Reilly`,
     data: { intake: it.id, product_id: it.product_id, handle: it.product_handle },
   });
-  return { ok: true, id: it.id, verified: 1 };
+  // Re-decide the product's recent lines: chart_verified and the reason wording refresh, and only
+  // now (a confirmed chart) may a size-up become a KFB ask.
+  const ids = [it.product_id];
+  if (it.product_handle && it.product_id !== `handle:${it.product_handle}`) ids.push(`handle:${it.product_handle}`);
+  const recheck = await redecideProduct(env, { store: it.store, ids, handle: it.product_handle, nowMs });
+  return { ok: true, id: it.id, verified: 1, recheck };
 }
 
 /**
