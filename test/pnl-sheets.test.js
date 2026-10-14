@@ -1060,7 +1060,8 @@ test("schedule: once a day from 07:00 New York; retried each slot until noon whi
   // 07:36: due. Google isn't connected here, so yesterday can't be filled: not done.
   const r1 = await runSheetsMorning(env, { nowMs: etMs("2026-10-15", 7) });
   assert.equal(r1.ran, true);
-  assert.ok(r1.waiting_on.length === LIVE_STORE_IDS.length);
+  assert.equal(r1.waiting_on.length, LIVE_STORE_IDS.length + 1, "every store workbook and the Ecom P&L");
+  assert.equal(r1.filled_yesterday, false);
   assert.equal((await sheetsDue(DB, etMs("2026-10-15", 8))).why, "retry: yesterday was not closed yet");
   await runSheetsMorning(env, { nowMs: etMs("2026-10-15", 8) });
   assert.deepEqual(await sheetsDue(DB, etMs("2026-10-15", 12)), { due: false, why: "retries stop at noon; next run tomorrow 07:00" });
@@ -1084,23 +1085,109 @@ test("schedule: once a day from 07:00 New York; retried each slot until noon whi
   assert.equal(seed.source, "chat 2026-10-14");
 });
 
-test("schedule: the morning run is done once yesterday is closed for every store and every workbook was read; it fills yesterday", async () => {
-  const { runSheetsMorning, sheetsDue } = await import("../src/agents/pnl/sheets.js");
-  const env = baseEnv();
+const ECOM = "1xL1Nbv0I1rztGx_a--1LJPg_YnjrdRkR04oLbIHDFw4";
+async function morningFixture(envExtra = {}) {
+  const env = baseEnv(envExtra);
   await connectGoogle(env);
   const books = {};
   for (const id of LIVE_STORE_IDS) {
     books[STORES[id].pnlSheetId] = book(`${STORES[id].name} P&L`, { OCT: monthTab(2026, 10, {}), SETUP: setupTab({ store: `${STORES[id].name} (${STORES[id].domain})` }) });
     await closedDay(env.DB, id, "2026-10-14", { revenue: 0, orders: 0, ads: 10, guy_fee: 1, fees: 0 });
   }
+  books[ECOM] = book("Ecom P&L", {
+    OCT: monthTab(2026, 10, {}, "ALL STORES"),
+    SETUP: setupTab().map((r) => (r[0] && r[0].f === "Store" ? [cell("Scope"), cell("ALL STORES — the three stores summed day by day.")] : r)),
+  });
+  return { env, books };
+}
+
+test("schedule: 'filled' is recorded only when every workbook's yesterday cells were written AND verified (stores first, the Ecom sum at the next slot)", async () => {
+  const { runSheetsMorning, sheetsDue } = await import("../src/agents/pnl/sheets.js");
+  const { env, books } = await morningFixture();
   const g = fakeGoogle(books);
-  const r = await runSheetsMorning(env, { nowMs: etMs("2026-10-15", 7), fetchImpl: g.fetchImpl });
-  assert.deepEqual(r.waiting_on, []);
-  assert.equal((await sheetsDue(env.DB, etMs("2026-10-15", 8))).why, "done for today");
-  // Yesterday's ad spend and services went in this morning (no 3-day wait for yesterday).
-  const yRow = 15; // Oct 14
-  assert.ok(g.log.updates.some((u) => u.range === `'OCT'!D${yRow}` && u.value === 10));
-  assert.ok(g.log.updates.some((u) => u.range === `'OCT'!E${yRow}` && u.value === 1));
+  const r1 = await runSheetsMorning(env, { nowMs: etMs("2026-10-15", 7), fetchImpl: g.fetchImpl });
+  assert.equal(r1.filled_yesterday, false);
+  assert.deepEqual(r1.waiting_on.map((w) => w.store), ["all"]);
+  assert.match(r1.waiting_on[0].why, /Ecom row is summed next slot/);
+  // Yesterday's ad spend and services went into each store sheet (no 3-day wait for yesterday).
+  for (const id of LIVE_STORE_IDS) {
+    assert.ok(g.log.updates.some((u) => u.id === STORES[id].pnlSheetId && u.range === "'OCT'!D15" && u.value === 10));
+    assert.ok(g.log.updates.some((u) => u.id === STORES[id].pnlSheetId && u.range === "'OCT'!E15" && u.value === 1));
+  }
+  assert.match((await env.DB.prepare(`SELECT last_result FROM job_runs WHERE job = 'pnl.sheets.morning'`).first()).last_result, /^retrying until noon: all:/);
+  const r2 = await runSheetsMorning(env, { nowMs: etMs("2026-10-15", 8), fetchImpl: g.fetchImpl });
+  assert.equal(r2.filled_yesterday, true);
+  assert.ok(g.log.updates.some((u) => u.id === ECOM && u.range === "'OCT'!D15" && u.value === 30), "Ecom = 10 + 10 + 10");
+  assert.equal((await sheetsDue(env.DB, etMs("2026-10-15", 9))).why, "done for today");
+  assert.match((await env.DB.prepare(`SELECT last_result FROM job_runs WHERE job = 'pnl.sheets.done'`).first()).last_result, /^filled: /);
+});
+
+test("schedule: never 'filled' when writes fail, the kill switch is on or yesterday isn't closed; after noon it records 'not filled' with the reason", async () => {
+  const { runSheetsMorning } = await import("../src/agents/pnl/sheets.js");
+  const last = async (DB, job) => (await DB.prepare(`SELECT last_result FROM job_runs WHERE job = ?`).bind(job).first()) || {};
+  // Write calls fail.
+  const a = await morningFixture();
+  const r = await runSheetsMorning(a.env, { nowMs: etMs("2026-10-15", 7), fetchImpl: fakeGoogle(a.books, { failUpdate: true }).fetchImpl });
+  assert.equal(r.filled_yesterday, false);
+  assert.match(r.waiting_on.find((w) => w.store === "hc").why, /write failed/);
+  assert.equal((await last(a.env.DB, "pnl.sheets.done")).last_result, undefined);
+  // Still failing at the 11:36 retry, then the noon slot records "not filled".
+  await runSheetsMorning(a.env, { nowMs: etMs("2026-10-15", 11), fetchImpl: fakeGoogle(a.books, { failUpdate: true }).fetchImpl });
+  await runSheetsMorning(a.env, { nowMs: etMs("2026-10-15", 12), fetchImpl: fakeGoogle(a.books).fetchImpl });
+  assert.match((await last(a.env.DB, "pnl.sheets.morning")).last_result, /^not filled: /);
+  assert.equal((await last(a.env.DB, "pnl.sheets.done")).last_result, undefined, "never 'filled'");
+  // Kill switch.
+  const b = await morningFixture({ SHEETS_WRITE: "off" });
+  const rb = await runSheetsMorning(b.env, { nowMs: etMs("2026-10-15", 7), fetchImpl: fakeGoogle(b.books).fetchImpl });
+  assert.equal(rb.filled_yesterday, false);
+  assert.ok(rb.waiting_on.every((w) => /kill switch/.test(w.why)));
+  // Yesterday not closed in the brain.
+  const c = await morningFixture();
+  await c.env.DB.prepare(`UPDATE pnl_days SET complete = 0 WHERE store = 'aub'`).run();
+  const rc = await runSheetsMorning(c.env, { nowMs: etMs("2026-10-15", 7), fetchImpl: fakeGoogle(c.books).fetchImpl });
+  assert.match(rc.waiting_on.find((w) => w.store === "aub").why, /2026-10-14 not closed by the brain yet/);
+  // A missed morning, single run after noon, failing: "not filled" straight away.
+  const d = await morningFixture();
+  await runSheetsMorning(d.env, { nowMs: etMs("2026-10-15", 14), fetchImpl: fakeGoogle(d.books, { failUpdate: true }).fetchImpl });
+  assert.match((await last(d.env.DB, "pnl.sheets.morning")).last_result, /^not filled: /);
+});
+
+test("schedule: two runs at the same moment — one atomic claim, only one goes ahead", async () => {
+  const { runSheetsMorning, claimMorning } = await import("../src/agents/pnl/sheets.js");
+  const { env, books } = await morningFixture();
+  const g = fakeGoogle(books);
+  const t = etMs("2026-10-15", 7);
+  const [x, y] = await Promise.all([runSheetsMorning(env, { nowMs: t, fetchImpl: g.fetchImpl }), runSheetsMorning(env, { nowMs: t, fetchImpl: g.fetchImpl })]);
+  assert.equal([x, y].filter((r) => r.ran).length, 1);
+  assert.match([x, y].find((r) => !r.ran).reason, /another run holds this slot|morning run/);
+  // The claim itself: first wins, the second at the same instant gets nothing.
+  const DB = makeD1();
+  assert.equal(await claimMorning(DB, t, "a"), true);
+  assert.equal(await claimMorning(DB, t, "b"), false);
+  assert.equal(await claimMorning(DB, t + 31 * 60000, "c"), true);
+});
+
+test("planning: yesterday is planned first and never crowded out by older gaps; days with only permanent skips don't use up the cap", async () => {
+  const { planStore, readWorkbook, workbooks } = await import("../src/agents/pnl/sheets.js");
+  const env = baseEnv();
+  const days = {};
+  // Sep 1-12: closed, with blank cells. Sep 1-5 only have blanks the rules keep blank.
+  for (let d = 1; d <= 12; d++) {
+    const day = `2026-09-${String(d).padStart(2, "0")}`;
+    days[day] = d <= 5 ? { revenue: 10, adspend: 5, services: 0.5, fee: 0.3, orders: 1, clicks: 1, cog_eur: 1 } : {};
+    await closedDay(env.DB, "hc", day, { revenue: 10, orders: 1, ads: 5, guy_fee: d <= 5 ? 0 : 0.5, fees: 0.3 });
+  }
+  await closedDay(env.DB, "hc", "2026-10-13", { revenue: 50, orders: 1, ads: 300, guy_fee: 30, fees: 1.5 });
+  const books = { [HC]: book("Holt & Crane P&L", { SEP: monthTab(2026, 9, days), OCT: monthTab(2026, 10, {}), SETUP: setupTab() }) };
+  const wb = workbooks().find((w) => w.store === "hc");
+  const read = await readWorkbook(env, wb, { token: "g", fetchImpl: fakeGoogle(books).fetchImpl, nowMs: NOW });
+  const p = await planStore(env.DB, wb, read, { nowMs: NOW, maxDays: 3, maxCells: 2 });
+  const planned = [...new Set(p.plan.map((x) => x.day))];
+  assert.equal(planned[0], "2026-10-13", "yesterday first");
+  assert.ok(p.plan.filter((x) => x.day === "2026-10-13").length >= 2, "all of yesterday's writable cells, outside the cell cap");
+  assert.ok(!planned.some((d) => d <= "2026-09-05"), "Sep 1-5 (sessions only, never written without the day basis) didn't count");
+  assert.deepEqual(planned.slice(1), ["2026-09-06"], "older gaps only within their own 2-cell cap (Sep 6: 1 cell; Sep 7 would make 3)");
+  assert.equal(p.yesterday.planned, p.plan.filter((x) => x.day === "2026-10-13").length);
 });
 
 test("corrections: a cell the brain wrote in the last 3 days is updated when the brain's value changed (ads restated) and the cell still holds the brain's value; a cell Reilly changed is never touched", async () => {

@@ -690,29 +690,44 @@ export async function writeCells(env, wb, plan, { token, fetchImpl = fetch, nowM
 /** The cells the brain would fill in one store workbook (closed days, blank inputs only). */
 export async function planStore(db, wb, read, { nowMs = Date.now(), maxDays = PLAN_DAYS_PER_RUN, maxCells = PLAN_CELLS_PER_RUN, dayOk = false, dayWhy = null } = {}) {
   const today = localDay(nowMs, wb.tz);
+  const yesterday = minusDays(today, 1);
   const plan = [], skipped = {};
+  const bump = (k, n = 1) => { skipped[k] = (skipped[k] || 0) + n; };
+  const y = { day: yesterday, in_sheet: false, closed: false, planned: 0, skipped: {} };
   // Every closed day of the store in one query (not one per day): bounded D1 work per run.
   const { results: closed } = await db.prepare(`SELECT * FROM pnl_days WHERE store = ? AND complete = 1 AND day < ?`).bind(wb.store, today).all();
   const closedBy = new Map((closed || []).map((r) => [r.day, r]));
-  let days = 0;
-  for (const m of read.months) {
-    for (const d of m.days) {
-      if (d.day >= today) continue;
-      const fields = INPUT_FIELDS.filter((f) => writableBlank(d, f));
-      if (!fields.length) continue;
-      const pnl = closedBy.get(d.day);
-      if (!pnl) { skipped["day not closed by the brain"] = (skipped["day not closed by the brain"] || 0) + fields.length; continue; }
-      if (days >= maxDays || plan.length >= maxCells) { skipped["more days next run (per-run limit)"] = (skipped["more days next run (per-run limit)"] || 0) + fields.length; continue; }
-      days++;
-      for (const f of fields) {
-        const v = await brainValue(db, wb.store, d.day, f, { pnl, setup: read.setup, tz: wb.tz, today, dayOk, dayWhy });
-        if (v.skip) { skipped[v.skip] = (skipped[v.skip] || 0) + 1; continue; }
-        if (v.value == null || !Number.isFinite(Number(v.value))) continue;
-        plan.push({ tab: m.tab, day: d.day, row_no: d.row_no, field: f, cell: d.cells[f], value: v.value });
-      }
+  // YESTERDAY FIRST, always, outside the caps (Reilly's morning fill); then older gaps.
+  const rows = [];
+  for (const m of read.months) for (const d of m.days) if (d.day < today) rows.push({ m, d });
+  rows.sort((p, q) => (p.d.day === yesterday ? -1 : q.d.day === yesterday ? 1 : p.d.day < q.d.day ? -1 : 1));
+  let days = 0, evaluated = 0, capped = false;
+  for (const { m, d } of rows) {
+    const isY = d.day === yesterday;
+    if (isY) { y.in_sheet = true; }
+    const fields = INPUT_FIELDS.filter((f) => writableBlank(d, f));
+    if (!fields.length) continue;
+    const pnl = closedBy.get(d.day);
+    if (!pnl) { bump("day not closed by the brain", fields.length); if (isY) y.skipped["yesterday not closed by the brain yet"] = fields.length; continue; }
+    if (isY) y.closed = true;
+    if (!isY && capped) { bump("more days next run (per-run limit)", fields.length); continue; }
+    // Bounded work: older days are only evaluated up to a limit per run.
+    if (!isY && ++evaluated > maxDays * 6) { capped = true; bump("more days next run (per-run limit)", fields.length); continue; }
+    const cells = [];
+    for (const f of fields) {
+      const v = await brainValue(db, wb.store, d.day, f, { pnl, setup: read.setup, tz: wb.tz, today, dayOk, dayWhy });
+      if (v.skip) { bump(v.skip); if (isY) y.skipped[v.skip] = (y.skipped[v.skip] || 0) + 1; continue; }
+      if (v.value == null || !Number.isFinite(Number(v.value))) continue;
+      cells.push({ tab: m.tab, day: d.day, row_no: d.row_no, field: f, cell: d.cells[f], value: v.value });
     }
+    if (!cells.length) continue; // only blanks the rules keep blank: doesn't count toward the cap
+    if (isY) { plan.push(...cells); y.planned = cells.length; continue; }
+    if (days >= maxDays || plan.length + cells.length > maxCells + y.planned) { capped = true; bump("more days next run (per-run limit)", cells.length); continue; }
+    days++;
+    plan.push(...cells);
   }
-  return { plan, skipped };
+  if (closedBy.has(yesterday)) y.closed = true;
+  return { plan, skipped, yesterday: y };
 }
 
 /**
@@ -755,22 +770,33 @@ export async function planEcom(db, read, { nowMs = Date.now() } = {}) {
   // only as good as the three sheets it adds up.
   const marks = stores.map(() => "?").join(", ");
   const fresh = await db.prepare(`SELECT COUNT(*) AS n FROM sheet_workbooks WHERE store IN (${marks}) AND last_ok_at >= ?`).bind(...stores, nowIso(nowMs - 90 * 60000)).first();
-  if (!fresh || Number(fresh.n) !== stores.length) return { plan, skipped: { "a store workbook was not read this run": 1 } };
+  const yesterday = minusDays(today, 1);
+  const y = { day: yesterday, in_sheet: false, planned: 0, skipped: {} };
+  if (!fresh || Number(fresh.n) !== stores.length) return { plan, skipped: { "a store workbook was not read this run": 1 }, yesterday: { ...y, retry: "a store workbook was not read this run" } };
   // Only store rows whose tab was read in THIS run.
   const { results: all } = await db.prepare(`SELECT * FROM sheet_pnl_days WHERE store IN (${marks}) AND seen_at >= ?`).bind(...stores, nowIso(nowMs - 90 * 60000)).all();
   const byDay = new Map();
   for (const r of all || []) { if (!byDay.has(r.day)) byDay.set(r.day, []); byDay.get(r.day).push(r); }
-  for (const m of read.months) {
-    for (const d of m.days) {
-      if (d.day >= today) continue;
+  const rows = [];
+  for (const m of read.months) for (const d of m.days) if (d.day < today) rows.push({ m, d });
+  rows.sort((p, q) => (p.d.day === yesterday ? -1 : q.d.day === yesterday ? 1 : p.d.day < q.d.day ? -1 : 1));
+  for (const { m, d } of rows) {
+    {
+      const isY = d.day === yesterday;
+      if (isY) y.in_sheet = true;
       const results = byDay.get(d.day) || [];
-      if (results.length !== stores.length) { skipped["a store sheet has no row for the day"] = (skipped["a store sheet has no row for the day"] || 0) + 1; continue; }
+      if (results.length !== stores.length) {
+        skipped["a store sheet has no row for the day"] = (skipped["a store sheet has no row for the day"] || 0) + 1;
+        if (isY) y.skipped["a store sheet has no row for yesterday"] = 1;
+        continue;
+      }
       for (const f of INPUT_FIELDS) {
         const parts = results.map((r) => r[f]);
-        if (parts.some((x) => x == null)) continue;
+        if (parts.some((x) => x == null)) { if (isY && writableBlank(d, f)) y.skipped[`${f}: a store cell is blank`] = 1; continue; }
         const sum = ["orders", "clicks", "sessions"].includes(f) ? parts.reduce((s, x) => s + Number(x), 0) : r2(parts.reduce((s, x) => s + Number(x), 0));
-        if (writableBlank(d, f) && plan.length >= PLAN_CELLS_PER_RUN) { skipped["more cells next run (per-run limit)"] = (skipped["more cells next run (per-run limit)"] || 0) + 1; continue; }
+        if (writableBlank(d, f) && !isY && plan.length >= PLAN_CELLS_PER_RUN + y.planned) { skipped["more cells next run (per-run limit)"] = (skipped["more cells next run (per-run limit)"] || 0) + 1; continue; }
         if (writableBlank(d, f)) {
+          if (isY) y.planned++;
           plan.push({ tab: m.tab, day: d.day, row_no: d.row_no, field: f, cell: d.cells[f], value: sum });
         } else if (d.values[f] != null && Math.abs(Number(d.values[f]) - sum) > (["orders", "clicks", "sessions"].includes(f) ? 0 : MISMATCH_USD)) {
           await mismatch(db, { store: "all", day: d.day, field: f, sheet: d.values[f], brain: sum, source: "sum of the three store sheets" }, budget, at);
@@ -778,7 +804,7 @@ export async function planEcom(db, read, { nowMs = Date.now() } = {}) {
       }
     }
   }
-  return { plan, skipped };
+  return { plan, skipped, yesterday: y };
 }
 
 /** One "OCT tab missing" event per workbook per day; the brain never creates tabs. */
@@ -827,6 +853,9 @@ export async function runSheets(env, { fetchImpl = fetch, nowMs = Date.now(), ca
     return { status: err.code === "NOT_WIRED" ? "not wired: Google not connected" : `Google sign-in failed (${String(err.message).slice(0, 80)})`, read: 0 };
   }
   const out = { status: "ran", read: [], unreachable: [], filled: 0, recomputed: 0, mismatches: 0, written: {}, missing_tabs: [], write: sheetsWriteOn(env) ? "on" : "off (SHEETS_WRITE=0)", mode: sheetsWriteOn(env) ? WRITER_MODE : "off" };
+  // Per workbook: was YESTERDAY's row filled this run? { ok, why } (see yesterdayVerdict).
+  out.yesterday = {};
+  const yv = (store, ok, why) => { out.yesterday[store] = { ok, why }; };
   const reads = {};
   const rowBudget = { rows: STORE_ROWS_PER_RUN };
   for (const wb of workbooks()) {
@@ -845,17 +874,22 @@ export async function runSheets(env, { fetchImpl = fetch, nowMs = Date.now(), ca
       out.unreachable.push({ store: wb.store, error: msg });
     }
   }
+  for (const wb of workbooks()) if (!out.read.includes(wb.store)) yv(wb.store, false, "workbook not read this run (unreachable or call budget)");
   if (!out.read.length) return out;
   out.filled = (await fillAdsFromSheet(db, { nowMs })).length;
   out.recomputed = (await recomputeChanged(db, { nowMs })).length;
   out.mismatches = (await crossCheck(db, { nowMs })).length;
-  if (!sheetsWriteOn(env)) return out;
+  if (!sheetsWriteOn(env)) {
+    for (const wb of workbooks()) if (reads[wb.store]) yv(wb.store, false, "SHEETS_WRITE kill switch is set");
+    return out;
+  }
+  const storesWroteYesterday = [];
   for (const wb of workbooks()) {
     const read = reads[wb.store];
     if (!read) continue; // unreachable this run: never write blind
     // A write is 4 calls (two re-reads, the write, the confirming read).
-    if (!budget.has(WRITE_CALLS)) { out.written[wb.store] = "call budget for this run used up"; continue; }
-    if (!(await claimJob(db, `pnl.sheets.write.${wb.store}`, WRITE_EVERY_MIN, nowMs))) { out.written[wb.store] = "not due"; continue; }
+    if (!budget.has(WRITE_CALLS)) { out.written[wb.store] = "call budget for this run used up"; yv(wb.store, false, "call budget for this run used up"); continue; }
+    if (!(await claimJob(db, `pnl.sheets.write.${wb.store}`, WRITE_EVERY_MIN, nowMs))) { out.written[wb.store] = "not due"; yv(wb.store, false, "write not due (once an hour per workbook)"); continue; }
     try {
       let gate = { dayOk: false, dayWhy: null };
       if (wb.store !== "all") {
@@ -863,19 +897,23 @@ export async function runSheets(env, { fetchImpl = fetch, nowMs = Date.now(), ca
         const shop = await shopTimezone(env, wb.store, { nowMs, fetchImpl, budget });
         const basis = shop.ok ? await dayBasis(db, wb.store, { nowMs }) : null;
         gate = { dayOk: !!(shop.ok && basis && basis.ok), dayWhy: !shop.ok ? shop.why : basis && !basis.ok ? basis.why : null };
-        if (!budget.has(WRITE_CALLS)) { out.written[wb.store] = "call budget for this run used up"; continue; }
+        if (!budget.has(WRITE_CALLS)) { out.written[wb.store] = "call budget for this run used up"; yv(wb.store, false, "call budget for this run used up"); continue; }
       }
-      const { plan, skipped } = wb.store === "all" ? await planEcom(db, read, { nowMs }) : await planStore(db, wb, read, { nowMs, ...gate });
+      const { plan, skipped, yesterday } = wb.store === "all" ? await planEcom(db, read, { nowMs }) : await planStore(db, wb, read, { nowMs, ...gate });
       // Same write batch: corrections of the brain's own recent cells (one backup, one write, one re-read).
       if (wb.store !== "all") plan.push(...(await planCorrections(db, wb, read, { nowMs, ...gate })));
       const r = await writeCells(env, wb, plan, { token, fetchImpl, nowMs });
       const ok = (r.written || []).filter((w) => w.verified).length;
       out.written[wb.store] = ok;
+      const verdict = yesterdayVerdict(wb, yesterday, plan, r, storesWroteYesterday);
+      yv(wb.store, verdict.ok, verdict.why);
+      if (wb.store !== "all" && (r.written || []).some((w) => w.day === yesterday.day && w.verified && w.expect == null)) storesWroteYesterday.push(wb.store);
       await db.prepare(`UPDATE sheet_workbooks SET last_write_at = ?, last_write = ? WHERE store = ?`)
         .bind(nowIso(nowMs), JSON.stringify({ planned: plan.length, written: ok, unverified: (r.written || []).length - ok, dropped_not_blank_any_more: r.dropped || 0, skipped }), wb.store).run();
     } catch (err) {
       const msg = String((err && err.message) || err).slice(0, 200);
       out.written[wb.store] = { error: msg, phase: err && err.phase };
+      yv(wb.store, false, `write failed: ${msg}`);
       // Say only what is true: "nothing changed" only when nothing was sent to Google.
       const unknown = err && err.phase === "write_unknown";
       await logEvent(db, {
@@ -889,6 +927,31 @@ export async function runSheets(env, { fetchImpl = fetch, nowMs = Date.now(), ca
     }
   }
   return out;
+}
+
+/**
+ * Pure: was yesterday's row of one workbook filled? ok = every planned yesterday cell was
+ * written AND verified (a cell Reilly filled in between counts as filled), or there was provably
+ * nothing to write (the reasons are given). Anything else = retry.
+ */
+export function yesterdayVerdict(wb, y, plan, r, storesWroteYesterday = []) {
+  if (!y) return { ok: false, why: "no plan for yesterday" };
+  if (y.retry) return { ok: false, why: y.retry };
+  if (!y.in_sheet) return { ok: false, why: `no row for ${y.day} in the sheet (month tab missing?)` };
+  if (wb.store !== "all" && !y.closed) return { ok: false, why: `${y.day} not closed by the brain yet` };
+  // The Ecom P&L sums the store sheets as read this run: if a store just got yesterday's cells,
+  // the Ecom row is summed on the next slot.
+  if (wb.store === "all" && storesWroteYesterday.length) return { ok: false, why: `store sheets just filled (${storesWroteYesterday.join(", ")}); the Ecom row is summed next slot` };
+  const yPlan = plan.filter((p) => p.day === y.day && p.expect == null);
+  if (!yPlan.length) {
+    const reasons = Object.keys(y.skipped || {});
+    return { ok: true, why: reasons.length ? `nothing writable for ${y.day}: ${reasons.join("; ")}` : `nothing to write for ${y.day}: every input cell already filled` };
+  }
+  const done = (r.written || []).filter((w) => w.day === y.day && w.expect == null);
+  const bad = done.filter((w) => !w.verified);
+  if (bad.length) return { ok: false, why: `${bad.length} cell${bad.length === 1 ? "" : "s"} for ${y.day} not verified` };
+  // Cells not written were dropped because they were no longer blank (Reilly typed them): filled.
+  return { ok: true, why: `${y.day}: ${done.length} cell${done.length === 1 ? "" : "s"} written and verified${yPlan.length > done.length ? `, ${yPlan.length - done.length} already filled by hand` : ""}` };
 }
 
 /* ---------------- the morning schedule ---------------- */
@@ -911,6 +974,7 @@ export async function sheetsDue(db, nowMs = Date.now()) {
   const tried = await lastRun(db, "pnl.sheets.morning");
   const triedToday = !!(tried && tried.last_run_at && localDay(tried.last_run_at, MORNING_TZ) === today);
   if (triedToday && hour >= MORNING_RETRY_UNTIL_HOUR) return { due: false, why: "retries stop at noon; next run tomorrow 07:00" };
+  if (triedToday && tried.last_run_at && nowMs - Date.parse(tried.last_run_at) < MORNING_CLAIM_GAP_MIN * 60000) return { due: false, why: "another run holds this slot" };
   return { due: true, why: triedToday ? "retry: yesterday was not closed yet" : "morning run" };
 }
 
@@ -918,27 +982,51 @@ const mark = (db, job, at, result) => db.prepare(
   `INSERT INTO job_runs (job, last_run_at, last_result) VALUES (?, ?, ?) ON CONFLICT(job) DO UPDATE SET last_run_at = excluded.last_run_at, last_result = excluded.last_result`
 ).bind(job, at, String(result).slice(0, 300)).run();
 
+/** Two attempts at least this far apart: a second concurrent run can never claim the same slot. */
+export const MORNING_CLAIM_GAP_MIN = 30;
+
+/**
+ * One atomic claim of a morning attempt: a single INSERT ... ON CONFLICT ... WHERE statement,
+ * then a check of `changes`. Two runs at the same moment: only one row update succeeds.
+ */
+export async function claimMorning(db, nowMs, why) {
+  const res = await db.prepare(
+    `INSERT INTO job_runs (job, last_run_at, last_result) VALUES ('pnl.sheets.morning', ?, ?)
+     ON CONFLICT(job) DO UPDATE SET last_run_at = excluded.last_run_at, last_result = excluded.last_result
+     WHERE julianday(excluded.last_run_at) - julianday(job_runs.last_run_at) >= ?`
+  ).bind(nowIso(nowMs), `running (${why})`, MORNING_CLAIM_GAP_MIN / (24 * 60) - 1e-9).run();
+  return !!(res.meta && res.meta.changes > 0);
+}
+
 /** The P&L slot's entry point: runs runSheets only when the morning run is due, and records it. */
 export async function runSheetsMorning(env, { fetchImpl = fetch, nowMs = Date.now(), calls = null } = {}) {
   const db = env.DB;
   const due = await sheetsDue(db, nowMs);
-  if (!due.due) return { ran: false, reason: due.why };
-  const at = nowIso(nowMs);
-  await mark(db, "pnl.sheets.morning", at, due.why);
-  const out = await runSheets(env, { fetchImpl, nowMs, calls });
-  // Done when every live store with a workbook has yesterday CLOSED in the brain (so its row
-  // could be filled) and its workbook was read this run. Otherwise: retry next slot, until noon.
-  const stores = LIVE_STORE_IDS.filter((id) => STORES[id].pnlSheetId);
-  const open = [];
-  for (const id of stores) {
-    const y = minusDays(localDay(nowMs, storeTz(id)), 1);
-    const row = await db.prepare(`SELECT complete FROM pnl_days WHERE store = ? AND day = ?`).bind(id, y).first();
-    if (!row || !row.complete || !(out.read || []).includes(id)) open.push(`${id} ${y}`);
+  if (!due.due) {
+    // Past noon without success: say so once ("not filled", never "filled").
+    if (/retries stop at noon/.test(due.why)) {
+      const m = await lastRun(db, "pnl.sheets.morning");
+      if (m && m.last_result && !/^not filled:/.test(m.last_result)) {
+        await db.prepare(`UPDATE job_runs SET last_result = ? WHERE job = 'pnl.sheets.morning'`).bind(`not filled: ${m.last_result.replace(/^(retrying|running)[^:]*: ?/, "")}`.slice(0, 300)).run();
+      }
+    }
+    return { ran: false, reason: due.why };
   }
-  const result = open.length ? `ran; waiting on ${open.join(", ")}` : "ran; yesterday filled";
-  await db.prepare(`UPDATE job_runs SET last_result = ? WHERE job = 'pnl.sheets.morning'`).bind(result).run();
+  if (!(await claimMorning(db, nowMs, due.why))) return { ran: false, reason: "another run holds this slot" };
+  const at = nowIso(nowMs);
+  const out = await runSheets(env, { fetchImpl, nowMs, calls });
+  // Done only when EVERY workbook's yesterday row was filled and verified, or provably had
+  // nothing writable (runSheets' yesterdayVerdict). Anything else: retry next slot, until noon.
+  const verdicts = workbooks().map((wb) => ({ store: wb.store, ...((out.yesterday || {})[wb.store] || { ok: false, why: String(out.status || "did not run") }) }));
+  const open = verdicts.filter((v) => !v.ok);
+  const afterNoon = hourIn(nowMs, MORNING_TZ) >= MORNING_RETRY_UNTIL_HOUR;
+  const text = (vs) => vs.map((v) => `${v.store}: ${v.why}`).join(" | ");
+  const result = !open.length ? `filled: ${text(verdicts)}`
+    : afterNoon ? `not filled: ${text(open)}`
+    : `retrying until noon: ${text(open)}`;
+  await db.prepare(`UPDATE job_runs SET last_result = ? WHERE job = 'pnl.sheets.morning'`).bind(result.slice(0, 300)).run();
   if (!open.length) await mark(db, "pnl.sheets.done", at, result);
-  return { ran: true, ...out, waiting_on: open };
+  return { ran: true, ...out, filled_yesterday: !open.length, waiting_on: open };
 }
 
 /** When the next morning run will be, in words and as an ISO time when it is a fixed time. */
