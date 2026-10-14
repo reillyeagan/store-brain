@@ -52,10 +52,13 @@ export const KFB_IMPORT_MAX_BYTES = 5 * 1024 * 1024;
 /** Rows per section; more means something is wrong with the read, not a busy morning. */
 export const KFB_IMPORT_MAX_ROWS = 6000;
 /**
- * A read older than this is not imported as a morning session (rule 4: freshness before
- * numbers). Matches the digest's 36 h limit: a missed morning still counts, two don't.
+ * A read older than this is not imported (rule 4: freshness before numbers). The same limit
+ * as the kfb.morning_sweep feed (26 h in src/lib/freshness.js), so an import can never mark
+ * the feed fresh with a read the feed itself would call stale.
  */
-export const KFB_IMPORT_MAX_AGE_H = 36;
+export const KFB_IMPORT_MAX_AGE_H = 26;
+/** Raw payloads kept in R2 for audit this long; older ones are deleted on the next import (they hold order data). */
+export const KFB_RAW_RETENTION_DAYS = 30;
 /** The feed the Order-to-Supplier Watcher and the Freshness Sentinel read (src/lib/freshness.js). */
 export const KFB_FEED = "kfb.morning_sweep";
 /** Eastern clock time of the one phone reminder when no import has landed (minutes after midnight). */

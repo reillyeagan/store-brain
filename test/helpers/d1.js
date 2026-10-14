@@ -57,6 +57,7 @@ export function makeR2() {
     async put(key, body) { store.set(key, typeof body === "string" ? body : String(body)); },
     async head(key) { return store.has(key) ? { key, size: new TextEncoder().encode(store.get(key)).length } : null; },
     async get(key) { return store.has(key) ? { text: async () => store.get(key) } : null; },
+    async delete(key) { store.delete(key); },
     _store: store,
   };
 }

@@ -57,6 +57,12 @@ export async function runOrderWatch(env, { nowMs = Date.now() } = {}) {
   const sweep = await sweepStatus(db, nowMs);
   if (!sweep.usable) return { status: "waiting", reason: sweep.reason, checked: 0, flagged: 0 };
   const sweepMs = Date.parse(sweep.at);
+  // A KFB morning import whose orders read was cut off (page limit) only covers the newest
+  // orders: an absence from it says nothing (rule 6). Found orders still count; nothing is
+  // marked missing and ful.not_in_kfb is never raised from it.
+  const imp = await db.prepare(`SELECT sections FROM kfb_imports WHERE fetched_at = ? ORDER BY id DESC LIMIT 1`).bind(sweep.at).first().catch(() => null);
+  const impOrders = imp ? (safeJson(imp.sections, {}) || {}).orders : null;
+  const noMiss = !!(impOrders && impOrders.truncated);
   const latestOrder = nowIso(sweepMs - hours(env) * 3600000);
   const earliest = nowIso(nowMs - LOOKBACK_DAYS * 86400000);
   let checked = 0, suspect = 0, flagged = 0, found = 0, cancelled = 0, writes = 0;
@@ -107,6 +113,7 @@ export async function runOrderWatch(env, { nowMs = Date.now() } = {}) {
         }
         continue;
       }
+      if (noMiss) continue;
       if (!row) {
         await db.prepare(`INSERT INTO order_watch (store, order_id, order_name, created_at, state, first_missing_at, checked_at, sweep_at) VALUES (?, ?, ?, ?, 'suspect', ?, ?, ?)`)
           .bind(id, o.order_id, o.name, o.created_at, at, at, sweep.at).run();
@@ -124,7 +131,8 @@ export async function runOrderWatch(env, { nowMs = Date.now() } = {}) {
       }
     }
   }
-  return { status: "checked", sweep_at: sweep.at, checked, suspect, flagged, found, cancelled, skipped_stores: skippedStores };
+  return { status: "checked", sweep_at: sweep.at, checked, suspect, flagged, found, cancelled, skipped_stores: skippedStores,
+    ...(noMiss ? { partial_read: "the KFB orders read was cut off: absences not counted" } : {}) };
 }
 
 export async function orderWatchState(env, { nowMs = Date.now() } = {}) {

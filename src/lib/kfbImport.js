@@ -31,11 +31,11 @@
 import { STORES, STORE_IDS } from "../config/stores.js";
 import {
   KFB_ORIGINS, KFB_IMPORT_MAX_BYTES, KFB_IMPORT_MAX_ROWS, KFB_IMPORT_MAX_AGE_H, KFB_FEED,
-  KFB_REMINDER_AFTER_MIN, KFB_BILLS_PAGE,
+  KFB_REMINDER_AFTER_MIN, KFB_BILLS_PAGE, KFB_RAW_RETENTION_DAYS,
 } from "../config/kfb.js";
 import { validateQuoteRow } from "../agents/supplier/quotes.js";
 import { handleFrom } from "../agents/supplier/common.js";
-import { markFeedOk } from "./freshness.js";
+import { markFeedOk, markFeedFailed, ensureFeeds } from "./freshness.js";
 import { logEvent } from "./eventlog.js";
 import { nowIso, localDay } from "./time.js";
 import { sendPhone } from "./phone.js";
@@ -97,10 +97,16 @@ export function kfbTime(v, offset = "+08:00") {
   let ms = NaN;
   if (/^\d{10}$/.test(s)) ms = Number(s) * 1000;
   else if (/^\d{13}$/.test(s)) ms = Number(s);
-  else if (/T.*(Z|[+-]\d\d:?\d\d)$/i.test(s)) ms = Date.parse(s);
   else {
-    const m = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?/.exec(s);
-    if (m) ms = Date.parse(`${m[1]}-${m[2]}-${m[3]}T${m[4] || "00"}:${m[5] || "00"}:${m[6] || "00"}${offset}`);
+    // "2026-10-13 09:15:00", "2026/10/13 09:15", "2026-10-13T09:15:00Z", "2026-10-13 09:15:00+08:00".
+    // A zone written in the stamp wins; only a zone-less stamp is read at `offset`.
+    const m = /^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2})(\.\d+)?)?)?\s*(Z|[+-]\d{2}:?\d{2})?$/i.exec(s);
+    if (m) {
+      const p2 = (x) => String(x || "0").padStart(2, "0");
+      let zone = m[8] ? m[8].toUpperCase() : offset;
+      if (/^[+-]\d{4}$/.test(zone)) zone = `${zone.slice(0, 3)}:${zone.slice(3)}`;
+      ms = Date.parse(`${m[1]}-${p2(m[2])}-${p2(m[3])}T${p2(m[4])}:${p2(m[5])}:${p2(m[6])}${m[7] || ""}${zone}`);
+    }
   }
   return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
 }
@@ -155,6 +161,8 @@ export function quoteCost(raw) {
  */
 export const QUOTE_TIME_KEYS = Object.freeze(["quote_time", "quotation_time", "quoted_time", "relates_information_time",
   "update_time", "updated_at", "update_at", "create_time", "create_at", "created_at"]);
+/** Creation times: they never move, so a re-quote at the same status would hide behind them. */
+const CREATE_TIME_KEYS = new Set(["create_time", "create_at", "created_at"]);
 
 /* ------------------------------------------------------------------ payload check */
 
@@ -183,6 +191,8 @@ export function validatePayload(p, nowMs = Date.now()) {
     for (const k of keys.filter((x) => SECTIONS.includes(x))) {
       const s = p.sections[k];
       if (!isObj(s) || typeof s.ok !== "boolean") { errors.push(`${k}: must be {ok, rows}`); continue; }
+      if (s.truncated != null && typeof s.truncated !== "boolean") errors.push(`${k}: truncated must be true or false`);
+      if (s.total != null && !(Number.isInteger(s.total) && s.total >= 0)) errors.push(`${k}: total must be a whole number`);
       if (s.ok) {
         if (!Array.isArray(s.rows)) errors.push(`${k}: rows must be an array`);
         else if (s.rows.length > KFB_IMPORT_MAX_ROWS) errors.push(`${k}: ${s.rows.length} rows is more than ${KFB_IMPORT_MAX_ROWS}`);
@@ -213,6 +223,7 @@ export function normalizeQuoteRow(raw) {
   const link = pick(item, ["un_good_url", "store_link", "good_url"]) ?? pick(raw, ["un_good_url", "store_link", "goods_url", "link"]);
   const status = pick(raw, ["status", "quotation_status", "quote_status"]);
   const cost = quoteCost(raw);
+  const timeKey = QUOTE_TIME_KEYS.find((k) => !blank(raw[k])) || null;
   const row = {
     store: sc.store,
     link,
@@ -226,7 +237,7 @@ export function normalizeQuoteRow(raw) {
   };
   const v = validateQuoteRow(row);
   if (v.reason) return { code, store: sc.store, reason: v.reason };
-  return { code, store: sc.store, row, clean: v };
+  return { code, store: sc.store, row, clean: v, timeFromCreation: CREATE_TIME_KEYS.has(timeKey) };
 }
 
 /** One order row → a kfb_orders row. */
@@ -250,27 +261,50 @@ export function normalizeOrderRow(raw) {
 const LINE_ARRAY_KEYS = ["details", "detail", "bill_details", "lines", "list", "items", "children", "sub_orders", "suborders", "order_list", "orders"];
 const BILL_ID_KEYS = ["bill_no", "bill_sn", "bill_id", "bill_order_no", "bill_number", "bill_order_id", "bill_code"];
 const BILL_TIME_KEYS = ["bill_time", "billed_at", "bill_date", "create_time", "create_at", "created_at"];
-const PAY_TIME_KEYS = ["pay_time", "paid_at", "pay_at", "payment_time"];
+// Paid state. A bill HEADER may use the plain names; a flat bill-detail row is one order line,
+// and its own pay_time / pay_status is most likely the CUSTOMER's Shopify payment, so on a flat
+// row only fields that name the bill count (review of 7ce2827, finding 1).
 const PAY_FLAG_KEYS = ["pay_status", "is_pay", "is_paid", "paid", "payment_status"];
-const BILL_TOTAL_KEYS = ["bill_amount", "bill_price", "bill_total", "total_amount", "total_money", "pay_amount", "total_price", "total", "amount", "money"];
-// A line's cost. Totals first; a unit price is multiplied by the quantity (GUESS: the vault
-// does not name KFB's cost field). un_total_price is the SHOPIFY order total and is never read.
+const PAY_TIME_KEYS = ["pay_time", "paid_at", "pay_at", "payment_time"];
+const BILL_PAY_FLAG_KEYS = ["bill_pay_status", "bill_is_pay", "bill_is_paid", "bill_paid", "bill_payment_status"];
+const BILL_PAY_TIME_KEYS = ["bill_pay_time", "bill_paid_at", "bill_payment_time"];
+// A header's bill total. No pay_amount: on an unpaid bill it is the amount paid so far (0).
+const BILL_TOTAL_KEYS = ["bill_amount", "bill_price", "bill_total", "total_amount", "total_money", "total_price", "total", "amount", "money"];
+// A line's cost (GUESS: the vault does not name KFB's cost field, so every line records which
+// field it came from in cost_basis). A line total wins and is never multiplied; a named unit
+// price is multiplied by the quantity. No bare "price". un_total_price is the SHOPIFY order
+// total and is never read.
 const LINE_TOTAL_KEYS = ["goods_total", "goods_amount", "total_goods_price", "product_total", "goods_money", "purchase_amount"];
-const LINE_UNIT_KEYS = ["goods_price", "purchase_price", "product_price", "unit_price", "price", "cost"];
+const LINE_UNIT_KEYS = ["goods_price", "purchase_price", "product_price", "unit_price", "cost"];
 const LINE_ANY_TOTAL_KEYS = ["total_price", "amount", "money", "total", "subtotal"];
 const FEE_KEYS = ["service_fee", "service_price", "service_charge", "handling_fee", "commission", "fee"];
 const SHIP_KEYS = ["freight", "freight_price", "shipping_fee", "shipping_price", "shipping", "logistics_fee", "logistics_price", "postage", "express_fee"];
 const QTY_KEYS = ["quantity", "num", "goods_num", "qty", "number"];
 
-/** true paid · false unpaid · null can't tell (never a guess). */
-function paidFlag(o) {
-  if (!blank(pick(o, PAY_TIME_KEYS)) && kfbTime(pick(o, PAY_TIME_KEYS))) return true;
-  const v = pick(o, PAY_FLAG_KEYS);
+/** A pay flag's meaning: true paid · false unpaid · null can't tell. */
+function flagValue(v) {
   if (v == null) return null;
   const s = String(v).trim().toLowerCase();
   if (["1", "true", "paid", "yes", "已支付", "已付款"].includes(s)) return true;
   if (["0", "false", "unpaid", "no", "未支付", "未付款", "wait", "pending"].includes(s)) return false;
   return null;
+}
+
+/**
+ * A bill's paid state from the fields allowed for that kind of row. An explicit flag beats a
+ * timestamp; a timestamp alone counts only when there is no flag. Unclear → null (unknown),
+ * never "paid".
+ */
+export function billPaidState(o, { header }) {
+  const flags = header ? [...BILL_PAY_FLAG_KEYS, ...PAY_FLAG_KEYS] : BILL_PAY_FLAG_KEYS;
+  const times = header ? [...BILL_PAY_TIME_KEYS, ...PAY_TIME_KEYS] : BILL_PAY_TIME_KEYS;
+  const rawFlag = pick(o, flags);
+  const at = kfbTime(pick(o, times));
+  if (rawFlag != null) {
+    const f = flagValue(rawFlag);
+    return { paid: f, paidAt: f === true ? at : null };
+  }
+  return at ? { paid: true, paidAt: at } : { paid: null, paidAt: null };
 }
 
 function billLine(raw, header) {
@@ -280,36 +314,41 @@ function billLine(raw, header) {
   const no = pick(raw, ["order_no", "order_sn", "kfb_order_no"]);
   const ref = orderRefFrom(raw);
   const qty = num(pick(raw, QTY_KEYS));
-  let cost = num(pick(raw, LINE_TOTAL_KEYS));
+  let cost = num(pick(raw, LINE_TOTAL_KEYS)), basis = cost != null ? "line_total" : null;
   if (cost == null) {
     const unit = num(pick(raw, LINE_UNIT_KEYS));
-    if (unit != null) cost = qty != null && qty > 1 ? unit * qty : unit;
+    if (unit != null) { cost = qty != null && qty > 1 ? unit * qty : unit; basis = qty != null && qty > 1 ? "unit_x_qty" : "unit"; }
   }
   const fees = num(pick(raw, FEE_KEYS));
   const ship = num(pick(raw, SHIP_KEYS));
-  if (cost == null && fees == null && ship == null) cost = num(pick(raw, LINE_ANY_TOTAL_KEYS));
+  if (cost == null && fees == null && ship == null) { cost = num(pick(raw, LINE_ANY_TOTAL_KEYS)); basis = cost != null ? "any_total" : null; }
   if (cost == null && fees == null && ship == null) return { code, store: sc.store, reason: "no cost on the bill line" };
   return {
-    code, store: sc.store,
+    code, store: sc.store, basis: basis || "fees_only",
     line: {
       kfb_shop_code: code, order_ref: ref ? ref.ref : null, kfb_order_id: no == null ? null : String(no).trim(),
       parent_kfb_order_id: ref && ref.parent ? ref.parent : null,
       sku: pick(raw, ["sku", "goods_sku", "un_good_sku"]), quantity: qty == null ? null : Math.round(qty),
       cost_eur: r2(cost), fees_eur: r2(fees), shipping_eur: r2(ship),
     },
-    paid: paidFlag(raw), paidAt: kfbTime(pick(raw, PAY_TIME_KEYS)),
     billId: pick(raw, BILL_ID_KEYS), billedAt: kfbTime(pick(raw, BILL_TIME_KEYS)),
   };
 }
+
+/** A line's identity for merging (line_no is only a position, so it is not part of it). */
+export const lineKey = (l) => [l.kfb_order_id || "", l.order_ref || "", l.sku || "", l.cost_eur ?? "", l.fees_eur ?? "", l.shipping_eur ?? ""].join("|");
 
 /**
  * Bill rows → bills with their lines. A row is either a bill with nested lines (details,
  * list, children, ...) or one bill line itself (KFB's "bill details"); flat lines are grouped
  * by bill id. A bill with no id is filed under its shop + bill day, which is stable.
+ * `truncated`: the read stopped before KFB's last row, so the bill of the LAST row read may
+ * continue on the next page: it is marked incomplete.
  */
-export function normalizeBills(rows) {
+export function normalizeBills(rows, { truncated = false } = {}) {
   const bills = new Map();
   const rejected = [];
+  let lastId = null;
   for (const raw of rows || []) {
     const nestedKey = LINE_ARRAY_KEYS.find((k) => Array.isArray(raw[k]) && raw[k].some(isObj));
     const lines = nestedKey ? raw[nestedKey].filter(isObj) : [raw];
@@ -324,35 +363,40 @@ export function normalizeBills(rows) {
         id = `kfb-day:${n.code}:${String(pick(raw, BILL_TIME_KEYS) || pick(l, BILL_TIME_KEYS)).slice(0, 10)}`;
       }
       id = String(id).trim();
+      lastId = id;
       if (!bills.has(id)) {
+        const headerTotal = nestedKey ? r2(num(pick(raw, BILL_TOTAL_KEYS))) : null;
         bills.set(id, {
-          bill_id: id, billed_at: billedAt, codes: new Set(), lines: [], flags: [], paidAt: null,
-          // Only a header's own total counts as the bill total; a flat line's total is a line.
-          total_eur: nestedKey ? r2(num(pick(raw, BILL_TOTAL_KEYS))) : null,
+          bill_id: id, billed_at: billedAt, codes: new Set(), lines: [], states: [], bases: new Set(), nested: !!nestedKey,
+          // Only a header's own positive total is the bill total; otherwise the lines are summed.
+          total_eur: headerTotal != null && headerTotal > 0 ? headerTotal : null,
         });
-        if (nestedKey) { const f = paidFlag(raw); if (f != null) bills.get(id).flags.push(f); bills.get(id).paidAt = kfbTime(pick(raw, PAY_TIME_KEYS)); }
+        if (nestedKey) bills.get(id).states.push(billPaidState(raw, { header: true }));
       }
       const b = bills.get(id);
       b.codes.add(n.code);
       b.lines.push(n.line);
-      if (n.paid != null) b.flags.push(n.paid);
-      if (!b.paidAt && n.paidAt) b.paidAt = n.paidAt;
+      b.bases.add(n.basis);
+      if (!nestedKey) b.states.push(billPaidState(l, { header: false }));
       if (!b.billed_at && billedAt) b.billed_at = billedAt;
     }
   }
   const out = [];
   for (const b of bills.values()) {
     // Stable line numbers, so the same bill always gets the same line_no for the same line.
-    const key = (l) => [l.kfb_order_id || "", l.order_ref || "", l.sku || "", l.cost_eur ?? "", l.fees_eur ?? "", l.shipping_eur ?? ""].join("|");
-    b.lines.sort((a, c) => (key(a) < key(c) ? -1 : key(a) > key(c) ? 1 : 0));
+    b.lines.sort((a, c) => (lineKey(a) < lineKey(c) ? -1 : lineKey(a) > lineKey(c) ? 1 : 0));
     b.lines.forEach((l, i) => { l.line_no = i + 1; });
-    const flags = new Set(b.flags);
-    const paid = b.paidAt ? true : flags.size === 1 ? [...flags][0] : null;
+    // Every row that states a paid state must agree; none stated, or a disagreement → unknown.
+    const stated = b.states.filter((s) => s.paid != null);
+    const vals = new Set(stated.map((s) => s.paid));
+    const paid = vals.size === 1 ? [...vals][0] : null;
+    const paidAt = paid === true ? (stated.map((s) => s.paidAt).filter(Boolean).sort()[0] || null) : null;
     const codes = [...b.codes];
     const linesEur = r2(b.lines.reduce((s, l) => s + (l.cost_eur || 0) + (l.fees_eur || 0) + (l.shipping_eur || 0), 0));
     out.push({
       bill_id: b.bill_id, kfb_shop_code: codes.length === 1 ? codes[0] : null, billed_at: b.billed_at,
-      total_eur: b.total_eur, paid_at: b.paidAt, paid, lines: b.lines, codes, amount_eur: b.total_eur ?? linesEur,
+      total_eur: b.total_eur, paid_at: paidAt, paid, lines: b.lines, codes, amount_eur: b.total_eur ?? linesEur,
+      cost_basis: [...b.bases].sort().join(","), incomplete: !!(truncated && b.bill_id === lastId),
     });
   }
   return { bills: out, rejected };
@@ -419,7 +463,7 @@ export function normalizePayload(p) {
     }
   }
   if (s.bills && s.bills.ok) {
-    const nb = normalizeBills(s.bills.rows);
+    const nb = normalizeBills(s.bills.rows, { truncated: s.bills.truncated === true });
     out.bills = nb.bills;
     out.refused.bills = nb.rejected;
     for (const b of nb.bills) for (const l of b.lines) seenShop("bills", l.kfb_shop_code);
@@ -427,10 +471,44 @@ export function normalizePayload(p) {
   return out;
 }
 
+/** How many rows an import refused (from its stored counts). */
+export function refusedTotal(c) {
+  if (!c) return 0;
+  const sum = (m) => Object.values(m || {}).reduce((s, x) => s + (Number(x) || 0), 0);
+  return sum(c.quotes && c.quotes.refused) + sum(c.orders && c.orders.refused) + sum(c.bills && c.bills.refused_lines) + ((c.unknown_shops || []).length);
+}
+
+/**
+ * Sections this payload read that an EARLIER-stored import read more recently. Importing it
+ * would put older KFB data over newer (a stale pasted file, a tab left open overnight).
+ */
+async function newerReadsThan(db, payload, fetchedAt) {
+  const { results } = await db.prepare(`SELECT sections FROM kfb_imports WHERE fetched_at > ?`).bind(fetchedAt).all();
+  const mine = SECTIONS.filter((k) => payload.sections[k] && payload.sections[k].ok);
+  const hit = new Set();
+  for (const r of results || []) {
+    let s = {}; try { s = JSON.parse(r.sections) || {}; } catch { s = {}; }
+    for (const k of mine) if (s[k] && s[k].ok) hit.add(k);
+  }
+  return [...hit];
+}
+
+/** Raw payloads hold order data: keep KFB_RAW_RETENTION_DAYS of them, delete the rest. */
+async function pruneRaw(env, nowMs) {
+  if (!env.BACKUPS || typeof env.BACKUPS.delete !== "function") return 0;
+  const cutoff = nowIso(nowMs - KFB_RAW_RETENTION_DAYS * 86400000);
+  const { results } = await env.DB.prepare(`SELECT id, r2_key FROM kfb_imports WHERE r2_key IS NOT NULL AND imported_at < ? ORDER BY id LIMIT 50`).bind(cutoff).all();
+  for (const r of results || []) {
+    await env.BACKUPS.delete(r.r2_key);
+    await env.DB.prepare(`UPDATE kfb_imports SET r2_key = NULL WHERE id = ?`).bind(r.id).run();
+  }
+  return (results || []).length;
+}
+
 /**
  * Import one payload. Returns {ok, status?, duplicate?, counts, errors?}.
- * Nothing is written unless the whole payload passes the envelope check and the audit copy
- * is safely in R2.
+ * Nothing is written unless the whole payload passes the envelope check, it is not older than
+ * a read already imported, and the audit copy is safely in R2.
  */
 export async function importKfb(env, payload, { nowMs = Date.now() } = {}) {
   const db = env.DB;
@@ -439,22 +517,34 @@ export async function importKfb(env, payload, { nowMs = Date.now() } = {}) {
   const at = nowIso(nowMs);
   const day = localDay(nowMs, "America/New_York");
   const fetchedAt = nowIso(Math.min(Date.parse(payload.fetched_at), nowMs));
+  const newer = await newerReadsThan(db, payload, fetchedAt);
+  if (newer.length) {
+    return { ok: false, status: 409, errors: [`KFB ${newer.join(", ")} were already imported from a later read: this older read would roll newer data back. Read KFB again.`] };
+  }
   const n = normalizePayload(payload);
 
   const sectionInfo = {};
   for (const k of SECTIONS) {
     const s = payload.sections[k];
-    if (s) sectionInfo[k] = { ok: !!s.ok, rows: Array.isArray(s.rows) ? s.rows.length : 0, endpoint: s.endpoint ? String(s.endpoint).slice(0, 120) : null, error: s.ok ? null : String(s.error || "not read").slice(0, 300) };
+    if (s) {
+      sectionInfo[k] = {
+        ok: !!s.ok, rows: Array.isArray(s.rows) ? s.rows.length : 0, total: s.total ?? null, truncated: s.ok ? s.truncated === true : null,
+        endpoint: s.endpoint ? String(s.endpoint).slice(0, 120) : null, error: s.ok ? null : String(s.error || "not read").slice(0, 300),
+      };
+    }
   }
   // The hash covers what was read, not when: the same KFB rows twice are the same import.
   const hash = await sha256Hex(stableJson({ origin: payload.origin, sections: payload.sections }));
   const dup = await db.prepare(`SELECT id, counts FROM kfb_imports WHERE payload_hash = ? AND local_day = ?`).bind(hash, day).first();
+  let reuseId = null;
   if (dup) {
     let counts = null; try { counts = JSON.parse(dup.counts); } catch { counts = null; }
-    return { ok: true, duplicate: true, importId: dup.id, message: "Already imported today: nothing changed.", counts };
+    // Nothing was refused last time: the same rows again can change nothing.
+    if (!refusedTotal(counts)) return { ok: true, duplicate: true, importId: dup.id, message: "Already imported today: nothing changed.", counts };
+    reuseId = dup.id; // some rows were refused: try them again (a shop code may have been added since)
   }
 
-  // Audit copy first (rule 8 spirit): if it can't be stored, nothing is imported.
+  // Audit copy first: if it can't be stored, nothing is imported.
   if (!env.BACKUPS) return { ok: false, status: 503, errors: ["The R2 audit store (BACKUPS) is not bound: nothing imported."] };
   const r2Key = `kfb-imports/${day}/${hash}.json`;
   const body = JSON.stringify({ received_at: at, payload });
@@ -463,11 +553,13 @@ export async function importKfb(env, payload, { nowMs = Date.now() } = {}) {
   if (!head || head.size !== new TextEncoder().encode(body).length) {
     return { ok: false, status: 503, errors: [`The audit copy ${r2Key} could not be confirmed in R2: nothing imported.`] };
   }
+  const pruned = await pruneRaw(env, nowMs);
 
+  const billsTruncated = !!(sectionInfo.bills && sectionInfo.bills.truncated);
   const counts = {
-    quotes: await writeQuotes(db, n.quotes, at),
+    quotes: await writeQuotes(db, n.quotes, at, fetchedAt),
     orders: await writeOrders(db, n.orders, at),
-    bills: await writeBills(db, n.bills, at),
+    bills: await writeBills(db, n.bills, at, { truncated: billsTruncated }),
   };
   counts.quotes.refused = tally(n.refused.quotes);
   counts.quotes.skipped_not_live = n.skippedNotLive.quotes;
@@ -477,23 +569,38 @@ export async function importKfb(env, payload, { nowMs = Date.now() } = {}) {
   const unknownShops = [...new Set([...n.refused.quotes, ...n.refused.orders, ...n.refused.bills].map((r) => r.unknownShop).filter(Boolean))];
   counts.unknown_shops = unknownShops;
   counts.by_store = byStore(n);
+  counts.raw_files_pruned = pruned;
 
-  const ins = await db.prepare(
-    `INSERT OR IGNORE INTO kfb_imports (payload_hash, local_day, fetched_at, imported_at, origin, sections, counts, r2_key) VALUES (?,?,?,?,?,?,?,?)`
-  ).bind(hash, day, fetchedAt, at, payload.origin, JSON.stringify(sectionInfo), JSON.stringify(counts), r2Key).run();
-  const importId = ins.meta && ins.meta.changes ? ins.meta.last_row_id : null;
+  let importId = reuseId;
+  if (reuseId) {
+    await db.prepare(`UPDATE kfb_imports SET fetched_at = ?, imported_at = ?, sections = ?, counts = ?, r2_key = ? WHERE id = ?`)
+      .bind(fetchedAt, at, JSON.stringify(sectionInfo), JSON.stringify(counts), r2Key, reuseId).run();
+    await db.prepare(`DELETE FROM kfb_import_shops WHERE import_id = ?`).bind(reuseId).run();
+  } else {
+    const ins = await db.prepare(
+      `INSERT OR IGNORE INTO kfb_imports (payload_hash, local_day, fetched_at, imported_at, origin, sections, counts, r2_key) VALUES (?,?,?,?,?,?,?,?)`
+    ).bind(hash, day, fetchedAt, at, payload.origin, JSON.stringify(sectionInfo), JSON.stringify(counts), r2Key).run();
+    importId = ins.meta && ins.meta.changes ? ins.meta.last_row_id : null;
+  }
   if (importId) {
     const shopStmts = Object.entries(n.shops).map(([k, rows]) => {
       const [code, section] = k.split("|");
-      return db.prepare(`INSERT OR IGNORE INTO kfb_import_shops (import_id, kfb_shop_code, section, rows) VALUES (?,?,?,?)`).bind(importId, code, section, rows);
+      return db.prepare(`INSERT OR REPLACE INTO kfb_import_shops (import_id, kfb_shop_code, section, rows) VALUES (?,?,?,?)`).bind(importId, code, section, rows);
     });
     if (shopStmts.length) await runBatched(db, shopStmts);
   }
 
-  // The sweep happened when KFB was read. Agents stop waiting on it from here.
-  await markFeedOk(db, KFB_FEED, fetchedAt);
+  // The sweep feed means "KFB orders were read": the Order Watcher trusts absences from it.
+  // Fresh only when the orders section was read; otherwise it is recorded as failing, with why.
+  const ord = sectionInfo.orders;
+  if (ord && ord.ok) await markFeedOk(db, KFB_FEED, fetchedAt);
+  else {
+    await ensureFeeds(db); // the row may not exist yet before the first sentinel run
+    await markFeedFailed(db, KFB_FEED, `KFB import ${at.slice(0, 16)}: orders not read (${ord ? ord.error : "not sent"})`, at);
+  }
 
-  const failed = Object.entries(sectionInfo).filter(([, s]) => !s.ok).map(([k, s]) => `${k}: ${s.error}`);
+  const failed = Object.entries(sectionInfo).filter(([, s]) => !s.ok).map(([k]) => k);
+  const cut = Object.entries(sectionInfo).filter(([, s]) => s.truncated).map(([k]) => k);
   const refusedN = n.refused.quotes.length + n.refused.orders.length + n.refused.bills.length;
   await logEvent(db, {
     actor: ACTOR, kind: "kfb.imported", target: "sys.kfb", at,
@@ -501,7 +608,8 @@ export async function importKfb(env, payload, { nowMs = Date.now() } = {}) {
       `orders ${counts.orders.inserted} new, ${counts.orders.updated} changed · bills ${counts.bills.inserted} new, ${counts.bills.updated} changed (${counts.bills.lines} lines)` +
       (refusedN ? ` · ${refusedN} row${refusedN === 1 ? "" : "s"} refused` : "") +
       (unknownShops.length ? ` (unknown shop ${unknownShops.join(", ")})` : "") +
-      (failed.length ? ` · NOT read: ${failed.map((f) => f.split(":")[0]).join(", ")}` : ""),
+      (cut.length ? ` · read cut off before the end: ${cut.join(", ")}` : "") +
+      (failed.length ? ` · NOT read: ${failed.join(", ")}` : ""),
     data: { importId, fetched_at: fetchedAt, sections: sectionInfo, counts, r2Key },
   });
   return { ok: true, importId, counts, sections: sectionInfo, r2Key };
@@ -516,24 +624,49 @@ function byStore(n) {
   return out;
 }
 
-/** kfb_quotes: insert-or-ignore on the Quote Desk's own UNIQUE key; similar remarks recorded too. */
-async function writeQuotes(db, quotes, at) {
-  const out = { inserted: 0, unchanged: 0, similar_recorded: 0 };
+/**
+ * kfb_quotes: insert-or-ignore on the Quote Desk's own UNIQUE key; similar remarks recorded too.
+ * A row filed under its CREATION time (no quote/update time in the row) can't show a re-quote at
+ * the same status: when its cost differs from the latest stored one, it is filed under the time
+ * KFB was read instead, so the new cost lands (and the same cost again is a no-op).
+ */
+async function writeQuotes(db, quotes, at, observedAt) {
+  const out = { inserted: 0, unchanged: 0, requoted: 0, similar_recorded: 0 };
   if (!quotes.length) return out;
-  const stmts = quotes.map(({ row, clean: v }) => db.prepare(
+  const qkey = (store, handle, variant, status) => `${store}|${handle}|${variant || ""}|${status}`;
+  let latest = null;
+  if (quotes.some((q) => q.timeFromCreation)) {
+    latest = new Map();
+    const { results } = await db.prepare(`SELECT store, product_handle, variant_id, status, cost, quoted_at FROM kfb_quotes ORDER BY quoted_at, id`).all();
+    for (const r of results || []) latest.set(qkey(r.store, r.product_handle, r.variant_id, r.status), r);
+  }
+  const rows = [];
+  for (const q of quotes) {
+    const v = q.clean;
+    let quotedAt = v.quotedAt;
+    if (q.timeFromCreation) {
+      const prev = latest.get(qkey(v.store, v.handle, v.variantId, v.status));
+      if (prev) {
+        if (same(prev.cost, v.cost)) { out.unchanged++; continue; }
+        quotedAt = observedAt;
+        out.requoted++;
+      }
+    }
+    rows.push({ q, v, quotedAt });
+  }
+  const res = await runBatched(db, rows.map(({ q, v, quotedAt }) => db.prepare(
     `INSERT OR IGNORE INTO kfb_quotes (store, product_handle, variant_id, sku, kfb_quote_id, status_code, status, cost, currency,
        quoted_at, remark, similar, source, imported_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
-  ).bind(v.store, v.handle, v.variantId, row.sku == null ? null : String(row.sku), row.kfb_id == null ? null : String(row.kfb_id), v.code, v.status,
-    v.cost, v.currency, v.quotedAt, row.remark == null ? null : String(row.remark).slice(0, 500), v.similar ? 1 : 0, "kfb_session", at));
-  const res = await runBatched(db, stmts);
+  ).bind(v.store, v.handle, v.variantId, q.row.sku == null ? null : String(q.row.sku), q.row.kfb_id == null ? null : String(q.row.kfb_id), v.code, v.status,
+    v.cost, v.currency, quotedAt, q.row.remark == null ? null : String(q.row.remark).slice(0, 500), v.similar ? 1 : 0, "kfb_session", at)));
   for (const r of res) { if (r.meta && r.meta.changes) out.inserted++; else out.unchanged++; }
   // "Only similar ones" quotes: one offer each for the Similar QC (keyed by the quote's own time).
-  const sim = quotes.filter(({ clean: v }) => v.similar);
+  const sim = rows.filter(({ v }) => v.similar);
   if (sim.length) {
-    const sres = await runBatched(db, sim.map(({ row, clean: v }) => db.prepare(
+    const sres = await runBatched(db, sim.map(({ q, v, quotedAt }) => db.prepare(
       `INSERT OR IGNORE INTO kfb_similar_offers (store, context, product_handle, order_name, remark, photo_url, cost, currency, received_at, source)
        VALUES (?, 'quote', ?, '', ?, NULL, ?, ?, ?, 'kfb_session')`
-    ).bind(v.store, handleFrom(row.link) || "", row.remark == null ? null : String(row.remark).slice(0, 500), v.cost, v.currency, v.quotedAt)));
+    ).bind(v.store, handleFrom(q.row.link) || "", q.row.remark == null ? null : String(q.row.remark).slice(0, 500), v.cost, v.currency, quotedAt)));
     out.similar_recorded = sres.filter((r) => r.meta && r.meta.changes).length;
   }
   return out;
@@ -565,6 +698,8 @@ async function writeOrders(db, orders, at) {
 
 const lineSig = (lines) => lines.map((l) => [l.line_no, l.kfb_shop_code ?? "", l.order_ref ?? "", l.kfb_order_id ?? "", l.parent_kfb_order_id ?? "", l.sku ?? "",
   l.quantity ?? "", l.cost_eur ?? "", l.fees_eur ?? "", l.shipping_eur ?? ""].join(":")).join("|");
+const lineEurOf = (l) => (Number(l.cost_eur) || 0) + (Number(l.fees_eur) || 0) + (Number(l.shipping_eur) || 0);
+
 /** Equal as stored: null with null, numbers to the cent, everything else as text. */
 function same(a, b) {
   if (a == null || b == null) return a == null && b == null;
@@ -573,12 +708,17 @@ function same(a, b) {
 }
 
 /**
- * kfb_bills + kfb_bill_lines (what the COGS Matcher reads) and supplier_bills (bills to pay).
- * Only changed bills are rewritten; a bill's lines are replaced as a set when any line differs.
+ * kfb_bills + kfb_bill_lines (what the COGS Matcher reads), kfb_bill_flags, and supplier_bills
+ * (bills to pay). Only changed bills are rewritten.
+ *   Complete read: a bill's lines are replaced as a set when any line differs.
+ *   Truncated read (the bookmark stopped before KFB's last row): lines are only ADDED, never
+ *   deleted, and the bill at the cut is flagged incomplete (the COGS Matcher waits on it, and
+ *   it is not listed to pay from a partial line sum).
  * usd_charged / fx_source / matched_sig are never written here.
  */
-async function writeBills(db, bills, at) {
-  const out = { inserted: 0, updated: 0, unchanged: 0, lines: 0, to_pay: { inserted: 0, updated: 0, unchanged: 0, no_amount: 0, paid_state_unknown: 0 } };
+async function writeBills(db, bills, at, { truncated = false } = {}) {
+  const out = { inserted: 0, updated: 0, unchanged: 0, lines: 0, lines_added: 0, incomplete: 0,
+    to_pay: { inserted: 0, updated: 0, unchanged: 0, no_amount: 0, incomplete: 0, paid_state_unknown: 0 } };
   if (!bills.length) return out;
   const ids = bills.map((b) => b.bill_id);
   const oldBills = new Map((await readIn(db, `SELECT * FROM kfb_bills WHERE bill_id IN (?)`, ids)).map((r) => [r.bill_id, r]));
@@ -588,38 +728,63 @@ async function writeBills(db, bills, at) {
     oldLines.get(l.bill_id).push(l);
   }
   const oldPay = new Map((await readIn(db, `SELECT * FROM supplier_bills WHERE bill_id IN (?)`, ids)).map((r) => [r.bill_id, r]));
+  const oldFlags = new Map((await readIn(db, `SELECT * FROM kfb_bill_flags WHERE bill_id IN (?)`, ids)).map((r) => [r.bill_id, r]));
   const stmts = [];
   for (const b of bills) {
     out.lines += b.lines.length;
+    if (b.incomplete) out.incomplete++;
     const old = oldBills.get(b.bill_id);
     const prevLines = (oldLines.get(b.bill_id) || []).sort((x, y) => x.line_no - y.line_no);
-    const linesChanged = lineSig(prevLines) !== lineSig(b.lines);
-    const billedAt = b.billed_at ?? (old ? old.billed_at : null);
-    const paidAt = b.paid_at ?? (old ? old.paid_at : null);
-    if (!old) {
-      stmts.push(db.prepare(`INSERT OR IGNORE INTO kfb_bills (bill_id, kfb_shop_code, billed_at, currency, total_eur, paid_at, imported_at) VALUES (?,?,?,?,?,?,?)`)
-        .bind(b.bill_id, b.kfb_shop_code, billedAt, "EUR", b.total_eur, paidAt, at));
-      out.inserted++;
-    } else if (!same(old.kfb_shop_code, b.kfb_shop_code) || !same(old.billed_at, billedAt) || !same(old.total_eur, b.total_eur) || !same(old.paid_at, paidAt) || linesChanged) {
-      stmts.push(db.prepare(`UPDATE kfb_bills SET kfb_shop_code = ?, billed_at = ?, total_eur = ?, paid_at = ? WHERE bill_id = ?`)
-        .bind(b.kfb_shop_code, billedAt, b.total_eur, paidAt, b.bill_id));
-      out.updated++;
-    } else out.unchanged++;
-    if (linesChanged) {
-      stmts.push(db.prepare(`DELETE FROM kfb_bill_lines WHERE bill_id = ?`).bind(b.bill_id));
-      for (const l of b.lines) {
-        stmts.push(db.prepare(
-          `INSERT INTO kfb_bill_lines (bill_id, line_no, kfb_shop_code, order_ref, kfb_order_id, parent_kfb_order_id, sku, quantity, cost_eur, fees_eur, shipping_eur)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?)`
-        ).bind(b.bill_id, l.line_no, l.kfb_shop_code, l.order_ref, l.kfb_order_id, l.parent_kfb_order_id, l.sku == null ? null : String(l.sku), l.quantity, l.cost_eur, l.fees_eur, l.shipping_eur));
+    let storedLines = b.lines;
+    let linesChanged;
+    if (truncated) {
+      // Additive only: a partial read never removes a line KFB showed before.
+      const have = new Set(prevLines.map(lineKey));
+      let next = prevLines.reduce((m, l) => Math.max(m, Number(l.line_no) || 0), 0);
+      const add = b.lines.filter((l) => !have.has(lineKey(l))).map((l) => ({ ...l, line_no: ++next }));
+      linesChanged = add.length > 0;
+      for (const l of add) stmts.push(insertLine(db, b.bill_id, l));
+      out.lines_added += add.length;
+      storedLines = [...prevLines, ...add];
+    } else {
+      linesChanged = lineSig(prevLines) !== lineSig(b.lines);
+      if (linesChanged) {
+        stmts.push(db.prepare(`DELETE FROM kfb_bill_lines WHERE bill_id = ?`).bind(b.bill_id));
+        for (const l of b.lines) stmts.push(insertLine(db, b.bill_id, l));
+        out.lines_added += b.lines.length;
       }
     }
-    // The bill to pay. No amount or no date: not listed (never a $0 bill, never an undated one).
-    const amount = b.amount_eur;
+    const billedAt = b.billed_at ?? (old ? old.billed_at : null);
+    // Paid state as read now (null = unknown). A paid date is kept only while the bill reads as paid.
+    const paidAt = b.paid === true ? (b.paid_at ?? (old ? old.paid_at : null)) : null;
+    const codes = [...new Set(storedLines.map((l) => l.kfb_shop_code).filter(Boolean))];
+    const shop = codes.length === 1 ? codes[0] : null;
+    if (!old) {
+      stmts.push(db.prepare(`INSERT OR IGNORE INTO kfb_bills (bill_id, kfb_shop_code, billed_at, currency, total_eur, paid_at, imported_at) VALUES (?,?,?,?,?,?,?)`)
+        .bind(b.bill_id, shop, billedAt, "EUR", b.total_eur, paidAt, at));
+      out.inserted++;
+    } else if (!same(old.kfb_shop_code, shop) || !same(old.billed_at, billedAt) || !same(old.total_eur, b.total_eur) || !same(old.paid_at, paidAt) || linesChanged) {
+      stmts.push(db.prepare(`UPDATE kfb_bills SET kfb_shop_code = ?, billed_at = ?, total_eur = ?, paid_at = ? WHERE bill_id = ?`)
+        .bind(shop, billedAt, b.total_eur, paidAt, b.bill_id));
+      out.updated++;
+    } else out.unchanged++;
+    // Flags: incomplete (cut by a truncated read) and which field the line costs came from.
+    const fl = oldFlags.get(b.bill_id);
+    const incomplete = b.incomplete ? 1 : 0;
+    if (!fl || fl.incomplete !== incomplete || fl.cost_basis !== b.cost_basis) {
+      stmts.push(db.prepare(`INSERT INTO kfb_bill_flags (bill_id, incomplete, cost_basis, updated_at) VALUES (?,?,?,?)
+        ON CONFLICT(bill_id) DO UPDATE SET incomplete = excluded.incomplete, cost_basis = excluded.cost_basis, updated_at = excluded.updated_at`)
+        .bind(b.bill_id, incomplete, b.cost_basis, at));
+    }
+    // The bill to pay. Header total if KFB gave a positive one, else the sum of every stored line.
+    // Not listed: no amount, no date, or a bill cut by the read with no header total (a partial
+    // line sum would understate what Reilly owes).
+    if (b.incomplete && b.total_eur == null) { out.to_pay.incomplete++; continue; }
+    const amount = b.total_eur ?? r2(storedLines.reduce((s, l) => s + lineEurOf(l), 0));
     if (!(amount > 0) || !billedAt) { out.to_pay.no_amount++; continue; }
     const status = b.paid === true ? "paid" : b.paid === false ? "unpaid" : "unknown";
     if (status === "unknown") out.to_pay.paid_state_unknown++;
-    const store = b.codes.length === 1 ? (storeForShopCode(b.codes[0]) || {}).id || null : null;
+    const store = shop ? (storeForShopCode(shop) || {}).id || null : null;
     const p = oldPay.get(b.bill_id);
     if (!p) {
       stmts.push(db.prepare(`INSERT OR IGNORE INTO supplier_bills (bill_id, store, amount, currency, billed_at, paid_at, status, source, imported_at) VALUES (?,?,?,?,?,?,?,?,?)`)
@@ -634,6 +799,14 @@ async function writeBills(db, bills, at) {
   if (stmts.length) await runBatched(db, stmts);
   return out;
 }
+
+function insertLine(db, billId, l) {
+  return db.prepare(
+    `INSERT OR IGNORE INTO kfb_bill_lines (bill_id, line_no, kfb_shop_code, order_ref, kfb_order_id, parent_kfb_order_id, sku, quantity, cost_eur, fees_eur, shipping_eur)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?)`
+  ).bind(billId, l.line_no, l.kfb_shop_code, l.order_ref, l.kfb_order_id, l.parent_kfb_order_id, l.sku == null ? null : String(l.sku), l.quantity, l.cost_eur, l.fees_eur, l.shipping_eur);
+}
+
 
 /* ------------------------------------------------------------------ HTTP */
 

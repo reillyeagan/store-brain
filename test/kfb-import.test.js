@@ -6,7 +6,7 @@ import { makeD1, makeR2 } from "./helpers/d1.js";
 
 import {
   validatePayload, importKfb, normShopCode, storeForShopCode, shopCodeOf, kfbTime, parseOrderNo,
-  normalizeQuoteRow, normalizeOrderRow, normalizeBills, quoteCost, runKfbReminder,
+  normalizeQuoteRow, normalizeOrderRow, normalizeBills, quoteCost, runKfbReminder, billPaidState,
 } from "../src/lib/kfbImport.js";
 import { kfbImportStatus } from "../src/lib/kfbReads.js";
 import { KFB_ORIGINS, DASHBOARD_ORIGIN, KFB_ENDPOINTS, KFB_IMPORT_MAX_ROWS } from "../src/config/kfb.js";
@@ -40,15 +40,20 @@ const quoteRows = () => [
   { order_no: "Q-6", status: 10, un_shop_url: "mek6yu-91", update_time: "2026-10-12 08:00:00", items: [{ un_good_url: "https://t.com/products/b" }] },
 ];
 const orderRows = () => [
-  { id: 501, order_no: "3733-1009", un_shop_url: "jmzjx1-it", shopify_create_at: "2026-10-13T14:00:00Z", status: 2, receiver_address: "x" },
+  { id: 501, order_no: "3733-1009", un_shop_url: "jmzjx1-it", shopify_create_at: "2026-10-13T14:00:00Z", status: 2, receiver_address: "x",
+    name: "Jane Doe", consignee_name: "Jane", receiver_name: "Jane", shipping_name: "Jane", street: "1 Main", city: "Charlotte", province: "NC",
+    phone_number: "1", telephone: "2", company: "Acme", email: "j@x.com" },
   { id: 502, order_no: "3733-1119-1", un_shop_url: "jmzjx1-it", shopify_create_at: "2026-10-12T14:00:00Z", status: 3 },
   { id: 503, order_no: "1009", un_shop_url: "3as2ya-dw", un_create_at: "2026-10-13 22:00:00", status: 2 },
   { id: 504, order_no: "1010", un_shop_url: "qqq111-zz", shopify_create_at: "2026-10-13T14:00:00Z", status: 2 },
 ];
 const billRows = () => [
-  // Flat bill-detail rows (KFB's "bill details"): grouped by bill_no.
-  { bill_no: "B100", bill_time: "2026-10-13 10:00:00", order_no: "3733-1009", un_shop_url: "jmzjx1-it", goods_price: 12.5, num: 2, freight: 3, pay_status: 0, un_total_price: 99.9 },
-  { bill_no: "B100", bill_time: "2026-10-13 10:00:00", order_no: "3733-1119-1", un_shop_url: "jmzjx1-it", goods_price: 7, num: 1, pay_status: 0, un_total_price: 0 },
+  // Flat bill-detail rows (KFB's "bill details"): grouped by bill_no. Their own pay_status /
+  // pay_time are the CUSTOMER's payment and must not make the bill "paid"; bill_pay_status does.
+  { bill_no: "B100", bill_time: "2026-10-13 10:00:00", order_no: "3733-1009", un_shop_url: "jmzjx1-it", goods_price: 12.5, num: 2, freight: 3,
+    pay_status: 1, pay_time: "2026-10-12 09:00:00", bill_pay_status: 0, un_total_price: 99.9 },
+  { bill_no: "B100", bill_time: "2026-10-13 10:00:00", order_no: "3733-1119-1", un_shop_url: "jmzjx1-it", goods_price: 7, num: 1,
+    pay_status: 1, bill_pay_status: 0, un_total_price: 0 },
   // A bill with nested lines and a header total, already paid.
   { bill_no: "B101", bill_time: "2026-10-12 10:00:00", pay_time: "2026-10-12 11:00:00", un_shop_url: "3as2ya-dw", bill_amount: 30,
     details: [{ order_no: "1009", goods_total: 25, freight: 5 }] },
@@ -64,6 +69,14 @@ const payload = (over = {}) => ({
   },
   ...over,
 });
+/** The same morning with nothing to refuse (no unknown shops). */
+const cleanPayload = (over = {}) => {
+  const p = payload(over);
+  p.sections.quotes.rows = p.sections.quotes.rows.filter((r) => r.un_shop_url !== "zzz999-xx");
+  p.sections.orders.rows = p.sections.orders.rows.filter((r) => r.un_shop_url !== "qqq111-zz");
+  p.sections.bills.rows = p.sections.bills.rows.filter((r) => r.un_shop_url !== "zzz999-xx");
+  return p;
+};
 const env = () => ({ DB: makeD1(), BACKUPS: makeR2(), MC_KEY: KEY });
 const snapshot = async (DB) => {
   const out = {};
@@ -94,7 +107,8 @@ test("origin: the dashboard, the bookmarklet and the server use the same origins
   assert.equal(/var SB = "([^"]+)"/.exec(bm)[1], DASHBOARD_ORIGIN);
   for (const [k, list] of Object.entries(KFB_ENDPOINTS)) for (const ep of list) assert.ok(bm.includes(`"${ep}"`), `${k} ${ep} in the bookmarklet`);
   // The dashboard checks both the sender origin and that the sender is the tab that opened it.
-  assert.match(html, /KFB_ORIGINS\.indexOf\(ev\.origin\)<0\|\|!window\.opener\|\|ev\.source!==window\.opener/);
+  assert.match(html, /function kfbTrusted\(ev\)\{ return KFB_ORIGINS\.indexOf\(ev\.origin\)>=0&&!!ev\.source&&\(ev\.source===window\.opener\|\|ev\.source===kfbPeer\); \}/);
+  assert.match(html, /if\(!kfbTrusted\(ev\)\)\{ kfbIn\.ignored/);
   // No key or secret in the bookmarklet.
   assert.doesNotMatch(bm, /x-store-brain-key|MC_KEY|sessionStorage|localStorage|document\.cookie/);
   assert.match(html, /<script src="\/kfb-bookmarklet\.js"><\/script>/);
@@ -102,6 +116,7 @@ test("origin: the dashboard, the bookmarklet and the server use the same origins
 
 /* ---------------- the bookmarklet itself, run in a sandbox ---------------- */
 
+const timers = [];
 function sandbox({ origin = "https://www.kungfubuy.com", answers = {} } = {}) {
   const calls = [], posted = [], alerts = [], opened = [];
   let listener = null;
@@ -120,7 +135,9 @@ function sandbox({ origin = "https://www.kungfubuy.com", answers = {} } = {}) {
       return { ok: true, status: 200, text: async () => JSON.stringify(a) };
     },
     setTimeout: (fn, ms) => (ms >= 10000 ? 0 : setTimeout(fn, 0)),
-    Promise, JSON, String, Number, Array, Object, Error, Date, URL, Blob: class {},
+    setInterval: (fn) => { const t = setInterval(fn, 5); timers.push(t); return t; },
+    clearInterval: (t) => clearInterval(t),
+    TextEncoder, URL, Blob: class {},
   };
   ctx.window = ctx;
   ctx.open = (url) => { opened.push(url); return tab; };
@@ -148,16 +165,22 @@ test("bookmarklet: GET only, same-origin session, tries bill endpoints in turn, 
     "/index/bill/get.html": { code: 0, count: 1, data: billRows().slice(0, 1) },
   } });
   vm.runInNewContext(`(${s.ctx.SB_KFB_BOOKMARKLET.toString()})()`, s.ctx);
-  assert.deepEqual(s.opened, [`${DASHBOARD_ORIGIN}/#/import/kfb`]);
+  assert.equal(s.opened.length, 1);
+  assert.match(s.opened[0], new RegExp(`^${DASHBOARD_ORIGIN.replace(/[.]/g, "\\.")}/#/import/kfb\\?n=[a-z0-9]+$`), "a nonce per click: a reused tab still navigates");
+  const data = () => s.posted.filter((x) => x.msg.type === "sb-kfb-data");
   // A "ready" from anywhere else is ignored.
   s.send({ origin: "https://evil.example", source: s.tab, data: { type: "sb-kfb-ready" } });
   s.send({ origin: DASHBOARD_ORIGIN, source: {}, data: { type: "sb-kfb-ready" } });
   await settle(() => /handing over/.test(s.box.textContent));
-  assert.equal(s.posted.length, 0, "nothing sent before the real dashboard said ready");
+  assert.equal(data().length, 0, "nothing sent before the real dashboard said ready");
+  // Until then it keeps saying hello (so an already-open dashboard tab can answer), only to the dashboard origin.
+  await settle(() => s.posted.some((x) => x.msg.type === "sb-kfb-hello"));
+  assert.ok(s.posted.every((x) => x.target === DASHBOARD_ORIGIN));
   s.send({ origin: DASHBOARD_ORIGIN, source: s.tab, data: { type: "sb-kfb-ready" } });
-  await settle(() => s.posted.length > 0);
-  assert.equal(s.posted.length, 1);
-  assert.equal(s.posted[0].target, DASHBOARD_ORIGIN);
+  await settle(() => data().length > 0);
+  for (const t of timers) clearInterval(t);
+  assert.equal(data().length, 1);
+  s.posted.splice(0, s.posted.length, ...data());
   for (const c of s.calls) {
     assert.equal(c.opt.method, "GET");
     assert.equal(c.opt.credentials, "same-origin");
@@ -167,7 +190,16 @@ test("bookmarklet: GET only, same-origin session, tries bill endpoints in turn, 
   assert.equal(s.posted[0].msg.type, "sb-kfb-data");
   assert.equal(p.sections.bills.endpoint, "/index/bill/get.html");
   assert.equal(p.sections.quotes.rows.length, 2);
-  assert.equal(p.sections.orders.rows[0].receiver_address, undefined, "customer details are not sent");
+  // Allowlist: customer details never leave the KFB tab; what the server reads does.
+  const o0 = p.sections.orders.rows[0];
+  for (const k of ["receiver_address", "name", "consignee_name", "receiver_name", "shipping_name", "street", "city", "province", "phone_number", "telephone", "company", "email"]) {
+    assert.equal(o0[k], undefined, k);
+  }
+  assert.equal(o0.order_no, "3733-1009");
+  assert.equal(o0.shopify_create_at, "2026-10-13T14:00:00Z");
+  assert.deepEqual(JSON.parse(JSON.stringify(p.sections.quotes.rows[0].product[0].manual_pricing)), { "United States": { nameOne: "15.47", nameTwo: 0 } }, "country price keys kept");
+  assert.equal(p.sections.quotes.total, 2);
+  assert.equal(p.sections.quotes.truncated, false);
   // What it sends passes the server's own check.
   const back = JSON.parse(JSON.stringify(p));
   assert.equal(validatePayload(back, Date.parse(p.fetched_at)).ok, true);
@@ -277,14 +309,14 @@ test("shop codes: rows map to stores by KFB shop code only; unknown shops are re
 
 test("idempotent: the same data again changes nothing; next day it only confirms the read", async () => {
   const e = env();
-  const first = await importKfb(e, payload(), { nowMs: NOW });
+  const first = await importKfb(e, cleanPayload(), { nowMs: NOW });
   assert.equal(first.ok, true);
   const snap = await snapshot(e.DB);
   const events = (await e.DB.prepare(`SELECT COUNT(*) AS n FROM events`).first()).n;
   const feeds = await evaluateFeeds(e.DB, NOW);
 
   // Same rows, read a minute later, same day: refused as a duplicate, nothing written.
-  const again = await importKfb(e, payload({ fetched_at: iso(NOW) }), { nowMs: NOW + 120000 });
+  const again = await importKfb(e, cleanPayload({ fetched_at: iso(NOW) }), { nowMs: NOW + 120000 });
   assert.equal(again.ok, true);
   assert.equal(again.duplicate, true);
   assert.deepEqual(await snapshot(e.DB), snap);
@@ -294,7 +326,7 @@ test("idempotent: the same data again changes nothing; next day it only confirms
 
   // Next morning, same rows: a new import (the read happened) but every data row unchanged.
   const tomorrow = NOW + 86400000;
-  const next = await importKfb(e, payload({ fetched_at: iso(tomorrow - 60000) }), { nowMs: tomorrow });
+  const next = await importKfb(e, cleanPayload({ fetched_at: iso(tomorrow - 60000) }), { nowMs: tomorrow });
   assert.equal(next.duplicate, undefined);
   assert.equal(next.counts.quotes.inserted, 0);
   assert.equal(next.counts.orders.inserted + next.counts.orders.updated, 0);
@@ -303,8 +335,8 @@ test("idempotent: the same data again changes nothing; next day it only confirms
   assert.deepEqual(await snapshot(e.DB), snap);
 
   // A real change (bill B100 paid, an order status moved) updates only those rows.
-  const changed = payload({ fetched_at: iso(tomorrow) });
-  changed.sections.bills.rows[0].pay_status = 1; changed.sections.bills.rows[1].pay_status = 1;
+  const changed = cleanPayload({ fetched_at: iso(tomorrow) });
+  changed.sections.bills.rows[0].bill_pay_status = 1; changed.sections.bills.rows[1].bill_pay_status = 1;
   changed.sections.orders.rows[0].status = 5;
   const upd = await importKfb(e, changed, { nowMs: tomorrow + 60000 });
   assert.equal(upd.counts.orders.updated, 1);
@@ -471,4 +503,198 @@ test("claims: a billed order that was cancelled in Shopify opens one credit, onc
   assert.equal(await detectCancelledBilled(e.DB, { nowMs: NOW }), 0);
   const c = (await e.DB.prepare(`SELECT store, kind, order_name, amount, currency, source FROM kfb_credits`).all()).results;
   assert.deepEqual(c, [{ store: "hc", kind: "cancelled_billed", order_name: "#1009", amount: 28, currency: "EUR", source: "kfb_bill" }]);
+});
+
+/* ---------------- review of 7ce2827: one test per finding ---------------- */
+
+test("review 1: paid state comes from the bill (header or bill_* fields), a flag beats a time, unclear is unknown", () => {
+  // Nested bill: only the header counts; a line's pay fields (the customer's payment) are ignored.
+  let b = normalizeBills([{ bill_no: "N1", bill_time: "2026-10-13 10:00:00", un_shop_url: "jmzjx1-it", bill_amount: 20,
+    details: [{ order_no: "1001", goods_total: 20, pay_status: 1, pay_time: "2026-10-13 09:00:00" }] }]).bills[0];
+  assert.equal(b.paid, null);
+  assert.equal(b.paid_at, null);
+  // Header flag 0 with a pay time: the flag wins (unpaid).
+  b = normalizeBills([{ bill_no: "N2", bill_time: "2026-10-13 10:00:00", un_shop_url: "jmzjx1-it", bill_amount: 20, pay_status: 0, pay_time: "2026-10-13 11:00:00",
+    details: [{ order_no: "1001", goods_total: 20 }] }]).bills[0];
+  assert.equal(b.paid, false);
+  // Unreadable flag: unknown, never paid, even with a time.
+  assert.deepEqual(billPaidState({ pay_status: "processing", pay_time: "2026-10-13 11:00:00" }, { header: true }), { paid: null, paidAt: null });
+  // Flat rows: plain pay_status / pay_time are ignored; rows that disagree make it unknown.
+  b = normalizeBills([{ bill_no: "F1", bill_time: "2026-10-13 10:00:00", order_no: "1001", un_shop_url: "jmzjx1-it", goods_total: 5, pay_status: 1, pay_time: "2026-10-13 09:00:00" }]).bills[0];
+  assert.equal(b.paid, null);
+  b = normalizeBills([
+    { bill_no: "F2", bill_time: "2026-10-13 10:00:00", order_no: "1001", un_shop_url: "jmzjx1-it", goods_total: 5, bill_pay_status: 1 },
+    { bill_no: "F2", bill_time: "2026-10-13 10:00:00", order_no: "1002", un_shop_url: "jmzjx1-it", goods_total: 5, bill_pay_status: 0 },
+  ]).bills[0];
+  assert.equal(b.paid, null);
+});
+
+test("review 2: pay_amount is never the bill amount; a 0 header total falls back to the lines; no-amount bills are shown", async () => {
+  const b = normalizeBills([{ bill_no: "Z1", bill_time: "2026-10-13 10:00:00", un_shop_url: "jmzjx1-it", pay_amount: 0, bill_amount: 0,
+    details: [{ order_no: "1001", goods_total: 12 }, { order_no: "1002", goods_total: 8, freight: 2 }] }]).bills[0];
+  assert.equal(b.total_eur, null);
+  assert.equal(b.amount_eur, 22);
+  const e = env();
+  const p = cleanPayload();
+  p.sections.bills.rows.push({ bill_no: "Z2", bill_time: "2026-10-13 10:00:00", un_shop_url: "jmzjx1-it", details: [{ order_no: "1003", service_fee: 0 }] });
+  const r = await importKfb(e, p, { nowMs: NOW });
+  assert.equal(r.counts.bills.to_pay.no_amount, 1);
+  assert.equal((await e.DB.prepare(`SELECT COUNT(*) AS n FROM supplier_bills WHERE bill_id = 'Z2'`).first()).n, 0);
+  assert.match(digestBody(await digestData(e.DB, NOW)), /1 bill read with no amount/);
+  const html = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(html, /tp\.no_amount\?/, "the import result shows it");
+});
+
+test("review 3: the sweep feed is fresh only when orders were read; otherwise it fails with the reason", async () => {
+  const e = env();
+  const p = cleanPayload();
+  p.sections.orders = { ok: false, error: "/index/order/get.html answered a web page, not data" };
+  const r = await importKfb(e, p, { nowMs: NOW });
+  assert.equal(r.ok, true);
+  assert.equal(r.sections.orders.ok, false);
+  assert.equal(r.sections.quotes.ok, true);
+  const f = (await evaluateFeeds(e.DB, NOW)).find((x) => x.id === "kfb.morning_sweep");
+  assert.equal(f.current, "failing");
+  assert.match(f.last_error, /orders not read/);
+  assert.equal((await sweepStatus(e.DB, NOW)).usable, false);
+});
+
+test("review 4: a truncated bills read never deletes lines, flags the bill at the cut, and the COGS Matcher waits on it", async () => {
+  const e = env();
+  await importKfb(e, cleanPayload(), { nowMs: NOW });
+  assert.equal((await e.DB.prepare(`SELECT COUNT(*) AS n FROM kfb_bill_lines WHERE bill_id = 'B100'`).first()).n, 2);
+  // An hour later the read stops after B100's first line: B100 is the bill at the cut.
+  const later = NOW + 3600000;
+  const p = cleanPayload({ fetched_at: iso(later) });
+  p.sections.bills = { ok: true, endpoint: "/index/billOrder/get.html", total: 9, truncated: true,
+    rows: [billRows()[2], { ...billRows()[0], goods_price: 13 }] }; // B101 whole, then B100 cut (one line re-costed)
+  const r = await importKfb(e, p, { nowMs: later });
+  assert.equal(r.counts.bills.incomplete, 1);
+  const lines = (await e.DB.prepare(`SELECT line_no FROM kfb_bill_lines WHERE bill_id = 'B100' ORDER BY line_no`).all()).results;
+  assert.equal(lines.length, 3, "both old lines kept, the new one added");
+  assert.equal((await e.DB.prepare(`SELECT incomplete FROM kfb_bill_flags WHERE bill_id = 'B100'`).first()).incomplete, 1);
+  assert.equal((await e.DB.prepare(`SELECT incomplete FROM kfb_bill_flags WHERE bill_id = 'B101'`).first()).incomplete, 0);
+  assert.equal(r.counts.bills.to_pay.incomplete, 1, "not re-listed to pay from a partial sum");
+  assert.equal((await e.DB.prepare(`SELECT amount FROM supplier_bills WHERE bill_id = 'B100'`).first()).amount, 35);
+  await e.DB.prepare(`UPDATE kfb_bills SET usd_charged = 40`).run();
+  await matchBills(e.DB, { nowMs: later });
+  assert.equal((await e.DB.prepare(`SELECT matched_sig FROM kfb_bills WHERE bill_id = 'B100'`).first()).matched_sig, null, "incomplete bill not matched");
+  assert.notEqual((await e.DB.prepare(`SELECT matched_sig FROM kfb_bills WHERE bill_id = 'B101'`).first()).matched_sig, null);
+});
+
+test("review 4: a truncated orders read raises no not-in-KFB flags", async () => {
+  const e = env();
+  const created = "2026-10-13T00:00:00Z";
+  await upsertOrder(e.DB, STORES.hc, { order_id: "gid://shopify/Order/hc-1500", name: "#1500", created_at: created, currency: "USD",
+    subtotal: 50, discounts: 0, total: 50, financial_status: "paid", payload_updated_at: created }, JSON.stringify({}), STORES.hc.timezone, created);
+  const p = cleanPayload();
+  p.sections.orders.truncated = true; p.sections.orders.total = 900;
+  await importKfb(e, p, { nowMs: NOW });
+  const r = await runOrderWatch({ DB: e.DB }, { nowMs: NOW });
+  assert.equal(r.status, "checked");
+  assert.equal(r.suspect, 0);
+  assert.match(r.partial_read, /cut off/);
+  assert.equal((await e.DB.prepare(`SELECT COUNT(*) AS n FROM order_watch`).first()).n, 0);
+  // The same order missing from a COMPLETE read is a suspect.
+  const later = NOW + 3600000;
+  await importKfb(e, cleanPayload({ fetched_at: iso(later) }), { nowMs: later });
+  assert.equal((await runOrderWatch({ DB: e.DB }, { nowMs: later })).suspect, 1);
+});
+
+test("review 5: raw payloads older than 30 days are deleted from R2 on the next import", async () => {
+  const e = env();
+  const first = await importKfb(e, cleanPayload(), { nowMs: NOW });
+  assert.ok(e.BACKUPS._store.has(first.r2Key));
+  const later = NOW + 31 * 86400000;
+  const r = await importKfb(e, cleanPayload({ fetched_at: iso(later - 1000) }), { nowMs: later });
+  assert.equal(r.counts.raw_files_pruned, 1);
+  assert.equal(e.BACKUPS._store.has(first.r2Key), false);
+  assert.ok(e.BACKUPS._store.has(r.r2Key));
+  assert.equal((await e.DB.prepare(`SELECT r2_key FROM kfb_imports WHERE id = ?`).bind(first.importId).first()).r2_key, null);
+});
+
+test("review 6: an older read can't roll newer data back; done today follows the read day; 26 h limit", async () => {
+  const e = env();
+  await importKfb(e, cleanPayload(), { nowMs: NOW });
+  const old = cleanPayload({ fetched_at: iso(NOW - 3600000) });
+  old.sections.bills.rows[0].bill_pay_status = 1;
+  const r = await importKfb(e, old, { nowMs: NOW + 60000 });
+  assert.equal(r.ok, false);
+  assert.equal(r.status, 409);
+  assert.match(r.errors[0], /later read/);
+  assert.equal((await e.DB.prepare(`SELECT status FROM supplier_bills WHERE bill_id = 'B100'`).first()).status, "unpaid");
+  // A file read last evening, imported this morning: not today's session.
+  const e2 = env();
+  const lastEvening = Date.parse("2026-10-14T00:30:00Z"); // 20:30 EDT on the 13th
+  await importKfb(e2, cleanPayload({ fetched_at: iso(lastEvening) }), { nowMs: NOW });
+  assert.equal((await kfbImportStatus(e2.DB, NOW)).doneToday, false);
+  assert.match(validatePayload(cleanPayload({ fetched_at: iso(NOW - 27 * 3600000) }), NOW).errors.join(), /older than 26 h/);
+});
+
+test("review 7: the import page answers a hello, so a second click into a reused tab still hands over", () => {
+  const html = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(html, /if\(d\.type==="sb-kfb-hello"\)\{\s*if\(KFB_ORIGINS\.indexOf\(ev\.origin\)<0\|\|!ev\.source\) return;\s*kfbPeer=ev\.source;\s*try\{ ev\.source\.postMessage\(\{type:"sb-kfb-ready"\},ev\.origin\); \}/);
+});
+
+test("review 8: no bare price; a line total is never multiplied; claims credits are marked as estimates", async () => {
+  const one = (l) => normalizeBills([{ bill_no: "C", bill_time: "2026-10-13 10:00:00", un_shop_url: "jmzjx1-it", order_no: "1001", ...l }]);
+  assert.equal(one({ price: 5 }).bills.length, 0, "a bare price is not a cost");
+  assert.equal(one({ price: 5 }).rejected[0].reason, "no cost on the bill line");
+  const t = one({ goods_total: 30, goods_price: 10, num: 3 }).bills[0];
+  assert.equal(t.lines[0].cost_eur, 30);
+  assert.equal(t.cost_basis, "line_total");
+  assert.equal(one({ goods_price: 10, num: 3 }).bills[0].cost_basis, "unit_x_qty");
+  const e = env();
+  const created = "2026-10-13T14:00:00Z";
+  await upsertOrder(e.DB, STORES.hc, { order_id: "gid://shopify/Order/hc-1009", name: "#1009", created_at: created, currency: "USD",
+    subtotal: 50, discounts: 0, total: 50, financial_status: "refunded", payload_updated_at: created },
+  JSON.stringify({ cancelled_at: created }), STORES.hc.timezone, created);
+  await importKfb(e, cleanPayload(), { nowMs: NOW });
+  await detectCancelledBilled(e.DB, { nowMs: NOW });
+  assert.match((await e.DB.prepare(`SELECT note FROM kfb_credits`).first()).note, /ESTIMATE.*unit_x_qty/);
+});
+
+test("review 9: the same rows again on the same day are retried when the first import refused some", async () => {
+  const e = env();
+  const first = await importKfb(e, payload(), { nowMs: NOW }); // has unknown-shop rows
+  assert.ok(first.counts.unknown_shops.length);
+  const snap = await snapshot(e.DB);
+  const again = await importKfb(e, payload(), { nowMs: NOW + 60000 });
+  assert.equal(again.duplicate, undefined, "retried, not refused as a duplicate");
+  assert.equal(again.importId, first.importId, "same import row, updated");
+  assert.equal((await e.DB.prepare(`SELECT COUNT(*) AS n FROM kfb_imports`).first()).n, 1);
+  assert.deepEqual(await snapshot(e.DB), snap, "and still changes no data row");
+});
+
+test("review 10: a quote filed under its creation time still lands when re-quoted at the same status", async () => {
+  const e = env();
+  const row = (cost) => ({ order_no: "QC1", status: 30, un_shop_url: "jmzjx1-it", create_time: "2026-10-01 08:00:00",
+    items: [{ un_good_url: "https://holtandcrane.com/products/cord-blazer" }], product: [{ manual_pricing: { "United States": { nameOne: cost } } }] });
+  const only = (cost, at) => ({ ...cleanPayload({ fetched_at: iso(at) }), sections: { quotes: { ok: true, rows: [row(cost)] } } });
+  await importKfb(e, only(20, NOW - 60000), { nowMs: NOW });
+  const r = await importKfb(e, only(23, NOW), { nowMs: NOW + 60000 });
+  assert.equal(r.counts.quotes.requoted, 1);
+  const q = (await e.DB.prepare(`SELECT cost, quoted_at FROM kfb_quotes WHERE product_handle = 'cord-blazer' ORDER BY quoted_at`).all()).results;
+  assert.deepEqual(q.map((x) => x.cost), [20, 23]);
+  assert.equal(q[1].quoted_at, iso(NOW), "filed under the read time");
+  // The same cost again (next morning, so not a same-day duplicate) is not a new quote.
+  const again = await importKfb(e, only(23, NOW + 20 * 3600000), { nowMs: NOW + 20 * 3600000 });
+  assert.equal(again.duplicate, undefined);
+  assert.equal(again.counts.quotes.inserted, 0);
+  assert.equal(again.counts.quotes.unchanged, 1);
+  assert.equal((await e.DB.prepare(`SELECT COUNT(*) AS n FROM kfb_quotes WHERE product_handle = 'cord-blazer'`).first()).n, 2);
+});
+
+test("review 11: the bookmarklet's 5 MB check counts UTF-8 bytes", () => {
+  const bm = readFileSync(new URL("../public/kfb-bookmarklet.js", import.meta.url), "utf8");
+  assert.match(bm, /new TextEncoder\(\)\.encode\(JSON\.stringify\(payload\)\)\.length > 4900000/);
+});
+
+test("review 12: KFB times respect a written zone and accept YYYY/MM/DD", () => {
+  assert.equal(kfbTime("2026-10-13 09:15:00+00:00"), "2026-10-13T09:15:00.000Z");
+  assert.equal(kfbTime("2026-10-13 09:15:00 Z"), "2026-10-13T09:15:00.000Z");
+  assert.equal(kfbTime("2026-10-13 09:15:00-0400"), "2026-10-13T13:15:00.000Z");
+  assert.equal(kfbTime("2026/10/13 09:15"), "2026-10-13T01:15:00.000Z");
+  assert.equal(kfbTime("2026/1/3"), "2026-01-02T16:00:00.000Z");
+  assert.equal(kfbTime("2026-10-13T09:15:00"), "2026-10-13T01:15:00.000Z", "a T stamp without a zone is still China time");
 });

@@ -20,7 +20,7 @@ import { STORES } from "../../config/stores.js";
 import { creditAging } from "./claims.js";
 import { LATEST_QUOTE_SQL } from "./preflight.js";
 import { money } from "./common.js";
-import { lastSectionRead } from "../../lib/kfbReads.js";
+import { lastSectionRead, lastSectionImport } from "../../lib/kfbReads.js";
 
 /** The later of two ISO times (either may be null). */
 const later = (a, b) => (!a ? b || null : !b ? a : a > b ? a : b);
@@ -42,7 +42,11 @@ const agoText = (h) => (h < 48 ? `${Math.round(h)} hours ago` : `${Math.floor(h 
 /** Bills summary, or null when no bill has ever been imported (not wired ≠ zero). */
 export async function billsSummary(db, nowMs = Date.now()) {
   const any = await db.prepare(`SELECT COUNT(*) AS n, MAX(imported_at) AS last FROM supplier_bills`).first();
-  if (!any || !any.n) return null;
+  // Bills read by the morning import but not listed to pay (no amount, or cut by the read):
+  // shown, never silently dropped (review of 7ce2827, finding 2).
+  const imp = await lastSectionImport(db, "bills");
+  const toPay = (imp && imp.counts && imp.counts.bills && imp.counts.bills.to_pay) || {};
+  if ((!any || !any.n) && !imp) return null;
   const { results } = await db.prepare(`SELECT currency, COUNT(*) AS n, SUM(amount) AS total, MIN(billed_at) AS oldest FROM supplier_bills WHERE status = 'unpaid' GROUP BY currency`).all();
   const unpaid = (results || []).reduce((m, r) => m + r.n, 0);
   const oldest = (results || []).map((r) => r.oldest).sort()[0] || null;
@@ -53,6 +57,7 @@ export async function billsSummary(db, nowMs = Date.now()) {
   return {
     unpaid, totals: Object.fromEntries((results || []).map((r) => [r.currency, Math.round(r.total * 100) / 100])),
     unknownPaidState: unknown ? unknown.n : 0,
+    noAmount: Number(toPay.no_amount) || 0, incomplete: Number(toPay.incomplete) || 0,
     oldest, oldestDays: oldest ? Math.floor((nowMs - Date.parse(oldest)) / 86400000) : null, lastImport: last,
     ageHours: ageHours(last, nowMs), stale: ageHours(last, nowMs) > KFB_READ_MAX_AGE_H,
   };
@@ -147,8 +152,10 @@ export function digestBody(d) {
   if (!d.bills) out.push("• Bills: waiting on KFB session.");
   else if (d.bills.stale) out.push(`• Bills: KFB last read ${agoText(d.bills.ageHours)}: too old to say what's unpaid.`);
   else {
-    const unk = d.bills.unknownPaidState ? ` · ${plural(d.bills.unknownPaidState, "bill")} whose paid state KFB didn't show: check` : "";
-    if (!d.bills.unpaid) out.push(`• Bills: ${d.bills.unknownPaidState ? "none marked unpaid" : "none unpaid"}${unk}.`);
+    const unk = (d.bills.unknownPaidState ? ` · ${plural(d.bills.unknownPaidState, "bill")} whose paid state KFB didn't show: check` : "") +
+      (d.bills.noAmount ? ` · ${plural(d.bills.noAmount, "bill")} read with no amount (not listed: check in KFB)` : "") +
+      (d.bills.incomplete ? ` · ${plural(d.bills.incomplete, "bill")} cut off by the read (not listed until read whole)` : "");
+    if (!d.bills.unpaid) out.push(`• Bills: ${d.bills.unknownPaidState || d.bills.noAmount || d.bills.incomplete ? "none marked unpaid" : "none unpaid"}${unk}.`);
     else out.push(`• Bills: ${plural(d.bills.unpaid, "unpaid bill")}, ${totalsText(d.bills.totals)}, oldest ${d.bills.oldestDays} day${d.bills.oldestDays === 1 ? "" : "s"}${unk}.`);
   }
   if (d.credits.count) {

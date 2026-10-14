@@ -79,8 +79,9 @@ export async function detectCancelledBilled(db, { nowMs = Date.now() } = {}) {
   const since = nowIso(nowMs - CANCELLED_BILLED_LOOKBACK_DAYS * 86400000);
   const { results: lines } = await db.prepare(
     `SELECT COALESCE(l.kfb_shop_code, b.kfb_shop_code) AS code, trim(replace(l.order_ref, '#', '')) AS ref,
-            SUM(COALESCE(l.cost_eur,0) + COALESCE(l.fees_eur,0) + COALESCE(l.shipping_eur,0)) AS eur, GROUP_CONCAT(DISTINCT l.bill_id) AS bills
-       FROM kfb_bill_lines l JOIN kfb_bills b ON b.bill_id = l.bill_id
+            SUM(COALESCE(l.cost_eur,0) + COALESCE(l.fees_eur,0) + COALESCE(l.shipping_eur,0)) AS eur, GROUP_CONCAT(DISTINCT l.bill_id) AS bills,
+            GROUP_CONCAT(DISTINCT f.cost_basis) AS basis
+       FROM kfb_bill_lines l JOIN kfb_bills b ON b.bill_id = l.bill_id LEFT JOIN kfb_bill_flags f ON f.bill_id = l.bill_id
       WHERE l.order_ref IS NOT NULL AND (b.billed_at IS NULL OR b.billed_at >= ?)
       GROUP BY code, ref`
   ).bind(since).all();
@@ -105,7 +106,10 @@ export async function detectCancelledBilled(db, { nowMs = Date.now() } = {}) {
       const credit = await addCredit(db, {
         store: id, kind: "cancelled_billed", order_name: o.name, order_id: o.order_id,
         amount: eur > 0 ? eur : null, currency: "EUR",
-        note: `cancelled in Shopify but on KFB bill ${l.bills}`,
+        // KFB's bill cost field isn't confirmed (the import records which field it used), so
+        // the amount is an estimate until Reilly checks it on the bill.
+        note: `cancelled in Shopify but on KFB bill ${l.bills}; amount is an ESTIMATE` +
+          (l.basis ? ` (KFB cost field not confirmed: ${l.basis})` : " (KFB cost field not confirmed)"),
       }, { source: "kfb_bill", nowMs });
       if (credit) opened++;
     }

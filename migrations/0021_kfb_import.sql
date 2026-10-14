@@ -29,3 +29,15 @@ CREATE TABLE IF NOT EXISTS kfb_import_shops (
   rows          INTEGER NOT NULL,
   PRIMARY KEY (import_id, kfb_shop_code, section)
 );
+
+-- Per bill notes the import keeps beside kfb_bills.
+-- incomplete 1 = the read stopped mid bill (the bookmark hit its page limit), so lines may be
+-- missing. The COGS Matcher waits on it and it is not listed to pay from a partial line sum.
+-- cost_basis = which KFB field the line costs came from (the field names are not confirmed,
+-- so a credit built from them is shown as an estimate).
+CREATE TABLE IF NOT EXISTS kfb_bill_flags (
+  bill_id       TEXT    PRIMARY KEY,
+  incomplete    INTEGER NOT NULL DEFAULT 0,
+  cost_basis    TEXT,
+  updated_at    TEXT    NOT NULL
+);

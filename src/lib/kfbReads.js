@@ -12,10 +12,12 @@ const parse = (s, d) => { try { return s ? JSON.parse(s) : d; } catch { return d
  */
 export async function kfbImportStatus(db, nowMs = Date.now()) {
   const day = localDay(nowMs, "America/New_York");
-  const last = await db.prepare(`SELECT * FROM kfb_imports ORDER BY id DESC LIMIT 1`).first().catch(() => null);
+  // The latest READ, not the latest import: a file read yesterday and pasted today is not
+  // today's session.
+  const last = await db.prepare(`SELECT * FROM kfb_imports ORDER BY fetched_at DESC, id DESC LIMIT 1`).first().catch(() => null);
   return {
     day,
-    doneToday: !!(last && last.local_day === day),
+    doneToday: !!(last && localDay(last.fetched_at, "America/New_York") === day),
     lastAt: last ? last.imported_at : null,
     lastFetchedAt: last ? last.fetched_at : null,
     sections: last ? parse(last.sections, null) : null,
@@ -29,11 +31,22 @@ export async function kfbImportStatus(db, nowMs = Date.now()) {
  * imported_at can't say how fresh the read is: this can.
  */
 export async function lastSectionRead(db, section) {
-  const { results } = await db.prepare(`SELECT fetched_at, sections FROM kfb_imports ORDER BY id DESC LIMIT 30`).all()
+  const { results } = await db.prepare(`SELECT fetched_at, sections FROM kfb_imports ORDER BY fetched_at DESC, id DESC LIMIT 30`).all()
     .catch(() => ({ results: [] }));
   for (const r of results || []) {
     const s = parse(r.sections, {});
     if (s && s[section] && s[section].ok) return r.fetched_at;
+  }
+  return null;
+}
+
+/** The latest import that read `section` OK: its fetched_at, section info and counts (or null). */
+export async function lastSectionImport(db, section) {
+  const { results } = await db.prepare(`SELECT fetched_at, sections, counts FROM kfb_imports ORDER BY fetched_at DESC, id DESC LIMIT 30`).all()
+    .catch(() => ({ results: [] }));
+  for (const r of results || []) {
+    const s = parse(r.sections, {});
+    if (s && s[section] && s[section].ok) return { fetched_at: r.fetched_at, info: s[section], counts: parse(r.counts, {}) };
   }
   return null;
 }
