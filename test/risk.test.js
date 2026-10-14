@@ -473,6 +473,112 @@ test("fix: a stranger's ticket that only TYPED the order number (order_mismatch 
   assert.ok(JSON.parse((await DB.prepare(`SELECT missing FROM risk_evidence_packs`).first()).missing).some((m) => /Customer emails/.test(m)));
 });
 
+/* ---------------- first live runs (2026-10-14) ---------------- */
+
+/** The live #1098 shape: H&C, PRODUCT_NOT_RECEIVED, NEEDS_RESPONSE, $65.95, evidence due Oct 16. */
+const live1098 = () => disputeNode({
+  id: "gid://shopify/ShopifyPaymentsDispute/1098", legacyResourceId: "1098", evidenceDueBy: "2026-10-16",
+  initiatedAt: "2026-09-30T09:00:00Z", amount: { amount: "65.95", currencyCode: "USD" },
+  reasonDetails: { reason: "PRODUCT_NOT_RECEIVED", networkReasonCode: "13.1" },
+  order: {
+    id: "gid://shopify/Order/1098", name: "#1098", createdAt: "2026-09-02T18:00:00Z", email: "kim@example.org",
+    displayFulfillmentStatus: "FULFILLED", totalPriceSet: { shopMoney: { amount: "65.95", currencyCode: "USD" } },
+    customer: null, // guest checkout
+    shippingAddress: { name: "Kim Lee", city: "Denver", provinceCode: "CO", countryCodeV2: "US", zip: "80202" },
+    billingAddress: { countryCodeV2: "US", zip: "80202" },
+    fulfillments: [{ createdAt: "2026-09-05T10:00:00Z", displayStatus: "IN_TRANSIT", deliveredAt: null,
+      trackingInfo: [{ number: "YT2624500012345", company: "Other", url: null }] }],
+    lineItems: { nodes: [{ title: "Oxford Shirt", variantTitle: "White / M", quantity: 1, sku: "HC-OXF-002" }] },
+  },
+});
+const won1001 = () => disputeNode({ id: "gid://shopify/ShopifyPaymentsDispute/1001", legacyResourceId: "1001", status: "WON",
+  finalizedOn: "2026-09-20", order: { ...disputeNode().order, id: "gid://shopify/Order/1001", name: "#1001" } });
+
+test("live #1098: a failed AI attempt still leaves a code-written evidence draft from the order's own data; drafts is never []", async () => {
+  const DB = makeD1();
+  // Another order's verified ticket and a stranger who typed #1098: neither may reach #1098's evidence.
+  const ins = (gmailId, orderId, mismatch, body) => DB.prepare(
+    `INSERT INTO cs_tickets (opened_at, updated_at, slot, gmail_id, received_at, store, from_email, from_name, subject, body,
+       order_ref, order_id, order_name, order_store, order_mismatch)
+     VALUES (?, ?, 'google', ?, '2026-10-02T15:00:00Z', 'hc', 'x@example.net', 'X', 'About my order', ?, '1098', ?, '#1098', 'hc', ?)`
+  ).bind(iso(NOW), iso(NOW), gmailId, body, orderId, mismatch).run();
+  await ins("other-order", "gid://shopify/Order/1053", 0, "OTHER-ORDER-TEXT my 1053 blazer");
+  await ins("stranger", "gid://shopify/Order/1098", 1, "STRANGER-TEXT I am not the cardholder");
+  // A 17TRACK row claiming delivery: parcel tracking is off, so it must not be used.
+  await DB.prepare(`INSERT INTO shipments (store, order_id, tracking_number, state, delivered_at, updated_at) VALUES ('hc', 'gid://shopify/Order/1098', 'YT2624500012345', 'delivered', '2026-09-12T00:00:00Z', ?)`)
+    .bind(iso(NOW)).run();
+
+  let claudeUp = false;
+  const net = fakeNet({ shopify: only("hc", () => ({ disputes: { nodes: [live1098(), won1001()] } }), emptyFor) });
+  const fetchImpl = async (url, init) => {
+    if (String(url).startsWith("https://api.anthropic.com/") && !claudeUp) {
+      net.calls.push({ kind: "claude-failed" });
+      return new Response(JSON.stringify({ type: "error", error: { type: "overloaded_error", message: "Overloaded" } }), { status: 529 });
+    }
+    return net.fetchImpl(url, init);
+  };
+  const env = { DB, ...CREDS, ANTHROPIC_API_KEY: KEY };
+  const live = Date.parse("2026-10-14T13:00:00Z");
+
+  const r1 = await runChargebacks(env, { nowMs: live, fetchImpl });
+  assert.deepEqual(r1.stores.hc, { read: 2, needsResponse: 1 });
+  assert.equal(r1.drafts.length, 1, "the open dispute is listed, never []");
+  assert.deepEqual(r1.drafts[0], { order: "#1098", store: "hc", draft: "code", ai: "failed 1/3", add: r1.drafts[0].add });
+  assert.ok(r1.drafts[0].add >= 2);
+
+  const pack = await DB.prepare(`SELECT * FROM risk_evidence_packs WHERE dispute_id = 'gid://shopify/ShopifyPaymentsDispute/1098'`).first();
+  const draft = pack.code_draft;
+  assert.ok(draft, "a draft exists without the AI");
+  assert.equal(pack.blocked, null);
+  assert.match(draft, /#1098/);
+  assert.match(draft, /\$65\.95/);
+  assert.match(draft, /product not received/);
+  assert.match(draft, /YT2624500012345/);
+  assert.match(draft, /Shipped 2026-09-05/);
+  assert.match(draft, /\[ADD: carrier\]/, "carrier 'Other' is called out");
+  assert.match(draft, /\[ADD: carrier proof of delivery/);
+  // Only this order's own data.
+  for (const leak of ["OTHER-ORDER-TEXT", "STRANGER-TEXT", "#1053", "Wool Blazer", "1001"]) assert.ok(!draft.includes(leak), `draft must not contain ${leak}`);
+  const facts = JSON.parse(pack.facts);
+  assert.deepEqual(facts.ledger_shipments, [], "17TRACK data not used while parcel tracking is off");
+  assert.match(facts.parcel_tracking, /^off/);
+  assert.ok(!/delivered 2026-09-12/.test(draft));
+  const missing = JSON.parse(pack.missing);
+  assert.ok(missing.some((m) => /Carrier name for tracking YT2624500012345/.test(m)));
+  assert.ok(missing.some((m) => /Proof of delivery/.test(m)));
+  assert.ok(missing.some((m) => /Tracking link/.test(m)));
+
+  // Next hour: no AI hammering, but the draft is still reported.
+  const r2 = await runChargebacks(env, { nowMs: live + 3600000, fetchImpl });
+  assert.equal(r2.drafts.length, 1);
+  assert.equal(r2.drafts[0].draft, "code");
+  assert.equal(net.calls.filter((c) => c.kind === "claude-failed").length, 1);
+
+  // 3 hours on: the AI is retried and now succeeds.
+  claudeUp = true;
+  const net2 = fakeNet({ shopify: only("hc", () => ({ disputes: { nodes: [live1098(), won1001()] } }), emptyFor), claude: "Order #1098 shipped 2026-09-05, tracking YT2624500012345. [ADD: carrier proof of delivery]" });
+  const r3 = await runChargebacks(env, { nowMs: live + 3 * 3600000 + 60000, fetchImpl: net2.fetchImpl });
+  assert.equal(r3.drafts[0].draft, "claude");
+  const st = await riskState(env, { nowMs: live + 4 * 3600000 });
+  const open = st.disputes.open.find((d) => d.order === "#1098");
+  assert.equal(open.evidence.draftBy, "claude");
+  assert.match(open.evidence.draft, /YT2624500012345/);
+  assert.match(open.evidence.submitted, /Reilly submits/);
+  // Nothing was ever written to Shopify.
+  assert.ok([...net.calls, ...net2.calls].filter((c) => c.kind === "shopify").every((c) => c.op === "RiskDisputes"));
+});
+
+test("live #1098: when no order is linked the state says exactly what is missing instead of an empty list", async () => {
+  const DB = makeD1();
+  const net = fakeNet({ shopify: only("hc", () => ({ disputes: { nodes: [{ ...live1098(), order: null }] } }), emptyFor) });
+  const r = await runChargebacks({ DB, ...CREDS }, { nowMs: NOW, fetchImpl: net.fetchImpl });
+  assert.equal(r.drafts.length, 1);
+  assert.equal(r.drafts[0].draft, null);
+  assert.match(r.drafts[0].blocked, /did not link an order/);
+  const st = await riskState({ DB }, { nowMs: NOW });
+  assert.match(st.disputes.open[0].evidence.blocked, /did not link an order/);
+});
+
 test("fix: redactPii removes emails, phones, street addresses and known names", () => {
   const s = redactPii("Jo Smith, 221 Baker Street, call +1 415-555-0100, jo@x.co, Springfield", ["Jo Smith", "Springfield"]);
   assert.ok(!/Smith|Baker|415|jo@x\.co|Springfield/.test(s), s);

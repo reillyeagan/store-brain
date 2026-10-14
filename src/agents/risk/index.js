@@ -88,7 +88,8 @@ export async function riskState(env, { nowMs = Date.now() } = {}) {
   const since7 = new Date(nowMs - 7 * 86400000).toISOString();
 
   const { results: dRows } = await db.prepare(
-    `SELECT d.*, p.status AS pack_status, p.missing AS pack_missing, p.rebuttal AS pack_rebuttal, p.ai_error AS pack_ai_error, p.updated_at AS pack_updated_at
+    `SELECT d.*, p.status AS pack_status, p.missing AS pack_missing, p.rebuttal AS pack_rebuttal, p.ai_error AS pack_ai_error, p.updated_at AS pack_updated_at,
+            p.code_draft AS pack_code_draft, p.blocked AS pack_blocked, p.ai_attempts AS pack_ai_attempts
        FROM risk_disputes d LEFT JOIN risk_evidence_packs p ON p.store = d.store AND p.dispute_id = d.dispute_id
       WHERE d.status IN ('NEEDS_RESPONSE', 'UNDER_REVIEW')
       ORDER BY d.evidence_due_by IS NULL, d.evidence_due_by LIMIT 50`
@@ -98,10 +99,18 @@ export async function riskState(env, { nowMs = Date.now() } = {}) {
     reason: d.reason, status: d.status, amount: d.amount, currency: d.currency, due: d.evidence_due_by,
     daysLeft: daysLeft(d.evidence_due_by, nowMs), needsResponse: needsResponse(d), evidenceSentOn: d.evidence_sent_on,
     approvalId: d.approval_id > 0 ? d.approval_id : null,
+    // The draft to review: Claude's wording when there is one, else the code-written draft from
+    // the order's own facts. Not submitted: Reilly submits in Shopify.
     evidence: d.pack_status ? {
-      status: d.pack_status, missing: safeJson(d.pack_missing, []), rebuttal: d.pack_rebuttal ? String(d.pack_rebuttal).slice(0, 4000) : null,
+      status: d.pack_status,
+      draftBy: d.pack_rebuttal ? "claude" : d.pack_code_draft ? "code" : null,
+      draft: d.pack_rebuttal ? String(d.pack_rebuttal).slice(0, 4000) : d.pack_code_draft ? String(d.pack_code_draft).slice(0, 4000) : null,
+      blocked: d.pack_blocked || null,
+      missing: safeJson(d.pack_missing, []),
+      aiAttempts: d.pack_ai_attempts || 0,
       aiNote: d.pack_ai_error || null, updatedAt: d.pack_updated_at,
-    } : null,
+      submitted: "never by the brain: Reilly submits in Shopify",
+    } : (needsResponse(d) ? { status: "missing", draft: null, blocked: "no evidence pack yet: facts were not gathered (see Risk errors)" } : null),
     fetchedAt: d.fetched_at,
   }));
   const { results: closed } = await db.prepare(

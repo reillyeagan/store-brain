@@ -9,16 +9,25 @@
  *     and 2 days before the deadline"), and one "overdue" line if the date passes;
  *   - builds an evidence pack DRAFT in the ledger: code gathers the order, customer,
  *     fulfillment and tracking numbers, delivery info, customer emails (if the CS tables
- *     exist) and policy facts from the Core; Claude writes a rebuttal draft ONCE per dispute.
+ *     exist) and policy facts from the Core, and CODE writes a first evidence draft from
+ *     that order's own facts straight away (buildCodeDraft), with [ADD: ...] for each gap.
+ *     Claude then writes a better-worded rebuttal; a failed AI attempt is retried a few
+ *     times, spaced out (MAX_AI_ATTEMPTS), and never leaves the dispute without a draft.
+ *     Why (live 2026-10-14, #1098): the only draft used to be Claude's, made in ONE attempt;
+ *     once that attempt was spent, the run reported `drafts: []` forever and Reilly had
+ *     nothing to submit two days before the deadline.
+ *   - Parcel tracking (17TRACK) is switched off (Reilly, 2026-10-13), so the pack uses only
+ *     Shopify's own fulfillment and tracking info on the order; the ledger's 17TRACK
+ *     shipments are read only when parcel tracking is on.
  *
- * Inputs: Shopify Admin GraphQL `disputes` (via Store Guard), the ledger's shipments and
- * core_facts tables, CS tables when they exist (optional).
+ * Inputs: Shopify Admin GraphQL `disputes` (via Store Guard), core_facts, the ledger's
+ * shipments (only with parcel tracking on), CS tables when they exist (optional).
  * Outputs: risk_disputes, risk_evidence_packs, approvals, events.
  *
  * It NEVER submits evidence: there is no write scope, and Reilly submits in Shopify
  * (CLAUDE.md rule 12). Due dates always come from Shopify's own answer, never from notes.
  */
-import { LIVE_STORE_IDS, STORES } from "../../config/stores.js";
+import { LIVE_STORE_IDS, STORES, parcelTrackingOn } from "../../config/stores.js";
 import { shopifyGraphQL } from "../../lib/storeGuard.js";
 import { createApproval } from "../../lib/approvals.js";
 import { logEvent } from "../../lib/eventlog.js";
@@ -34,6 +43,10 @@ export const ACTOR = "risk.chargebacks";
 export const REMINDER_DAYS = Object.freeze([7, 2]);
 /** At most this many rebuttal drafts per run: AI is capped, and each dispute gets one. */
 export const MAX_AI_DRAFTS_PER_RUN = 1;
+/** A failed AI attempt is retried, at most this many attempts per dispute in total ... */
+export const MAX_AI_ATTEMPTS = 3;
+/** ... and no sooner than this after the last one (a broken API isn't hammered every hour). */
+export const AI_RETRY_AFTER_HOURS = 3;
 export const DISPUTES_PER_STORE = 25;
 
 /** Validated against the Admin 2026-07 schema (disputes is a QueryRoot field). */
@@ -166,8 +179,11 @@ async function remindIfDue(db, storeId, d, nowMs) {
   const sent = safeJson(d.reminders, []) || [];
   const due = reminderDue(dl, sent);
   if (due) {
-    const pack = await db.prepare(`SELECT status FROM risk_evidence_packs WHERE store = ? AND dispute_id = ?`).bind(storeId, d.dispute_id).first();
-    const packLine = pack && pack.status === "draft" ? "Evidence draft is ready to review." : "Evidence draft is not finished yet (facts gathered, rebuttal pending).";
+    const pack = await db.prepare(`SELECT status, code_draft, blocked FROM risk_evidence_packs WHERE store = ? AND dispute_id = ?`).bind(storeId, d.dispute_id).first();
+    const packLine = !pack ? "Evidence draft is not built yet."
+      : pack.status === "draft" ? "Evidence draft is ready to review."
+      : pack.code_draft ? "Evidence draft (from the order's own data) is ready to review; the AI-worded version is still pending."
+      : `No evidence draft: ${pack.blocked || "facts not gathered yet"}.`;
     await db.prepare(`UPDATE risk_disputes SET reminders = ? WHERE store = ? AND dispute_id = ?`)
       .bind(JSON.stringify([...sent, ...due.mark].sort((a, b) => b - a)), storeId, d.dispute_id).run();
     await logEvent(db, {
@@ -248,15 +264,20 @@ async function customerMessages(db, storeId, d, o) {
   }
 }
 
-/** Everything code can gather for one dispute. Pure facts; no judgement. */
-export async function gatherFacts(db, storeId, d) {
+/**
+ * Everything code can gather for one dispute. Pure facts; no judgement. Every fact comes from
+ * THIS dispute's own order (the order Shopify linked to the dispute) or store-wide policy:
+ * nothing is looked up by a typed order number or a customer's name.
+ * `parcelTracking`: read the ledger's 17TRACK shipments too (off by Reilly's decision).
+ */
+export async function gatherFacts(db, storeId, d, { parcelTracking = false } = {}) {
   const o = safeJson(d.order_snapshot, null);
   const fulfillments = (o && Array.isArray(o.fulfillments) ? o.fulfillments : []).map((f) => ({
     shipped_at: f.createdAt || null, status: f.displayStatus || null, delivered_at: f.deliveredAt || null,
     tracking: (f.trackingInfo || []).map((t) => ({ number: t.number || null, company: t.company || null, url: t.url || null })),
   }));
   let ledgerShipments = [];
-  if (d.order_id && (await tableExists(db, "shipments"))) {
+  if (parcelTracking && d.order_id && (await tableExists(db, "shipments"))) {
     const { results } = await db.prepare(
       `SELECT tracking_number, carrier_hint, shipped_at, state, last_status, last_event_at, last_event_text, last_event_location,
               pickup_at, delivered_at, pod, shopify_status, shopify_delivered_at
@@ -289,6 +310,7 @@ export async function gatherFacts(db, storeId, d) {
     billing_address: bill ? { country: bill.countryCodeV2, zip: bill.zip } : null,
     fulfillments,
     ledger_shipments: ledgerShipments,
+    parcel_tracking: parcelTracking ? "on" : "off (Reilly, 2026-10-13): Shopify's fulfillment and tracking info only",
     customer_messages: messages,
     policies: (policies || []).map((p) => ({ key: p.key, value: String(p.value).slice(0, 800), source: p.source })),
   };
@@ -301,6 +323,11 @@ export function missingEvidence(f) {
   const ledgerTracking = f.ledger_shipments.filter((s) => s.tracking_number);
   if (!f.order) miss.push("The order itself (Shopify did not link an order to this dispute)");
   if (!tracking.length && !ledgerTracking.length) miss.push("Tracking number (the order has no fulfillment with tracking in Shopify)");
+  const noCarrier = tracking.filter((t) => !t.company || /^other$/i.test(String(t.company).trim()));
+  if (noCarrier.length) {
+    miss.push(`Carrier name for tracking ${noCarrier.map((t) => t.number).join(", ")} (Shopify has it as "${noCarrier[0].company || "blank"}": name the carrier so the bank can check the number)`);
+  }
+  if (tracking.length && !tracking.some((t) => t.url)) miss.push("Tracking link (Shopify has no tracking URL for this fulfillment: add the carrier's tracking page)");
   const delivered = f.fulfillments.some((x) => x.delivered_at) || f.ledger_shipments.some((s) => s.delivered_at || s.shopify_delivered_at);
   if (!delivered) miss.push("Proof of delivery (no delivery date from Shopify; parcel tracking is off, so check the carrier site and screenshot it)");
   if (!f.customer_messages.length) miss.push("Customer emails about this order (the CS inbox isn't linked to the ledger yet: search Gmail for the order number)");
@@ -312,15 +339,70 @@ export function missingEvidence(f) {
   return miss;
 }
 
-async function savePackFacts(db, storeId, d, nowMs) {
-  const facts = await gatherFacts(db, storeId, d);
+const day = (iso) => (iso ? String(iso).slice(0, 10) : null);
+
+/**
+ * Plain code, no AI: a first evidence draft built ONLY from this dispute's own facts, so
+ * Reilly always has something to review and submit. Every gap becomes an [ADD: ...] line.
+ * Returns { draft } or { blocked } (exactly what stops a draft) when no order is linked.
+ */
+export function buildCodeDraft(f, missing) {
+  if (!f.order) {
+    return { blocked: "Shopify did not link an order to this dispute, so there are no order facts to build evidence from. Open the dispute in Shopify admin to see which order it is." };
+  }
+  const o = f.order, dsp = f.dispute;
+  const L = [];
+  const reason = reasonText(dsp.reason);
+  L.push(`Response to ${String(dsp.type || "chargeback").toLowerCase()} (${reason}${dsp.network_reason_code ? `, network code ${dsp.network_reason_code}` : ""}), ${fmtMoney(dsp.amount, dsp.currency)}.`);
+  L.push("");
+  L.push(`Order ${o.name}, placed ${day(o.created_at) || "[ADD: order date]"}, total ${fmtMoney(o.total, o.currency)}.`);
+  if (o.lines.length) L.push(`Items: ${o.lines.map((l) => `${l.qty} x ${l.title}${l.variant ? ` (${l.variant})` : ""}`).join("; ")}.`);
+  const sa = f.shipping_address;
+  if (sa) L.push(`Shipped to the address the customer gave at checkout${[sa.city, sa.province, sa.country].filter(Boolean).length ? ` (${[sa.city, sa.province, sa.country].filter(Boolean).join(", ")})` : ""}.`);
+  L.push("");
+  if (f.fulfillments.length) {
+    L.push(`Fulfillment (Shopify, order status ${o.fulfillment_status || "unknown"}):`);
+    for (const x of f.fulfillments) {
+      const tr = x.tracking.filter((t) => t.number)
+        .map((t) => `${t.company && !/^other$/i.test(t.company) ? t.company : "[ADD: carrier]"} tracking ${t.number}${t.url ? ` (${t.url})` : ""}`);
+      const deliv = x.delivered_at ? `delivered ${day(x.delivered_at)} per Shopify` : `Shopify shows ${String(x.status || "no status").toLowerCase().replace(/_/g, " ")}, no delivery date`;
+      L.push(`- Shipped ${day(x.shipped_at) || "[ADD: ship date]"}: ${tr.length ? tr.join("; ") : "[ADD: tracking number]"}; ${deliv}.`);
+    }
+  } else {
+    L.push(`Fulfillment: Shopify shows no fulfillment for this order (status ${o.fulfillment_status || "unknown"}). [ADD: proof of shipment]`);
+  }
+  if (dsp.reason === "PRODUCT_NOT_RECEIVED") {
+    L.push("");
+    L.push("The order was shipped to the address the customer entered, with the tracking above."
+      + (f.fulfillments.some((x) => x.delivered_at) ? " The carrier reports it delivered." : " [ADD: carrier proof of delivery, e.g. a screenshot of the tracking page showing delivered]"));
+  }
+  if (f.customer_messages.length) {
+    L.push("");
+    L.push(`Customer contact about this order: ${f.customer_messages.map((m) => `${day(m.received_at)} "${m.subject}"`).join("; ")}.`);
+  }
+  if (f.policies.length) {
+    L.push("");
+    L.push(`Store policy: ${f.policies.map((p) => `${p.key}: ${p.value}`).join(" | ").slice(0, 600)}`);
+  }
+  if (missing.length) {
+    L.push("");
+    for (const m of missing) L.push(`[ADD: ${m}]`);
+  }
+  return { draft: L.join("\n") };
+}
+
+async function savePackFacts(env, storeId, d, nowMs) {
+  const db = env.DB;
+  const facts = await gatherFacts(db, storeId, d, { parcelTracking: parcelTrackingOn(env) });
   const missing = missingEvidence(facts);
+  const code = buildCodeDraft(facts, missing);
   const at = nowIso(nowMs);
   await db.prepare(
-    `INSERT INTO risk_evidence_packs (store, dispute_id, status, facts, missing, created_at, updated_at)
-     VALUES (?, ?, 'facts_only', ?, ?, ?, ?)
-     ON CONFLICT(store, dispute_id) DO UPDATE SET facts = excluded.facts, missing = excluded.missing, updated_at = excluded.updated_at`
-  ).bind(storeId, d.dispute_id, JSON.stringify(facts), JSON.stringify(missing), at, at).run();
+    `INSERT INTO risk_evidence_packs (store, dispute_id, status, facts, missing, code_draft, blocked, created_at, updated_at)
+     VALUES (?, ?, 'facts_only', ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(store, dispute_id) DO UPDATE SET facts = excluded.facts, missing = excluded.missing,
+       code_draft = excluded.code_draft, blocked = excluded.blocked, updated_at = excluded.updated_at`
+  ).bind(storeId, d.dispute_id, JSON.stringify(facts), JSON.stringify(missing), code.draft || null, code.blocked || null, at, at).run();
 }
 
 /* ---------------- evidence pack (AI rebuttal, once per dispute) ---------------- */
@@ -357,14 +439,21 @@ export function factsForAi(facts, missing) {
   return { ...f, evidence_we_could_not_find: missing };
 }
 
+/**
+ * AI-worded rebuttals, at most `limit` per run. A pack is picked when it has no AI draft yet,
+ * has attempts left (MAX_AI_ATTEMPTS) and its last failed attempt is AI_RETRY_AFTER_HOURS
+ * old. Earliest deadline first. A pack with nothing to build from (blocked) is skipped.
+ */
 export async function draftRebuttals(env, { nowMs, fetchImpl, limit = MAX_AI_DRAFTS_PER_RUN }) {
+  const retryBefore = nowIso(nowMs - AI_RETRY_AFTER_HOURS * 3600000);
   const { results } = await env.DB.prepare(
     `SELECT p.*, d.order_name, d.legacy_id, d.status AS dispute_status, d.evidence_sent_on
        FROM risk_evidence_packs p JOIN risk_disputes d ON d.store = p.store AND d.dispute_id = p.dispute_id
-      WHERE p.ai_attempted_at IS NULL AND p.status IN ('facts_only', 'waiting_ai')
-        AND d.status = 'NEEDS_RESPONSE' AND d.evidence_sent_on IS NULL
+      WHERE p.status IN ('facts_only', 'waiting_ai', 'ai_failed') AND p.blocked IS NULL
+        AND COALESCE(p.ai_attempts, 0) < ? AND (p.ai_attempted_at IS NULL OR p.ai_attempted_at <= ?)
+        AND d.status = 'NEEDS_RESPONSE' AND (d.evidence_sent_on IS NULL OR d.evidence_sent_on = '')
       ORDER BY d.evidence_due_by LIMIT ?`
-  ).bind(limit).all();
+  ).bind(MAX_AI_ATTEMPTS, retryBefore, limit).all();
   const out = [];
   for (const p of results || []) {
     const facts = safeJson(p.facts, {});
@@ -376,31 +465,56 @@ export async function draftRebuttals(env, { nowMs, fetchImpl, limit = MAX_AI_DRA
         actor: ACTOR, label: `Chargeback rebuttal draft ${p.order_name || p.legacy_id || ""}`.trim(), store: p.store,
       }, { fetchImpl, nowMs });
     } catch (err) {
-      // A real attempt that failed counts as the one attempt: no retry loop that burns budget.
-      await env.DB.prepare(`UPDATE risk_evidence_packs SET status = 'ai_failed', ai_attempted_at = ?, ai_error = ?, updated_at = ? WHERE store = ? AND dispute_id = ?`)
-        .bind(nowIso(nowMs), String(err && err.message).slice(0, 300), nowIso(nowMs), p.store, p.dispute_id).run();
+      // A real attempt that failed counts: retried at most MAX_AI_ATTEMPTS times in all, spaced
+      // AI_RETRY_AFTER_HOURS apart, so a broken API can't burn budget. The code draft stays.
+      const attempts = Number(p.ai_attempts || 0) + 1;
+      await env.DB.prepare(`UPDATE risk_evidence_packs SET status = 'ai_failed', ai_attempted_at = ?, ai_attempts = ?, ai_error = ?, updated_at = ? WHERE store = ? AND dispute_id = ?`)
+        .bind(nowIso(nowMs), attempts, String(err && err.message).slice(0, 300), nowIso(nowMs), p.store, p.dispute_id).run();
+      const more = attempts < MAX_AI_ATTEMPTS ? `will try again in ${AI_RETRY_AFTER_HOURS}h (attempt ${attempts} of ${MAX_AI_ATTEMPTS})` : "no more AI attempts";
       await logEvent(env.DB, { actor: ACTOR, kind: "error.risk", store: p.store, target: "sys.claude",
-        summary: `Rebuttal draft for ${p.order_name || "a dispute"} failed; the facts pack is still there for Reilly (${String(err && err.message).slice(0, 160)})`, at: nowIso(nowMs) });
-      out.push({ dispute: p.dispute_id, result: "ai_failed" });
+        summary: `AI rebuttal for ${p.order_name || "a dispute"} failed, ${more}; the code-written evidence draft is there for Reilly (${String(err && err.message).slice(0, 140)})`, at: nowIso(nowMs) });
+      out.push({ dispute: p.dispute_id, order: p.order_name, result: `ai_failed ${attempts}/${MAX_AI_ATTEMPTS}` });
       continue;
     }
     if (r.skipped) {
       // No key or budget reached: not an attempt. Wait and try on a later run.
       await env.DB.prepare(`UPDATE risk_evidence_packs SET status = 'waiting_ai', ai_error = ?, updated_at = ? WHERE store = ? AND dispute_id = ?`)
         .bind(r.skipped, nowIso(nowMs), p.store, p.dispute_id).run();
-      out.push({ dispute: p.dispute_id, result: `waiting on AI (${r.skipped})` });
+      out.push({ dispute: p.dispute_id, order: p.order_name, result: `waiting on AI (${r.skipped})` });
       break; // the same reason applies to every other pack this run
     }
-    await env.DB.prepare(`UPDATE risk_evidence_packs SET status = 'draft', rebuttal = ?, ai_model = ?, ai_attempted_at = ?, ai_error = NULL, updated_at = ? WHERE store = ? AND dispute_id = ?`)
+    await env.DB.prepare(`UPDATE risk_evidence_packs SET status = 'draft', rebuttal = ?, ai_model = ?, ai_attempted_at = ?, ai_attempts = COALESCE(ai_attempts, 0) + 1, ai_error = NULL, updated_at = ? WHERE store = ? AND dispute_id = ?`)
       .bind(r.text, r.model, nowIso(nowMs), nowIso(nowMs), p.store, p.dispute_id).run();
     await logEvent(env.DB, {
       actor: ACTOR, kind: "risk.evidence_drafted", store: p.store,
       summary: `Evidence draft ready for ${p.order_name || "a dispute"}: rebuttal written, ${missing.length} item${missing.length === 1 ? "" : "s"} for Reilly to add. Not submitted (Reilly submits in Shopify).`,
       data: { disputeId: p.dispute_id, missing }, at: nowIso(nowMs),
     });
-    out.push({ dispute: p.dispute_id, result: "draft" });
+    out.push({ dispute: p.dispute_id, order: p.order_name, result: "draft" });
   }
   return out;
+}
+
+/**
+ * One line per dispute that needs a response: which draft exists, the AI state, how many
+ * items Reilly must add, and, when nothing could be drafted, exactly what is missing. Never
+ * an empty list while a dispute is open (live #1098 showed `drafts: []` and no draft).
+ */
+export async function evidenceSummary(db) {
+  const { results } = await db.prepare(
+    `SELECT d.store, d.dispute_id, d.order_name, d.legacy_id, p.status, p.code_draft IS NOT NULL AS has_code, p.rebuttal IS NOT NULL AS has_ai,
+            p.missing, p.blocked, p.ai_attempts, p.ai_error
+       FROM risk_disputes d LEFT JOIN risk_evidence_packs p ON p.store = d.store AND p.dispute_id = d.dispute_id
+      WHERE d.status = 'NEEDS_RESPONSE' AND (d.evidence_sent_on IS NULL OR d.evidence_sent_on = '')
+      ORDER BY d.evidence_due_by`
+  ).all();
+  return (results || []).map((r) => {
+    const base = { order: r.order_name || `dispute ${r.legacy_id || r.dispute_id}`, store: r.store };
+    if (r.status == null) return { ...base, draft: null, blocked: "no evidence pack yet: facts were not gathered (see this run's error)" };
+    if (!r.has_code && !r.has_ai) return { ...base, draft: null, blocked: r.blocked || "no draft and no reason recorded" };
+    const ai = r.has_ai ? "done" : r.status === "ai_failed" ? `failed ${r.ai_attempts || 0}/${MAX_AI_ATTEMPTS}` : r.status === "waiting_ai" ? "waiting" : "pending";
+    return { ...base, draft: r.has_ai ? "claude" : "code", ai, add: (safeJson(r.missing, []) || []).length };
+  });
 }
 
 /* ---------------- the run ---------------- */
@@ -451,7 +565,12 @@ export async function runChargebacks(env, { nowMs = Date.now(), fetchImpl = fetc
       }
       if (needsResponse(after)) {
         open++;
-        await savePackFacts(db, storeId, after, nowMs);
+        try {
+          await savePackFacts(env, storeId, after, nowMs);
+        } catch (err) {
+          // The approval and reminders must still happen; the summary names the missing pack.
+          await logProblem(db, ACTOR, storeId, err, `${STORES[storeId].name} evidence pack for ${label(after)}`, nowMs);
+        }
         await ensureApproval(db, storeId, after, nowMs);
         const fresh = await db.prepare(`SELECT * FROM risk_disputes WHERE store = ? AND dispute_id = ?`).bind(storeId, after.dispute_id).first();
         await remindIfDue(db, storeId, fresh, nowMs);
@@ -461,7 +580,9 @@ export async function runChargebacks(env, { nowMs = Date.now(), fetchImpl = fetc
     }
     stores[storeId] = { read: nodes.length, needsResponse: open };
   }
-  const drafts = await draftRebuttals(env, { nowMs, fetchImpl });
+  const ai = await draftRebuttals(env, { nowMs, fetchImpl });
+  // `drafts` describes every open dispute's evidence (not just this run's AI calls).
+  const drafts = await evidenceSummary(db);
   const okStores = Object.values(stores).filter((s) => typeof s === "object");
   if (okStores.length) {
     const openTotal = okStores.reduce((s, x) => s + x.needsResponse, 0);
@@ -472,5 +593,5 @@ export async function runChargebacks(env, { nowMs = Date.now(), fetchImpl = fetc
     if (changes) await logEvent(db, { ...e, at });
     else await logOnce(db, e, { windowMin: 6 * 60, nowMs });
   }
-  return { stores, drafts };
+  return { stores, drafts, ai };
 }
