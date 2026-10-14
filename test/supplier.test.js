@@ -717,22 +717,39 @@ test("Quote status 40: rows stored before the change (raw code 40, status 'unkno
   assert.equal((await DB.prepare(`SELECT COUNT(*) AS n FROM events WHERE kind = 'quotes.status40_remapped'`).first()).n, 1);
 });
 
-test("Similar QC: old 'ask_reilly' order offers are re-judged as accepted and their open approvals expired with a note (nothing deleted)", async () => {
+test("Similar QC: old 'ask_reilly' order offers are re-judged (verdict only), not reported as new substitutions; approvals untouched", async () => {
   const DB = makeD1();
+  const oldJudged = iso(NOW - 2 * 3600000); // inside the digest's 24h window on purpose
   await recordSimilarOffer(DB, { store: "hc", context: "order", order_name: "#1099", remark: "similar colour" }, { nowMs: NOW - DAY });
-  await DB.prepare(`UPDATE kfb_similar_offers SET verdict = 'ask_reilly', verdict_reason = 'old rule', judged_at = ?`).bind(iso(NOW - DAY)).run();
-  await DB.prepare(`INSERT INTO approvals (created_at, dept, requested_by, title, options, status) VALUES (?, 'sup', 'sup.similar_qc', 'Similar item for #1099?', '[]', 'pending')`).bind(iso(NOW - DAY)).run();
+  await DB.prepare(`UPDATE kfb_similar_offers SET verdict = 'ask_reilly', verdict_reason = 'old rule', judged_at = ?`).bind(oldJudged).run();
+  // An approval from elsewhere: Similar QC never touches approvals (their note holds Reilly's words).
+  await DB.prepare(`INSERT INTO approvals (created_at, dept, requested_by, title, options, status) VALUES (?, 'sup', 'sup.similar_qc', 'x', '[]', 'pending')`).bind(oldJudged).run();
   const r = await runSimilarQc({ DB }, { nowMs: NOW });
-  assert.equal(r.substituted, 1);
-  assert.equal(r.approvalsExpired, 1);
-  const o = await DB.prepare(`SELECT verdict, verdict_reason FROM kfb_similar_offers WHERE order_name = '#1099'`).first();
+  assert.deepEqual([r.rejudged, r.substituted, r.judged], [1, 0, 0]);
+  const o = await DB.prepare(`SELECT verdict, verdict_reason, judged_at FROM kfb_similar_offers WHERE order_name = '#1099'`).first();
   assert.equal(o.verdict, "accepted");
-  assert.match(o.verdict_reason, /Re-judged .* \(was ask_reilly\)/);
-  const a = await DB.prepare(`SELECT status, note FROM approvals WHERE requested_by = 'sup.similar_qc'`).first();
-  assert.equal(a.status, "expired");
-  assert.match(a.note, /Expired by the brain: covered by Reilly's 2026-10-13 answer \("yes"/);
+  assert.match(o.verdict_reason, /^Re-judged under Reilly's 2026-10-13 rule \(was ask_reilly\): old rule/);
+  assert.equal(o.judged_at, oldJudged, "judged_at left as it was");
+  assert.equal((await DB.prepare(`SELECT COUNT(*) AS n FROM events WHERE kind = 'similar.substituted'`).first()).n, 0);
+  const ev = (await DB.prepare(`SELECT summary FROM events WHERE kind = 'similar.rejudged'`).all()).results;
+  assert.equal(ev.length, 1);
+  assert.match(ev[0].summary, /^1 old similar offer re-judged under Reilly's 2026-10-13 rule/);
+  assert.equal((await digestData(DB, NOW)).similarSubs24h, 0, "not counted as a new substitution");
+  const a = await DB.prepare(`SELECT status, note FROM approvals`).first();
+  assert.deepEqual([a.status, a.note], ["pending", null]);
   assert.equal((await DB.prepare(`SELECT COUNT(*) AS n FROM kfb_similar_offers`).first()).n, 1, "kept, not deleted");
-  assert.equal((await runSimilarQc({ DB }, { nowMs: NOW + 60000 })).judged, 0, "done once");
+  assert.equal((await runSimilarQc({ DB }, { nowMs: NOW + 60000 })).rejudged, 0, "done once");
+});
+
+test("Size Checker: 'man' is not a men's marker (Man-made fibres, Man Made, Isle of Man)", () => {
+  const base = { title: "Shawl Collar Cardigan", orderedSize: "M", chartRows: SMALL_CHART, audience: "both" };
+  for (const marks of [{ tags: ["Man-made fibres"] }, { tags: ["Man Made"] }, { productType: "Isle of Man" }, { title: "Shawl Collar Cardigan, man-made fibres" }]) {
+    const r = recommendSize({ ...base, ...marks });
+    assert.equal(r.verdict, "no_reference", JSON.stringify(marks));
+    assert.equal(r.reason, "H&C sells men's and women's; this product isn't marked either way");
+  }
+  assert.equal(productAudience({ tags: ["Man Made", "Womens"] }), "women", "'Man' doesn't turn a women's line into 'mixed'");
+  assert.equal(productAudience({ tags: ["Men"] }), "men");
 });
 
 test("Quote Desk: a proposal under Auberlane's $30 minimum margin is flagged, not quietly re-priced", () => {

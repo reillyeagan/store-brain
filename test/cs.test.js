@@ -864,3 +864,21 @@ test("cs size-up gate: the draft check catches every way of saying 'we sent a bi
     assert.equal(sizeUpMention(fine), null, fine);
   }
 });
+
+test("cs size-up gate: 'my size' and a bare 'fits' don't open it; 'went up one' and a larger named size are caught", () => {
+  const asks = (body) => emailAsksAboutSize({ category: "where_is_my_order", subject: "", body });
+  assert.equal(asks("I ordered my size M, where is it?"), false);
+  assert.equal(asks("It was a gift, hope it fits!"), false);
+  assert.equal(asks("will it fit a 42 chest?"), true);
+  assert.equal(asks("these fit small, should I size up?"), true);
+  for (const said of ["we went up one for you", "we went up a size", "we went up one size"]) assert.ok(sizeUpMention(said), said);
+  // Ordered size known: naming a larger letter size is a size-up.
+  const ctx = { name: "#1234", items: [{ title: "Shawl Cardigan", size: "M" }] };
+  const p = checkDraft("Hi Sam, your Shawl Cardigan in L is on its way. Holt & Crane Customer Care", { ctx });
+  assert.ok(p.some((x) => /names size L, larger than ordered/.test(x)), p.join("; "));
+  assert.ok(sizeUpMention("Your XL is on its way.", { orderedSizes: ["Medium"] }));
+  assert.equal(sizeUpMention("Your M is on its way.", { orderedSizes: ["M"] }), null, "the ordered size itself is fine");
+  assert.equal(sizeUpMention("Your S is on its way.", { orderedSizes: ["M"] }), null, "smaller isn't a size-up");
+  assert.equal(sizeUpMention("Your L is on its way.", {}), null, "ordered size unknown: no comparison");
+  assert.deepEqual(checkDraft("Hi Sam, your Shawl Cardigan in L is on its way. Holt & Crane Customer Care", { ctx, sizeAsked: true }).filter((x) => /larger than ordered/.test(x)), []);
+});

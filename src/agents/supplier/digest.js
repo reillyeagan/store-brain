@@ -89,7 +89,8 @@ export async function digestData(db, nowMs = Date.now()) {
   const scout = await db.prepare(`SELECT COUNT(*) AS n FROM sourcing_flags`).first();
   const similar = await db.prepare(`SELECT COUNT(*) AS n FROM kfb_similar_offers WHERE verdict = 'ask_reilly' AND judged_at >= ?`).bind(nowIso(nowMs - 86400000)).first();
   // Order substitutions are fine (Reilly: "yes", 2026-10-13) but still reported, so they're never invisible.
-  const subs = await db.prepare(`SELECT COUNT(*) AS n FROM kfb_similar_offers WHERE context = 'order' AND verdict = 'accepted' AND judged_at >= ?`).bind(nowIso(nowMs - 86400000)).first();
+  const subs = await db.prepare(`SELECT COUNT(*) AS n FROM kfb_similar_offers WHERE context = 'order' AND verdict = 'accepted' AND judged_at >= ?
+      AND COALESCE(verdict_reason, '') NOT LIKE 'Re-judged%'`).bind(nowIso(nowMs - 86400000)).first();
   return {
     kfbSession: quotes ? "has data" : "waiting on KFB session",
     quotes,

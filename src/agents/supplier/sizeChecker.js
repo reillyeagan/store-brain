@@ -80,7 +80,8 @@ const WOMENS_RE = /\b(women'?s?|womens|ladies|her)\b/i;
 // Word boundaries matter: "women" contains "men" and "female" contains "male"; \bmen and
 // \bmale never match inside them. Any feminine marker counts (woman, womenswear, lady, girl...).
 const WOMEN_MARK_RE = /\b(wom[ae]n(?:'?s)?|womens|womenswear|lad(?:y|ies)(?:'?s)?|females?|girls?(?:'?s)?)\b/i;
-const MEN_MARK_RE = /\b(m[ae]n(?:'?s)?|mens|menswear|males?)\b/i;
+// Not the bare word "man": "Man-made fibres", "Man Made", "Isle of Man" say nothing about who it's for.
+const MEN_MARK_RE = /\b(men(?:'?s)?|menswear|males?)\b/i;
 
 /** The reason a "both" store's unmarked product gets no size (only H&C is "both" today). */
 export const UNMARKED_BOTH_REASON = "H&C sells men's and women's; this product isn't marked either way";

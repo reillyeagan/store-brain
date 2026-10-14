@@ -56,17 +56,12 @@ export async function recordSimilarOffer(db, o, { source = "manual", nowMs = Dat
 export async function runSimilarQc(env, { nowMs = Date.now() } = {}) {
   const db = env.DB;
   const at = nowIso(nowMs);
-  // New offers, plus order offers judged "ask_reilly" under the old rule: Reilly's "yes"
-  // (2026-10-13) covers them too, so they are re-judged (kept, never deleted).
-  const { results } = await db.prepare(
-    `SELECT * FROM kfb_similar_offers WHERE verdict IS NULL OR (context = 'order' AND verdict = 'ask_reilly') ORDER BY id LIMIT 100`
-  ).all();
-  const expired = await expireOldOrderApprovals(db, at);
+  const rejudged = await rejudgeOldOrderOffers(db, at);
+  const { results } = await db.prepare(`SELECT * FROM kfb_similar_offers WHERE verdict IS NULL ORDER BY id LIMIT 100`).all();
   let accepted = 0; const substitutes = []; const asks = [];
   for (const o of results || []) {
     const j = judgeSimilar(o);
-    const reason = o.verdict ? `Re-judged under Reilly's 2026-10-13 answer (was ${o.verdict}): ${j.reason}` : j.reason;
-    await db.prepare(`UPDATE kfb_similar_offers SET verdict = ?, verdict_reason = ?, judged_at = ? WHERE id = ?`).bind(j.verdict, reason, at, o.id).run();
+    await db.prepare(`UPDATE kfb_similar_offers SET verdict = ?, verdict_reason = ?, judged_at = ? WHERE id = ?`).bind(j.verdict, j.reason, at, o.id).run();
     if (j.verdict !== "accepted") asks.push(o);
     else if (o.context === "order") substitutes.push(o);
     else accepted++;
@@ -86,23 +81,26 @@ export async function runSimilarQc(env, { nowMs = Date.now() } = {}) {
       summary: `${STORES[o.store] ? STORES[o.store].name : o.store} ${o.order_name || o.product_handle}: similar offer with an unknown context: not covered by Reilly's rule`,
       data: { offerId: o.id, remark: o.remark, photo: o.photo_url } });
   }
-  return { judged: (results || []).length, accepted: accepted + substitutes.length, substituted: substitutes.length, flagged: asks.length, approvalsExpired: expired };
+  return { judged: (results || []).length, accepted: accepted + substitutes.length, substituted: substitutes.length, flagged: asks.length, rejudged };
 }
 
 /**
- * Any approval still open from the old "ask Reilly about a similar item on an order" rule is
- * answered by his 2026-10-13 "yes": expired with a note saying so (kept as history, not deleted).
+ * Order offers judged "ask_reilly" under the old rule are covered by Reilly's 2026-10-13 "yes".
+ * Only the verdict changes (reason says "was ask_reilly"); judged_at stays as it was so they
+ * never look like new substitutions (no per-offer event, not in the digest's 24h count).
+ * One summary event. (Similar QC never created approvals, so there are none to close.)
  */
-async function expireOldOrderApprovals(db, at) {
-  const { results } = await db.prepare(`SELECT id FROM approvals WHERE requested_by = ? AND status = 'pending'`).bind(ACTOR).all();
-  for (const a of results || []) {
-    await db.prepare(`UPDATE approvals SET status = 'expired', decided_at = ?, note = ? WHERE id = ? AND status = 'pending'`)
-      .bind(at, `Expired by the brain: covered by Reilly's 2026-10-13 answer ("${SIMILAR_ORDERS_RULE.words}" to "${SIMILAR_ORDERS_RULE.question}"): similar substitutes on orders are fine`, a.id).run();
+export const REJUDGED_PREFIX = "Re-judged under Reilly's 2026-10-13 rule (was ask_reilly)";
+async function rejudgeOldOrderOffers(db, at) {
+  const r = await db.prepare(
+    `UPDATE kfb_similar_offers SET verdict = 'accepted', verdict_reason = ? || ': ' || COALESCE(verdict_reason, '')
+      WHERE context = 'order' AND verdict = 'ask_reilly'`
+  ).bind(REJUDGED_PREFIX).run();
+  const n = (r.meta && r.meta.changes) || 0;
+  if (n) {
+    await logEvent(db, { actor: ACTOR, kind: "similar.rejudged", at,
+      summary: `${n} old similar offer${n === 1 ? "" : "s"} re-judged under Reilly's 2026-10-13 rule ("${SIMILAR_ORDERS_RULE.words}": similar substitutes on customer orders are fine)`,
+      data: { rejudged: n } });
   }
-  if ((results || []).length) {
-    await logEvent(db, { actor: ACTOR, kind: "similar.approvals_expired", target: "core.approvals", at,
-      summary: `${results.length} open similar-item approval${results.length === 1 ? "" : "s"} expired: Reilly's "yes" (2026-10-13) covers order substitutions`,
-      data: { approvalIds: results.map((a) => a.id) } });
-  }
-  return (results || []).length;
+  return n;
 }

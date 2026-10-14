@@ -137,7 +137,7 @@ Every price change and every draft is ONE approval per batch, showing old → ne
 4. **"Similar ones":** your rule: when is similar OK, and when must the listing change or be drafted?
    - **Answered 2026-10-11 (Reilly):** "q4 always fine"
    - Means: a "similar" quote is treated exactly like an exact match: priced by the rules, never drafted for being similar.
-   - **Extended 2026-10-13 (Reilly):** asked "does 'similar always fine' cover substitutions on customer orders?": "yes". Similar substitutes on customer orders are fine, still recorded. Offers judged "ask Reilly" under the old rule are re-judged as accepted, and any open approval for one is expired with a note.
+   - **Extended 2026-10-13 (Reilly):** asked "does 'similar always fine' cover substitutions on customer orders?": "yes". Similar substitutes on customer orders are fine, still recorded. Offers judged "ask Reilly" under the old rule are re-judged as accepted (verdict only, "was ask_reilly" in the reason, one summary event; they are not counted as new substitutions).
 5. **WhatsApp:** what do you usually message KFB about, and how fast do they reply?
 6. **Returns:** do returned items go to your Charlotte address or back to KFB? For exchanges, does KFB ship the new size from China?
    - **Answered 2026-10-11 (Reilly):** "i never return things to KFB." Returns come to Reilly; replacements/exchanges are new shipments from KFB.

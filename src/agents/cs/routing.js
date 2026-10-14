@@ -51,7 +51,8 @@ export function checkDraft(body, { ctx = null, orderRef = null, sizeAsked = fals
   if (raw.length > 3000) problems.push("too long");
   // A bigger Chinese size shipping is never volunteered (Reilly: "no unless they ask").
   // Defaults to "didn't ask", so a caller that forgets to say fails safe.
-  const sizeUp = sizeAsked ? null : sizeUpMention(raw);
+  const orderedSizes = ((ctx && ctx.items) || []).map((i) => i.size).filter(Boolean);
+  const sizeUp = sizeAsked ? null : sizeUpMention(raw, { orderedSizes });
   if (sizeUp) problems.push(`mentions sizing up ("${sizeUp}") but the customer didn't ask about size or fit`);
 
   // Harmless set phrases that would otherwise trip the word lists.
