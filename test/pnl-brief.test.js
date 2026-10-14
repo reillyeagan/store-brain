@@ -996,3 +996,74 @@ test("brief: dozens of tiny restatements never push a real alarm out", async () 
   assert.ok(txt.includes("REAL ALARM"));
   assert.ok(!txt.includes("penny"));
 });
+
+/* Live 2026-10-14: "Morning brief has 3 numbers not found in its data: $65.95, -$61.29, -$47.23".
+ * $65.95 was the #1098 chargeback, only inside an approval title; -$61.29 → -$47.23 was a
+ * restated P&L day, only inside the event's text. Both are now numbers in the data. */
+async function liveCase(DB, nowMs) {
+  await allFresh(DB, nowMs);
+  const { createApproval } = await import("../src/lib/approvals.js");
+  const { approvalTitle } = await import("../src/agents/risk/chargebacks.js");
+  const { logEvent } = await import("../src/lib/eventlog.js");
+  const d = { store: "hc", dispute_id: "gid://shopify/ShopifyPaymentsDispute/1", order_name: "#1098", type: "CHARGEBACK", reason: "PRODUCT_NOT_RECEIVED", amount: 65.95, currency: "USD", evidence_due_by: "2026-10-31", status: "NEEDS_RESPONSE" };
+  const title = approvalTitle("hc", d);
+  assert.match(title, /\$65\.95/);
+  const ap = await createApproval(DB, { dept: "risk", requestedBy: "risk.chargebacks", store: "hc", title, options: [{ id: "will_submit", label: "I'll submit", detail: "x" }] });
+  await DB.prepare(`INSERT INTO risk_disputes (store, dispute_id, order_name, status, type, reason, amount, currency, evidence_due_by, approval_id, first_seen_at, fetched_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(d.store, d.dispute_id, d.order_name, d.status, d.type, d.reason, d.amount, d.currency, d.evidence_due_by, ap, iso(nowMs), iso(nowMs)).run();
+  // Same shape as pnl.js writePnlRow's restatement event.
+  await logEvent(DB, { actor: "pnl.ledger", kind: "pnl.restated", store: "hc", summary: "Holt & Crane P&L for 2026-10-12 restated: profit $-61.29 → $-47.23",
+    data: { day: "2026-10-12", changed: ["profit"], before: { profit: -61.29 }, after: { profit: -47.23 } }, at: iso(nowMs - 3600000) });
+}
+
+test("brief: a chargeback amount and a restatement's before/after/change are numbers in the data, so the brief can quote them and they verify", async () => {
+  const DB = makeD1();
+  const nowMs = Date.parse("2026-10-14T12:05:00Z"); // 08:05 EDT
+  await liveCase(DB, nowMs);
+  const data = await gatherBriefData({ DB }, { nowMs });
+  const cb = data.waiting.approvals.find((a) => a.dispute);
+  assert.equal(cb.dispute.amount, 65.95);
+  assert.deepEqual(cb.amounts_in_title, [65.95]);
+  assert.equal(cb.dispute.evidence_due_by, "2026-10-31");
+  const rs = data.risk.find((r) => r.kind === "pnl.restated");
+  assert.deepEqual(rs.changes, [{ field: "profit", before: -61.29, after: -47.23, change: 14.06 }]);
+
+  const text = "## Waiting on you\n- Chargeback #1098 at Holt & Crane: $65.95, evidence due 2026-10-31 (Oct 31).\n" +
+    "## Risk\n- Holt & Crane 2026-10-12 profit restated from -$61.29 to -$47.23 (up $14.06).";
+  assert.deepEqual(unverifiedNumbers(text, data), []);
+  // The verifier is not loosened: a number that isn't in the data is still flagged, and a
+  // loss written as a gain still fails.
+  assert.deepEqual(unverifiedNumbers("- #1098 chargeback $65.00; profit moved by $14.60", data), ["$65.00", "$14.60"]);
+  assert.deepEqual(unverifiedNumbers("- H&C profit $61.29", data), ["$61.29"]);
+
+  // End to end, including Reilly's "Rewrite now".
+  const { rewriteBrief } = await import("../src/lib/brief.js");
+  const { fetchImpl } = fakeApis({ text });
+  const r = await runBrief(briefEnv(DB), { nowMs, fetchImpl });
+  assert.deepEqual(r.unverified, []);
+  assert.equal(r.checked, true);
+  const rw = await rewriteBrief(briefEnv(DB), { nowMs: nowMs + 3600000, fetchImpl });
+  assert.equal(rw.ok, true, JSON.stringify(rw));
+  assert.equal(rw.checked, true);
+  const row = await DB.prepare(`SELECT checked, unverified FROM briefs WHERE id = ?`).bind(r.id).first();
+  assert.equal(row.checked, 1);
+  assert.equal(row.unverified, "[]");
+});
+
+test("brief: the prompt forbids computing differences or splits; payout checks and per-store pending refunds come computed", async () => {
+  const { SYSTEM_PROMPT, dollarsIn } = await import("../src/lib/brief.js");
+  assert.match(SYSTEM_PROMPT, /Never work out a difference, total, average or per-store split yourself/);
+  assert.deepEqual(dollarsIn("profit $-61.29 → $-47.23, fee -$1,200.50 and $3"), [-61.29, -47.23, -1200.5, 3]);
+  const DB = makeD1();
+  const nowMs = Date.parse("2026-10-14T12:05:00Z");
+  await allFresh(DB, nowMs);
+  const { logEvent } = await import("../src/lib/eventlog.js");
+  await logEvent(DB, { actor: "pnl.money_map", kind: "payout.mismatch", store: "aub", summary: "Auberlane: payout of 120.00 on 2026-10-13 doesn't match its 4 transactions (they add up to 118.50, off by 1.50)",
+    data: { payoutId: "p1", payoutCents: 12000, sumCents: 11850, diffCents: 150 }, at: iso(nowMs - 3600000) });
+  await refund(DB, "hc", { id: "r1", orderId: "o1", processed_at: iso(nowMs - 86400000), amount: 20, status: "PENDING" });
+  await refund(DB, "mar", { id: "r2", orderId: "o2", processed_at: iso(nowMs - 86400000), amount: 30.5, status: "PENDING" });
+  const data = await gatherBriefData({ DB }, { nowMs });
+  assert.deepEqual(data.risk.find((r) => r.kind === "payout.mismatch").payout_check, { payout: 120, transactions_add_up_to: 118.5, off_by: 1.5 });
+  assert.deepEqual(data.money.pending_refunds.by_store, [{ store: "Holt & Crane", count: 1, amount: 20 }, { store: "Marlowe Standard", count: 1, amount: 30.5 }]);
+  assert.deepEqual(unverifiedNumbers("Auberlane payout $120.00 vs $118.50 (off by $1.50); PENDING refunds H&C $20.00, Marlowe $30.50", data), []);
+});
