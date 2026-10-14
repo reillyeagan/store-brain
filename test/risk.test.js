@@ -798,3 +798,31 @@ test("personal details: settings Shopify refuses are noted as not wired, and the
   assert.ok(r.notes.some((n) => /contact settings not readable/.test(n)));
   assert.equal((await DB.prepare(`SELECT cleared_at FROM risk_personal_hits`).first()).cleared_at, null);
 });
+
+test("personal details: 913 phones in every common form, E.164 included; never inside a longer number", () => {
+  const ph = (t) => scanText(t).some((h) => h.pattern === "phone_913");
+  for (const t of ["+19135551234", "(913) 592-9849", "9132163296", "+1 (913) 592-9849", "1-913-555-1234", "913.555.1234"]) assert.equal(ph(t), true, t);
+  for (const t of ["49135551234", "91355512345", "SKU 913-55", "order 2913555123"]) assert.equal(ph(t), false, t);
+});
+
+test("personal details: a product hit is cleared only when THAT product was re-read (the run reads 20 products, not all)", async () => {
+  const DB = makeD1();
+  let products = [{ id: "p1", title: "A", handle: "coat", description: "<p>Made in Olathe.</p>" }];
+  const net = fakeNet({
+    shopify: (s, op) => op === "RiskPolicies" ? { shop: { shopPolicies: [] } }
+      : op === "RiskShopSettings" ? { shop: { name: "H&C", contactEmail: "info@holtandcrane.com" } }
+      : { themes: { nodes: [] }, products: { nodes: products } },
+  });
+  const env = { DB, ...CREDS };
+  await collectStore(env, "hc", { nowMs: NOW, fetchImpl: net.fetchImpl });
+  const open = async () => (await DB.prepare(`SELECT source FROM risk_personal_hits WHERE cleared_at IS NULL`).all()).results.map((r) => r.source);
+  assert.deepEqual(await open(), ["product:coat"]);
+  // Next week "coat" isn't among the 20 most recently updated products: unknown, NOT cleared.
+  products = [{ id: "p2", title: "B", handle: "scarf", description: "<p>Soft wool.</p>" }];
+  await collectStore(env, "hc", { nowMs: NOW + 7 * DAY, fetchImpl: net.fetchImpl });
+  assert.deepEqual(await open(), ["product:coat"]);
+  // Re-read and fixed: cleared.
+  products = [{ id: "p1", title: "A", handle: "coat", description: "<p>Made with care.</p>" }];
+  await collectStore(env, "hc", { nowMs: NOW + 14 * DAY, fetchImpl: net.fetchImpl });
+  assert.deepEqual(await open(), []);
+});

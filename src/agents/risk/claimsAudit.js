@@ -30,7 +30,7 @@ import { logEvent } from "../../lib/eventlog.js";
 import { askJson } from "../../lib/ai.js";
 import { nowIso } from "../../lib/time.js";
 import { fingerprint, logProblem, logOnce, isAccessDenied, isNotWired } from "./shared.js";
-import { SHOP_SETTINGS_QUERY, scanItems, settingsItems, saveHits } from "./personalDetails.js";
+import { SHOP_SETTINGS_QUERY, SETTINGS_SOURCES, scanItems, settingsItems, saveHits } from "./personalDetails.js";
 
 export const ACTOR = "risk.claims_audit";
 export const BATCH_SIZE = 15;
@@ -159,11 +159,10 @@ export async function collectStore(env, storeId, { nowMs = Date.now(), fetchImpl
   const name = STORES[storeId].name;
   const notes = [];
   const sf = await shopifyGraphQL(env, storeId, STOREFRONT_QUERY, { files: [...THEME_FILES] }, { fetchImpl, nowMs });
-  let policies = [], policiesRead = false;
+  let policies = [];
   try {
     const p = await shopifyGraphQL(env, storeId, POLICIES_QUERY, {}, { fetchImpl, nowMs });
     policies = (p && p.shop && p.shop.shopPolicies) || [];
-    policiesRead = true;
   } catch (err) {
     if (!(isAccessDenied(err) || isNotWired(err))) throw err;
     notes.push("store policies not read (the app needs read_legal_policies); theme and product text still checked");
@@ -184,11 +183,11 @@ export async function collectStore(env, storeId, { nowMs = Date.now(), fetchImpl
     if (!(isAccessDenied(err) || isNotWired(err))) throw err;
     notes.push("store contact settings not readable for the personal-details scan (not wired)");
   }
-  const scanned = new Set(["product"]);
-  if (themeName) scanned.add("theme");
-  if (policiesRead) scanned.add("policy");
-  if (shop) scanned.add("settings");
-  const personal = await saveHits(db, storeId, scanItems([...rawStorefrontItems(sf, policies), ...settingsItems(shop)]), { nowMs, scannedSources: scanned });
+  // Exactly what was read this run: only these sources can have an old hit cleared.
+  const raw = rawStorefrontItems(sf, policies);
+  const readSources = new Set(raw.map((it) => it.source));
+  if (shop) for (const s of SETTINGS_SOURCES) readSources.add(s);
+  const personal = await saveHits(db, storeId, scanItems([...raw, ...settingsItems(shop)]), { nowMs, readSources });
   let added = 0;
   for (const it of items) {
     const hash = await fingerprint(it.text);

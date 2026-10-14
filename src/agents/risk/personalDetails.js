@@ -33,7 +33,9 @@ export const PERSONAL_PATTERNS = Object.freeze([
   { id: "kansas", label: "Kansas", re: /\bKansas\b/i },
   { id: "ks_zip", label: "Kansas ZIP (KS 66...)", re: /\bKS[,.]?\s*66\d{0,3}\b/i },
   { id: "personal_gmail", label: "personal Gmail (reillyworking26@gmail.com)", re: /reillyworking26@gmail\.com/i },
-  { id: "phone_913", label: "personal phone (913 area code)", re: /(?:\+?1[\s.\-]?)?(?:\(913\)|\b913)[\s.\-]?\d{3}[\s.\-]?\d{4}\b/ },
+  // Any 913 number, with or without +1 / 1, brackets, spaces, dots or dashes, E.164 included
+  // ("+19135551234"); never part of a longer digit run.
+  { id: "phone_913", label: "personal phone (913 area code)", re: /(?<!\d)(?:\+?1[\s.\-]?)?\(?913\)?[\s.\-]?\d{3}[\s.\-]?\d{4}(?!\d)/ },
 ]);
 
 /** Settings Shopify shows customers (read-only). Validated fields of Admin GraphQL `Shop`. */
@@ -65,6 +67,7 @@ export function scanItems(items) {
 }
 
 /** Pure: the customer-facing settings as scannable items. */
+export const SETTINGS_SOURCES = Object.freeze(["settings:contact_email", "settings:store_address"]);
 export function settingsItems(shop) {
   if (!shop) return [];
   const items = [];
@@ -75,7 +78,11 @@ export function settingsItems(shop) {
 }
 
 /** Store this week's hits: new ones opened, ones no longer found closed. Returns {found, added}. */
-export async function saveHits(db, storeId, hits, { nowMs = Date.now(), scannedSources = null } = {}) {
+/**
+ * `readSources`: the exact sources read in THIS run ("product:<handle>", "theme:<file>",
+ * "policy:<type>", "settings:<field>"). Only a hit whose own source was re-read can be cleared.
+ */
+export async function saveHits(db, storeId, hits, { nowMs = Date.now(), readSources = null } = {}) {
   const at = nowIso(nowMs);
   let added = 0;
   for (const h of hits) {
@@ -88,14 +95,14 @@ export async function saveHits(db, storeId, hits, { nowMs = Date.now(), scannedS
     ).bind(storeId, h.source, h.pattern, h.label, h.excerpt.slice(0, 300), at, at).run();
     if (!had || had.cleared_at) added++;
   }
-  // Close hits not found this time, but only in sources that were actually read this time
-  // (a source Shopify didn't show is unknown, not clean).
+  // Close hits not found this time, but only when THAT source was actually re-read this time:
+  // the run reads only the 20 most recently updated products, so a product not in this run's
+  // read is unknown, not clean (and neither is a source Shopify didn't show).
   const { results } = await db.prepare(`SELECT id, source, pattern FROM risk_personal_hits WHERE store = ? AND cleared_at IS NULL`).bind(storeId).all();
   const seen = new Set(hits.map((h) => `${h.source}|${h.pattern}`));
   for (const r of results || []) {
     if (seen.has(`${r.source}|${r.pattern}`)) continue;
-    const kind = String(r.source).split(":")[0];
-    if (scannedSources && !scannedSources.has(kind)) continue;
+    if (!readSources || !readSources.has(r.source)) continue;
     await db.prepare(`UPDATE risk_personal_hits SET cleared_at = ? WHERE id = ?`).bind(at, r.id).run();
   }
   if (added) {
