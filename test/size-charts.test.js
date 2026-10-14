@@ -221,7 +221,7 @@ test("intake validation: inches, flat, the inches-or-flat question, bad rows", (
   assert.match(bad([{ size: "M", chest: 110 }, { size: "M", chest: 115 }]).error, /out of order/);
   assert.match(bad([{ size: "M", chest: 110 }]).error, /at least 2 sizes/);
   assert.match(bad([{ size: "M", chest: 250 }, { size: "L", chest: 260 }]).error, /outside 60–200cm/);
-  assert.match(bad([{ size: "M", chest: 110 }, { size: "L", chest: 115 }], { unit: "cm", flat: true }).error, /outside 60–200cm/, "flat on a full chest doubles past 200");
+  assert.match(bad([{ size: "M", chest: 110 }, { size: "L", chest: 115 }], { unit: "cm", flat: true }).error, /full circumference/, "flat on a full chest is refused before doubling");
   assert.match(bad([{ size: "M", chest: 20 }, { size: "L", chest: 22 }], { unit: "cm", flat: true }).error, /outside 60–200cm/, "even doubled, 40cm is nonsense");
   assert.match(bad([{ size: "M", chest: 110 }, { size: "L", chest: 105 }]).error, /gets smaller/);
   assert.match(bad([{ size: "M", chest: "abc" }, { size: "L", chest: 105 }]).error, /not a number/);
@@ -539,4 +539,11 @@ test("routes: /api/size-charts and /confirm need the key; with it, a paste saves
   // Image route without an AI key: not wired, nothing saved.
   const img = await post("/api/size-charts/image", { store: "hc", product_handle: "other", image_base64: "iVBORw0KGgo=", media_type: "image/png" }, KEY);
   assert.equal(img.status, 503);
+});
+
+test("intake: flat ticked on a full-circumference chart is refused, never doubled", async () => {
+  const { validateChart } = await import("../src/agents/supplier/sizeIntake.js");
+  const v = validateChart({ unit: "cm", flat: true, rows: [{ size: "M", chest: 92 }, { size: "L", chest: 96 }] });
+  assert.equal(v.ok, false);
+  assert.match(v.error || JSON.stringify(v), /full circumference/);
 });

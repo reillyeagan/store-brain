@@ -83,6 +83,9 @@ export function validateChart({ unit, flat, rows } = {}) {
     }
     if (row.chest == null) return fail(400, `${size}: chest is required`);
     if (row.chest < 75 && !(flat === true && unitGiven)) return fail(400, `${size} chest ${r1(row.chest)}cm: ${UNCLEAR_UNIT}`);
+    // A flat (half) chest is never 75cm or more: ticking "flat" on a full-circumference chart
+    // would double it into a garment that looks big enough (the flattering direction).
+    if (flat === true && row.chest >= 75) return fail(400, `${size} chest ${r1(row.chest)}cm is already a full circumference: untick flat (a flat chest is half, under 75cm)`);
     if (flat === true) {
       row.chest *= 2;
       if (row.waist != null) row.waist *= 2;
