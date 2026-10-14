@@ -25,6 +25,7 @@ import { STORES, LIVE_STORE_IDS, GUY_FEE } from "../../config/stores.js";
 import { logEvent } from "../../lib/eventlog.js";
 import { nowIso } from "../../lib/time.js";
 import { parseRate } from "../../lib/pnl.js";
+import { readPriceFact } from "./priceFacts.js";
 
 const ACTOR = "core.librarian";
 
@@ -45,16 +46,6 @@ export const SPEC_PRICE_RULES = Object.freeze({
 });
 
 const EMPTY = new Set(["", "null", "{}", "[]", '""', "undefined"]);
-
-/** First number in a fact value: 44.95, "44.95", "$44.95", {"usd":44.95}, {"value":"44.95"}. */
-export function factNumber(value) {
-  let v = value;
-  if (typeof v === "string") { try { v = JSON.parse(v); } catch { /* text */ } }
-  if (v && typeof v === "object") v = v.usd ?? v.value ?? v.amount ?? v.price ?? null;
-  if (typeof v === "number") return Number.isFinite(v) ? v : null;
-  const m = /-?\d+(?:\.\d+)?/.exec(String(v ?? "").replace(/,/g, ""));
-  return m ? Number(m[0]) : null;
-}
 
 function factText(value) {
   let v = value;
@@ -84,19 +75,18 @@ export function checkFacts(facts, nowMs = Date.now()) {
 
     // --- contradictions with the config / specs ---
     const key = String(f.key).toLowerCase();
-    const stores = f.store ? [f.store] : LIVE_STORE_IDS;
-    const n = factNumber(f.value);
-    const isPrice = /price/.test(key) && !/cogs|band|target|compare/.test(key);
-    if (isPrice && /(floor|min)/.test(key) && n != null) {
-      for (const s of stores) {
-        const rule = SPEC_PRICE_RULES[s];
-        if (rule && Math.abs(n - rule.floor) >= 0.005) add(f, "contradicts_spec", `Core says ${STORES[s].name} price floor is ${n} (${f.key}); the spec says ${rule.floor}`, { expected: rule.floor, found: n, against: "docs/specs/supplier.md" });
-      }
-    }
-    if (isPrice && /(ceiling|max)/.test(key) && n != null) {
-      for (const s of stores) {
-        const rule = SPEC_PRICE_RULES[s];
-        if (rule && Math.abs(n - rule.ceiling) >= 0.005) add(f, "contradicts_spec", `Core says ${STORES[s].name} price ceiling is ${n} (${f.key}); the spec says ${rule.ceiling}`, { expected: rule.ceiling, found: n, against: "docs/specs/supplier.md" });
+    // Retail price floor / ceiling: like with like only (priceFacts.js). A KFB supply tier is
+    // not a retail ceiling, a fact stating both numbers is read label by label, and a fact
+    // that can't be read with confidence is reported as unparsed, never as a contradiction.
+    const price = readPriceFact(f);
+    if (price && price.unparsed) {
+      add(f, "unparsed", `Couldn't read a retail price floor/ceiling from "${f.key}"${f.store ? ` (${f.store})` : ""} with confidence (${price.unparsed}); not compared with the spec`, { why: price.unparsed });
+    } else if (price) {
+      for (const c of price.claims) {
+        const rule = SPEC_PRICE_RULES[c.store];
+        if (!rule) continue;
+        const want = rule[c.kind];
+        if (Math.abs(c.value - want) >= 0.005) add(f, "contradicts_spec", `Core says ${STORES[c.store].name} price ${c.kind} is ${c.value} (${f.key}); the spec says ${want}`, { expected: want, found: c.value, kind_of_rule: c.kind, rule_store: c.store, against: "docs/specs/supplier.md" });
       }
     }
     if (/kfb/.test(key) && /(shop|store)/.test(key) && /code/.test(key) && f.store && STORES[f.store]) {

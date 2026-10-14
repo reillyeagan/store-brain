@@ -86,6 +86,46 @@ test("librarian: finds missing values, stale facts, contradictions with the conf
   assert.deepEqual(kinds(9), ["stale"]);
 });
 
+test("librarian: only like with like — a fact stating floor AND ceiling is read label by label, a KFB supply tier is not a retail ceiling, a real ceiling of 150 is still caught", () => {
+  const at = "2026-10-01T00:00:00Z";
+  const facts = [
+    // Live fact 263's shape: both numbers in one value, for all three stores.
+    { id: 263, store: null, key: "pricing.price_floor_ceiling", value: "Floor $44.95 on H&C and Auberlane, $49.95 on Marlowe; ceiling $144.95 all 3 stores (Reilly 2026-10-11)", observed_at: at },
+    { id: 264, store: null, key: "pricing.price_floor_ceiling", value: "min price 44.95 on H&C going forwards. max price 144.95 all 3 stores", observed_at: at },
+    { id: 265, store: "mar", key: "pricing.price_floor_ceiling", value: "{\"floor\":49.95,\"ceiling\":144.95}", observed_at: at },
+    // Live fact 384: a KFB supply price tier, not the store's retail ceiling.
+    { id: 384, store: null, key: "kfb.price_tier_supply_ceiling", value: "175", observed_at: at },
+    // Genuine contradictions must still be found.
+    { id: 400, store: "hc", key: "pricing.price_ceiling", value: "150", observed_at: at },
+    { id: 401, store: null, key: "pricing.price_floor_ceiling", value: "floor $44.95 H&C, AUB, $49.95 MAR; ceiling $150 all stores", observed_at: at },
+    { id: 402, store: "mar", key: "pricing.price_floor", value: "$44.95", observed_at: at },
+    // Can't tell which number is which: unparsed, not a contradiction.
+    { id: 500, store: null, key: "pricing.price_floor_ceiling", value: "44.95 / 144.95", observed_at: at },
+    { id: 501, store: null, key: "pricing.price_floor_ceiling", value: "Floor and ceiling: 44.95 / 144.95", observed_at: at },
+    { id: 502, store: null, key: "pricing.price_floor", value: "$44.95 H&C, $49.95 Marlowe", observed_at: at },
+  ];
+  const f = checkFacts(facts, T0);
+  // (Several of these share a key on purpose, so "conflicting_live" is expected and set aside.)
+  const of = (id, kind) => f.filter((x) => x.fact_id === id && x.kind !== "conflicting_live" && (!kind || x.kind === kind));
+  for (const id of [263, 264, 265, 384]) assert.deepEqual(of(id), [], `fact ${id}: ${JSON.stringify(of(id))}`);
+  assert.equal(f.filter((x) => /ceiling is 44\.95/.test(x.summary)).length, 0);
+
+  const c400 = of(400, "contradicts_spec");
+  assert.equal(c400.length, 1);
+  assert.match(c400[0].summary, /Holt & Crane price ceiling is 150 .*the spec says 144\.95/);
+  assert.equal(c400[0].found, 150);
+  assert.equal(c400[0].expected, 144.95);
+  // Stated for all stores: one contradiction per store, floors (all correct) not flagged.
+  const c401 = of(401, "contradicts_spec");
+  assert.deepEqual(c401.map((x) => [x.rule_store, x.kind_of_rule, x.found]).sort(), [["aub", "ceiling", 150], ["hc", "ceiling", 150], ["mar", "ceiling", 150]]);
+  assert.deepEqual(of(402, "contradicts_spec").map((x) => [x.rule_store, x.found, x.expected]), [["mar", 44.95, 49.95]]);
+  for (const id of [500, 501]) {
+    assert.deepEqual(of(id).map((x) => x.kind), ["unparsed"], `fact ${id}`);
+  }
+  // Prices tied to named stores without a floor/ceiling word: read by the key, per store.
+  assert.deepEqual(of(502), []);
+});
+
 test("librarian: the vault outbox queues decisions, new facts and briefs once each; vault-sourced facts are not sent back", async () => {
   const DB = makeD1();
   await recordDecision(DB, { topic: "t", words: "do it" }, { nowMs: T0 });
