@@ -1004,15 +1004,22 @@ const lastRun = async (db, job) => (await db.prepare(`SELECT last_run_at, last_r
  * run finished). Before noon an unfinished morning is retried at each P&L slot; after noon only a
  * day with NO attempt yet gets its one run.
  */
-export async function sheetsDue(db, nowMs = Date.now()) {
+export async function sheetsDue(db, nowMs = Date.now(), rerunAfter = null) {
   const today = localDay(nowMs, MORNING_TZ);
   const hour = hourIn(nowMs, MORNING_TZ);
   if (hour < MORNING_FROM_HOUR) return { due: false, why: "before 07:00 New York" };
+  // A re-run after a fix (2026-10-15: that morning's run happened before the revenue / COG /
+  // day-basis fixes): the first slot after the deploy fills yesterday again, even after noon.
+  // rerunAfter = env SHEETS_RERUN_AFTER (an ISO time, wrangler.toml): runs before it don't count
+  // for that day. Not set = no re-run.
+  const rerunDay = rerunAfter ? localDay(Date.parse(rerunAfter), MORNING_TZ) : null;
+  const rerun = !!(rerunDay && rerunDay === today);
+  const counts = (r) => !!(r && r.last_run_at && localDay(r.last_run_at, MORNING_TZ) === today && !(rerun && Date.parse(r.last_run_at) < Date.parse(rerunAfter)));
   const done = await lastRun(db, "pnl.sheets.done");
-  if (done && done.last_run_at && localDay(done.last_run_at, MORNING_TZ) === today) return { due: false, why: "done for today" };
+  if (counts(done)) return { due: false, why: "done for today" };
   const tried = await lastRun(db, "pnl.sheets.morning");
-  const triedToday = !!(tried && tried.last_run_at && localDay(tried.last_run_at, MORNING_TZ) === today);
-  if (triedToday && hour >= MORNING_RETRY_UNTIL_HOUR) return { due: false, why: "retries stop at noon; next run tomorrow 07:00" };
+  const triedToday = counts(tried);
+  if (triedToday && hour >= MORNING_RETRY_UNTIL_HOUR && !rerun) return { due: false, why: "retries stop at noon; next run tomorrow 07:00" };
   if (triedToday && tried.last_run_at && nowMs - Date.parse(tried.last_run_at) < MORNING_CLAIM_GAP_MIN * 60000) return { due: false, why: "another run holds this slot" };
   return { due: true, why: triedToday ? "retry: yesterday was not closed yet" : "morning run" };
 }
@@ -1040,7 +1047,7 @@ export async function claimMorning(db, nowMs, why) {
 /** The P&L slot's entry point: runs runSheets only when the morning run is due, and records it. */
 export async function runSheetsMorning(env, { fetchImpl = fetch, nowMs = Date.now(), calls = null } = {}) {
   const db = env.DB;
-  const due = await sheetsDue(db, nowMs);
+  const due = await sheetsDue(db, nowMs, env.SHEETS_RERUN_AFTER || null);
   if (!due.due) {
     // Past noon without success: say so once ("not filled", never "filled").
     if (/retries stop at noon/.test(due.why)) {

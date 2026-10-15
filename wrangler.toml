@@ -54,6 +54,10 @@ BRIEF_MODEL = "claude-sonnet-5-5"
 # P&L Sheets agent: writes blank input cells of the Google Sheets P&L workbooks (Reilly asked
 # for it on 2026-10-14, so it is ON when unset). To stop every write, uncomment this and redeploy:
 # SHEETS_WRITE = "0"
+# Re-run of one day's morning fill after a fix: morning runs before this time don't count for
+# that day. 2026-10-15: the 07:37 run predated the revenue / COG / day-basis fixes. Harmless
+# after that day; remove whenever.
+SHEETS_RERUN_AFTER = "2026-10-15T14:00:00Z"
 # Shopify app Client IDs are identifiers, not passwords, so they live here where a
 # deploy can never wipe them. The matching Client SECRETS stay Cloudflare secrets.
 SB_HC_CLIENT_ID = "91f62305f583acc7ac4dcaf6641590c1"

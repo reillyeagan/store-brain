@@ -1321,3 +1321,13 @@ test("COG estimate still standing after 38 days is reported to Reilly (rule 5)",
   assert.equal(ev.length, 1);
   assert.match(ev[0].summary, /2026-10-11: COG is still the brain's estimate/);
 });
+
+test("schedule: SHEETS_RERUN_AFTER makes that day's earlier morning runs not count, even after noon; other days are untouched", async () => {
+  const { sheetsDue } = await import("../src/agents/pnl/sheets.js");
+  const DB = makeD1();
+  await DB.prepare(`INSERT INTO job_runs (job, last_run_at, last_result) VALUES ('pnl.sheets.done', ?, 'filled'), ('pnl.sheets.morning', ?, 'filled')`).bind(iso(etMs("2026-10-15", 7)), iso(etMs("2026-10-15", 7))).run();
+  assert.equal((await sheetsDue(DB, etMs("2026-10-15", 13))).due, false);
+  assert.equal((await sheetsDue(DB, etMs("2026-10-15", 13), "2026-10-15T14:00:00Z")).due, true);
+  await DB.prepare(`UPDATE job_runs SET last_run_at = ?`).bind(iso(etMs("2026-10-15", 13))).run();
+  assert.equal((await sheetsDue(DB, etMs("2026-10-15", 14), "2026-10-15T14:00:00Z")).why, "done for today");
+});
