@@ -40,7 +40,7 @@ test("order watch: no KFB session yet → waiting, nothing flagged", async () =>
   assert.equal((await DB.prepare(`SELECT COUNT(*) AS n FROM order_watch`).first()).n, 0);
   const st = await fulfillmentState({ DB }, { nowMs: SWEEP });
   assert.equal(st.order_watch.status, "waiting on KFB session");
-  assert.equal(st.exceptions.status, "planned");
+  assert.equal(st.exceptions, undefined, "Exception Fixer removed 2026-10-14");
   assert.equal(st.parcel_tracking.on, false);
 });
 

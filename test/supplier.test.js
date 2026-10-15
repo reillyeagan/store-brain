@@ -9,7 +9,6 @@ import { runSimilarQc, recordSimilarOffer, judgeSimilar } from "../src/agents/su
 import { runPreflight, preflightProduct } from "../src/agents/supplier/preflight.js";
 import { addCredit, runClaims, creditAging, markCredited } from "../src/agents/supplier/claims.js";
 import { runDigest, digestData, digestBody, importBills } from "../src/agents/supplier/digest.js";
-import { runScout } from "../src/agents/supplier/scout.js";
 import { ensureSupplierDecisions, SUPPLIER_DECISIONS } from "../src/agents/supplier/decisions.js";
 import { runSupplier, supplierState } from "../src/agents/supplier/index.js";
 import { listPending, decide } from "../src/lib/approvals.js";
@@ -853,18 +852,6 @@ test("Digest: an old KFB read is not used (never 'none unpaid' from a stale impo
   assert.match(fresh, /1 waiting for your KFB confirmation/);
 });
 
-/* ------------------------------------------------------------ Scout */
-
-test("Scout: flags a category only after 3+ denials, once per growth", async () => {
-  const DB = makeD1();
-  await DB.prepare(`INSERT INTO supplier_batches (store, created_at, prices_read_at, status) VALUES ('hc', ?, ?, 'awaiting_approval')`).bind(iso(NOW), iso(NOW)).run();
-  for (const h of ["a", "b", "c"]) {
-    await DB.prepare(`INSERT INTO supplier_plans (batch_id, store, kind, product_handle, product_type, created_at) VALUES (1,'hc','draft',?,'Cardigans',?)`).bind(h, iso(NOW)).run();
-  }
-  assert.equal((await runScout({ DB }, { nowMs: NOW })).raised, 1);
-  assert.equal((await runScout({ DB }, { nowMs: NOW + DAY })).raised, 0);
-});
-
 /* ------------------------------------------------------------ decisions, cron, state */
 
 test("Reilly's supplier decisions are recorded verbatim, once", async () => {
@@ -881,7 +868,7 @@ test("runSupplier: throttled, never throws, no network when nothing needs Shopif
   const DB = makeD1();
   let fetched = 0;
   const fetchImpl = async () => { fetched++; throw new Error("no network"); };
-  const boom = { job: "sup.boom", everyMin: 15, actor: "sup.scout", run: async () => { throw new Error("kaboom"); } };
+  const boom = { job: "sup.boom", everyMin: 15, actor: "sup.relay", run: async () => { throw new Error("kaboom"); } };
   const out = await runSupplier({ DB, ...HC_CREDS }, { nowMs: NOW, fetchImpl });
   assert.ok(out["sup.quote_desk"]);
   assert.equal(fetched, 0, "no quotes → no Shopify call");

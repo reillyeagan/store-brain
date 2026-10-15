@@ -25,6 +25,8 @@ const OPEN_QS_AT = "2026-10-14T00:23:00Z";
  * give the day, not the time: 12:00Z is a placeholder time on that day.
  */
 export const SEED_DECISIONS = Object.freeze([
+  { at: "2026-10-15T00:39:00Z", topic: "core.agents_removed", scope: "all", source: "chat 2026-10-14 (Exception Fixer + Sourcing Scout removed)",
+    words: "delete the other 2 exception and sourcing scout agents" },
   { at: "2026-10-11T12:00:00Z", topic: "pnl.guy_fee", scope: "all", source: "docs/specs/pnl-finance.md (Guy's fee, 2026-10-11)",
     words: "10% is constant its been going on since the 7th" },
   { at: "2026-10-11T12:00:00Z", topic: "core.morning_brief", scope: "all", source: "docs/specs/core.md",

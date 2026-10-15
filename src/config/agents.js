@@ -64,7 +64,6 @@ export const AGENTS = Object.freeze([
   a("sup.relay", "sup", "Relay", "ai", "L0", "built"),
   a("sup.digest", "sup", "Supplier Digest", "ai", "L2", "built"),
   a("sup.size_charts", "sup", "Size-Chart Checker", "ai", "L0", "built"),
-  a("sup.scout", "sup", "Sourcing Scout", "ai", "L0"),
   a("sup.claims", "sup", "Claims & Credits", "code", "L0", "built"),
 
   // P&L
@@ -90,7 +89,6 @@ export const AGENTS = Object.freeze([
 
   // Fulfillment
   a("ful.order_watch", "ful", "Order-to-Supplier Watcher", "code", "L1", "built"),
-  a("ful.exceptions", "ful", "Exception Fixer", "ai", "L0"),
 
   // Catalog
   a("cat.pricing", "cat", "Pricing", "code", "L0", "built"),
@@ -110,6 +108,7 @@ export const AGENTS = Object.freeze([
 export const RETIRED_AGENTS = Object.freeze([
   { id: "ful.tracking", dept: "ful", name: "Tracking Sync", retired: "2026-10-13: parcel tracking switched off" },
   { id: "ful.late", dept: "ful", name: "Late-Shipment Watcher", retired: "2026-10-13: parcel tracking switched off" },
+  { id: "sup.scout", dept: "sup", name: "Sourcing Scout", retired: "2026-10-14: Reilly: \"delete the other 2 exception and sourcing scout agents\"" },
 ]);
 
 /** Shared safety services — plain code every agent runs through. */
@@ -177,7 +176,6 @@ export const AGENT_DOES = Object.freeze({
   "sup.relay": "Writes the daily KFB message for Reilly to copy and paste: express orders, parcels no carrier picked up, and later size, colour and address changes.",
   "sup.digest": "Summarises supplier activity for the brief.",
   "sup.size_charts": "Checks every order's size against the supplier chart and customer complaints, and suggests the right size to send.",
-  "sup.scout": "Flags product categories that keep failing at KFB (finding new suppliers is out of scope for now).",
   "sup.claims": "Tracks claims and credits owed by KFB.",
   "pnl.pullers": "Pulls orders, ad spend, refunds and fees into the ledger.",
   "pnl.cogs": "Matches real KFB costs to orders so COGS stops being an estimate (waiting on KFB bills).",
@@ -194,7 +192,6 @@ export const AGENT_DOES = Object.freeze({
   "ful.order_watch": "Checks every order reached KFB (waiting on the KFB morning session).",
   "ful.tracking": "Syncs tracking numbers with 17TRACK and flags parcels stuck, waiting for pickup or failed.",
   "ful.late": "Flags day-15 and day-20 parcels and asks Reilly: reship or refund.",
-  "ful.exceptions": "Proposes fixes for delivery problems.",
   "cat.pricing": "Checks prices against Reilly's rules (floors, $144.95 ceiling, compare-at tiers).",
   "cat.margin_guard": "Flags products whose cost makes the price unprofitable.",
   "cat.status": "Keeps product status in line with supplier availability.",

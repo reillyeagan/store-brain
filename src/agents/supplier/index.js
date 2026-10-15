@@ -18,7 +18,6 @@
  *   sup.size_charts 15 min  ≤ 100 order lines
  *   sup.preflight   60 min  5 set-based queries
  *   sup.claims      6 h     aging flags
- *   sup.scout       daily   category flags
  *   sup.digest      15 min  writes once per Eastern day after 07:00
  */
 import { claimJob, retrySoon, noteJobResult } from "../../lib/jobRuns.js";
@@ -31,7 +30,6 @@ import { runSizeChecker, REFERENCE_SOURCE } from "./sizeChecker.js";
 import { chartsNeeded, recentCharts } from "./sizeIntake.js";
 import { runPreflight } from "./preflight.js";
 import { runClaims, creditAging } from "./claims.js";
-import { runScout } from "./scout.js";
 import { runDigest, digestData, digestBody, latestSupplierDigest } from "./digest.js";
 import { logAgentError, WAITING_ON_KFB } from "./common.js";
 
@@ -48,7 +46,6 @@ export const SUPPLIER_JOBS = Object.freeze([
   { job: "sup.size_charts", everyMin: 15, actor: "sup.size_charts", run: runSizeChecker },
   { job: "sup.preflight", everyMin: 60, actor: "sup.preflight", run: runPreflight },
   { job: "sup.claims", everyMin: 360, actor: "sup.claims", run: runClaims },
-  { job: "sup.scout", everyMin: 1440, actor: "sup.scout", run: runScout },
   { job: "sup.digest", everyMin: 15, actor: "sup.digest", run: runDigest },
 ]);
 
@@ -115,7 +112,6 @@ export async function supplierState(env, { nowMs = Date.now() } = {}) {
   const { results: flags } = await db.prepare(`SELECT * FROM supply_flags ORDER BY id DESC LIMIT 50`).all();
   const { results: credits } = await db.prepare(`SELECT * FROM kfb_credits WHERE status IN ('open','claimed') ORDER BY opened_at LIMIT 50`).all();
   const { results: similar } = await db.prepare(`SELECT * FROM kfb_similar_offers ORDER BY id DESC LIMIT 20`).all();
-  const { results: scout } = await db.prepare(`SELECT * FROM sourcing_flags ORDER BY last_at DESC LIMIT 20`).all();
   const digest = await latestSupplierDigest(db);
   const kfbWired = !!data.quotes;
 
@@ -156,7 +152,6 @@ export async function supplierState(env, { nowMs = Date.now() } = {}) {
         rule: "credits only: \"i never return things to KFB\"",
         aging: creditAging(credits || [], nowMs), open: credits || [],
       },
-      "sup.scout": { lastRun: lastRun["sup.scout"] || null, status: "flag only (Reilly Q7: not in scope for v1); idle until quotes arrive", flags: scout || [] },
       "sup.digest": { lastRun: lastRun["sup.digest"] || null, latest: digest, preview: digestBody(data) },
     },
     bills: data.bills, // null = waiting on KFB session

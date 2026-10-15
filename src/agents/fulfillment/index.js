@@ -5,12 +5,7 @@
  *   fulfillmentState(env, {nowMs})          — JSON for the Fulfillment page.
  *
  * Built here: ful.order_watch (Order-to-Supplier Watcher), shadow.
- * Not built: ful.exceptions (Exception Fixer). Parcel tracking is OFF by Reilly's decision
- * (2026-10-13, stores.js PARCEL_TRACKING_DECISION). The only data left for delivery problems
- * would be Shopify's own fulfillment status, which for KFB parcels is driven by the same
- * carrier events Reilly turned off as noise. Building a second parcel flagger would bring the
- * noise back under another name, so it stays planned until Reilly says otherwise.
- * ful.tracking and ful.late stay off (switched off by Reilly).
+ * The Exception Fixer was removed 2026-10-14 (Reilly). Delivery problems reach CS as customer email.
  */
 import { claimJob } from "../../lib/jobRuns.js";
 import { PARCEL_TRACKING, PARCEL_TRACKING_DECISION } from "../../config/stores.js";
@@ -44,10 +39,6 @@ export async function fulfillmentState(env, { nowMs = Date.now() } = {}) {
     mode: "shadow",
     jobs: { "ful.order_watch": await jobInfo(env.DB, "ful.order_watch") },
     order_watch: orderWatch,
-    exceptions: {
-      status: "planned",
-      why: "Parcel tracking is off by Reilly's decision; without carrier events there is nothing real to fix. Stays planned until Reilly decides otherwise.",
-    },
     parcel_tracking: { on: PARCEL_TRACKING, decision: PARCEL_TRACKING_DECISION },
   };
 }

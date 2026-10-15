@@ -32,6 +32,10 @@ directory = "public"
 binding = "ASSETS"
 
 [vars]
+# Merchant Center account ids (identifiers, not secrets), from Reilly 2026-10-14.
+GMC_MERCHANT_ID_HC = "5813782710"
+GMC_MERCHANT_ID_AUB = "5821098936"
+GMC_MERCHANT_ID_MAR = "5849183740"
 TIMEZONE = "America/New_York"
 # Where the brain lives, for links in phone notifications sent from crons.
 PUBLIC_BASE_URL = "https://store-brain.reillyworking26.workers.dev"

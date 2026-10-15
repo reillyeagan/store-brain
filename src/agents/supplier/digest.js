@@ -101,7 +101,6 @@ export async function digestData(db, nowMs = Date.now()) {
   const msg = await db.prepare(`SELECT id, local_day, status, mode FROM kfb_messages ORDER BY id DESC LIMIT 1`).first();
   const { results: credits } = await db.prepare(`SELECT * FROM kfb_credits WHERE status IN ('open','claimed')`).all();
   const flags = await db.prepare(`SELECT COUNT(*) AS n FROM supply_flags WHERE created_at >= ?`).bind(nowIso(nowMs - 86400000)).first();
-  const scout = await db.prepare(`SELECT COUNT(*) AS n FROM sourcing_flags`).first();
   const similar = await db.prepare(`SELECT COUNT(*) AS n FROM kfb_similar_offers WHERE verdict = 'ask_reilly' AND judged_at >= ?`).bind(nowIso(nowMs - 86400000)).first();
   // Order substitutions are fine (Reilly: "yes", 2026-10-13) but still reported, so they're never invisible.
   const subs = await db.prepare(`SELECT COUNT(*) AS n FROM kfb_similar_offers WHERE context = 'order' AND verdict = 'accepted' AND judged_at >= ?
@@ -116,7 +115,6 @@ export async function digestData(db, nowMs = Date.now()) {
     bills: await billsSummary(db, nowMs),
     credits: (credits || []).length ? { count: credits.length, ...creditAging(credits, nowMs) } : { count: 0 },
     preflightFlags24h: flags ? flags.n : 0,
-    sourcingFlags: scout ? scout.n : 0,
     similarAsks24h: similar ? similar.n : 0,
     similarSubs24h: subs ? subs.n : 0,
   };
@@ -165,7 +163,6 @@ export function digestBody(d) {
   if (d.preflightFlags24h) out.push(`• Pre-flight: ${plural(d.preflightFlags24h, "order line")} flagged in 24h.`);
   if (d.similarSubs24h) out.push(`• Similar substitutes on customers' orders: ${d.similarSubs24h} in 24h (fine per your rule; recorded).`);
   if (d.similarAsks24h) out.push(`• Similar offers the rule doesn't cover: ${d.similarAsks24h} (check).`);
-  if (d.sourcingFlags) out.push(`• Sourcing: ${plural(d.sourcingFlags, "category")} failing at KFB (flag only).`);
   return out.join("\n");
 }
 
