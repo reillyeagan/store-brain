@@ -1355,3 +1355,13 @@ test("cs (review 2026-10-15): business mail quoting a store address isn't a cust
   await runCs(env, { nowMs: NOW + 20 * MIN, fetchImpl: w.fetchImpl });
   assert.ok(await env.DB.prepare(`SELECT value FROM agent_cursors WHERE name = ?`).bind(LOOKBACK_DONE).first());
 });
+
+test("cs cards (Reilly 2026-10-15, less text): a flagged email becomes a short card — store, kind, summary, customer, order, draft", async () => {
+  const { csCards } = await import("../src/agents/cs/index.js");
+  const env = await setup();
+  const aid = await createApproval(env.DB, { dept: "cs", requestedBy: "cs.escalation", store: "hc", title: "t", options: [{ id: "handled", label: "x", detail: "long text" }] });
+  await env.DB.prepare(`INSERT INTO cs_tickets (opened_at, updated_at, slot, gmail_id, store, from_email, from_name, subject, body, status, category, summary, context, context_at, approval_id, gmail_draft_id, received_at) VALUES ('t', 't', 'google', 'g1', 'hc', 'j@x.com', 'Jane', 's', 'b', 'needs_reilly', 'return_refund', 'Wants a refund for a wrong colour.', ?, 't', ?, 'd1', 't')`)
+    .bind(JSON.stringify({ name: "#1032", financial_status: "PAID", shipped: true }), aid).run();
+  const cards = await csCards(env.DB, await listPending(env.DB));
+  assert.deepEqual({ ...cards[aid], at: undefined, idea: undefined }, { store: "hc", kind: "Return / refund", summary: "Wants a refund for a wrong colour.", customer: "Jane", email: "j@x.com", order: "#1032 · paid · shipped", draft: true, idea: undefined, emails: 1, at: undefined });
+});

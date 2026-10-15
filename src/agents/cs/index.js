@@ -185,3 +185,49 @@ export async function csState(env, { nowMs = Date.now() } = {}) {
     warnings: inboxes.map((i) => i.draft_from_warning).filter(Boolean),
   };
 }
+
+/**
+ * A short card for each flagged email in "What needs you" (Reilly 2026-10-15: "wayyy too much
+ * text everywhere ... organize it all better"). Built from the ticket itself, so the dashboard
+ * can show: store · what it is · who · order · why it's his · whether a draft is waiting.
+ * The old one-paragraph detail stays on the approval (phone page, event log).
+ */
+const KIND_LABEL = {
+  return_refund: "Return / refund", cancel: "Cancel request", chargeback_or_scam_angry: "Upset customer",
+  size_complaint: "Doesn't fit", exchange: "Exchange", where_is_order: "Where's my order",
+  size_question: "Size question", address_change: "Address change", colour_change: "Colour change",
+  product_question: "Product question", other: "Needs your call",
+};
+export async function csCards(db, approvals) {
+  const ids = (approvals || []).filter((a) => a.requested_by === "cs.escalation").map((a) => a.id);
+  if (!ids.length) return {};
+  // In groups of 90: D1 takes about 100 bound values per query.
+  const results = [];
+  for (let i = 0; i < ids.length; i += 90) {
+    const part = ids.slice(i, i + 90);
+    const r = await db.prepare(
+      `SELECT approval_id, store, order_store, category, summary, subject, from_name, from_email, context, context_note, order_mismatch, gmail_draft_id, gmail_draft_state, draft_status, triage, retention, escalated_at, received_at
+         FROM cs_tickets WHERE approval_id IN (${part.map(() => "?").join(", ")}) ORDER BY id`
+    ).bind(...part).all().catch(() => ({ results: [] }));
+    results.push(...(r.results || []));
+  }
+  const out = {};
+  for (const t of results) {
+    const ctx = safeJson(t.context, null);
+    const prev = out[t.approval_id];
+    const retention = safeJson(t.retention, null);
+    out[t.approval_id] = {
+      store: t.order_store || t.store,
+      kind: KIND_LABEL[t.category] || "Needs your call",
+      summary: clip(t.summary || t.subject || "", 160),
+      customer: t.from_name || t.from_email || null,
+      email: t.from_email || null,
+      order: ctx ? `${ctx.name} · ${String(ctx.financial_status || "").toLowerCase() || "?"} · ${ctx.shipped ? "shipped" : ctx.shipped === false ? "not shipped" : "shipping ?"}` : t.order_mismatch ? "order number belongs to a different email" : "no order found",
+      draft: !!t.gmail_draft_id && t.gmail_draft_state !== "gone",
+      idea: retention && retention.option ? clip(String(retention.option), 100) : null,
+      emails: (prev ? prev.emails : 0) + 1, // the customer wrote again in the same conversation
+      at: t.received_at || t.escalated_at,
+    };
+  }
+  return out;
+}

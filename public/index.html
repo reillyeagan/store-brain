@@ -87,6 +87,14 @@ a{color:inherit}
 .card .t{font:500 13px var(--font);display:flex;justify-content:space-between;gap:8px}
 .card .t span{font:400 11px var(--font);color:var(--faint);white-space:nowrap}
 .card .d{font-size:12px;color:var(--muted);margin-top:3px;line-height:1.45}
+.card .sum{font-size:13px;color:var(--text);margin-top:6px;line-height:1.45}
+.card .meta{display:flex;flex-wrap:wrap;gap:4px 12px;font-size:11.5px;color:var(--muted);margin-top:6px}
+.card .meta .tag{margin-left:0}
+.card .meta,.card .meta span:not(.tag){font:400 11.5px var(--font);letter-spacing:0}
+.card details{margin-top:6px;font-size:12px;color:var(--muted)}
+.card details summary{cursor:pointer;color:var(--faint);font-size:11px;list-style:none}
+.card details summary::-webkit-details-marker{display:none}
+.card details[open] summary{margin-bottom:4px}
 .feed .r{display:grid;grid-template-columns:40px 26px minmax(0,1fr);gap:8px;align-items:center;padding:7px 0;border-bottom:1px solid var(--soft);font-size:12px;color:var(--muted)}
 .feed .r .tm{font-size:11px;color:var(--faint);font-variant-numeric:tabular-nums}
 .feed .r b{color:var(--text);font-weight:500}
@@ -443,7 +451,9 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
       '<div class="legend"><span><i style="border:1px solid var(--good);box-shadow:0 0 0 3px rgba(111,227,180,.2)"></i>working now</span><span><i style="background:var(--accent)"></i>built</span><span><i style="border:1px solid var(--faint)"></i>planned</span><span><i style="border:1px solid var(--accent);background:none;outline:1px solid rgba(185,211,255,.35);outline-offset:2px"></i>uses Claude</span><span>solid line = built · dashed = not built yet</span><span>ring around a department = how much is built</span><span>moving dots = real hand-offs</span></div></div>';
     var n=needs();
     var wait='<div class="lab" style="display:flex;justify-content:space-between;margin-bottom:12px"><span>Waiting on you · '+n.length+'</span><a href="#/brief" style="text-transform:none;letter-spacing:0;color:var(--muted)">open Brief →</a></div><div class="col" style="gap:10px">'+
-      (n.length?n.slice(0,5).map(function(x){ return '<a href="'+(x.href||"#/brief")+'" style="text-decoration:none"><div class="card" style="border-left-color:'+x.color+'"><div class="t">'+esc(x.title)+'<span>'+esc(x.who)+'</span></div><div class="d">'+esc(x.detail)+'</div></div></a>'; }).join(""):'<div class="card" style="border-left-color:var(--good)"><div class="d">Nothing is waiting on you.</div></div>')+'</div>';
+      (n.length?n.slice(0,5).map(function(x){ var c=x.a&&x.a.card;
+        var t=c?(storeName(c.store)||"")+" · "+c.kind:x.title, d=c?(c.customer||"unknown sender")+" · "+(c.draft?"draft in Gmail":"no draft"):(x.kind==="kfbimport"?"Log in to KungFuBuy, click the bookmark":x.detail||"");
+        return '<a href="'+(x.href||"#/brief")+'" style="text-decoration:none"><div class="card" style="border-left-color:'+x.color+'"><div class="t">'+esc(t)+'<span>'+esc(c?ago(c.at||x.a.created_at):x.who)+'</span></div><div class="d">'+esc(d)+'</div></div></a>'; }).join(""):'<div class="card" style="border-left-color:var(--good)"><div class="d">Nothing is waiting on you.</div></div>')+'</div>';
     var feed='<div class="lab" style="display:flex;justify-content:space-between"><span>Activity · live</span><span style="color:var(--good);text-transform:none;letter-spacing:0"><span class="dot live" style="background:var(--good);margin-right:5px"></span>'+w.length+' agent'+(w.length===1?"":"s")+' working</span></div>'+feedHtml(25);
     return kpis+storeCards()+'<div class="home">'+map+'<div class="col homeside"><div class="box">'+wait+'</div><div class="box feedbox"><div class="inner">'+feed+'</div></div></div></div>';
   }
@@ -567,7 +577,7 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
     var out=[], st=allStores?"all":store, since=etDay(Date.now()-86400000);
     /* Until a KFB import lands today, the KFB agents work from yesterday (or nothing). */
     var ki=state.kfbImport;
-    if(ki&&!ki.doneToday) out.push({kind:"kfbimport",title:"KFB import not done today",who:"KFB Morning Session",detail:(ki.lastAt?"Last import "+ago(ki.lastAt):"Never imported")+" · log in to KungFuBuy, then click the KFB → Store Brain bookmark",color:PAL.sup,href:"#/import/kfb"});
+    if(ki&&!ki.doneToday) out.push({kind:"kfbimport",title:"KFB import not done today",who:"KFB Morning Session",lastAt:ki.lastAt||null,color:PAL.sup,href:"#/import/kfb"});
     (state.approvals||[]).forEach(function(a){ if(st!=="all"&&a.store&&a.store!==st) return;
       out.push({kind:"approval",id:a.id,title:a.title,who:actorName(a.requested_by),detail:(a.store?storeName(a.store)+" · ":"")+ago(a.created_at),color:colorOf(a.requested_by),a:a}); });
     var sup=state.supplier||{kfbMessages:[]};
@@ -611,21 +621,32 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
         :'<div class="empty">No brief yet. The brain writes it once a day at 8:00 am Eastern.</div>')+'</div>';
     var live='<div class="box"><div class="lab" style="display:flex;justify-content:space-between"><span>What has happened · live</span><span style="color:var(--good);text-transform:none;letter-spacing:0"><span class="dot live" style="background:var(--good);margin-right:5px"></span>updating</span></div>'+feedHtml(60,true)+'</div>';
     var n=needs();
-    var need='<div class="box"><div class="lab" style="display:flex;justify-content:space-between"><span>What needs you · '+n.length+'</span><span style="text-transform:none;letter-spacing:0">approvals live here</span></div><div class="col" style="margin-top:12px">'+
+    var need='<div class="box"><div class="lab" style="display:flex;justify-content:space-between"><span>What needs you · '+n.length+'</span></div><div class="col" style="margin-top:12px">'+
       (n.length?n.map(needCard).join(""):'<div class="empty">Nothing needs you right now.</div>')+'</div>'+expressBox()+'</div>';
     return '<div class="two"><div class="col">'+top+live+'</div><div class="col">'+need+'</div></div>';
   }
   function needCard(x){
-    if(x.kind==="approval"){ var a=x.a;
-      return '<div class="card" id="ap-'+esc(a.id)+'" style="border-left-color:'+x.color+'"><div class="t">'+esc(a.title)+'<span>'+esc(x.who)+'</span></div><div class="d">'+esc(x.detail)+'</div>'+
-        (a.options||[]).map(function(o){return o.detail?'<div class="d">'+esc(o.label)+': '+esc(o.detail)+'</div>':""}).join("")+
-        '<div class="btns">'+(a.options||[]).map(function(o,i){return '<button class="btn'+(i===0?" p":"")+'" data-ap="'+esc(a.id)+'" data-choice="'+esc(o.id)+'">'+esc(o.label)+'</button>'}).join("")+'<button class="btn no" data-ap="'+esc(a.id)+'" data-choice="reject">Reject</button></div></div>';
+    if(x.kind==="approval"){ var a=x.a, c=a.card;
+      var btns=function(okLabel,noLabel){ return '<div class="btns">'+(a.options||[]).map(function(o,i){return '<button class="btn'+(i===0?" p":"")+'" data-ap="'+esc(a.id)+'" data-choice="'+esc(o.id)+'">'+esc(okLabel&&i===0?okLabel:o.label)+'</button>'}).join("")+'<button class="btn no" data-ap="'+esc(a.id)+'" data-choice="reject">'+esc(noLabel||"Reject")+'</button></div>'; };
+      var why=(a.options||[]).map(function(o){ var m=/Why it's yours: ([^.]+)\./.exec(o.detail||""); return m?m[1]:null; }).filter(Boolean)[0];
+      if(c){
+        /* A flagged customer email, short: what · who · order · draft. The rest under "more". */
+        return '<div class="card" id="ap-'+esc(a.id)+'" style="border-left-color:'+x.color+'"><div class="t">'+esc((storeName(c.store)||"")+" · "+c.kind)+'<span>'+esc(ago(c.at||a.created_at))+'</span></div>'+
+          '<div class="sum">'+esc(c.summary)+'</div>'+
+          '<div class="meta"><span>'+esc(c.customer||"unknown sender")+'</span><span>'+esc(c.order)+'</span>'+(c.emails>1?'<span>'+c.emails+' emails</span>':'')+(c.draft?'<span class="tag ok">draft in Gmail</span>':'<span class="tag mut">no draft</span>')+'</div>'+
+          '<details><summary>more</summary>'+(why?'<div>Why it\'s yours: '+esc(why)+'</div>':'')+(c.idea?'<div>Idea: '+esc(c.idea)+'</div>':'')+(c.email?'<div>'+esc(c.email)+'</div>':'')+'</details>'+
+          btns("Done","Dismiss")+'</div>';
+      }
+      var long=(a.options||[]).map(function(o){return o.detail||""}).filter(Boolean).join(" ");
+      return '<div class="card" id="ap-'+esc(a.id)+'" style="border-left-color:'+x.color+'"><div class="t">'+esc(a.title)+'<span>'+esc(ago(a.created_at))+'</span></div>'+
+        (long?'<div class="sum">'+esc(long.length>150?long.slice(0,150).replace(/\s+\S*$/,"")+"…":long)+'</div>'+(long.length>150?'<details><summary>more</summary><div>'+esc(long)+'</div></details>':''):'')+
+        '<div class="meta"><span>'+esc(x.who)+'</span>'+(a.store?'<span>'+esc(storeName(a.store))+'</span>':'')+'</div>'+btns()+'</div>';
     }
     if(x.kind==="kfb"){ var m=x.m;
       return '<div class="card" style="border-left-color:'+x.color+'"><div class="t">KFB message ready<span>Relay</span></div><div class="d">'+esc(x.detail)+' · copy it into WhatsApp, then mark it sent</div><div class="msg">'+esc(m.body)+'</div>'+
         '<div class="btns"><button class="btn g" data-copy="'+esc(m.id)+'">Copy</button><button class="btn" data-sent="'+esc(m.id)+'">Mark sent</button></div></div>';
     }
-    if(x.kind==="kfbimport") return '<a href="#/import/kfb" style="text-decoration:none"><div class="card" style="border-left-color:'+x.color+'"><div class="t">'+esc(x.title)+'<span>'+esc(x.who)+'</span></div><div class="d">'+esc(x.detail)+'</div><div class="d" style="color:var(--blue)">Open the KFB import page →</div></div></a>';
+    if(x.kind==="kfbimport") return '<a href="#/import/kfb" style="text-decoration:none"><div class="card" style="border-left-color:'+x.color+'"><div class="t">'+esc(x.title)+'<span>'+esc(x.lastAt?"last "+ago(x.lastAt):"never")+'</span></div><div class="sum">Log in to KungFuBuy, click the bookmark.</div><div class="meta" style="color:var(--blue)"><span>Open the import page →</span></div></div></a>';
     if(x.kind==="flaggroup") return '<a href="'+x.href+'" style="text-decoration:none"><div class="card" style="border-left-color:'+x.color+'"><div class="t">'+esc(x.title)+'<span>'+esc(x.who)+'</span></div><div class="d">'+esc(x.detail)+'</div><div class="d" style="color:var(--blue)">Open the Shipping page →</div></div></a>';
     return '<div class="card" style="border-left-color:'+x.color+'"><div class="t">'+esc(x.title)+'<span>'+esc(x.who)+'</span></div><div class="d">'+esc(x.detail)+'</div></div>';
   }
@@ -811,10 +832,16 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
     V.textContent=loadingSess?"…":cumFmt(end);
     /* Green/red only for profit, and only when every day in the window is known: a sum with
        unknown days left out isn't a verdict (rule 5), so it stays grey and says so. */
-    V.style.color=M==="profit"&&end!=null&&!unknown?(end>=0?"var(--good)":"var(--bad)"):end==null?"var(--faint)":unknown?"var(--muted)":"var(--text)";
+    /* Rule 5 too: a window holding today (still moving) or estimated COGS is not final, so the
+       profit figure is muted and says why instead of turning green. */
+    var notFinal=rows.some(function(x){return x.v!=null&&x.r&&!x.r.none&&(x.r.complete===false||x.r.day===pnlData.today)});
+    var cogsEst=rows.some(function(x){return x.v!=null&&x.r&&(x.r.cogs_estimated_share>0)});
+    var soft=M==="profit"&&(notFinal||cogsEst);
+    V.style.color=M==="profit"&&end!=null&&!unknown&&!soft?(end>=0?"var(--good)":"var(--bad)"):end==null?"var(--faint)":unknown||soft?"var(--muted)":"var(--text)";
     D.className="cumd"+(unknown&&known?" warn-t":"");
     D.textContent=loadingSess?"loading sessions":M==="sessions"&&sess&&!known?(sess.ok?"sessions not wired yet (Shopify read_reports)":"couldn't load sessions"):
-      !known?"no known days in this window":unknown?"known days only · "+unknown+" of "+rows.length+" day"+(rows.length>1?"s":"")+" unknown":"";
+      !known?"no known days in this window":unknown?"known days only · "+unknown+" of "+rows.length+" day"+(rows.length>1?"s":"")+" unknown":
+      soft?[notFinal?"includes today so far":null,cogsEst?"COGS partly estimated":null].filter(Boolean).join(" · "):"";
     var Wd=Math.max(280,Math.round(box.clientWidth||600)), H=Wd<600?220:300, L=Wd<600?44:56, R=12, T=12, B=26, iw=Wd-L-R, ih=H-T-B;
     var pv=rows.filter(function(x){return x.plot!=null}).map(function(x){return x.plot});
     cumPts=null; cumTip=-1;

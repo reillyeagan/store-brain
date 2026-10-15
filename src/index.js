@@ -96,6 +96,7 @@ import { handleKfbImport, runKfbReminder, kfbReminderMode } from "./lib/kfbImpor
 import { kfbImportStatus } from "./lib/kfbReads.js";
 import { runPhoneAlerts, phoneAlertsState } from "./lib/phoneAlerts.js";
 import { liveSwitches } from "./config/live.js";
+import { csCards } from "./agents/cs/index.js";
 
 export const VERSION = "0.2.0-eagano-llc";
 
@@ -142,6 +143,9 @@ async function handleState(env) {
     shippingState(env),
   ]);
   const money = await moneyState(env.DB, feeds);
+  // Short cards for flagged customer emails (the dashboard's "What needs you").
+  const cards = await csCards(env.DB, approvals).catch(() => ({}));
+  for (const a of approvals) if (cards[a.id]) a.card = cards[a.id];
   const [pnl, brief, kfbImport, alerts] = await Promise.all([pnlState(env.DB), latestBrief(env.DB), kfbImportStatus(env.DB), phoneAlertsState(env)]);
   return json({
     version: VERSION,
@@ -219,7 +223,8 @@ export default {
         const which = String(url.searchParams.get("store") || "all").slice(0, 10);
         const r = await pnlHistory(env.DB, which);
         // The P&L page's Payouts block: next payout + recent paid ones, freshness-gated.
-        if (r.ok) r.payouts = await payoutsState(env.DB, which);
+        // A payouts fault never takes the P&L page down with it (the block says "not loaded").
+        if (r.ok) r.payouts = await payoutsState(env.DB, which).catch(() => ({ ok: false }));
         return json(r, r.ok ? 200 : 400);
       }
       const ae = path.match(/^\/api\/agents\/([a-z0-9_.]{1,60})\/events$/);
