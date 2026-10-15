@@ -736,6 +736,18 @@ export function sumRows(rows, label = null) {
   return out;
 }
 
+/**
+ * Everything taken off revenue that is neither ad spend nor COGS: Shopify Payments fees,
+ * refunds (incl. pending) and the media buyer's fee (Guy). The P&L page shows it as one
+ * number, so profit reads as revenue − ad spend − COGS − this. Null when any part is null
+ * (rule 4): a missing part would flatter the total. A store with no media buyer has
+ * guy_fee 0 (a real zero: guyFeeFor), which adds nothing.
+ */
+export function feesRefundsGuy(row) {
+  if (!row || row.fees == null || row.refunds == null || row.guy_fee == null) return null;
+  return r2(Number(row.fees) + Number(row.refunds) + Number(row.guy_fee));
+}
+
 export async function rowsBetween(db, storeId, from, to) {
   const { results } = await db.prepare(`SELECT * FROM pnl_days WHERE store = ? AND day >= ? AND day <= ? ORDER BY day DESC`).bind(storeId, from, to).all();
   return (results || []).map(parseRow);
@@ -824,7 +836,7 @@ export async function pnlHistory(db, store = "all", { nowMs = Date.now() } = {})
   for (const [day, list] of byDay) {
     const sum = sumRows(list, day);
     sum.day = day;
-    sum.per_store = list.map((r) => ({ store: r.store, revenue: r.revenue, profit: r.profit, ads: r.ads, roas: r.roas, complete: !!r.complete }));
+    sum.per_store = list.map((r) => ({ store: r.store, revenue: r.revenue, profit: r.profit, ads: r.ads, roas: r.roas, guy_fee: r.guy_fee, fees_refunds_guy: feesRefundsGuy(r), complete: !!r.complete }));
     // Where the day's numbers came from, so the page can say so (rule 5: never pass a sheet
     // figure or an estimate off as the system of record).
     sum.cogs_sources = [...new Set(list.map((r) => r.cogs_source).filter(Boolean))];
@@ -840,6 +852,8 @@ export async function pnlHistory(db, store = "all", { nowMs = Date.now() } = {})
       for (const k of SUM_KEYS) sum[k] = null;
       sum.complete = false;
     }
+    // Computed here from the ledger's own parts, so the page never re-derives it.
+    sum.fees_refunds_guy = feesRefundsGuy(sum);
     sum.computed_at = list.map((r) => r.computed_at).filter(Boolean).sort()[0] || null;
     sum.status = list.map((r) => r.status).includes("restated") ? "restated" : null;
     days.push(sum);

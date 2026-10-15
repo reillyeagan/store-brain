@@ -4,7 +4,7 @@
  * Routes
  *   GET  /health                         public, no data — is the brain up?
  *   GET  /api/state                      Mission Control data (key required)
- *   GET  /api/pnl?store=all|hc|aub|mar    every stored P&L day for the P&L page (key required)
+ *   GET  /api/pnl?store=all|hc|aub|mar    every stored P&L day + payouts for the P&L page (key required)
  *   GET  /api/agents/:id/events          one agent's latest events, for its page (key required)
  *   POST /api/brief/rewrite              compose today's brief again from fresh numbers (key required)
  *   GET  /api/dept/:id                   one department's dashboard data (cs, media, catalog, risk, supplier, core, pnl, fulfillment)
@@ -80,6 +80,7 @@ import { runOrderBackfill } from "./lib/orderBackfill.js";
 import { runHistoryExtension } from "./lib/historyExtend.js";
 import { runMoneyJobs } from "./lib/moneyJobs.js";
 import { moneyState } from "./lib/moneyState.js";
+import { payoutsState } from "./lib/payoutsState.js";
 import { startGoogleConnect, handleGoogleCallback, googleStatus, mailboxStatus, secretPresence } from "./lib/google.js";
 import {
   runKfbComposer, handleKfbPage, handleKfbSent, listKfbMessages, expressOrdersToday, supplierMode,
@@ -215,7 +216,10 @@ export default {
       }
       if (path === "/api/pnl" && request.method === "GET") {
         if (!hasKey(request, env)) return json({ ok: false, error: "unauthorized" }, 401);
-        const r = await pnlHistory(env.DB, String(url.searchParams.get("store") || "all").slice(0, 10));
+        const which = String(url.searchParams.get("store") || "all").slice(0, 10);
+        const r = await pnlHistory(env.DB, which);
+        // The P&L page's Payouts block: next payout + recent paid ones, freshness-gated.
+        if (r.ok) r.payouts = await payoutsState(env.DB, which);
         return json(r, r.ok ? 200 : 400);
       }
       const ae = path.match(/^\/api\/agents\/([a-z0-9_.]{1,60})\/events$/);
