@@ -1,5 +1,6 @@
 /**
- * The department agents (built 2026-10-13, all SHADOW): one place that knows how to run them
+ * The department agents (built 2026-10-13, LIVE since 2026-10-14 within Reilly's limits: Shopify
+ * read-only, emails as drafts, KFB copy-paste, ads watch-only; modes in src/config/live.js): one place that knows how to run them
  * and read their dashboard state.
  *
  * Why a rotation: the 15-minute cron already does the ledger work (orders, money, P&L,

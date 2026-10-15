@@ -1,5 +1,5 @@
 /**
- * cs.reply_writer — Reply Writer (AI). SHADOW: drafts are stored in D1 (cs_tickets.draft_body).
+ * cs.reply_writer — Reply Writer (AI). Drafts are always stored in D1 (cs_tickets.draft_body).
  * NEVER sends. Only when env CS_DRAFTS_LIVE === "1" does it also create a Gmail DRAFT (threaded
  * reply, in the inbox the customer wrote to) for Reilly to review and send himself
  * (spec decision 2, Reilly 2026-10-11: "lets start of with the emails being put in my drafts").
@@ -24,10 +24,12 @@ import { threadWaitingOnReilly, staleGmailDraft } from "./escalation.js";
 import { otherLiveDraft } from "./gmailDrafts.js";
 import { createReplyDraft, getDraft } from "./gmail.js";
 import { safeJson, clip, logOnce } from "./util.js";
+import { modeFor } from "../../config/live.js";
 
 const ACTOR = "cs.reply_writer";
 
-export const draftsLive = (env) => !!(env && env.CS_DRAFTS_LIVE === "1");
+// CS_DRAFTS_LIVE, read in one place (src/config/live.js). "1" since go-live (2026-10-14): Gmail DRAFTS only.
+export const draftsLive = (env) => modeFor(env, "cs") === "live";
 
 /** CS rules from the Core (the vault's CS Playbook, once seeded). Capped so the prompt stays small. */
 async function corePolicy(db, store) {

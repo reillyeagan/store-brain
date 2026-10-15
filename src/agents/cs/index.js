@@ -1,5 +1,5 @@
 /**
- * Customer Service department — cron entry point and dashboard data. ALL SHADOW.
+ * Customer Service department — cron entry point and dashboard data. LIVE as DRAFTS ONLY (go-live 2026-10-14, decision core.go_live).
  *
  * runCs (each CS slot in the department rotation, about every 20 minutes; self-throttled with claimJob):
  *   read  (every run): cs.triage reads the connected inboxes
@@ -9,9 +9,11 @@
  * One subrequest allowance per run is shared by every step (CAPS.subrequests). Each step has
  * its own try, so one failure never stops the others and runCs never throws.
  *
- * Nothing is ever sent. The only outside write possible is a Gmail DRAFT, and only with
- * CS_DRAFTS_LIVE = "1" (default off).
+ * Nothing is ever sent (decision cs.sending: "drafts that i review and click send" until Reilly
+ * says "start sending"). The only outside write possible is a Gmail DRAFT, and only with
+ * CS_DRAFTS_LIVE = "1" (on in wrangler.toml since go-live; "0" keeps drafts on the CS page).
  */
+import { modeFor, liveMeans } from "../../config/live.js";
 import { claimJob, noteJobResult } from "../../lib/jobRuns.js";
 import { CAPS, CADENCE, CATEGORIES, inboxPlan, storeName } from "./config.js";
 import { Budget, logOnce, safeJson, clip } from "./util.js";
@@ -157,7 +159,7 @@ export async function csState(env, { nowMs = Date.now() } = {}) {
   if (!env.ANTHROPIC_API_KEY) notWired.push("AI: no ANTHROPIC_API_KEY, so emails are read but not sorted or drafted");
 
   return {
-    mode: "shadow",
+    mode: modeFor(env, "cs"), live_means: liveMeans(env, "cs"),
     drafts_to_gmail: draftsLive(env), // false = drafts live only on this page (CS_DRAFTS_LIVE not "1")
     categories: CATEGORIES,
     inboxes,

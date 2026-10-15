@@ -243,7 +243,7 @@ export async function runBudget(env, { nowMs = Date.now(), fetchImpl = fetch } =
   }
   await logEvent(db, {
     actor: AGENT, kind: "media.proposed", target: "sys.ads", at,
-    summary: `Budget calls in shadow: ${total} standing (${opened} new), not applied; Guy runs the accounts${scored ? `; ${scored} older calls scored (early, crude)` : ""}`,
+    summary: `Budget calls (watch only): ${total} standing (${opened} new), not applied; Guy runs the accounts${scored ? `; ${scored} older calls scored (early, crude)` : ""}`,
     data: { stores: summary.map((s) => ({ store: s.store, calls: s.calls ? s.calls.length : 0, skipped: s.skipped || null })), opened, scored },
   });
   return `ok: ${total} standing calls (${opened} new), ${scored} scored`;

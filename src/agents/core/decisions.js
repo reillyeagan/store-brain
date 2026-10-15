@@ -25,6 +25,11 @@ const OPEN_QS_AT = "2026-10-14T00:23:00Z";
  * give the day, not the time: 12:00Z is a placeholder time on that day.
  */
 export const SEED_DECISIONS = Object.freeze([
+  // Go-live (rule 11), 2026-10-14 20:46 New York. Wired: the live switches in wrangler.toml and
+  // src/config/live.js. Within his standing decisions: Shopify read-only, customer emails stay
+  // drafts (cs.sending), supplier messages stay copy-paste (sup.kfb_channel), ads watch-only (media.role).
+  { at: "2026-10-15T00:46:00Z", topic: "core.go_live", scope: "all", source: "chat 2026-10-14",
+    words: "i want to move EVERYTHING in the brain to live so its all working - can we do that" },
   { at: "2026-10-15T00:39:00Z", topic: "core.agents_removed", scope: "all", source: "chat 2026-10-14 (Exception Fixer + Sourcing Scout removed)",
     words: "delete the other 2 exception and sourcing scout agents" },
   { at: "2026-10-11T12:00:00Z", topic: "pnl.guy_fee", scope: "all", source: "docs/specs/pnl-finance.md (Guy's fee, 2026-10-11)",

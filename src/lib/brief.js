@@ -23,8 +23,8 @@
  *    and `temperature` must not be set (400). https://platform.claude.com/docs/en/models/sonnet-5-5/overview
  *    If a different model rejects those fields, the call is retried once without them.
  *
- * Mode (rule 11): shadow by default — the brief is saved and shown in Mission Control only.
- * BRIEF_PHONE_LIVE = "1" (Reilly flips it) also sends a Pushover notification with a SIGNED
+ * Mode (rule 11): without BRIEF_PHONE_LIVE = "1" the brief is saved and shown in Mission Control
+ * only. BRIEF_PHONE_LIVE = "1" (in wrangler.toml since go-live, 2026-10-14) also sends a Pushover notification with a SIGNED
  * link to /brief/:id. The notification text itself carries no money figures (it passes
  * through Pushover's servers); the numbers are only on the signed page.
  */
@@ -40,6 +40,7 @@ import { orderCoverage, coveredDays } from "./orderBackfill.js";
 import { minusDays } from "./adsSpend.js";
 import { localDay, nowIso } from "./time.js";
 import { kfbImportStatus } from "./kfbReads.js";
+import { modeFor } from "../config/live.js";
 
 export const BRIEF_AFTER_MIN = 8 * 60; // 08:00 Eastern
 export const DEFAULT_BRIEF_MODEL = "claude-sonnet-5-5";
@@ -62,8 +63,9 @@ export const PRICES = Object.freeze({
 });
 const UNKNOWN_PRICE = [10, 50];
 
+/** BRIEF_PHONE_LIVE, read in one place (src/config/live.js). */
 export function briefMode(env) {
-  return env && env.BRIEF_PHONE_LIVE === "1" ? "live" : "shadow";
+  return modeFor(env, "brief");
 }
 
 export function aiCostUsd(model, usage) {

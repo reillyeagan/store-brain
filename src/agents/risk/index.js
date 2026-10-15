@@ -3,9 +3,10 @@
  *
  * runRisk(env) is called once an hour: Risk's slot in the department rotation
  * (src/agents/index.js). Each agent throttles itself through job_runs (claimJob), runs inside
- * its own try (one failing agent never stops the others) and never throws. Everything is
- * SHADOW: Shopify is only read; the brain stores, flags, drafts and asks Reilly. Reilly
- * submits dispute evidence and cancels orders himself.
+ * its own try (one failing agent never stops the others) and never throws. Live since go-live
+ * (GO_LIVE = "1", 2026-10-14) but Shopify is only read: the brain stores, flags, drafts and asks
+ * Reilly; a chargeback due within 48 h and a HIGH fraud flag also reach his phone (phoneAlerts.js).
+ * Reilly submits dispute evidence and cancels orders himself.
  *
  * Cadences (why):
  *   risk.chargebacks      hourly   evidence deadlines are days away; hourly is plenty
@@ -13,8 +14,9 @@
  *   risk.account_health   daily    spec: "Account health (daily)"; weekly summary on top
  *   risk.claims_audit     weekly per store (one store per hourly run), classification hourly
  *
- * Kill switch: env RISK_OFF = "1" skips the whole department (default: runs, in shadow).
+ * Kill switch: env RISK_OFF = "1" skips the whole department (default: runs).
  */
+import { modeFor, liveMeans } from "../../config/live.js";
 import { claimJob, noteJobResult, retrySoon } from "../../lib/jobRuns.js";
 import { STORES } from "../../config/stores.js";
 import { runChargebacks, needsResponse } from "./chargebacks.js";
@@ -147,7 +149,7 @@ export async function riskState(env, { nowMs = Date.now() } = {}) {
   ).bind(since7).all();
 
   return {
-    mode: "shadow",
+    mode: modeFor(env, "risk"), live_means: liveMeans(env, "risk"),
     disputes: {
       open: openDisputes,
       needResponse: openDisputes.filter((d) => d.needsResponse).length,

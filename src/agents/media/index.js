@@ -26,6 +26,7 @@
  * hourly run, and NO numbers are written (never zero for a failure).
  * Kill switch: env MEDIA_PAUSED = "1" stops the whole department.
  */
+import { modeFor, liveMeans } from "../../config/live.js";
 import { claimJob, retrySoon, noteJobResult } from "../../lib/jobRuns.js";
 import { STORE_IDS } from "../../config/stores.js";
 import { localDay, nowIso } from "../../lib/time.js";
@@ -213,7 +214,8 @@ export async function mediaState(env, { nowMs = Date.now() } = {}) {
     });
   }
   return {
-    mode: "watch only",
+    mode: modeFor(env, "media"), live_means: liveMeans(env, "media"),
+    watch: "watch only: Guy runs the accounts, nothing is changed in Google Ads",
     decision: "guy is still the mediabuyer, dont worry about the spend cieling, and for now, the media section is just watching more than anything",
     google: google ? { connected: true, since: google.created_at } : { connected: false, reason: "Google not connected" },
     watched,

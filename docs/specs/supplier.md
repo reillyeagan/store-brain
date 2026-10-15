@@ -19,13 +19,13 @@ Legend: **CODE** = program, no AI · **AI** = Claude for judgement/language · L
    → Supplier Digest                                → one summary in the brief
 ```
 
-### The KFB morning import (built 2026-10-14, shadow)
+### The KFB morning import (built 2026-10-14, live since go-live)
 - **Reilly, each morning:** log in to KungFuBuy (he types the CAPTCHA), click the **KFB → Store Brain** bookmark, press **Import** on the page it opens (`#/import/kfb`). The bookmark is on that page: drag it to the bookmarks bar once.
 - **Bookmark** (`public/kfb-bookmarklet.js`): runs only on the KFB origin, GETs KFB's own JSON with his session (never writes, never sees his password or cookies), opens the import page, waits for its "ready", hands the rows over by postMessage to the exact Store Brain origin. No key inside. A failed read names the endpoint; if the tab never answers it saves a JSON file for the page's **Paste JSON** box.
 - **Server** (`POST /api/import/kfb`, key, ≤ 5 MB, `src/lib/kfbImport.js`): checks the envelope, maps every row to a store by KFB shop code only (unknown shop = refused), upserts kfb_quotes (raw status code kept), kfb_similar_offers, kfb_orders, kfb_bills + kfb_bill_lines (parent + every suborder), supplier_bills (paid / unpaid / unknown), keeps the raw payload in R2, marks `kfb.morning_sweep` fresh, logs one `kfb.imported` event. Re-importing the same rows changes nothing.
 - **Endpoints** (`src/config/kfb.js`): quotations `/index/quotation/get.html` (vault, exact); orders `/index/order/get.html` (vault path, paging assumed); bills: guessed from the quotation pattern, tried in turn. KFB origin `https://www.kungfubuy.com` (from KFB's privacy-policy URL, not the vault).
 - **Safety (review of 7ce2827):** only an allowlist of fields leaves the KFB tab (no customer names or addresses); raw payloads in R2 are kept 30 days. A bill is paid / unpaid only from the bill header or bill-named fields (a flag beats a time; unclear = unknown); a 0 header total falls back to the line sum, and bills with no amount are shown. The sweep feed is fresh only when orders were read. A read cut at the page limit never deletes lines, flags the bill at the cut (COGS waits on it) and raises no "not in KFB" flags. A read older than one already imported is refused (409); the import limit is 26 h, like the feed.
-- **Reminders:** "KFB import not done today" leads Waiting on you (dashboard + brief) until an import lands; one phone reminder from 09:00 Eastern (shadow until `KFB_REMINDER_LIVE = "1"`).
+- **Reminders:** "KFB import not done today" leads Waiting on you (dashboard + brief) until an import lands; one phone reminder from 09:00 Eastern (`KFB_REMINDER_LIVE = "1"` since go-live, 2026-10-14; `"0"` = logged only).
 
 ---
 

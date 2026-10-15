@@ -35,7 +35,8 @@
  *                 15 min, payouts hourly; throttled in job_runs) → tracking (collect hourly, 17TRACK polls as due, checks)
  *                 → P&L recompute (last 3 days + a few missing history days, every tick) → morning brief (once per day after 08:00 ET)
  *                 → KFB import reminder (once per day from 09:00 ET, only when no import landed)
- *                 → KFB composer (once per day after 18:45 ET) → Freshness Sentinel
+ *                 → KFB composer (once per day after 18:45 ET) → urgent phone alerts (new events by kind,
+ *                 cursor; at most 6 a day, one per item) → Freshness Sentinel
  *   every 5 min   (minutes 1, 6, 11, ... 56) one department agent run, in rotation (src/agents/index.js)
  *   daily 05:00Z  P&L day close (01:00 EDT / 00:00 EST: "yesterday" is always the day that just ended)
  *
@@ -52,15 +53,20 @@
  *
  * Variables (not secret):
  *   GOOGLE_ADS_API_VERSION Google Ads API version, e.g. "v25" (wrangler.toml)
- *   SUPPLIER_MESSAGES_LIVE "1" = KFB messages go to the phone; anything else = shadow (Reilly flips it)
+ *   SUPPLIER_MESSAGES_LIVE "1" = KFB messages go to the phone; anything else = shadow
  *   PUBLIC_BASE_URL        this worker's https address, for links in phone notifications sent by crons
  *   BRIEF_MODEL            Claude model id for the morning brief (wrangler.toml)
- *   BRIEF_PHONE_LIVE       "1" = the 8:00 brief also goes to the phone; anything else = shadow (Reilly flips it)
- *   KFB_REMINDER_LIVE      "1" = the 9:00 "KFB import not done today" reminder goes to the phone; else shadow (Reilly flips it)
+ *   BRIEF_PHONE_LIVE       "1" = the 8:00 brief also goes to the phone; anything else = shadow
+ *   KFB_REMINDER_LIVE      "1" = the 9:00 "KFB import not done today" reminder goes to the phone; else shadow
+ *   CS_DRAFTS_LIVE         "1" = customer replies are saved as Gmail DRAFTS (never sent); else they stay on the CS page
+ *   PHONE_ALERTS_LIVE      "1" = urgent alerts (chargeback due in 48 h, spend alarm, HIGH fraud, incident, Store Guard)
+ *                          go to the phone; else logged only
+ *   GO_LIVE                "1" = the watching/reporting agents are labelled live (Reilly's go-live, 2026-10-14)
+ *   All six are "1" in wrangler.toml since go-live; see src/config/live.js. Reilly turns one off with "0".
  *   SB_<STORE>_CLIENT_ID / SB_<STORE>_CLIENT_SECRET   per-store Shopify app credentials
  */
 import { STORES, LIVE_STORE_IDS } from "./config/stores.js";
-import { DEPARTMENTS, AGENTS, SERVICES, SYSTEMS, AGENT_DOES, isKnownActor, RETIRED_AGENTS } from "./config/agents.js";
+import { DEPARTMENTS, SERVICES, SYSTEMS, isKnownActor, RETIRED_AGENTS, agentsWithMode } from "./config/agents.js";
 import { recentEvents, costSince, logEvent, agentEvents } from "./lib/eventlog.js";
 import { evaluateFeeds, runSentinel, ensureFeeds } from "./lib/freshness.js";
 import { listPending, decide, verifyDecisionSig, getApproval } from "./lib/approvals.js";
@@ -87,6 +93,8 @@ import { vaultOutbox, markVaultCopied } from "./agents/core/librarian.js";
 import { addPastedChart, addChartFromImage, confirmChart } from "./agents/supplier/sizeIntake.js";
 import { handleKfbImport, runKfbReminder, kfbReminderMode } from "./lib/kfbImport.js";
 import { kfbImportStatus } from "./lib/kfbReads.js";
+import { runPhoneAlerts, phoneAlertsState } from "./lib/phoneAlerts.js";
+import { liveSwitches } from "./config/live.js";
 
 export const VERSION = "0.2.0-eagano-llc";
 
@@ -133,13 +141,17 @@ async function handleState(env) {
     shippingState(env),
   ]);
   const money = await moneyState(env.DB, feeds);
-  const [pnl, brief, kfbImport] = await Promise.all([pnlState(env.DB), latestBrief(env.DB), kfbImportStatus(env.DB)]);
+  const [pnl, brief, kfbImport, alerts] = await Promise.all([pnlState(env.DB), latestBrief(env.DB), kfbImportStatus(env.DB), phoneAlertsState(env)]);
   return json({
     version: VERSION,
     now: new Date().toISOString(),
     stores: Object.values(STORES).map(({ id, name, live, kfbShopCode }) => ({ id, name, live, kfbShopCode })),
     departments: DEPARTMENTS,
-    agents: AGENTS.map((a) => ({ ...a, does: AGENT_DOES[a.id] || null })),
+    // status = live or not from the real switch (src/config/live.js); build = how far it is built.
+    agents: agentsWithMode(env),
+    // The go-live switches, read-only (values are not secrets). Reilly changes them in Cloudflare.
+    live: liveSwitches(env),
+    alerts,
     retired: RETIRED_AGENTS,
     services: SERVICES,
     systems: SYSTEMS,
@@ -435,6 +447,16 @@ export default {
           await logEvent(env.DB, {
             actor: "sup.relay", kind: "error.kfb_composer", target: "sys.kfb",
             summary: `KFB message composer failed; it will try again in 15 minutes (${String(err && err.message).slice(0, 200)})`,
+          }).catch(() => {});
+        }
+        // Urgent phone alerts: reads the events above (and the departments') by kind, from a cursor.
+        // Last before the Sentinel so this tick's alarms go out on this tick.
+        try {
+          await runPhoneAlerts(env);
+        } catch (err) {
+          await logEvent(env.DB, {
+            actor: "core.approvals", kind: "error.phone_alerts", target: "sys.phone",
+            summary: `Urgent phone alerts failed; they will try again in 15 minutes (${String(err && err.message).slice(0, 200)})`,
           }).catch(() => {});
         }
         await runSentinel(env.DB);

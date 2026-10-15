@@ -17,6 +17,7 @@
  * Shadow: everything stays in the ledger, except the P&L Sheets writes, which Reilly asked for
  * directly (2026-10-14) and which SHEETS_WRITE = "0" stops. AI: one capped Analyst call a day at most.
  */
+import { modeFor, liveMeans } from "../../config/live.js";
 import { claimJob } from "../../lib/jobRuns.js";
 import { guarded, noteResult, jobInfo } from "../core/shared.js";
 import { pullFunnel, funnelState } from "./funnel.js";
@@ -87,7 +88,7 @@ export async function pnlExtrasState(env, { nowMs = Date.now() } = {}) {
   const jobs = {};
   for (const j of Object.keys(PNL_EXTRA_JOBS)) jobs[j] = await jobInfo(db, j);
   return {
-    mode: "shadow",
+    mode: modeFor(env, "pnl"), live_means: liveMeans(env, "pnl"),
     jobs,
     funnel: await safe(() => funnelState(db, { nowMs })),
     cogs: await safe(() => cogsState(db)),

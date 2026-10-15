@@ -5,10 +5,17 @@
  * one of these ids. `kind` says whether a worker is plain code or uses Claude.
  * `level`: L0 proposes (Reilly approves) · L1 acts within limits, reports after ·
  * L2 runs quietly, shows in the digest.
- * `status`: planned → built → shadow → live. Only Reilly moves a worker to live.
+ * `status`: planned → built → shadow → live: the BUILD status. Only Reilly moves a worker to live.
+ * Whether a built agent runs live right now is not stored here: it comes from the go-live
+ * switches (src/config/live.js). Reilly made the brain live on 2026-10-14 (decision core.go_live),
+ * so with GO_LIVE = "1" every built watching/reporting agent shows as live, and an agent whose
+ * output leaves the ledger (brief, Gmail drafts, KFB messages) follows its own switch.
+ * agentsWithMode(env) gives the dashboard both: `status` (live or the build status) and `build`.
  * Agents Reilly switched off are removed from AGENTS (and the dashboard) and kept in
  * RETIRED_AGENTS, so their old events still show who wrote them.
  */
+
+import { agentStatus, areaForAgent, liveMeans } from "./live.js";
 
 export const DEPARTMENTS = Object.freeze([
   { id: "core", name: "Manager", short: "Core" },
@@ -26,8 +33,8 @@ const a = (id, dept, name, kind, level, status = "planned") => ({ id, dept, name
 export const AGENTS = Object.freeze([
   // Manager (around the Core)
   a("core.router", "core", "Router", "code", "L2", "built"),
-  // Morning brief at 8:00 ET: numbers by code, words by Claude, plain fallback. Shadow until
-  // Reilly sets BRIEF_PHONE_LIVE = "1".
+  // Morning brief at 8:00 ET: numbers by code, words by Claude, plain fallback. Goes to the phone
+  // while BRIEF_PHONE_LIVE = "1" (on since go-live, 2026-10-14).
   a("core.briefer", "core", "Briefer", "ai", "L2", "built"),
   a("core.approvals", "core", "Approvals Desk", "code", "L1", "built"),
   a("core.decisions", "core", "Decision Keeper", "code", "L2", "built"),
@@ -59,7 +66,8 @@ export const AGENTS = Object.freeze([
   a("sup.denial_sync", "sup", "Denial Sync", "code", "L0", "built"),
   a("sup.preflight", "sup", "Supply Pre-flight", "code", "L0", "built"),
   a("sup.similar_qc", "sup", "\"Similar ones\" QC", "ai", "L0", "built"),
-  // Relay writes the KFB copy-paste messages. v1 (express asks) is plain code, shadow by default;
+  // Relay writes the KFB copy-paste messages (Reilly sends them himself). v1 (express asks) is plain
+  // code; they reach his phone while SUPPLIER_MESSAGES_LIVE = "1" (on since go-live);
   // later asks from email (sizes, addresses) will use AI, hence kind "ai".
   a("sup.relay", "sup", "Relay", "ai", "L0", "built"),
   a("sup.digest", "sup", "Supplier Digest", "ai", "L2", "built"),
@@ -135,6 +143,17 @@ export const SYSTEMS = Object.freeze([
   { id: "sys.17track", name: "17TRACK" },
   { id: "sys.claude", name: "Claude API" },
 ]);
+
+/**
+ * The agents as the dashboard shows them: `build` is the build status above, `status` is "live"
+ * when its switch is on (src/config/live.js), `liveMeans` says in one line what live means there.
+ */
+export function agentsWithMode(env) {
+  return AGENTS.map((a) => {
+    const area = areaForAgent(a.id);
+    return { ...a, build: a.status, status: agentStatus(a, env), area, liveMeans: liveMeans(env, area), does: AGENT_DOES[a.id] || null };
+  });
+}
 
 const KNOWN = new Set([...AGENTS.map((x) => x.id), ...RETIRED_AGENTS.map((x) => x.id), ...SERVICES.map((x) => x.id), ...SYSTEMS.map((x) => x.id)]);
 

@@ -91,6 +91,10 @@ ntfy.sh refused every connection from Cloudflare (HTTP 522), so the phone channe
 
 Approvals arrive as a notification with an **Open to decide** link: a small signed page with one button per choice.
 
+**Since go-live (2026-10-14)** the phone also gets the 8:00 brief, the evening KFB message, the 9:00 KFB import reminder and urgent alerts (at most 6 a day). Every one has its own switch in `wrangler.toml` (`BRIEF_PHONE_LIVE`, `SUPPLIER_MESSAGES_LIVE`, `KFB_REMINDER_LIVE`, `PHONE_ALERTS_LIVE`; `CS_DRAFTS_LIVE` for Gmail drafts, `GO_LIVE` for the labels). To turn one off, set it to `0` in Cloudflare → Variables and Secrets and deploy there; a later code deploy puts `1` back unless `wrangler.toml` is changed too.
+
+> **Before deploying the go-live build:** apply migration 0023 (`phone_alerts`) with `npx wrangler d1 migrations apply store-brain-ledger --remote`.
+
 ## 6. Shopify webhooks (Claude prepares, Reilly approves)
 
 So orders show up in seconds for every store, each store's app subscribes to `orders/create`, `orders/updated` and `refunds/create`, delivered to:

@@ -14,8 +14,9 @@
  * time. KFB's working day in China starts ~20:00 Eastern and processes the previous
  * day's orders, so the ask must be in the group before then.
  *
- * Mode (rule 11): shadow by default — the message is saved and logged, nothing reaches
- * the phone. `SUPPLIER_MESSAGES_LIVE = "1"` (set by Reilly at go-live) also notifies.
+ * Mode (rule 11): without SUPPLIER_MESSAGES_LIVE = "1" the message is saved and logged, nothing
+ * reaches the phone. `SUPPLIER_MESSAGES_LIVE = "1"` (in wrangler.toml since go-live, 2026-10-14)
+ * also notifies. Either way Reilly sends it to KFB himself (decision sup.kfb_channel).
  *
  * Every order asked about is recorded in `kfb_message_items` with a UNIQUE
  * (store, order, kind), so an order is never asked for twice, even across days.
@@ -29,6 +30,7 @@ import { sendPhone, phoneReady } from "./phone.js";
 import { hmacHex, sameText, LINK_TTL_MS } from "./approvals.js";
 import { page, esc } from "./approvalPage.js";
 import { localDay, nowIso } from "./time.js";
+import { modeFor } from "../config/live.js";
 import { PICKUP_STUCK_DAYS, LOOKBACK_DAYS as TRACKING_LOOKBACK_DAYS, STATUS_FRESH_MS, shortDate } from "./tracking.js";
 
 export const KFB_TZ = "America/New_York";
@@ -45,8 +47,9 @@ const SKIP_STATUSES = ["refunded", "voided"];
 
 const ACTOR = "sup.relay";
 
+/** SUPPLIER_MESSAGES_LIVE, read in one place (src/config/live.js). */
 export function supplierMode(env) {
-  return env && env.SUPPLIER_MESSAGES_LIVE === "1" ? "live" : "shadow";
+  return modeFor(env, "supplier");
 }
 
 /** Eastern calendar day and minutes past midnight, at a moment. */

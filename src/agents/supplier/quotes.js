@@ -451,7 +451,7 @@ async function quoteDeskForStore(env, store, { nowMs, fetchImpl }) {
     summary: `${name}: ${plans.length} quoted product${plans.length === 1 ? "" : "s"} checked against Shopify prices → ` +
       `${reprices.length} reprice${reprices.length === 1 ? "" : "s"} proposed` + (waivers.length ? ` (${waivers.length} held by the $144.95 ceiling)` : "") +
       (counts.no_change ? `, ${counts.no_change} already right` : "") + (counts.held ? `, ${counts.held} held` : "") +
-      (counts.unmatched ? `, ${counts.unmatched} not found in the store` : "") + " (shadow: nothing changed)",
+      (counts.unmatched ? `, ${counts.unmatched} not found in the store` : "") + " (proposals only: nothing changed in the store)",
     data: { batchId, approvalId, counts, fx: FX, costFacts },
   });
   if (drafts.length || counts.already_off) {

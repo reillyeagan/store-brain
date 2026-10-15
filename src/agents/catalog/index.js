@@ -15,6 +15,7 @@
  * gives its claim back so the next tick retries (rule 6), and errors are logged at most
  * once an hour. Nothing is ever written to Shopify, Merchant Center or anywhere outside D1.
  */
+import { modeFor, liveMeans } from "../../config/live.js";
 import { LIVE_STORE_IDS, STORES } from "../../config/stores.js";
 import { claimJob } from "../../lib/jobRuns.js";
 import { nowIso } from "../../lib/time.js";
@@ -196,7 +197,7 @@ export async function catalogState(env, { nowMs = Date.now() } = {}) {
     `SELECT id, created_at, store, requested_by, title, status FROM approvals WHERE dept = 'cat' AND status = 'pending' ORDER BY id DESC LIMIT ?`
   ).bind(STATE_LIST_CAP).all();
   return {
-    generated_at: nowIso(nowMs), mode: "shadow", ceiling: PRICE_CEILING,
+    generated_at: nowIso(nowMs), mode: modeFor(env, "catalog"), live_means: liveMeans(env, "catalog"), ceiling: PRICE_CEILING,
     stores, pending_approvals: results || [],
   };
 }

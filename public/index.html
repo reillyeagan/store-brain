@@ -833,11 +833,27 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
     var right=route.a==="page"?deptPage(route.b):agentDetail(sel);
     return '<div class="agents">'+list+'<div class="col" id="agentMain">'+right+'</div></div>';
   }
+  /* ---- Live switches: read-only. Reilly changes them in Cloudflare (no button here on purpose). ---- */
+  function liveSwitchesBox(area){
+    var lv=state.live||{switches:[]};
+    var rows=(lv.switches||[]).map(function(w){
+      var mine=area&&w.area===area;
+      return '<div class="kv"><span style="color:'+(mine?"var(--text)":"var(--muted)")+'">'+esc(w.name)+(mine?" · this agent":"")+'<br><span style="font-size:11.5px;color:var(--faint)">'+esc(w.env)+" = "+esc(w.value==null?"not set":w.value)+" · "+esc(w.means)+'</span></span><b class="'+(w.mode==="live"?"ok-t":"warn-t")+'">'+esc(w.mode)+'</b></div>';
+    }).join("");
+    return '<div class="box"><div class="lab">Live switches (only you)</div>'+(rows||'<div class="empty">Switch values not loaded yet.</div>')+
+      '<div class="note">Live never means a Shopify write, an email sent to a customer, a message sent to KFB or a change in Google Ads. '+esc(lv.howToTurnOff||"")+'</div></div>';
+  }
+  /* Today's urgent phone alerts (at most 6 a day, each item once). */
+  function alertsBox(){
+    var al=state.alerts; if(!al) return "";
+    var rows=(al.today||[]).map(function(r){ return '<div class="kv"><span>'+esc(r.title)+' <span style="color:var(--faint)">· '+esc(ago(r.created_at))+'</span></span><b class="'+(r.status==="sent"?"ok-t":r.status==="failed"||r.status==="capped"?"bad-t":"warn-t")+'">'+esc(r.status)+'</b></div>'; }).join("");
+    return '<div class="box" style="margin-top:12px"><div class="lab">Urgent phone alerts today · '+esc(al.mode)+' · '+esc(String(al.used))+" of "+esc(String(al.cap))+'</div>'+(rows||'<div class="empty">None today.</div>')+'</div>';
+  }
   function agentDetail(id){
     var a=agentOf(id); if(!a) return '<div class="box"><div class="empty">No agent called '+esc(id)+'.</div></div>';
     var d=state.departments.find(function(x){return x.id===a.dept})||{name:a.dept}, c=PAL[a.dept];
     var working=workingAgents().indexOf(id)>=0;
-    var stLbl={planned:"planned · not built yet",built:"built · shadow (drafts and logs, nothing leaves without you)",shadow:"shadow",live:"live",off:"built, switched off by you (Oct 13)"}[a.status]||a.status;
+    var stLbl=a.status==="live"?"live: "+(a.liveMeans||"running for real"):({planned:"planned · not built yet",built:"built · shadow (drafts and logs, nothing leaves without you)",shadow:"shadow",off:"built, switched off by you (Oct 13)"}[a.status]||a.status);
     var cached=agentCache[id], err=cached&&cached.error;
     var head='<div class="box"><div style="font-size:12px;color:var(--faint)">'+esc(d.name)+' · '+(a.kind==="ai"?"uses Claude":"plain code")+' · '+esc(a.level==="L0"?"proposes, you approve":a.level==="L1"?"acts within limits, reports after":"runs quietly, shows in the brief")+'</div>'+
       '<div style="display:flex;align-items:center;gap:10px;margin-top:4px;flex-wrap:wrap"><span class="sw'+(working?" live":"")+'" style="width:10px;height:10px;background:'+(isOn(a)?c:"none")+';border:1px solid '+c+'"></span><span style="font:600 24px var(--font);letter-spacing:-.01em">'+esc(a.name)+'</span>'+(working?'<span class="tag ok">WORKING NOW</span>':'')+'<span class="tag mut">'+esc(a.status.toUpperCase())+'</span></div>'+
@@ -846,7 +862,7 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
       kpi("Actions, last 7 days",err?"—":cached?String(cached.week.events):"…",err?"couldn't load":"")+
       kpi("AI cost, last 7 days",err?"—":cached?"$"+Number(cached.week.cost_usd||0).toFixed(2):"…",err?"couldn't load":a.kind==="ai"?"":"plain code")+
       kpi("Last action",err?"—":cached&&cached.events.length?ago(cached.events[0].at):cached?"never":"…","")+
-      kpi("Go-live","per store",a.status==="live"?"live":"shadow everywhere")+'</div>';
+      kpi("Mode",a.status==="live"?"live":a.status==="planned"?"not built":a.status==="off"?"switched off":"shadow","every live store",a.status==="live"?"ok-t":"warn-t")+'</div>';
     var ev=cached?cached.events:null;
     var runs='<div class="box"><div class="lab">Latest actions</div>'+(err?'<div class="empty">Couldn\'t load this agent\'s actions ('+esc(err)+'). Retrying shortly.</div>':ev==null?'<div class="empty">Loading…</div>':ev.length?'<div class="feed">'+ev.filter(inStore).slice(0,40).map(function(e){
       return '<div class="r'+(isAlarm(e)?" alarm":"")+'"><span class="tm" title="'+esc(new Date(e.at).toLocaleString())+'">'+esc(hm(e.at))+'</span><span class="dot" style="background:'+colorOf(e.actor)+'"></span><span>'+(e.actor!==id?'<b>'+esc(actorName(e.actor))+'</b> → ':'')+esc(e.summary)+' <span style="color:var(--faint)">· '+esc(ago(e.at))+(e.store?" · "+esc(storeName(e.store)):"")+'</span></span></div>';
@@ -854,8 +870,7 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
     var talks={}; (ev||[]).forEach(function(e){ if(e.actor===id&&e.target) talks["→ "+actorName(e.target)]=1; if(e.target===id&&e.actor!==id) talks["← "+actorName(e.actor)]=1; });
     var tk=Object.keys(talks);
     var talk='<div class="box"><div class="lab">Talks to</div>'+(tk.length?'<div class="chips">'+tk.map(function(t){return '<span class="chip">'+esc(t)+'</span>'}).join("")+'</div>':'<div class="note">No hand-offs logged yet.</div>')+'</div>';
-    var gl='<div class="box"><div class="lab">Go live · per store (only you)</div>'+liveStores().map(function(s){return '<div class="kv"><span style="color:var(--text)">'+esc(storeName(s.id))+'</span><b class="'+(a.status==="live"?"ok-t":"warn-t")+'">'+(a.status==="live"?"live":a.status==="planned"?"not built":a.status==="off"?"switched off":"shadow")+'</b></div>'}).join("")+
-      '<div class="note">The go-live switches arrive with the next build. Until then every built agent stays in shadow, and only you can make one live.</div></div>';
+    var gl=liveSwitchesBox(a.area);
     if(!cached) loadAgent(id);
     return head+stats+'<div class="two">'+runs+'<div class="col">'+gl+talk+'</div></div>';
   }
@@ -885,6 +900,7 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
     else h+='<div class="empty">No such page.</div>';
     h+='</div>';
     if(p==="core") h+='<div class="box" id="vaultBox" style="margin-top:12px">'+vaultInner()+'</div>';
+    if(p==="setup") h+='<div style="margin-top:12px">'+liveSwitchesBox(null)+'</div>'+alertsBox();
     return h;
   }
   /* ---- Vault outbox (Core page): what is waiting to be copied into the Eagano vault ----
@@ -940,7 +956,8 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
     var c=deptCache[p];
     if(!c||Date.now()-c.at>30000){ loadDept(p); if(!c) return '<div class="empty">Loading…</div>'; }
     if(c.error) return '<div class="empty bad-t">Couldn\'t load this page ('+esc(c.error)+'). Retrying shortly.</div>';
-    return '<div class="note" style="margin:0 0 10px">Shadow mode: everything here is what the agents found or propose. Nothing was sent or changed.</div>'+(p==="supplier-agents"?sizeChartsHtml(c.data):"")+(p==="risk"?evidenceHtml(c.data):"")+jsonHtml(c.data,0);
+    var md=c.data&&c.data.mode, lm=c.data&&c.data.live_means;
+    return '<div class="note" style="margin:0 0 10px">'+(md==="live"?'<b class="ok-t">Live.</b> '+esc(lm||"")+' Nothing is sent to a customer, KFB or Shopify without you.':'Shadow mode: everything here is what the agents found or propose. Nothing was sent or changed.')+'</div>'+(p==="supplier-agents"?sizeChartsHtml(c.data):"")+(p==="risk"?evidenceHtml(c.data):"")+jsonHtml(c.data,0);
   }
   /* ---- Risk page: each open dispute's evidence draft in full, readable and copyable ---- */
   function evidenceHtml(st){

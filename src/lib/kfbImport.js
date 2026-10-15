@@ -39,6 +39,7 @@ import { markFeedOk, markFeedFailed, ensureFeeds } from "./freshness.js";
 import { logEvent } from "./eventlog.js";
 import { nowIso, localDay } from "./time.js";
 import { sendPhone } from "./phone.js";
+import { modeFor } from "../config/live.js";
 import { kfbImportStatus } from "./kfbReads.js";
 
 const ACTOR = "svc.kfb_session";
@@ -832,7 +833,7 @@ export async function handleKfbImport(request, env, { nowMs = Date.now() } = {})
 
 /** "1" = the 9:00 reminder goes to Reilly's phone; anything else = shadow (logged only). Reilly flips it. */
 export function kfbReminderMode(env) {
-  return env && env.KFB_REMINDER_LIVE === "1" ? "live" : "shadow";
+  return modeFor(env, "kfb_reminder"); // KFB_REMINDER_LIVE, read in one place (src/config/live.js)
 }
 
 /**

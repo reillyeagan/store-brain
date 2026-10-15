@@ -559,7 +559,7 @@ export async function runSizeChecker(env, { nowMs = Date.now() } = {}) {
       summary: `Size check: ${changed} order line${changed === 1 ? "" : "s"}${parts.length ? ` (${parts.join(", ")})` : ""}` +
         (asks ? `; ${asks} size ask${asks === 1 ? "" : "s"} ready for the KFB message` : "") +
         (updatedAsks ? `; ${updatedAsks} ask${updatedAsks === 1 ? "" : "s"} changed` : "") +
-        (withdrawn ? `; ${withdrawn} ask${withdrawn === 1 ? "" : "s"} withdrawn (no longer hold)` : "") + " (shadow: nothing sent)",
+        (withdrawn ? `; ${withdrawn} ask${withdrawn === 1 ? "" : "s"} withdrawn (no longer hold)` : "") + " (nothing sent to KFB or a customer by this check)",
       data: { counts, asks, updatedAsks, withdrawn },
     });
   }

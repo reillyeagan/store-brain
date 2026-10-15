@@ -4,9 +4,10 @@
  *   runFulfillment(env, {nowMs, fetchImpl}) — department rotation (about hourly). Never throws; throttled hourly.
  *   fulfillmentState(env, {nowMs})          — JSON for the Fulfillment page.
  *
- * Built here: ful.order_watch (Order-to-Supplier Watcher), shadow.
+ * Built here: ful.order_watch (Order-to-Supplier Watcher), live since go-live (reads the ledger, reports).
  * The Exception Fixer was removed 2026-10-14 (Reilly). Delivery problems reach CS as customer email.
  */
+import { modeFor, liveMeans } from "../../config/live.js";
 import { claimJob } from "../../lib/jobRuns.js";
 import { PARCEL_TRACKING, PARCEL_TRACKING_DECISION } from "../../config/stores.js";
 import { guarded, noteResult, jobInfo } from "../core/shared.js";
@@ -36,7 +37,7 @@ export async function fulfillmentState(env, { nowMs = Date.now() } = {}) {
   let orderWatch;
   try { orderWatch = await orderWatchState(env, { nowMs }); } catch (err) { orderWatch = { error: String(err && err.message) }; }
   return {
-    mode: "shadow",
+    mode: modeFor(env, "fulfillment"), live_means: liveMeans(env, "fulfillment"),
     jobs: { "ful.order_watch": await jobInfo(env.DB, "ful.order_watch") },
     order_watch: orderWatch,
     parcel_tracking: { on: PARCEL_TRACKING, decision: PARCEL_TRACKING_DECISION },

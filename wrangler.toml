@@ -6,7 +6,9 @@
 name = "store-brain"
 main = "src/index.js"
 compatibility_date = "2026-09-01"
-# Keep variables added in the Cloudflare dashboard when deploying.
+# Keep variables added in the Cloudflare dashboard when deploying. Only variables this file does
+# NOT list are kept: a variable listed in [vars] is written back to its value here on every deploy
+# (see the go-live switches at the bottom).
 keep_vars = true
 
 # Background checks. Every 15 minutes: freshness sentinel + reconciliation pulls.
@@ -48,10 +50,6 @@ GOOGLE_ACCOUNT = "reillyworking26@gmail.com"
 GOOGLE_ADS_API_VERSION = "v25"
 # Claude model for the 8:00 morning brief (Claude API model id). claude-sonnet-5-5 was the
 # newest Sonnet on 2026-10-11 ($2 / $10 per million tokens). Change it here and redeploy.
-# BRIEF_PHONE_LIVE is NOT set here: the brief stays shadow (Mission Control only) until
-# Reilly sets BRIEF_PHONE_LIVE = "1" in the Cloudflare dashboard.
-# KFB_REMINDER_LIVE is NOT set here either: the 9:00 "KFB import not done today" phone
-# reminder stays shadow (logged only) until Reilly sets KFB_REMINDER_LIVE = "1".
 BRIEF_MODEL = "claude-sonnet-5-5"
 # P&L Sheets agent: writes blank input cells of the Google Sheets P&L workbooks (Reilly asked
 # for it on 2026-10-14, so it is ON when unset). To stop every write, uncomment this and redeploy:
@@ -63,3 +61,34 @@ SB_AUB_CLIENT_ID = "7664f4cf5ed9ec191539f10c9a09335f"
 SB_MAR_CLIENT_ID = "d2f3cee30759ff7d4d5f12058bce3373"
 # Phone notifications go through Pushover. Its keys are secrets
 # (PUSHOVER_APP_TOKEN, PUSHOVER_USER_KEY) that Reilly adds himself.
+
+# ---------------------------------------------------------------------------------------------
+# GO-LIVE SWITCHES. Reilly, 2026-10-14 20:46 New York (decision core.go_live): "i want to move
+# EVERYTHING in the brain to live so its all working - can we do that". "1" = live, anything
+# else = shadow (logged / shown on Mission Control only). Read in one place: src/config/live.js.
+# Live never means: a Shopify write (read-only), an email SENT to a customer (drafts only, decision
+# cs.sending), a message sent to KFB (copy-paste Reilly sends), or a change in Google Ads (watch only).
+#
+# HOW TO TURN ONE OFF: Cloudflare dashboard -> Workers & Pages -> store-brain -> Settings ->
+# Variables and Secrets -> set it to "0" -> Deploy. It takes effect on the next run.
+# keep_vars = true (top of this file) only KEEPS dashboard variables that this file does NOT list.
+# These six ARE listed, so the next `wrangler deploy` writes "1" back over a dashboard "0".
+# To keep a switch off across deploys, also change it to "0" here (or ask Claude to).
+
+# Watching and reporting agents (Core, Media, Catalog, Risk, P&L, Fulfillment) are labelled live.
+# "0" puts those labels back to shadow; it does not stop the agents (AGENTS_OFF does that).
+GO_LIVE = "1"
+# The 8:00 morning brief also goes to Reilly's phone (Pushover). "0" = Mission Control only.
+BRIEF_PHONE_LIVE = "1"
+# The evening KFB copy-paste message goes to Reilly's phone; he sends it to KFB himself.
+# "0" = drafted on Mission Control only.
+SUPPLIER_MESSAGES_LIVE = "1"
+# One 9:00 phone reminder when no KFB import landed today. "0" = logged only.
+KFB_REMINDER_LIVE = "1"
+# Customer replies are saved as Gmail DRAFTS in the store inbox, for Reilly to review and click
+# send. Nothing is ever sent (decision cs.sending). "0" = drafts stay on the CS page only.
+CS_DRAFTS_LIVE = "1"
+# Urgent phone alerts (chargeback evidence due within 48 h, spend alarm, HIGH fraud, an incident
+# that needs Reilly, Store Guard / store timezone stop): at most 6 a day, one per item, no names
+# or emails. "0" = logged only (phone.alert_shadow events).
+PHONE_ALERTS_LIVE = "1"

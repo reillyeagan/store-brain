@@ -20,6 +20,7 @@
  *   sup.claims      6 h     aging flags
  *   sup.digest      15 min  writes once per Eastern day after 07:00
  */
+import { modeFor, liveMeans } from "../../config/live.js";
 import { claimJob, retrySoon, noteJobResult } from "../../lib/jobRuns.js";
 import { nowIso } from "../../lib/time.js";
 import { STORES, LIVE_STORE_IDS } from "../../config/stores.js";
@@ -117,7 +118,7 @@ export async function supplierState(env, { nowMs = Date.now() } = {}) {
 
   return {
     asOf: nowIso(nowMs),
-    mode: "shadow",
+    mode: modeFor(env, "supplier"), live_means: liveMeans(env, "supplier"),
     liveStores: LIVE_STORE_IDS,
     kfbSession: { status: kfbWired ? "has data" : WAITING_ON_KFB, lastQuoteImport: data.quotes ? data.quotes.lastImport : null },
     agents: {

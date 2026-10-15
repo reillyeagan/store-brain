@@ -38,3 +38,9 @@ Also (2026-10-11): "im a big fan of the eagano P&L right now, with the funnel, t
 - Revenue: Shopify webhooks (seconds). Ad spend: Google Ads pull every 15 minutes (Google's own data lags up to a few hours; the page shows how fresh it is).
 - The funnel (sessions, add to cart, checkout) needs Shopify's read-only `read_reports` scope on each store app. Until then it shows "not wired".
 - The old tabs (Supplier, Shipping, Money, Feeds, Setup, Activity) become pages inside **Agents**: each department and each agent has its own page.
+
+## Live and shadow labels (go-live, 2026-10-14)
+- Every department page and agent page shows its **real** mode, from the switch that controls it (`src/config/live.js`), with one line on what live means there. Nothing hardcodes "shadow".
+- An agent keeps its build status (`build`: planned, built, ...) separately from `status`, which is `live` when its switch is on.
+- The agent page box **Live switches (only you)** lists every switch, its current value and what it does, read-only, plus how to turn one off. There is no button: Reilly changes switches in Cloudflare.
+- Setup shows the same box and today's urgent phone alerts (used of 6).

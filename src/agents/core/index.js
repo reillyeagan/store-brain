@@ -10,8 +10,10 @@
  * 15-minute throttle never holds them back; the Router reads until it has caught up) ·
  * Auditor and Librarian (checks + vault outbox) hourly · Librarian weekly report every 7 days ·
  * decision seed daily (idempotent; inserts only what's missing).
- * All shadow: nothing leaves the ledger. No AI is used by these agents today.
+ * Live since go-live (GO_LIVE = "1", 2026-10-14). Still nothing leaves the ledger except an approval
+ * (and, through src/lib/phoneAlerts.js, an urgent phone alert). No AI is used by these agents today.
  */
+import { modeFor, liveMeans } from "../../config/live.js";
 import { claimJob } from "../../lib/jobRuns.js";
 import { guarded, noteResult, jobInfo } from "./shared.js";
 import { seedDecisions, decisionsState } from "./decisions.js";
@@ -59,7 +61,7 @@ export async function coreState(env, { nowMs = Date.now() } = {}) {
   const jobs = {};
   for (const j of Object.keys(CORE_JOBS)) jobs[j] = await jobInfo(db, j);
   return {
-    mode: "shadow",
+    mode: modeFor(env, "core"), live_means: liveMeans(env, "core"),
     jobs,
     decisions: await safe(() => decisionsState(db)),
     librarian: await safe(() => librarianState(db, { nowMs })),
