@@ -145,6 +145,35 @@ input[type=date]{background:var(--panel);border:1px solid var(--border);color:va
 textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;box-sizing:border-box}
 .scform{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px}
 .scform label{font-size:12px;color:var(--muted);display:flex;gap:6px;align-items:center}
+/* P&L cumulative chart (the Eagano dash chart: view, metric, range, headline, line + tooltip) */
+.mhead{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.ranges{display:flex;gap:3px;flex-wrap:wrap}
+.rb{background:var(--panel2);border:1px solid var(--border);color:var(--faint);font:500 10px var(--font);letter-spacing:.08em;text-transform:uppercase;padding:4px 9px;border-radius:6px;cursor:pointer;white-space:nowrap}
+.rb:hover{color:var(--muted)}
+.rb.on{color:var(--text);border-color:#3a3f46;background:#1b1f24}
+.cumbar{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin:14px 0 4px}
+.cumdates{display:flex;align-items:center;gap:7px;margin-left:auto;font-size:10px;color:var(--faint);letter-spacing:.06em;text-transform:uppercase}
+.cumdates input[type=date]{border-radius:6px;font-size:10.5px;padding:3px 8px;background:var(--panel2)}
+.cumhead{display:flex;align-items:baseline;gap:12px;margin:6px 0 10px;flex-wrap:wrap}
+.cumv{font:600 34px var(--font);font-variant-numeric:tabular-nums;letter-spacing:-.015em}
+.cumd{font-size:11px;color:var(--faint);letter-spacing:.02em}
+.cumwrap{position:relative;min-height:220px}
+.cumwrap svg{display:block;width:100%}
+.cumwrap svg text{font:400 10px var(--font);fill:#6f6f78}
+.ctip{position:absolute;pointer-events:none;background:var(--panel2);border:1px solid #2c2c33;border-radius:8px;padding:9px 11px;font-size:11px;color:var(--muted);min-width:170px;z-index:2;box-shadow:0 6px 24px rgba(0,0,0,.45)}
+.ctip .h{color:var(--text);font-weight:600;margin-bottom:5px}
+.ctip .r{display:flex;justify-content:space-between;gap:14px;font-variant-numeric:tabular-nums;line-height:1.7}
+.ctip .f{display:flex;justify-content:space-between;gap:14px;color:var(--text);font-weight:600;margin-top:6px;padding-top:6px;border-top:1px solid var(--border);font-variant-numeric:tabular-nums}
+@media (max-width:700px){.cumv{font-size:26px}.rb{font-size:9px;padding:4px 7px}.cumdates{margin-left:0}}
+.fnr{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,300px) minmax(0,1fr);align-items:center;gap:12px;min-height:62px}
+@media (max-width:600px){.fnr{grid-template-columns:minmax(0,1.2fr) minmax(0,.8fr) minmax(0,1fr);gap:8px}}
+/* Payouts */
+.pays{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:var(--gap);margin-top:12px}
+.pay{border:1px solid var(--soft);border-radius:10px;background:var(--panel2);padding:12px 14px;min-width:0}
+.pay .n{font:500 12.5px var(--font);color:var(--text);display:flex;justify-content:space-between;gap:8px}
+.pay .big{font:600 22px var(--font);font-variant-numeric:tabular-nums;margin-top:8px;letter-spacing:-.01em}
+.pay .sub{font-size:11.5px;color:var(--muted);margin-top:1px}
+.pay .kv{font-size:12px;padding:5px 0}
 .funnel{display:grid;place-items:center;text-align:center;color:var(--muted);font-size:12.5px;line-height:1.6;padding:24px 10px}
 /* Brief */
 .brief-body h3,.brief-body h4{margin:14px 0 4px;font-size:13.5px;color:var(--accent)}
@@ -625,7 +654,8 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
   function breakeven(margin){ if(margin==null||!isFinite(margin)) return null; var d=margin*(1-0.119)-0.0334; return d>0?1/d:null; }
   /* Sum days the same way the server does: any unknown part makes the total unknown (rule 5). */
   function sumDays(rows,gapDays){
-    var keys=["revenue","orders","refunds","refunds_pending","ads","guy_fee","fees","cogs","cogs_est","profit"], o={n:rows.length};
+    /* fees_refunds_guy is the server's own per-day figure (pnl.js feesRefundsGuy): only summed here. */
+    var keys=["revenue","orders","refunds","refunds_pending","ads","guy_fee","fees","fees_refunds_guy","cogs","cogs_est","profit"], o={n:rows.length};
     keys.forEach(function(k){ o[k]=rows.length&&rows.every(function(r){return r[k]!=null})?rows.reduce(function(s,r){return s+Number(r[k])},0):null; });
     var known=rows.filter(function(r){return r.profit!=null});
     o.profit_known=known.reduce(function(s,r){return s+Number(r.profit)},0); o.known_days=known.length;
@@ -643,7 +673,7 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
     /* Days missing inside the period: totals would leave their costs out (rule 5), so the
        money sums are unknown, not partial. */
     o.gap_days=gapDays||0;
-    if(o.gap_days){ ["revenue","orders","refunds","refunds_pending","ads","guy_fee","fees","cogs","cogs_est","profit","margin","gross_margin","roas","be","aov","cogs_est_share"].forEach(function(k){o[k]=null}); o.complete=false; }
+    if(o.gap_days){ ["revenue","orders","refunds","refunds_pending","ads","guy_fee","fees","fees_refunds_guy","cogs","cogs_est","profit","margin","gross_margin","roas","be","aov","cogs_est_share"].forEach(function(k){o[k]=null}); o.complete=false; }
     o.missing=[]; o.stale=[]; o.missing_stores=[];
     rows.forEach(function(r){ (r.missing||[]).forEach(function(m){ if(o.missing.indexOf(m)<0) o.missing.push(m) }); (r.stale||[]).forEach(function(m){ if(o.stale.indexOf(m)<0) o.stale.push(m) }); (r.missing_stores||[]).forEach(function(m){ if(o.missing_stores.indexOf(m)<0) o.missing_stores.push(m) }); });
     return o;
@@ -673,58 +703,217 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
       '<span style="width:6px"></span><button class="pill" data-step="-1" aria-label="Previous day">‹</button><input type="date" id="pnlDay" value="'+esc(pnlSel.day)+'" max="'+esc(d.today)+'"'+(first?' min="'+esc(first)+'"':'')+'><button class="pill" data-step="1" aria-label="Next day">›</button></div>'+
       '<div class="pills"><span class="status">'+esc(periodTxt)+'</span>'+verdict+'</div></div>';
     var cogsTag=(s.cogs_est_share>0?'<span class="tag">'+(s.cogs_est_share>=.999?"EST.":pct(s.cogs_est_share,0)+" EST.")+'</span>':s.cogs!=null?'<span class="tag ok">REAL</span>':"")+(s.cogs!=null&&s.cogs_sheet?'<span class="tag" title="Some COGS from the P&amp;L sheet: KFB ledger in EUR at the sheet rate (an estimate)">SHEET</span>':"");
-    var fr=s.refunds==null||s.fees==null?null:s.refunds+s.fees;
-    var guyRates=Object.keys(d.guy||{}).map(function(k){return d.guy[k].rate}).filter(function(x){return x>0});
-    var guyLbl=guyRates.length?"+ Guy "+Math.round(guyRates[0]*100)+"% ":"+ Guy ";
+    /* Media buyer (Guy): 0 is a real zero (no fee on these days), null is unknown (ads unknown). */
+    var mb=s.guy_fee==null?"media buyer —":s.guy_fee===0?"no media buyer":"media buyer "+money(s.guy_fee);
+    var frgSub="fees "+money(s.fees)+" · refunds "+money(s.refunds)+(s.refunds_pending?" ("+money(s.refunds_pending)+" pending)":"")+" · "+mb;
+    var adsSub=s.ads==null?"":pnlSel.period==="day"?"Google Ads":(s.n?"avg "+money(s.ads/s.n)+" a day":"");
     var blocks='<div class="blocks">'+
       blk("Revenue",money(s.revenue),s.orders!=null?s.orders+" orders · gross, refunds below":"")+
       blk("Net profit",s.profit==null?"—":money(s.profit,true),s.profit==null?profitWhy(s):"margin "+pct(s.margin),s.profit==null?"":s.profit<0?"bad-t":"ok-t")+
       blk("ROAS",x2(s.roas),s.be!=null?"break-even "+x2(s.be):"",s.roas!=null&&s.be!=null?(s.roas>=s.be?"ok-t":"bad-t"):"")+
-      blk("Ad spend"+(s.ads_sheet?'<span class="tag" title="Some days from the P&amp;L sheet: the Google Ads API has no row for them yet">SHEET</span>':''),money(s.ads),s.guy_fee?guyLbl+money(s.guy_fee):s.ads!=null?"no media-buyer fee these days":"")+
+      blk("Ad spend"+(s.ads_sheet?'<span class="tag" title="Some days from the P&amp;L sheet: the Google Ads API has no row for them yet">SHEET</span>':''),money(s.ads),adsSub)+
       blk("COGS"+cogsTag+(s.cogs_assumed?'<span class="tag bad">33% ASSUMED</span>':''),money(s.cogs),s.cogs_assumed?"no measured rate for some orders":s.cogs!=null&&s.cogs_sheet?"includes KFB ledger from the P&L sheet, FX estimated":s.cogs_est_share>0?"KFB rate estimate until real costs land":s.cogs!=null?"real KFB costs":"")+
       blk("Orders",s.orders==null?"—":String(s.orders),s.aov!=null?"AOV "+money(s.aov):"")+
       blk("CVR",fun&&fun.ok&&fun.totals&&fun.totals.conversion_rate!=null&&fun.totals.converted_sessions!=null?pct(fun.totals.conversion_rate,2):"—",fun&&fun.ok&&fun.totals&&fun.totals.sessions!=null?fun.totals.sessions.toLocaleString()+" sessions"+(pr.to===d.today?" · today so far":""):"funnel not wired yet")+
-      blk("Fees &amp; refunds",money(fr),"fees "+money(s.fees)+" · refunds "+money(s.refunds)+(s.refunds_pending?" ("+money(s.refunds_pending)+" pending)":""))+
+      blk("Fees, refunds &amp; media buyer",money(s.fees_refunds_guy),frgSub)+
     '</div>';
     var funnel=funnelBox(pr);
     var right='<div class="col">'+(store==="all"?byStore(pr.rows,pr.gap):"")+sureBox(pr.rows,s,pnlSel.day===d.today&&pnlSel.period==="day")+'</div>';
-    var trend=trendChart(d.days,pnlSel.day||d.today);
-    var table='<div class="box"><div class="lab">Every day · click a row to open it'+(first?' · history starts '+esc(fmtDay(first))+'':'')+'</div><div class="tblwrap"><table class="tbl"><thead><tr><th>Date</th><th>Revenue</th><th>Ad spend</th><th>ROAS</th><th>Orders</th><th>COGS</th><th>Fees+refunds</th><th>Profit</th><th>Status</th></tr></thead><tbody>'+
+    var trend=cumBox();
+    var pays=payoutsBox(d.payouts);
+    var table='<div class="box"><div class="lab">Every day · click a row to open it'+(first?' · history starts '+esc(fmtDay(first))+'':'')+'</div><div class="tblwrap"><table class="tbl"><thead><tr><th>Date</th><th>Revenue</th><th>Ad spend</th><th>ROAS</th><th>Orders</th><th>COGS</th><th title="Shopify fees + refunds + media buyer (Guy)">Fees+refunds+Guy</th><th>Profit</th><th>Status</th></tr></thead><tbody>'+
       (d.days.length?d.days.map(function(r){
         var c=r.profit==null?"":r.profit<0?"bad-t":"ok-t", sel=pnlSel.period==="day"&&r.day===pnlSel.day;
-        return '<tr class="row'+(sel?" sel":"")+'" data-day="'+esc(r.day)+'"><td>'+esc(fmtDay(r.day))+(r.day===d.today?' <span class="tag">today</span>':'')+'</td><td>'+money(r.revenue)+'</td><td>'+money(r.ads)+(r.ads_sheet?'<span class="warn-t" title="From the P&amp;L sheet: the Google Ads API has no row for this day yet"> ·s</span>':'')+'</td><td class="'+(r.roas!=null&&r.breakeven_roas!=null?(r.roas>=r.breakeven_roas?"ok-t":"bad-t"):"")+'">'+x2(r.roas)+'</td><td>'+(r.orders==null?"—":r.orders)+'</td><td>'+money(r.cogs)+'</td><td>'+(r.fees==null||r.refunds==null?"—":money(r.fees+r.refunds))+'</td><td class="'+c+'">'+(r.profit==null?"—":money(r.profit,true))+'</td><td>'+rowStatus(r,d.today)+'</td></tr>';
+        return '<tr class="row'+(sel?" sel":"")+'" data-day="'+esc(r.day)+'"><td>'+esc(fmtDay(r.day))+(r.day===d.today?' <span class="tag">today</span>':'')+'</td><td>'+money(r.revenue)+'</td><td>'+money(r.ads)+(r.ads_sheet?'<span class="warn-t" title="From the P&amp;L sheet: the Google Ads API has no row for this day yet"> ·s</span>':'')+'</td><td class="'+(r.roas!=null&&r.breakeven_roas!=null?(r.roas>=r.breakeven_roas?"ok-t":"bad-t"):"")+'">'+x2(r.roas)+'</td><td>'+(r.orders==null?"—":r.orders)+'</td><td>'+money(r.cogs)+'</td><td title="'+esc("fees "+money(r.fees)+" · refunds "+money(r.refunds)+" · Guy "+money(r.guy_fee))+'">'+money(r.fees_refunds_guy)+'</td><td class="'+c+'">'+(r.profit==null?"—":money(r.profit,true))+'</td><td>'+rowStatus(r,d.today)+'</td></tr>';
       }).join(""):'<tr><td colspan="9" class="empty">No P&amp;L days stored yet.</td></tr>')+'</tbody></table></div></div>';
-    return '<div class="col">'+head+blocks+trend+'<div class="two">'+funnel+right+'</div>'+table+'</div>';
+    return '<div class="col">'+head+blocks+trend+pays+'<div class="two">'+funnel+right+'</div>'+table+'</div>';
   }
   /* lHtml is built here from fixed text (+ a tag), never from data. */
-  /* 28 days ending on the selected day: profit bars (unknown days drawn as a grey stub,
-     never as zero), revenue and ad spend as lines. Click a day to open it. */
-  function trendChart(all,end){
-    var start=addDays(end,-27), byDay={}; (all||[]).forEach(function(r){byDay[r.day]=r});
-    var rows=[]; for(var i=0;i<28;i++){ var dd=addDays(start,i); rows.push(byDay[dd]||{day:dd,missing:true}); }
-    var W=1100,H=220,L=48,Rr=12,T=14,B=26, iw=W-L-Rr, ih=H-T-B;
-    var vals=[]; rows.forEach(function(r){ ["revenue","ads","profit"].forEach(function(k){ if(r[k]!=null) vals.push(r[k]); }); });
-    if(!vals.length) return '<div class="box"><div class="lab">Last 28 days</div><div class="empty">No days on record in this window yet.</div></div>';
-    var hi=Math.max.apply(null,vals.concat([0])), lo=Math.min.apply(null,vals.concat([0])); if(hi===lo) hi=lo+1;
-    var span=hi-lo; hi+=span*.08;
-    var x=function(i){return L+(i+.5)*iw/rows.length}, y=function(v){return T+(hi-v)/(hi-lo)*ih}, bw=iw/rows.length*.56;
-    var g='';
-    var step=Math.pow(10,Math.floor(Math.log10(span)))*(span/Math.pow(10,Math.floor(Math.log10(span)))>5?2:1);
-    for(var t=Math.ceil(lo/step)*step;t<=hi;t+=step){ g+='<line x1="'+L+'" x2="'+(W-Rr)+'" y1="'+y(t).toFixed(1)+'" y2="'+y(t).toFixed(1)+'" stroke="'+(t===0?"#3a3a44":"#1e1e25")+'"/><text x="'+(L-8)+'" y="'+(y(t)+3.5).toFixed(1)+'" text-anchor="end">'+(Math.abs(t)>=1000?(t/1000).toFixed(1)+"k":t.toFixed(0))+'</text>'; }
-    rows.forEach(function(r,i){
-      if(i%4===0||i===rows.length-1) g+='<text x="'+x(i).toFixed(1)+'" y="'+(H-8)+'" text-anchor="middle">'+esc(fmtDay(r.day))+'</text>';
-      var sel=r.day===end&&pnlSel.period==="day";
-      g+='<rect class="hit" data-day="'+esc(r.day)+'" x="'+(x(i)-iw/rows.length/2).toFixed(1)+'" y="'+T+'" width="'+(iw/rows.length).toFixed(1)+'" height="'+ih+'" fill="'+(sel?"#ffffff":"transparent")+'" fill-opacity="'+(sel?.04:0)+'"><title>'+esc(fmtDay(r.day,true))+(r.missing?": not on record":": revenue "+money(r.revenue)+" · ads "+money(r.ads)+" · profit "+(r.profit==null?"—":money(r.profit,true)))+'</title></rect>';
-      if(r.missing) return;
-      if(r.profit==null){ g+='<rect x="'+(x(i)-bw/2).toFixed(1)+'" y="'+(y(0)-1.5).toFixed(1)+'" width="'+bw.toFixed(1)+'" height="3" fill="#3a3a44" pointer-events="none"/>'; return; }
-      var top=Math.min(y(r.profit),y(0)), h=Math.max(2,Math.abs(y(r.profit)-y(0)));
-      g+='<rect x="'+(x(i)-bw/2).toFixed(1)+'" y="'+top.toFixed(1)+'" width="'+bw.toFixed(1)+'" height="'+h.toFixed(1)+'" rx="2" fill="'+(r.profit<0?"#ff8fab":"#6fe3b4")+'" opacity="'+(r.complete?.85:.45)+'" pointer-events="none"/>';
-    });
-    ["revenue","ads"].forEach(function(k){ var d="",pen=false; rows.forEach(function(r,i){ var v=r[k]; if(v==null){pen=false;return;} d+=(pen?"L":"M")+x(i).toFixed(1)+" "+y(v).toFixed(1); pen=true; });
-      g+='<path d="'+d+'" fill="none" stroke="'+(k==="revenue"?"#b9d3ff":"#ffd36e")+'" stroke-width="2" stroke-linejoin="round" pointer-events="none"/>';
-      rows.forEach(function(r,i){ if(r[k]!=null) g+='<circle cx="'+x(i).toFixed(1)+'" cy="'+y(r[k]).toFixed(1)+'" r="2.2" fill="'+(k==="revenue"?"#b9d3ff":"#ffd36e")+'" pointer-events="none"/>'; }); });
-    var key='<span><i style="background:#b9d3ff"></i>revenue</span><span><i style="background:#ffd36e"></i>ad spend</span><span><i style="background:#6fe3b4"></i>profit</span><span><i style="background:#ff8fab"></i>loss</span><span><i style="background:#3a3a44"></i>profit unknown</span><span>faded bar = not final</span>';
-    return '<div class="box"><div class="lab" style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px"><span>Last 28 days · click a day</span><span class="legend" style="padding:0;border:0;text-transform:none;letter-spacing:0">'+key+'</span></div><svg class="chart" viewBox="0 0 '+W+' '+H+'" role="img" aria-label="Revenue, ad spend and profit, last 28 days">'+g+'</svg></div>';
+  /* The Eagano dash chart: CUMULATIVE / DAILY, one metric at a time, a window (7 / 28 / 365
+     days, all time or custom), a headline for the window and a smooth line, green above zero
+     and red below. Every value is a P&L day as the server computed it (pnl_days); the chart
+     only adds them up. A day whose value is unknown is a gap in the line, never a 0, and the
+     tooltip says why. Click (or tap twice) a day to open it. */
+  var CUM=[["profit","Profit"],["revenue","Revenue"],["ads","Ad spend"],["orders","Orders"],["sessions","Sessions"]];
+  var CUMR=[["7","Last 7 days"],["28","Last 28 days"],["365","Last 365 days"],["all","All time"]];
+  var cumSel={view:"cum",metric:"profit",range:"28",from:null,to:null}, cumPts=null, cumTip=-1, cumResize=0;
+  function cumWindow(){
+    var d=pnlData, first=d.days.length?d.days[d.days.length-1].day:d.today, last=d.today, from=first, to=last;
+    if(cumSel.range==="custom"&&cumSel.from&&cumSel.to){ from=cumSel.from; to=cumSel.to; if(from>to){ var t=from; from=to; to=t; } }
+    else if(cumSel.range!=="all"){ from=addDays(last,-(Number(cumSel.range)-1)); }
+    if(from<first) from=first; if(to>last) to=last; if(from>to) from=to;
+    return {from:from,to:to,first:first,last:last};
+  }
+  /* Sessions come from the Shopify funnel feed (null until it is wired, never 0). */
+  var sessCache={};
+  function sessFor(from,to){
+    var k=store+"|"+from+"|"+to, c=sessCache[k];
+    if(c&&!c.loading&&Date.now()-(c._at||0)>120000) c=null;
+    if(!c){ sessCache[k]={loading:true}; (async function(){ try{ var r=await api("/api/funnel?store="+encodeURIComponent(store)+"&from="+from+"&to="+to); sessCache[k]=await r.json(); }catch(e){ sessCache[k]={ok:false,error:"couldn't load"}; } sessCache[k]._at=Date.now(); if(route.p==="pnl"&&$("#plcum")) drawCum(); })(); return null; }
+    return c.loading?null:c;
+  }
+  function cumBox(){
+    var w=cumWindow();
+    return '<div class="box" id="plcum"><div class="mhead"><div class="ranges">'+[["cum","Cumulative"],["daily","Daily"]].map(function(v){return '<button class="rb'+(cumSel.view===v[0]?" on":"")+'" data-cv="'+v[0]+'">'+v[1]+'</button>'}).join("")+'</div>'+
+      '<div class="ranges">'+CUM.map(function(m){return '<button class="rb'+(cumSel.metric===m[0]?" on":"")+'" data-cm="'+m[0]+'">'+m[1]+'</button>'}).join("")+'</div></div>'+
+      '<div class="cumbar"><div class="ranges">'+CUMR.map(function(r){return '<button class="rb'+(cumSel.range===r[0]?" on":"")+'" data-cr="'+r[0]+'">'+r[1]+'</button>'}).join("")+'<button class="rb'+(cumSel.range==="custom"?" on":"")+'" data-cr="custom">Custom</button></div>'+
+      '<div class="cumdates"><input type="date" id="cumFrom" value="'+esc(w.from)+'" min="'+esc(w.first)+'" max="'+esc(w.last)+'"><span>to</span><input type="date" id="cumTo" value="'+esc(w.to)+'" min="'+esc(w.first)+'" max="'+esc(w.last)+'"><button class="rb" id="cumApply">Apply</button></div></div>'+
+      '<div class="cumhead"><span class="cumv" id="cumV">—</span><span class="cumd" id="cumD"></span></div><div class="cumwrap" id="cumWrap"></div></div>';
+  }
+  /* Even, round ticks (the Eagano dash's axis()). */
+  function cumAxis(vals,zero){
+    var lo=Math.min.apply(null,vals.concat(zero?[0]:[])), hi=Math.max.apply(null,vals.concat(zero?[0]:[]));
+    if(!isFinite(lo)||!isFinite(hi)) return {min:0,max:1,step:1};
+    var span=(hi-lo)||Math.abs(hi)||1, p=span*.08; lo-=p; hi+=p; if(zero&&lo>=-p) lo=Math.min(0,lo+p);
+    var raw=((hi-lo)||1)/6, mag=Math.pow(10,Math.floor(Math.log10(raw))), n=raw/mag;
+    var step=(n<=1?1:n<=2?2:n<=2.5?2.5:n<=5?5:10)*mag;
+    return {min:Math.floor(lo/step)*step,max:Math.ceil(hi/step)*step,step:step};
+  }
+  /* Monotone cubic through points (no overshoot, so a day never looks lower or higher than it was). */
+  function smoothPath(p){
+    var n=p.length; if(!n) return "";
+    var s="M"+p[0].x.toFixed(1)+" "+p[0].y.toFixed(1); if(n===1) return s;
+    var d=[], m=[], i;
+    for(i=0;i<n-1;i++) d.push((p[i+1].y-p[i].y)/((p[i+1].x-p[i].x)||1));
+    m[0]=d[0]; m[n-1]=d[n-2];
+    for(i=1;i<n-1;i++) m[i]=d[i-1]*d[i]<=0?0:(d[i-1]+d[i])/2;
+    for(i=0;i<n-1;i++){ if(d[i]===0){ m[i]=m[i+1]=0; continue; } var a=m[i]/d[i], b=m[i+1]/d[i], q=a*a+b*b; if(q>9){ var t=3/Math.sqrt(q); m[i]=t*a*d[i]; m[i+1]=t*b*d[i]; } }
+    for(i=0;i<n-1;i++){ var h=p[i+1].x-p[i].x; s+="C"+(p[i].x+h/3).toFixed(1)+" "+(p[i].y+m[i]*h/3).toFixed(1)+" "+(p[i+1].x-h/3).toFixed(1)+" "+(p[i+1].y-m[i+1]*h/3).toFixed(1)+" "+p[i+1].x.toFixed(1)+" "+p[i+1].y.toFixed(1); }
+    return s;
+  }
+  function cumFmt(v){ return cumSel.metric==="orders"||cumSel.metric==="sessions"?(v==null?"—":Math.round(v).toLocaleString()):money(v); }
+  function tickFmt(v){ if(cumSel.metric==="orders"||cumSel.metric==="sessions") return Math.abs(v)>=1000?(v/1000).toFixed(1)+"k":String(Math.round(v)); var a=Math.abs(v); return (v<0?"−$":"$")+(a>=1000?(a/1000).toFixed(a>=10000?0:1)+"k":a.toFixed(a<10&&a%1?1:0)); }
+  /* Why a day's value is unknown, in a few words. */
+  function unknownWhy(r){
+    if(!r||r.none) return "not on record";
+    if(cumSel.metric==="sessions") return "sessions not wired";
+    if(r.missing_stores&&r.missing_stores.length) return "no row yet for "+r.missing_stores.map(storeName).join(", ");
+    var w=r.open_why||{}, ks=Object.keys(w);
+    if(cumSel.metric==="profit"&&ks.length) return "waiting on "+ks.join(", ");
+    return "not known yet";
+  }
+  function drawCum(){
+    var box=$("#cumWrap"); if(!box||!pnlData) return;
+    var w=cumWindow(), by={}; (pnlData.days||[]).forEach(function(r){by[r.day]=r});
+    var M=cumSel.metric, sess=M==="sessions"?sessFor(w.from,w.to):null, sby={};
+    if(sess&&sess.ok) (sess.days||[]).forEach(function(x){sby[x.day]=x});
+    var rows=[], guard=0;
+    for(var dd=w.from; dd<=w.to&&guard<2000; dd=addDays(dd,1),guard++){
+      var r=by[dd]||{day:dd,none:true};
+      var v=M==="sessions"?(sby[dd]&&sby[dd].sessions!=null?sby[dd].sessions:null):(r.none?null:r[M]);
+      rows.push({day:dd,r:r,v:v==null?null:Number(v)});
+    }
+    var run=0, known=0;
+    rows.forEach(function(x){ if(x.v!=null){ run+=x.v; known++; x.cum=Math.round(run*100)/100; } else x.cum=null; x.plot=cumSel.view==="daily"?x.v:x.cum; });
+    var unknown=rows.length-known, end=known?Math.round(run*100)/100:null;
+    var V=$("#cumV"), D=$("#cumD");
+    var loadingSess=M==="sessions"&&!sess;
+    V.textContent=loadingSess?"…":cumFmt(end);
+    /* Green/red only for profit, and only when every day in the window is known: a sum with
+       unknown days left out isn't a verdict (rule 5), so it stays grey and says so. */
+    V.style.color=M==="profit"&&end!=null&&!unknown?(end>=0?"var(--good)":"var(--bad)"):end==null?"var(--faint)":unknown?"var(--muted)":"var(--text)";
+    D.className="cumd"+(unknown&&known?" warn-t":"");
+    D.textContent=loadingSess?"loading sessions":M==="sessions"&&sess&&!known?(sess.ok?"sessions not wired yet (Shopify read_reports)":"couldn't load sessions"):
+      !known?"no known days in this window":unknown?"known days only · "+unknown+" of "+rows.length+" day"+(rows.length>1?"s":"")+" unknown":"";
+    var Wd=Math.max(280,Math.round(box.clientWidth||600)), H=Wd<600?220:300, L=Wd<600?44:56, R=12, T=12, B=26, iw=Wd-L-R, ih=H-T-B;
+    var pv=rows.filter(function(x){return x.plot!=null}).map(function(x){return x.plot});
+    cumPts=null; cumTip=-1;
+    if(!pv.length){ box.innerHTML='<div class="empty" style="padding-top:80px">'+(loadingSess?"Loading sessions…":"Nothing known to draw in this window.")+'</div>'; return; }
+    var signed=M==="profit"||pv.some(function(v){return v<0});
+    var ax=cumAxis(pv,true), span=(ax.max-ax.min)||1;
+    var n=rows.length, X=function(i){return n===1?L+iw/2:L+i*iw/(n-1)}, Y=function(v){return T+(ax.max-v)/span*ih};
+    var y0=Y(Math.max(ax.min,Math.min(ax.max,0))), k=Math.max(0,Math.min(1,(y0-T)/ih));
+    var good="#6fe3b4", bad="#ff8fab", solo=M==="ads"?bad:good;
+    var g='<defs><linearGradient id="cumFill" gradientUnits="userSpaceOnUse" x1="0" y1="'+T+'" x2="0" y2="'+(T+ih)+'">'+
+      (signed?'<stop offset="0" stop-color="'+good+'" stop-opacity=".30"/><stop offset="'+k.toFixed(4)+'" stop-color="'+good+'" stop-opacity=".02"/><stop offset="'+k.toFixed(4)+'" stop-color="'+bad+'" stop-opacity=".02"/><stop offset="1" stop-color="'+bad+'" stop-opacity=".30"/>'
+        :'<stop offset="0" stop-color="'+solo+'" stop-opacity=".24"/><stop offset="1" stop-color="'+solo+'" stop-opacity="0"/>')+'</linearGradient>'+
+      '<linearGradient id="cumLine" gradientUnits="userSpaceOnUse" x1="0" y1="'+T+'" x2="0" y2="'+(T+ih)+'">'+
+      (signed?'<stop offset="'+k.toFixed(4)+'" stop-color="'+good+'"/><stop offset="'+k.toFixed(4)+'" stop-color="'+bad+'"/>':'<stop offset="0" stop-color="'+solo+'"/><stop offset="1" stop-color="'+solo+'"/>')+'</linearGradient></defs>';
+    for(var t=ax.min;t<=ax.max+ax.step/2;t+=ax.step){ var ty=Y(t).toFixed(1), z=Math.abs(t)<ax.step/1e6; g+='<line x1="'+L+'" x2="'+(Wd-R)+'" y1="'+ty+'" y2="'+ty+'" stroke="'+(z&&signed?"#3a3a44":"#1c1c22")+'"/><text x="'+(L-8)+'" y="'+(Number(ty)+3.5)+'" text-anchor="end">'+esc(tickFmt(z?0:t))+'</text>'; }
+    var every=Math.max(1,Math.ceil(n/Math.max(2,Math.floor(iw/(Wd<600?62:78)))));
+    rows.forEach(function(x,i){ if(i%every===0) g+='<text x="'+X(i).toFixed(1)+'" y="'+(H-8)+'" text-anchor="'+(n>1&&i===0?"start":"middle")+'">'+esc(fmtDay(x.day))+'</text>'; });
+    /* Segments of known days: a gap where a day is unknown. */
+    var segs=[], cur=[];
+    rows.forEach(function(x,i){ if(x.plot==null){ if(cur.length) segs.push(cur); cur=[]; return; } cur.push({x:X(i),y:Y(x.plot),i:i}); }); if(cur.length) segs.push(cur);
+    segs.forEach(function(sg){ var p=smoothPath(sg);
+      if(sg.length>1) g+='<path d="'+p+'L'+sg[sg.length-1].x.toFixed(1)+' '+y0.toFixed(1)+'L'+sg[0].x.toFixed(1)+' '+y0.toFixed(1)+'Z" fill="url(#cumFill)"/>';
+      g+='<path d="'+p+'" fill="none" stroke="url(#cumLine)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>'; });
+    /* Dots: every day in a short daily view; otherwise the last point and lone days (so they show). */
+    segs.forEach(function(sg){ sg.forEach(function(q,j){ var show=(cumSel.view==="daily"&&n<=45)||sg.length===1||q.i===n-1||(cumSel.view==="cum"&&j===sg.length-1&&segs[segs.length-1]===sg);
+      if(show){ var v=rows[q.i].plot; g+='<circle cx="'+q.x.toFixed(1)+'" cy="'+q.y.toFixed(1)+'" r="3.2" fill="'+(signed?(v>=0?good:bad):solo)+'" stroke="#0b0b0d" stroke-width="2"/>'; } }); });
+    /* Unknown days: a faint tick on the zero line, never a point at 0. */
+    rows.forEach(function(x,i){ if(x.plot==null&&!x.r.none) g+='<line x1="'+X(i).toFixed(1)+'" x2="'+X(i).toFixed(1)+'" y1="'+(y0-3).toFixed(1)+'" y2="'+(y0+3).toFixed(1)+'" stroke="#3a3a44" stroke-width="2"/>'; });
+    g+='<line id="cumGuide" x1="0" x2="0" y1="'+T+'" y2="'+(T+ih)+'" stroke="#3a3a44" stroke-dasharray="3 3" visibility="hidden"/><circle id="cumDot" r="4.5" fill="#e8e8ea" stroke="#0b0b0d" stroke-width="2" visibility="hidden"/>';
+    box.innerHTML='<svg id="cumSvg" viewBox="0 0 '+Wd+' '+H+'" height="'+H+'" role="img" aria-label="'+esc((cumSel.view==="cum"?"Cumulative ":"Daily ")+M+", "+w.from+" to "+w.to)+'" style="cursor:pointer">'+g+'</svg><div class="ctip" id="cumTip" hidden></div>';
+    cumPts={rows:rows,X:X,Y:Y,n:n,L:L,iw:iw,Wd:Wd,H:H,T:T};
+    wireCumSvg();
+  }
+  function cumIndexAt(ev){ var s=$("#cumSvg"); if(!s||!cumPts) return -1; var b=s.getBoundingClientRect(), x=(ev.clientX-b.left)*cumPts.Wd/b.width;
+    var i=cumPts.n===1?0:Math.round((x-cumPts.L)/(cumPts.iw/(cumPts.n-1))); return Math.max(0,Math.min(cumPts.n-1,i)); }
+  function cumShow(i){
+    var P=cumPts, tip=$("#cumTip"), gd=$("#cumGuide"), dot=$("#cumDot"); if(!P||!tip) return;
+    cumTip=i; var x=P.rows[i], r=x.r, px=P.X(i);
+    gd.setAttribute("x1",px); gd.setAttribute("x2",px); gd.setAttribute("visibility","visible");
+    if(x.plot!=null){ dot.setAttribute("cx",px); dot.setAttribute("cy",P.Y(x.plot)); dot.setAttribute("visibility","visible"); } else dot.setAttribute("visibility","hidden");
+    var line=function(k,v){ return '<div class="r"><span>'+k+'</span><span>'+v+'</span></div>'; };
+    var h='<div class="h">'+esc(fmtDay(x.day,true))+(x.day===pnlData.today?" · so far":"")+'</div>';
+    if(r.none&&cumSel.metric!=="sessions") h+=line("Not on record","");
+    else {
+      h+=line("Revenue",money(r.revenue))+line("Ad spend",money(r.ads))+line("COGS",money(r.cogs))+line("Day profit",r.profit==null?"—":money(r.profit,true));
+      if(cumSel.metric==="orders") h+=line("Orders",r.orders==null?"—":r.orders);
+      if(cumSel.metric==="sessions") h+=line("Sessions",x.v==null?"—":x.v.toLocaleString());
+    }
+    if(x.v==null) h+='<div class="r warn-t"><span>'+esc(CUM.filter(function(m){return m[0]===cumSel.metric})[0][1])+' unknown</span><span>'+esc(unknownWhy(r))+'</span></div>';
+    h+='<div class="f"><span>'+(cumSel.view==="daily"?"This day":"Cumulative")+'</span><span>'+(x.plot==null?(cumSel.view==="cum"&&x.v==null?"gap":"—"):esc(cumFmt(x.plot)))+'</span></div>';
+    tip.innerHTML=h; tip.hidden=false;
+    var wrap=$("#cumWrap"), s=$("#cumSvg"), scale=s.getBoundingClientRect().width/P.Wd, left=px*scale+14, tw=tip.offsetWidth;
+    if(left+tw>wrap.clientWidth) left=px*scale-tw-14; if(left<0) left=Math.max(0,(wrap.clientWidth-tw)/2);
+    tip.style.left=left+"px"; tip.style.top=(P.T+6)+"px";
+  }
+  function cumHide(){ cumTip=-1; var t=$("#cumTip"); if(t) t.hidden=true; ["#cumGuide","#cumDot"].forEach(function(s){ var e=$(s); if(e) e.setAttribute("visibility","hidden"); }); }
+  function cumOpen(i){ var x=cumPts&&cumPts.rows[i]; if(!x||x.day>pnlData.today) return; pnlSel.period="day"; pnlSel.day=x.day; $("#pnl").innerHTML=pnlBody(); wirePnl(); window.scrollTo({top:0,behavior:"smooth"}); }
+  function wireCumSvg(){
+    var s=$("#cumSvg"); if(!s) return;
+    s.addEventListener("pointermove",function(e){ if(e.pointerType==="mouse") cumShow(cumIndexAt(e)); });
+    s.addEventListener("pointerleave",function(e){ if(e.pointerType==="mouse") cumHide(); });
+    /* Mouse: click opens the day. Touch: the first tap shows the day, a second tap on it opens it. */
+    s.addEventListener("pointerup",function(e){ var i=cumIndexAt(e); if(i<0) return; if(e.pointerType==="mouse"||cumTip===i) cumOpen(i); else cumShow(i); });
+  }
+  function redrawCumBox(){ var b=$("#plcum"); if(!b) return; b.outerHTML=cumBox(); wireCum(); }
+  function wireCum(){
+    document.querySelectorAll("[data-cv]").forEach(function(b){ b.addEventListener("click",function(){ cumSel.view=b.dataset.cv; redrawCumBox(); }); });
+    document.querySelectorAll("[data-cm]").forEach(function(b){ b.addEventListener("click",function(){ cumSel.metric=b.dataset.cm; redrawCumBox(); }); });
+    document.querySelectorAll("[data-cr]").forEach(function(b){ b.addEventListener("click",function(){ if(b.dataset.cr==="custom"){ cumSel.from=$("#cumFrom").value; cumSel.to=$("#cumTo").value; } cumSel.range=b.dataset.cr; redrawCumBox(); }); });
+    var take=function(){ var f=$("#cumFrom").value, t=$("#cumTo").value; if(!/^\d{4}-\d{2}-\d{2}$/.test(f)||!/^\d{4}-\d{2}-\d{2}$/.test(t)) return; cumSel.range="custom"; cumSel.from=f; cumSel.to=t; redrawCumBox(); };
+    var ap=$("#cumApply"); if(ap) ap.addEventListener("click",take);
+    ["#cumFrom","#cumTo"].forEach(function(id){ var e=$(id); if(!e) return; e.addEventListener("focus",function(){ busyUntil=Date.now()+30000; }); e.addEventListener("blur",function(){ busyUntil=0; }); });
+    drawCum();
+  }
+  window.addEventListener("resize",function(){ clearTimeout(cumResize); cumResize=setTimeout(function(){ if(route.p==="pnl"&&$("#cumWrap")) drawCum(); },150); });
+
+  /* Payouts: when Shopify Payments pays each store. The date is Shopify's payout date (when
+     it is sent), not the day it lands in the bank, which Shopify doesn't give. Upcoming
+     payouts are only shown while the payouts feed is fresh (server: payoutsState). */
+  var PAY_ST={SCHEDULED:"scheduled",IN_TRANSIT:"sent to bank",PAID:"paid",FAILED:"failed",CANCELED:"canceled"};
+  function payMoney(n,cur){ return money(n)+(cur&&cur!=="USD"?" "+cur:""); }
+  function payTotal(t){ if(!t) return "—"; var ks=Object.keys(t); return ks.length?ks.map(function(c){return payMoney(t[c],c)}).join(" + "):"$0.00"; }
+  function payoutsBox(p){
+    if(!p||!p.ok) return '<div class="box"><div class="lab">Payouts</div><div class="empty">Payouts not loaded.</div></div>';
+    var today=pnlData.today, rel=function(day){ if(!day) return ""; var n=dayCount(today,day)-1; return n===0?"today":n===1?"tomorrow":n>1?"in "+n+" days":n===-1?"yesterday":(-n)+" days ago"; };
+    var cards=p.stores.map(function(s){
+      var head='<div class="n"><span>'+esc(storeName(s.store))+'</span>'+(s.current?'<span class="ok-t" style="font-weight:400;font-size:11px">● '+esc(ago(s.feed.last_ok_at))+'</span>':'<span class="warn-t" style="font-weight:400;font-size:11px">● '+esc(s.feed.state==="not_wired"?"not wired":s.feed.state)+'</span>')+'</div>';
+      var nx;
+      if(!s.current) nx='<div class="big" style="color:var(--faint)">—</div><div class="sub warn-t">'+esc(s.feed.state==="not_wired"?(s.why||"not wired"):"payouts feed "+s.feed.state+(s.feed.last_ok_at?", last read "+ago(s.feed.last_ok_at):"")+" · next payout hidden until it reads again")+'</div>';
+      else if(!s.next) nx='<div class="big" style="color:var(--faint)">None</div><div class="sub">nothing scheduled yet'+(s.balance&&s.balance.amount?" · balance "+esc(payMoney(s.balance.amount,s.balance.currency)):"")+'</div>';
+      else nx='<div class="big">'+esc(payMoney(s.next.net,s.next.currency))+'</div><div class="sub">'+esc(fmtDay(s.next.date,true))+' · '+esc(rel(s.next.date))+' · '+esc(PAY_ST[s.next.status]||String(s.next.status||"").toLowerCase())+'</div>';
+      var more=s.current&&s.upcoming&&s.upcoming.length>1?s.upcoming.slice(1).map(function(u){return '<div class="kv"><span>'+esc(fmtDay(u.date))+' · '+esc(PAY_ST[u.status]||u.status)+'</span><b>'+esc(payMoney(u.net,u.currency))+'</b></div>'}).join(""):"";
+      var fails=(s.failed||[]).map(function(u){return '<div class="kv"><span class="bad-t">'+esc(fmtDay(u.date))+' · '+esc(PAY_ST[u.status]||u.status)+'</span><b class="bad-t">'+esc(payMoney(u.net,u.currency))+'</b></div>'}).join("");
+      var paid=(s.paid||[]).map(function(u){return '<div class="kv"><span>'+esc(fmtDay(u.date))+' · paid</span><b>'+esc(payMoney(u.net,u.currency))+'</b></div>'}).join("");
+      return '<div class="pay">'+head+nx+(more?'<div style="margin-top:8px">'+more+'</div>':'')+(fails||paid?'<div style="margin-top:8px;border-top:1px solid var(--border);padding-top:4px">'+fails+paid+'</div>':(s.wired?'<div class="note">No paid payouts on record yet.</div>':''))+'</div>';
+    }).join("");
+    var tot=p.stores.length>1?(p.upcoming_total?'<span class="status">upcoming <b style="color:var(--text);font-weight:600">'+esc(payTotal(p.upcoming_total))+'</b></span>':'<span class="status">upcoming total — (not every store is current)</span>'):
+      (p.stores[0]&&p.stores[0].current?'<span class="status">upcoming <b style="color:var(--text);font-weight:600">'+esc(payTotal(p.stores[0].upcoming_total))+'</b></span>':'');
+    return '<div class="box"><div class="mhead"><span class="lab">Payouts · Shopify payout date, not bank arrival</span>'+tot+'</div><div class="pays">'+cards+'</div></div>';
   }
   /* Shopify sessions funnel for the selected period (null until the funnel feed is wired). */
   var funCache={};
@@ -745,8 +934,8 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
     var steps=[["Sessions",t.sessions,"of all traffic",null],["Added to cart",t.cart_sessions,"of sessions",t.sessions],["Reached checkout",t.checkout_sessions,"of added to cart",t.cart_sessions],["Orders",t.converted_sessions,"of reached checkout",t.checkout_sessions]];
     var W=[300,96,64,44], h='';
     steps.forEach(function(st,i){ var known=st[1]!=null, w=known&&t.sessions?Math.max(14,Math.round(300*st[1]/t.sessions)):14;
-      h+='<div style="display:grid;grid-template-columns:1fr 300px 1fr;align-items:center;gap:12px;height:62px"><div style="text-align:right"><div style="font:500 13px var(--font)">'+st[0]+'</div><div class="note" style="margin:0">'+(known&&t.sessions?pct(st[1]/t.sessions,2)+" of sessions":"")+'</div></div>'+
-        '<div style="display:grid;place-items:center"><div style="height:46px;width:'+w+'px;border-radius:6px;background:'+(!known?"#2a2a33":i===3?"#6fe3b4":"#5f6b78")+';opacity:'+(i===3?.9:.6)+'"></div></div>'+
+      h+='<div class="fnr"><div style="text-align:right"><div style="font:500 13px var(--font)">'+st[0]+'</div><div class="note" style="margin:0">'+(known&&t.sessions?pct(st[1]/t.sessions,2)+" of sessions":"")+'</div></div>'+
+        '<div style="display:grid;place-items:center"><div style="height:46px;width:'+(w/3).toFixed(1)+'%;border-radius:6px;background:'+(!known?"#2a2a33":i===3?"#6fe3b4":"#5f6b78")+';opacity:'+(i===3?.9:.6)+'"></div></div>'+
         '<div><div style="font:600 17px var(--font)">'+(known?esc(st[1].toLocaleString()):"—")+'</div><div class="note" style="margin:0">'+(known&&st[3]?pct(st[1]/st[3],0)+" "+st[2]:known?st[2]:"not known")+'</div></div></div>'; });
     return '<div class="box"><div class="lab">Funnel'+(f.wired?'':' · some stores not wired')+'</div><div style="margin-top:8px">'+h+'</div></div>';
   }
@@ -808,7 +997,7 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
     document.querySelectorAll("[data-step]").forEach(function(b){ b.addEventListener("click",function(){ var nd=addDays(pnlSel.day,Number(b.dataset.step)); if(nd>pnlData.today) return; pnlSel.day=nd; $("#pnl").innerHTML=pnlBody(); wirePnl(); }); });
     var di=$("#pnlDay"); if(di){ di.addEventListener("focus",function(){ busyUntil=Date.now()+30000; }); di.addEventListener("blur",function(){ busyUntil=0; }); }
     if(di) di.addEventListener("change",function(){ if(/^\d{4}-\d{2}-\d{2}$/.test(di.value)){ pnlSel.day=di.value; $("#pnl").innerHTML=pnlBody(); wirePnl(); } });
-    document.querySelectorAll(".chart .hit").forEach(function(r){ r.style.cursor="pointer"; r.addEventListener("click",function(){ pnlSel.period="day"; pnlSel.day=r.getAttribute("data-day"); if(pnlSel.day>pnlData.today) return; $("#pnl").innerHTML=pnlBody(); wirePnl(); }); });
+    wireCum();
     document.querySelectorAll("tr[data-day]").forEach(function(tr){ tr.addEventListener("click",function(){ pnlSel.period="day"; pnlSel.day=tr.dataset.day; $("#pnl").innerHTML=pnlBody(); wirePnl(); window.scrollTo({top:0,behavior:"smooth"}); }); });
   }
 
