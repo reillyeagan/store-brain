@@ -137,7 +137,8 @@ test("modes: agents are live only when their switch is on; the build status is k
   assert.equal(go["cs.reply_writer"].status, "built", "Gmail drafts have their own switch");
   assert.equal(go["core.briefer"].status, "built", "the phone brief has its own switch");
   assert.equal(go["sup.relay"].status, "built");
-  assert.equal(go["cat.feed_health"].status, "planned", "a planned agent is never live");
+  assert.equal(go["cat.feed_health"].status, "live", "Merchant Center Health is built (GMC ids set 2026-10-14)");
+  assert.equal(agentStatus({ id: "x.future", status: "planned" }, { GO_LIVE: "1" }), "planned", "a planned agent is never live");
 
   const all = byId(agentsWithMode(ALL_ON));
   for (const a of AGENTS) {

@@ -104,7 +104,7 @@ export const AGENTS = Object.freeze([
   a("cat.status", "cat", "Product Status", "code", "L1", "built"),
   a("cat.prepublish", "cat", "New-Product Check", "code", "L2", "built"),
   a("cat.hygiene", "cat", "Feed Hygiene", "code", "L0", "built"),
-  a("cat.feed_health", "cat", "Merchant Center Health", "code", "L0"),
+  a("cat.feed_health", "cat", "Merchant Center Health", "code", "L0", "built"), // GMC ids set 2026-10-14 (wrangler.toml)
   // Dropped 2026-10-11 (Reilly): content & size notes, import builder, theme desk.
 ]);
 
