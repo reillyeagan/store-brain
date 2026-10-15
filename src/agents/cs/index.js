@@ -22,6 +22,7 @@ import { attachOrderContext } from "./orderContext.js";
 import { proposeRetention } from "./retention.js";
 import { escalateTickets } from "./escalation.js";
 import { writeReplies, draftsLive } from "./replyWriter.js";
+import { writeStarterDrafts } from "./starterDrafts.js";
 import { checkThreads, flagOverdue } from "./obligations.js";
 import { closeKeptPromises, askOverduePromises, evidenceFor } from "./promises.js";
 
@@ -48,7 +49,10 @@ export async function runCs(env, { nowMs = Date.now(), fetchImpl = fetch } = {})
       await step("retention", "cs.retention", () => proposeRetention(env, opts));
       await step("escalation", "cs.escalation", () => escalateTickets(env, opts));
       await step("drafts", "cs.reply_writer", () => writeReplies(env, opts));
-      await noteJobResult(env.DB, "cs.work", summarize({ classify: out.classify, context: out.context, escalation: out.escalation, drafts: out.drafts })).catch(() => {});
+      // Flagged emails get a starting reply in Gmail too (Reilly 2026-10-15: "i thought the brain
+      // was supposed to draft replies for me, not just tell me"). The decision stays his.
+      await step("starters", "cs.reply_writer", () => writeStarterDrafts(env, opts));
+      await noteJobResult(env.DB, "cs.work", summarize({ classify: out.classify, context: out.context, escalation: out.escalation, drafts: out.drafts, starters: out.starters })).catch(() => {});
     }
     if (await claimJob(env.DB, "cs.obligations", CADENCE.obligations, nowMs)) {
       await step("threads", "cs.obligations", () => checkThreads(env, opts));

@@ -32,7 +32,7 @@ const ACTOR = "cs.reply_writer";
 export const draftsLive = (env) => modeFor(env, "cs") === "live";
 
 /** CS rules from the Core (the vault's CS Playbook, once seeded). Capped so the prompt stays small. */
-async function corePolicy(db, store) {
+export async function corePolicy(db, store) {
   const { results } = await db.prepare(
     `SELECT key, value FROM core_facts WHERE live = 1 AND (store IS NULL OR store = ?)
        AND (area IN ('policy', 'cs') OR key LIKE 'cs.%' OR key LIKE 'policy.%') ORDER BY id LIMIT 30`

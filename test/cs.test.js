@@ -1217,3 +1217,84 @@ test("cs promises: awaiting-return promises never go overdue; at most 10 promise
   const st = await csState(env, { nowMs: NOW });
   assert.equal(st.promises_open.find((o) => o.id === 1).awaiting_return, true);
 });
+
+/* ---------- starter drafts for flagged emails (Reilly 2026-10-15) ---------- */
+import { writeStarterDrafts, NEW_CARD_TAIL, OLD_CARD_TAIL } from "../src/agents/cs/starterDrafts.js";
+import { Budget } from "../src/agents/cs/util.js";
+
+async function flagged(env, { id, body, category = "return_refund", mismatch = 0, orderRef = null, approvalStatus = "pending" }) {
+  const aid = await createApproval(env.DB, { dept: "cs", requestedBy: "cs.escalation", store: "hc", title: `t${id}`,
+    options: [{ id: "handled", label: "I'll handle it in Gmail", detail: `Summary. Why it's yours: x. ${OLD_CARD_TAIL}` }] });
+  if (approvalStatus !== "pending") await env.DB.prepare(`UPDATE approvals SET status = ? WHERE id = ?`).bind(approvalStatus, aid).run();
+  await env.DB.prepare(`INSERT INTO cs_tickets (id, opened_at, updated_at, slot, gmail_id, thread_id, rfc_message_id, store, from_email, from_name, subject, body, status, category, context_at, escalated_at, approval_id, order_mismatch, order_ref)
+    VALUES (?, 't', 't', 'google', ?, ?, ?, 'hc', 'jane@buyer.com', 'Jane Doe', 'Wrong colour', ?, 'needs_reilly', ?, 't', 't', ?, ?, ?)`)
+    .bind(id, `g${id}`, `th${id}`, `<m${id}@x>`, body, category, aid, mismatch, orderRef).run();
+  return aid;
+}
+
+test("cs starter drafts: a flagged email gets a checked starting reply in Gmail and the card says so; nothing sent, unsafe text and closed flags skipped", async () => {
+  const env = await setup({ CS_DRAFTS_LIVE: "1" });
+  await connect(env, "google", "reillyworking26@gmail.com", "rt-main");
+  const replies = {
+    "ordered red": { body: "Hi Jane, thanks for letting us know the blazers arrived in wine red rather than red. Could you reply with your order number and a photo of the item? The team is looking into it and will follow up shortly. Holt & Crane Customer Care" },
+    "money back": { body: "Hi Jane, we'll refund you right away. Holt & Crane Customer Care" },
+    "thankyou": { no_reply: true },
+  };
+  const w = world({ reply: (u) => { for (const [k, v] of Object.entries(replies)) if (u.toLowerCase().includes(k)) return v; return { body: "" }; } });
+  const a1 = await flagged(env, { id: 1, body: "I ordered red blazers but they came wine red." });
+  await flagged(env, { id: 2, body: "I want my money back." });
+  await flagged(env, { id: 3, body: "Thankyou", category: "other" });
+  await flagged(env, { id: 4, body: "I ordered red too", approvalStatus: "approved" }); // flag already handled
+  const out = await writeStarterDrafts(env, { nowMs: NOW, fetchImpl: w.fetchImpl, budget: new Budget(28) });
+  // Two AI starters per run (newest first: 3, 2), then the next run picks up 1.
+  const out2 = await writeStarterDrafts(env, { nowMs: NOW + MIN, fetchImpl: w.fetchImpl, budget: new Budget(28) });
+  assert.equal(out.no_reply + out2.no_reply, 1);
+  assert.equal(out.failed + out2.failed, 1);
+  assert.equal(out.gmail + out2.gmail, 1);
+  const ts = await tickets(env.DB);
+  assert.equal(ts[0].draft_status, "gmail_draft");
+  assert.ok(ts[0].gmail_draft_id);
+  assert.equal(ts[1].draft_status, "starter_skipped"); // failed the money check: no draft made
+  assert.equal(ts[1].gmail_draft_id, null);
+  assert.equal(ts[2].draft_status, "starter_skipped"); // a thank-you needs no reply
+  assert.equal(ts[3].draft_status, null); // closed flag untouched
+  assert.equal(w.drafts.size, 1);
+  assert.ok(!w.calls.some((c) => /\/send\b|messages\/send/.test(c.url)), "nothing is ever sent");
+  const card = await env.DB.prepare(`SELECT options FROM approvals WHERE id = ?`).bind(a1).first();
+  assert.ok(card.options.includes(NEW_CARD_TAIL));
+  // A third run does nothing new: one draft per conversation.
+  const out3 = await writeStarterDrafts(env, { nowMs: NOW + 2 * MIN, fetchImpl: w.fetchImpl, budget: new Budget(28) });
+  assert.equal(out3.gmail, 0);
+  assert.equal(w.drafts.size, 1);
+});
+
+test("cs starter drafts: off unless CS_DRAFTS_LIVE is on", async () => {
+  const env = await setup({ CS_DRAFTS_LIVE: "0" });
+  const w = world({ reply: () => ({ body: "x" }) });
+  await flagged(env, { id: 1, body: "hello" });
+  const out = await writeStarterDrafts(env, { nowMs: NOW, fetchImpl: w.fetchImpl, budget: new Budget(28) });
+  assert.ok(out.skipped);
+  assert.equal(w.calls.length, 0);
+});
+
+test("cs starter drafts: no starter when Reilly already replied in the thread, and an unusable AI answer is not retried every run", async () => {
+  const env = await setup({ CS_DRAFTS_LIVE: "1" });
+  await connect(env, "google", "reillyworking26@gmail.com", "rt-main");
+  let aiCalls = 0;
+  const w = world({
+    boxes: { "at-main": { messages: [], threads: { th1: [{ id: "s1", labelIds: ["SENT"], internalDate: String(NOW - 5 * MIN) }] } } },
+    reply: () => { aiCalls++; return "not json at all"; },
+  });
+  await flagged(env, { id: 1, body: "I ordered red blazers." });
+  await env.DB.prepare(`UPDATE cs_tickets SET received_at = ? WHERE id = 1`).bind(new Date(NOW - 60 * MIN).toISOString()).run();
+  await flagged(env, { id: 2, body: "Where is my parcel" });
+  await writeStarterDrafts(env, { nowMs: NOW, fetchImpl: w.fetchImpl, budget: new Budget(28) });
+  await writeStarterDrafts(env, { nowMs: NOW + MIN, fetchImpl: w.fetchImpl, budget: new Budget(28) });
+  const ts = await tickets(env.DB);
+  assert.equal(ts[0].draft_status, "starter_skipped");
+  assert.match(ts[0].draft_note, /already replied/);
+  assert.equal(ts[1].draft_status, "starter_skipped");
+  assert.match(ts[1].draft_note, /AI answer unusable/);
+  assert.equal(aiCalls, 1); // once, not every run
+  assert.equal(w.drafts.size, 0);
+});

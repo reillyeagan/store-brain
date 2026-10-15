@@ -113,6 +113,9 @@ export const SEED_DECISIONS = Object.freeze([
   // Wired: pnl.sheets runs once a day from 07:00 New York and fills yesterday (sheets.js runSheetsMorning).
   { at: "2026-10-14T23:03:00Z", topic: "pnl.sheets_schedule", scope: "all", source: "chat 2026-10-14",
     words: "P&L sheets only have to update once per day, in the monring, it should fill in yesterdays P&L. does not need to be hourly for the google sheets" },
+  // Wired: cs/starterDrafts.js — flagged emails also get a starting reply in Gmail (decision stays his).
+  { at: "2026-10-15T12:25:00Z", topic: "cs.starter_drafts", scope: "all", source: "chat 2026-10-15 — looking at Waiting on you (Escalation Desk cards)",
+    words: "i thought the brain was supposed to draft replies for me, not just tell me" },
 ]);
 
 /** Latest (unsuperseded) decision on a topic, or null. */
