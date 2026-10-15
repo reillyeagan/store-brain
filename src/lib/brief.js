@@ -46,7 +46,7 @@ export const BRIEF_AFTER_MIN = 8 * 60; // 08:00 Eastern
 export const DEFAULT_BRIEF_MODEL = "claude-sonnet-5-5";
 export const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
 export const ANTHROPIC_VERSION = "2023-06-01";
-export const BRIEF_MAX_TOKENS = 1500; // ~250 words of brief plus headroom; keeps the cost to cents
+export const BRIEF_MAX_TOKENS = 900; // ~120 words of brief plus headroom; keeps the cost to cents
 export const BRIEF_LINK_TTL_MS = 48 * 3600 * 1000; // money on the page: shorter than the 7-day approval links
 /** A 'composing' row older than this is a run that died part-way: the next run may reclaim it. */
 export const BRIEF_RECLAIM_MIN = 30;
@@ -408,9 +408,16 @@ Hard rules:
 9. A figure that appears inside a text field (an approval title, a risk "what") may be quoted only from the number field next to it: amounts_in_title, dispute.amount, changes[].before / after / change, payout_check. Never work out a difference, total, average or per-store split yourself; use the computed field (e.g. changes[].change, pending_refunds.by_store). If DATA has no field for a figure, describe it in words without the number.
 10. If waiting.kfb_import.done_today is false, the first line of Waiting on you is "KFB import not done today" (log in to KungFuBuy, click the bookmark).
 
-Format: plain markdown subset only: "## " headings, "- " bullets, **bold**. No tables, no links, no HTML.
-Sections in this order: Yesterday's money (per store + group, then month to date) · Waiting on you · Orders · Risk (omit if empty) · Media · Feeds.
-Keep it under about 250 words.`;
+Format (Reilly 2026-10-15: "wayyy too much text everywhere ... organize it all better"): a phone-sized scan, not prose.
+- Plain markdown subset only: "## " headings, "- " bullets, **bold**. No tables, links, HTML or paragraphs.
+- Sections, in order, each only if it has something: "## Yesterday" · "## Month to date" · "## To do" · "## Watch".
+- Yesterday: one bullet per store with sales, then one for the group, in this shape: "- **Holt & Crane** $453.70 · 5 orders · profit −$2.04 · ROAS 1.73 (break-even 1.81)". A store with no orders and no spend: "- **Auberlane** no orders, no spend".
+- Month to date: one bullet for the group in the same shape, plus one short bullet only if a store is clearly carrying or dragging it.
+- To do: at most 4 bullets, the most urgent first, each a few words saying what Reilly does ("Submit #1098 chargeback evidence (due 2026-10-16)"). Then, if there are more, a last bullet "+N more in What needs you".
+- Watch: at most 3 bullets, each under 12 words: risks, feed problems, restated days, media vs break-even.
+- Each caveat ONCE, as the last line, in italics: e.g. "_COGS are estimates until KFB costs land._" Never repeat it per store.
+- Under 120 words in total. Fragments, not sentences. No filler ("Overall", "It's worth noting").`;
+
 
 export function buildPrompt(data) {
   return { system: SYSTEM_PROMPT, user: `DATA (computed by code; the only numbers you may use):\n${JSON.stringify(data)}` };
@@ -671,7 +678,8 @@ export async function runBrief(env, { nowMs = Date.now(), fetchImpl = fetch, rew
       body = `> Plain brief, built by code: the AI version is unavailable (${aiError}).\n\n${plain}`;
       await logEvent(db, { actor: ACTOR, kind: "brief.ai_failed", target: "sys.claude", summary: `Morning brief ${day}: using the plain brief (${aiError})`, at });
     } else if (unverified.length) {
-      body = `> **Unverified numbers:** ${unverified.join(", ")}. These are not among the figures the brain computed; treat them as unverified.\n\n${body}`;
+      // Said once, at the end, not as a banner over the whole brief (still said: rule 5).
+      body = `${body}\n\n_Not found in the brain's numbers, so unchecked: ${unverified.join(", ")}._`;
     }
 
     await db.prepare(

@@ -395,13 +395,13 @@ test("brief: no API key → plain brief, Claude is never called", async () => {
   assert.equal(calls.length, 0);
 });
 
-test("brief: numbers the data doesn't contain are flagged at the top", async () => {
+test("brief: numbers the data doesn't contain are flagged (once, at the end)", async () => {
   const DB = makeD1();
   const { fetchImpl } = fakeApis({ text: "## Yesterday's money\n- H&C profit $9,999.00 (great!)" });
   const r = await runBrief(briefEnv(DB), { nowMs: Date.parse("2026-10-12T12:05:00Z"), fetchImpl });
   assert.deepEqual(r.unverified, ["$9,999.00"]);
   assert.equal(r.checked, false);
-  assert.match(r.body, /^> \*\*Unverified numbers:\*\* \$9,999\.00\./);
+  assert.match(r.body, /_Not found in the brain.s numbers, so unchecked: \$9,999\.00\._$/);
   const stored = await DB.prepare(`SELECT checked, unverified FROM briefs WHERE id = ?`).bind(r.id).first();
   assert.equal(stored.checked, 0);
   assert.deepEqual(unverifiedNumbers("ROAS 2.35 vs 1.8, margin 67%, 3 orders, $1,234", { a: 2.351, b: 1.8, m: 0.67, r: 1234 }), []);
