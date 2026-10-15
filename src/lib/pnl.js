@@ -252,10 +252,18 @@ export async function sheetDay(db, storeId, day, { nowMs = Date.now(), revenue =
   else if (Number(row.orders) !== orders || Math.abs(Number(row.revenue) - revenue) > Math.max(SHEET_DAY_MATCH_USD, 0.01 * revenue)) {
     block = `the sheet's day doesn't match the brain's (orders ${row.orders} vs ${orders}, revenue $${Number(row.revenue).toFixed(2)} vs $${Number(revenue).toFixed(2)})`;
   }
-  out.why.cog = block || (row.cog_ok ? null : row.cog_why || "not usable");
-  out.why.fee = block || (row.fee_ok ? null : row.fee_why || "not usable");
-  out.use.cog = !block && !!row.cog_ok && row.cog_eur != null && Number(row.fx_rate) > 0;
-  out.use.fee = !block && !!row.fee_ok && row.fee != null;
+  // A cell the BRAIN wrote (and nobody changed) is the brain's own number, often an estimate:
+  // never read back as the sheet's (rule 9; the COG estimate would otherwise come back as an
+  // exact KFB ledger figure and never be corrected).
+  const { results: own } = await db.prepare(`SELECT field, value FROM sheet_writes WHERE store = ? AND day = ? AND status = 'verified' ORDER BY id DESC`).bind(storeId, day).all().catch(() => ({ results: [] }));
+  const ownBy = new Map();
+  for (const w of own || []) if (!ownBy.has(w.field)) ownBy.set(w.field, Number(w.value));
+  const brainWrote = (field, v) => ownBy.has(field) && v != null && Math.abs(Number(v) - ownBy.get(field)) < 0.005;
+  const cogOwn = brainWrote("cog_eur", row.cog_eur), feeOwn = brainWrote("fee", row.fee);
+  out.why.cog = block || (cogOwn ? "the brain wrote this cell itself" : row.cog_ok ? null : row.cog_why || "not usable");
+  out.why.fee = block || (feeOwn ? "the brain wrote this cell itself" : row.fee_ok ? null : row.fee_why || "not usable");
+  out.use.cog = !block && !cogOwn && !!row.cog_ok && row.cog_eur != null && Number(row.fx_rate) > 0;
+  out.use.fee = !block && !feeOwn && !!row.fee_ok && row.fee != null;
   return out;
 }
 

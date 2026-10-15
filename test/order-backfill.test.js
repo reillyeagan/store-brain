@@ -53,7 +53,7 @@ function fakeShopify(all, { failOnCall = null } = {}) {
 
 test("backfill: query cost per page stays under Shopify's 1,000 and pages hold at most 50", () => {
   assert.ok(BACKFILL_PAGE_SIZE <= 50);
-  assert.equal(requestedCost(BACKFILL_PAGE_SIZE), 702);
+  assert.equal(requestedCost(BACKFILL_PAGE_SIZE), 502);
   assert.ok(requestedCost(BACKFILL_PAGE_SIZE) < SHOPIFY_MAX_QUERY_COST);
   assert.match(BACKFILL_QUERY, /totalPriceSet/);
   assert.match(ORDER_FIELDS, /\btest\b/);

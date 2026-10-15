@@ -595,9 +595,9 @@ test("cs backlog: 65 new emails over several pages are all read exactly once, ol
   const w = world({ boxes: { "at-main": { messages: msgs } }, pageCap: 25 });
   let t = NOW;
   await runCs(env, { nowMs: t, fetchImpl: w.fetchImpl });
-  // First run read the 6 OLDEST; the cursor hasn't moved past anything unread.
+  // First run read the 8 OLDEST; the cursor hasn't moved past anything unread.
   const first = (await tickets(env.DB)).map((x) => x.gmail_id);
-  assert.deepEqual(first, ["x00", "x01", "x02", "x03", "x04", "x05"]);
+  assert.deepEqual(first, ["x00", "x01", "x02", "x03", "x04", "x05", "x06", "x07"]);
   const inbox = await env.DB.prepare(`SELECT cursor_ms FROM cs_inboxes WHERE slot = 'google'`).first();
   assert.ok(inbox.cursor_ms <= NOW - 70 * MIN);
   // The list followed nextPageToken (25 per page here).
@@ -1297,4 +1297,61 @@ test("cs starter drafts: no starter when Reilly already replied in the thread, a
   assert.match(ts[1].draft_note, /AI answer unusable/);
   assert.equal(aiCalls, 1); // once, not every run
   assert.equal(w.drafts.size, 0);
+});
+
+test("cs screening (live 2026-10-15): a contact form from 'MS (Shopify)' is Marlowe's; a reply to a store's mail at Reilly's own address is that store's, even H&C's; personal mail still isn't", () => {
+  const main = { slot: "google", stores: ["aub", "mar"], own: false };
+  const H = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k.toLowerCase(), v]));
+  const cf = screenMail({ headers: H({ From: "MS (Shopify) <mailer@shopify.com>", "Reply-To": "Jules Sanders <jules@x.com>", To: "reillyworking26@gmail.com", Subject: "New customer message on October 15, 2026 at 7:41 am" }), body: "You received a new message from your online store's contact form. Body: What is the material blend?" }, main);
+  assert.deepEqual([cf.keep, cf.store, cf.via], [true, "mar", "contact_form"]);
+  const quoted = "Hello. We have to return the sweater...\n\nFrom: H&C <requests+holtandcrane.com@judge.me>\nSent: Tuesday\nSubject: Mary, what did you think";
+  const mary = screenMail({ headers: H({ From: "Mary Peretti <maryp520@msn.com>", To: "reillyworking26@gmail.com", Subject: "Re: ⭐️ Mary, what did you think about Men's Knit Cardigan" }), body: "Hello. We have to return the sweater...", fullBody: quoted }, main);
+  assert.deepEqual([mary.keep, mary.store], [true, "hc"]);
+  const pal = screenMail({ headers: H({ From: "Pal <pal@gmail.com>", To: "reillyworking26@gmail.com", Subject: "lunch?" }), body: "lunch tomorrow?", fullBody: "lunch tomorrow?" }, main);
+  assert.equal(pal.keep, false);
+  // Two stores quoted: can't tell, not kept.
+  const two = screenMail({ headers: H({ From: "X <x@y.com>", To: "reillyworking26@gmail.com", Subject: "Re: hi" }), body: "hi", fullBody: "From: Auberlane <info@auberlane.com>\nFrom: H&C <info@holtandcrane.com>" }, main);
+  assert.equal(two.keep, false);
+});
+
+test("cs: drafts are signed with just the store name (Reilly 2026-10-15)", async () => {
+  const { signOff } = await import("../src/agents/cs/replyWriter.js");
+  assert.equal(signOff("Hi Jonas,\n\nThanks.\n\nHolt & Crane Customer Care"), "Hi Jonas,\n\nThanks.\n\nHolt & Crane");
+  assert.equal(signOff("Hi,\n\nAuberlane"), "Hi,\n\nAuberlane");
+  const { inboxQuery } = await import("../src/agents/cs/gmail.js");
+  const q = inboxQuery(NOW, ["auberlane.com"], null, ["Holt & Crane", "holtandcrane.com"]);
+  assert.match(q, /"Holt & Crane"/);
+  assert.match(q, /"holtandcrane\.com"/);
+});
+
+test("cs (live 2026-10-15): a 'nothing there' / 'shows delivered' email is a missing parcel for Reilly; a draft never names Reilly; delivered-or-not comes only from the carrier", async () => {
+  const ctx = { name: "#1118", shipped: true, shipments: [{ tracking_number: "UL546222736YP", shopify_status: "IN_TRANSIT", delivered_at: null }] };
+  assert.equal(routeTicket({ category: "where_is_order", body: "Hi i checked all locations and there was nothing there" }, {}, ctx).action, "escalate");
+  assert.equal(routeTicket({ category: "where_is_order", body: "Where is my order? It hasn't arrived." }, {}, ctx).action, "draft");
+  assert.equal(routeTicket({ category: "where_is_order", body: "where is it" }, {}, { ...ctx, shipments: [{ ...ctx.shipments[0], carrier_delivered: true }] }).action, "escalate");
+  assert.ok(checkDraft("Hi Shaun, Reilly will review where things stand. Holt & Crane", { ctx }).some((p) => /Reilly/.test(p)));
+  const { userPrompt } = await import("../src/agents/cs/replyWriter.js");
+  const u = userPrompt({ category: "where_is_order", body: "where", subject: "x" }, { ...ctx, created_at: "t" }, null);
+  assert.match(u, /carrier tracking not read: never say delivered or not delivered/);
+  assert.doesNotMatch(u, /IN_TRANSIT/, "Shopify's lagging status is not given to the writer");
+});
+
+test("cs (review 2026-10-15): business mail quoting a store address isn't a customer; old carrier states don't count; the look-back runs once, after a finished read", async () => {
+  const { storeFromQuoted } = await import("../src/agents/cs/filters.js");
+  assert.equal(storeFromQuoted("Hi Reilly, please contact support@auberlane.com for the invoice.\nOn Mon, Guy <guy@x.com> wrote:"), null);
+  assert.equal(storeFromQuoted("On Mon, John Williams <j@x.com> wrote:"), null, "'ms' inside a name is not Marlowe");
+  const { ledgerContext } = await import("../src/agents/cs/orderContext.js");
+  const DB = makeD1();
+  await addOrder(DB, { store: "hc", id: "gid://shopify/Order/9", name: "#1118" });
+  await DB.prepare(`INSERT INTO shipments (store, order_id, tracking_number, state, polled_at, updated_at) VALUES ('hc', 'gid://shopify/Order/9', 'UL1', 'in_transit', ?, 't')`).bind(new Date(Date.now() - 3 * 86400000).toISOString()).run();
+  const order = await DB.prepare(`SELECT * FROM orders WHERE order_id = 'gid://shopify/Order/9'`).first();
+  assert.equal((await ledgerContext(DB, order)).shipments[0].carrier_delivered, null, "a 3-day-old carrier state says nothing");
+  const { LOOKBACK_DONE } = await import("../src/agents/cs/triage.js");
+  const env = await setup();
+  await connect(env, "google", "reillyworking26@gmail.com", "rt-main");
+  const w = world({ boxes: { "at-main": { messages: [] } } });
+  await runCs(env, { nowMs: NOW, fetchImpl: w.fetchImpl }); // first read: no look-back needed
+  assert.equal(await env.DB.prepare(`SELECT value FROM agent_cursors WHERE name = ?`).bind(LOOKBACK_DONE).first(), null);
+  await runCs(env, { nowMs: NOW + 20 * MIN, fetchImpl: w.fetchImpl });
+  assert.ok(await env.DB.prepare(`SELECT value FROM agent_cursors WHERE name = ?`).bind(LOOKBACK_DONE).first());
 });

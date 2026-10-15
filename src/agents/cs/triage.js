@@ -58,6 +58,30 @@ export async function readInboxes(env, { nowMs = Date.now(), fetchImpl = fetch, 
   return out;
 }
 
+/**
+ * ONE-OFF (2026-10-15): the main inbox missed customer mail sent to Reilly's own address (a
+ * Marlowe contact form from "MS (Shopify)", a reply to an H&C Judge.me request). Once the wider
+ * search and filter are live, the last LOOKBACK_DAYS are read again: what was screened out as
+ * "not addressed to a store" is screened again, and the cursor steps back so mail the old search
+ * never listed is listed. Claimed once (agent_cursors), so it never repeats. Duplicates can't
+ * happen: a ticket is unique per message.
+ */
+export const LOOKBACK_DONE = "cs.lookback_2026_10_15";
+export const LOOKBACK_DAYS = 1;
+// Marked done only after a read that finished and saved its cursor (markLookBackDone below), so
+// a run that fails half-way simply does the look-back again next time (the delete is idempotent).
+async function lookBackOnce(db, slot, cursor, nowMs) {
+  const done = await db.prepare(`SELECT value FROM agent_cursors WHERE name = ?`).bind(LOOKBACK_DONE).first();
+  if (done) return cursor;
+  const from = nowMs - LOOKBACK_DAYS * 86400000;
+  await db.prepare(`DELETE FROM cs_mail_seen WHERE slot = ? AND outcome = 'ignored:not addressed to a store' AND internal_ms >= ?`).bind(slot, from).run();
+  return Math.min(cursor, from);
+}
+async function markLookBackDone(db, nowMs) {
+  const r = await db.prepare(`INSERT INTO agent_cursors (name, value, updated_at) VALUES (?, 1, ?) ON CONFLICT(name) DO NOTHING`).bind(LOOKBACK_DONE, nowIso(nowMs)).run();
+  if (r.meta && r.meta.changes === 1) await logEvent(db, { actor: ACTOR, kind: "cs.lookback", target: "sys.gmail", at: nowIso(nowMs), summary: `Main inbox: re-read the last ${LOOKBACK_DAYS} days with the wider search (customer mail sent to Reilly's own address). Once only.` });
+}
+
 async function readOneInbox(env, inbox, account, { nowMs, fetchImpl, budget }) {
   const db = env.DB;
   const at = nowIso(nowMs);
@@ -80,14 +104,17 @@ async function readOneInbox(env, inbox, account, { nowMs, fetchImpl, budget }) {
   }
   const row = await db.prepare(`SELECT * FROM cs_inboxes WHERE slot = ?`).bind(inbox.slot).first();
   const firstRead = !row || row.cursor_ms == null;
-  const cursor = firstRead ? nowMs - FIRST_READ_DAYS * 86400000 : Number(row.cursor_ms);
+  let cursor = firstRead ? nowMs - FIRST_READ_DAYS * 86400000 : Number(row.cursor_ms);
+  if (!inbox.own && !firstRead) cursor = await lookBackOnce(db, inbox.slot, cursor, nowMs);
   // Main inbox: only mail sent to the store domains it serves (+ Shopify contact forms).
   const domains = inbox.own ? null : inbox.stores.map((s) => STORE_MAIL_DOMAINS[s]).filter(Boolean);
   // One list page was reserved above; more pages only while the run's allowance lasts.
   const maxPages = Math.max(1, Math.min(CAPS.listMaxPages, budget.left + 1));
   // Working back through a backlog bigger than one listing: only mail older than scan_before.
   const scanBefore = row && row.scan_before_ms != null ? Number(row.scan_before_ms) : null;
-  const listing = await listIds(token, { q: inboxQuery(cursor, domains, scanBefore), perPage: CAPS.listPage, maxPages, fetchImpl });
+  // Every live store's name and domain (not just this inbox's): replies to any store's mail land here.
+  const names = inbox.own ? null : LIVE_STORE_IDS.flatMap((s) => [storeName(s), STORE_MAIL_DOMAINS[s]]).filter(Boolean);
+  const listing = await listIds(token, { q: inboxQuery(cursor, domains, scanBefore, names), perPage: CAPS.listPage, maxPages, fetchImpl });
   budget.spend(listing.pages - 1);
   if (!listing.complete) {
     // Gmail lists newest first only. Mail older than what was listed is still unread: the
@@ -161,6 +188,7 @@ async function readOneInbox(env, inbox, account, { nowMs, fetchImpl, budget }) {
     account, cursor_ms: newCursor, scan_before_ms: newScan, last_read_at: at, last_ok_at: at, last_error: null,
     read_count: Number((row && row.read_count) || 0) + read,
   });
+  if (!inbox.own && !firstRead) await markLookBackDone(db, nowMs);
   const waiting = fresh.length - read - givenUp;
   if (read) {
     await logEvent(db, {
@@ -175,8 +203,9 @@ async function readOneInbox(env, inbox, account, { nowMs, fetchImpl, budget }) {
 /** Screen one message and store it as a ticket (or as seen-and-ignored). */
 async function storeMessage(db, inbox, account, msg, at) {
   const headers = headerMap(msg);
-  const body = stripQuoted(bodyText(msg));
-  const screen = screenMail({ headers, labelIds: msg.labelIds || [], body }, inbox, account);
+  const fullBody = bodyText(msg);
+  const body = stripQuoted(fullBody);
+  const screen = screenMail({ headers, labelIds: msg.labelIds || [], body, fullBody }, inbox, account);
   const internal = Number(msg.internalDate) || null;
   const seen = (outcome) => db.prepare(`INSERT OR IGNORE INTO cs_mail_seen (slot, gmail_id, seen_at, outcome, internal_ms) VALUES (?, ?, ?, ?, ?)`).bind(inbox.slot, msg.id, at, outcome, internal).run();
   if (!screen.keep) { await seen(`ignored:${screen.reason}`); return "ignored"; }

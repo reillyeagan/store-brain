@@ -17,6 +17,17 @@ export const STORE_MAIL_DOMAINS = Object.freeze({
   mar: "marlowestandard.com",
 });
 
+/**
+ * Other names a store goes by in mail. Shopify's contact-form mail comes from "<name> (Shopify)"
+ * where <name> is the shop's own short name (Marlowe's is "MS", live 2026-10-15), and customers
+ * reply to mail signed "Holt & Crane", "H&C" and so on.
+ */
+export const STORE_ALIASES = Object.freeze({
+  hc: ["Holt & Crane", "Holt and Crane", "H&C", "HC"],
+  aub: ["Auberlane", "AUB"],
+  mar: ["Marlowe Standard", "Marlowe", "MS"],
+});
+
 /** The fixed set of ticket categories. Anything the AI answers outside it becomes "other". */
 export const CATEGORIES = Object.freeze([
   "where_is_order", "size_question", "size_complaint", "exchange", "address_change",
@@ -41,7 +52,7 @@ export const RETENTION_CATEGORIES = Object.freeze(["cancel", "return_refund"]);
 /** Per-run caps. The Worker has subrequest/CPU limits; work is spread across runs. */
 export const CAPS = Object.freeze({
   subrequests: 28,           // every Gmail / Shopify / Claude call in one run counts against this
-  readPerInbox: 6,           // Gmail messages fetched per inbox per run
+  readPerInbox: 8,           // Gmail messages fetched per inbox per run (the main inbox search is wider since 2026-10-15)
   listPage: 500,             // ids per Gmail list page (Gmail's maximum)
   listMaxPages: 5,           // list pages followed per inbox per run (nextPageToken)
   classifyPerTick: 5,        // AI classifications per run

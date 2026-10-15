@@ -22,7 +22,7 @@ import { routeTicket, checkDraft } from "./routing.js";
 import { emailAsksAboutSize } from "./sizeUpGate.js";
 import { threadWaitingOnReilly, staleGmailDraft } from "./escalation.js";
 import { otherLiveDraft } from "./gmailDrafts.js";
-import { createReplyDraft, getDraft } from "./gmail.js";
+import { createReplyDraft, getDraft, getThread } from "./gmail.js";
 import { safeJson, clip, logOnce } from "./util.js";
 import { modeFor } from "../../config/live.js";
 
@@ -64,7 +64,7 @@ export async function sizeChartFor(db, ctx) {
 
 function system(store, policy) {
   return `You write customer-service email replies for ${store}, a small online clothing store. Reilly reviews and sends every reply himself.
-Voice: warm, short, plain English, no corporate filler. 3-8 sentences. Greet the customer by first name if known. Sign off exactly: "${store} Customer Care".
+Voice: warm, short, plain English, no corporate filler. 3-8 sentences. Greet the customer by first name if known. Sign off with just the store name on its own line, exactly: "${store}" (Reilly 2026-10-15: not "Customer Care").
 Hard rules:
 - Use ONLY the order facts given. Never invent order numbers, tracking numbers, dates, measurements or policies.
 - Never promise a refund, a reship, a replacement, or a delivery date.
@@ -73,12 +73,26 @@ Hard rules:
 - Express shipping can be described as the faster option, never with a guaranteed date.
 - Delivery timing you may use: ${DELIVERY_FACTS.join(" ")}
 - If a tracking number and link are given, include them. If no order was found, ask politely for the order number.
+- Say a parcel is delivered or not delivered ONLY from carrier_says_delivered; when it is unknown, give the tracking link and don't say either.
+- Write as the store ("we"). Never mention Reilly or any person by name.
 - For size questions use only the size chart given; if there is none, say you'll check the measurements and get back to them (no date).
 - Never mention that a bigger or different factory size may be sent, or that factory sizes run small, unless the customer's email asks about size or fit.
 - For address / colour / size changes before shipping: say you've passed the request on and will confirm once it's updated (no promise it will be possible).
 - If the email needs a decision only the owner can make (money back, a replacement, a complaint, a threat), set needs_reilly true and write no body.
 ${policy ? `Store policy (from the playbook):\n${policy}` : ""}
 Return {"body":"the full reply text","needs_reilly":false,"reason":null}`;
+}
+
+/** Signed with just the store name (Reilly 2026-10-15: "it should say just "Holt & Crane" at the end, not cusotmer care"). */
+export function signOff(body) {
+  const lines = String(body || "").trim().split(/\r?\n/);
+  const care = /^(?:customer\s+(?:care|service|support)(?:\s+team)?|the\s+team|team)$/i;
+  // "Customer Care" alone on the last line (under the store name): dropped.
+  while (lines.length > 1 && care.test(lines[lines.length - 1].trim())) lines.pop();
+  // "Holt & Crane Customer Care" / "The Holt & Crane Team" → "Holt & Crane".
+  const last = lines[lines.length - 1];
+  lines[lines.length - 1] = last.replace(/^\s*the\s+team\s+at\s+(.+?)\s*$/i, "$1").replace(/^\s*the\s+(.+?)\s+team\s*$/i, "$1").replace(/[ \t]+(?:customer\s+(?:care|service|support)(?:\s+team)?)[ \t]*$/i, "");
+  return lines.join("\n").trim();
 }
 
 export function userPrompt(t, ctx, chart) {
@@ -88,7 +102,10 @@ export function userPrompt(t, ctx, chart) {
     shipped: ctx.status_stale ? `not current (order data is ${ctx.age_hours ?? "?"} hours old)` : ctx.shipped == null ? "unknown" : ctx.shipped,
     express: ctx.express == null ? "unknown" : ctx.express, shipping_method: ctx.shipping_method,
     items: (ctx.items || []).map((i) => `${i.qty || 1} × ${i.title}${i.variant ? ` (${i.variant})` : ""}`),
-    tracking: (ctx.shipments || []).map((s) => ({ number: s.tracking_number, link: s.tracking_url, carrier: s.carrier, shopify_status: ctx.status_stale ? "not current" : s.shopify_status, delivered: ctx.status_stale ? "not current" : !!s.delivered_at })),
+    // Delivered or not comes ONLY from the carrier's own tracking; Shopify's status lags.
+    tracking: (ctx.shipments || []).map((s) => ({ number: s.tracking_number, link: s.tracking_url, carrier: s.carrier,
+      carrier_says_delivered: s.carrier_delivered == null ? "unknown (carrier tracking not read: never say delivered or not delivered)" : s.carrier_delivered,
+      carrier_last_event: s.carrier_last_event || null })),
     data_as_of: ctx.as_of,
   } : null;
   return [
@@ -129,6 +146,18 @@ export async function writeReplies(env, { nowMs = Date.now(), fetchImpl = fetch,
     if (routeTicket(t, triage, ctx).action !== "draft") continue; // cs.escalation takes it
     if (await threadWaitingOnReilly(db, t)) continue; // the conversation is with Reilly; escalation joins it
     if (await staleGmailDraft(env, t, { fetchImpl, nowMs, budget })) continue; // an older draft is still in Gmail; escalation tells Reilly to delete it
+    // Mail more than 2 h old may already have Reilly's own answer (re-read mail, a slow run): the
+    // thread is read first, and a conversation he already answered gets no draft.
+    const ageMs = nowMs - (Date.parse(t.received_at || t.opened_at) || nowMs);
+    if (ageMs > 2 * 3600000 && t.thread_id) {
+      if (!budget.take(2)) break;
+      const answered = await reillyAnswered(env, t, { fetchImpl, nowMs }).catch(() => null);
+      if (answered == null) continue; // a failed read proves nothing (rule 6): next run
+      if (answered) {
+        await db.prepare(`UPDATE cs_tickets SET replied_at = ?, status = 'replied', updated_at = ? WHERE id = ? AND status = 'open'`).bind(new Date(answered).toISOString(), nowIso(nowMs), t.id).run();
+        continue;
+      }
+    }
     if (!budget.take(1)) break;
     const at = nowIso(nowMs);
     const store = storeName(t.order_store || t.store) || "our store";
@@ -155,7 +184,7 @@ export async function writeReplies(env, { nowMs = Date.now(), fetchImpl = fetch,
       await logEvent(db, { actor: ACTOR, kind: "cs.draft_needs_reilly", store: t.store, target: "cs.escalation", at, summary: `Ticket ${t.id}: no reply drafted, needs Reilly (${clip(j.reason || "no reason given", 120)})`, data: { ticket: t.id } });
       continue;
     }
-    const body = typeof j.body === "string" ? j.body.trim() : "";
+    const body = signOff(typeof j.body === "string" ? j.body.trim() : "");
     const problems = checkDraft(body, { ctx, orderRef: t.order_ref, sizeAsked });
     if (problems.length) {
       blocked++;
@@ -174,6 +203,15 @@ export async function writeReplies(env, { nowMs = Date.now(), fetchImpl = fetch,
     await logEvent(db, { actor: ACTOR, kind: "cs.draft_written", store: t.store, target: draftsLive(env) ? "sys.gmail" : undefined, at, summary: `Reply drafted for ${store} (${String(t.category).replace(/_/g, " ")}${ctx ? `, ${ctx.name}` : ""}): ${where}. Nothing sent.`, data: { ticket: t.id } });
   }
   return { drafted, blocked, toReilly, gmailDrafts: gmail, waiting };
+}
+
+/** When Reilly's own reply in the thread was sent (ms) after the customer's email, false if none. */
+async function reillyAnswered(env, t, { fetchImpl, nowMs }) {
+  const token = await getGoogleAccessToken(env, { fetchImpl, nowMs, slot: t.slot });
+  const thread = await getThread(token, t.thread_id, { fetchImpl });
+  const customerMs = Date.parse(t.received_at || t.opened_at) || 0;
+  const sent = (thread.messages || []).filter((m) => (m.labelIds || []).includes("SENT") && Number(m.internalDate) > customerMs).map((m) => Number(m.internalDate));
+  return sent.length ? Math.min(...sent) : false;
 }
 
 /**

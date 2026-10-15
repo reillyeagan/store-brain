@@ -39,6 +39,7 @@ import {
 } from "../../lib/sheets.js";
 import { backup } from "../../lib/backupVault.js";
 import { logEvent } from "../../lib/eventlog.js";
+import { logOnce } from "../cs/util.js";
 import { claimJob } from "../../lib/jobRuns.js";
 import { localDay, nowIso } from "../../lib/time.js";
 import { minusDays } from "../../lib/adsSpend.js";
@@ -67,6 +68,14 @@ export const MORNING_FROM_HOUR = 7;
 export const MORNING_RETRY_UNTIL_HOUR = 12;
 /** How many days back the brain re-checks the cells it wrote (Google restates recent days). */
 export const CORRECT_DAYS = 3;
+/** Reilly 2026-10-15 (pnl.sheet_revenue): revenue = everything the customer paid, from the row of the decision day's eve on. */
+export const REVENUE_ALL_PAID_FROM = "2026-10-14";
+/** COG estimates are swapped for the actual KFB total when it lands, which can take weeks. */
+export const COG_CORRECT_DAYS = 45;
+/** A COG estimate is only written for a day this recent, so it has weeks to be corrected. */
+export const COG_ESTIMATE_MAX_AGE_DAYS = 30;
+/** From this age a COG cell still on an estimate is reported to Reilly (before corrections stop). */
+export const COG_ESTIMATE_WARN_DAYS = 38;
 /** Write planning per workbook per run (D1 work stays bounded; the rest next run). */
 export const PLAN_DAYS_PER_RUN = 10;
 export const PLAN_CELLS_PER_RUN = 40;
@@ -364,12 +373,9 @@ export async function crossCheck(db, { nowMs = Date.now() } = {}) {
       }
       if (!r.p_complete) continue; // only days the brain has closed
       const notes = safeJson(r.p_notes, {}) || {};
-      // On the sheet's own definition (no shipping, no tax) when the orders show it, so an express
-      // order isn't reported as a mismatch (and the brain's own writes never are).
       const tol = (x) => Math.max(1, 0.01 * x);
-      const plainOff = r.revenue != null && r.p_revenue != null && Math.abs(Number(r.revenue) - Number(r.p_revenue)) > tol(Number(r.p_revenue));
-      // Only a disagreeing day costs the extra look (bounded D1 work per run).
-      const pRev = plainOff ? await comparableRevenue(db, id, r.day, r.p_revenue) : r.p_revenue != null ? Number(r.p_revenue) : null;
+      // Before Reilly's decision the sheet's revenue was products only: not comparable.
+      const pRev = r.p_revenue != null && r.day >= REVENUE_ALL_PAID_FROM ? Number(r.p_revenue) : null;
       if (r.revenue != null && pRev != null && Math.abs(Number(r.revenue) - pRev) > tol(pRev)) {
         await push({ field: "revenue", sheet: r.revenue, brain: r2(pRev), source: "brain (Shopify orders)" });
       }
@@ -388,111 +394,6 @@ export async function crossCheck(db, { nowMs = Date.now() } = {}) {
 }
 
 /* ---------------- 4. write ---------------- */
-
-/**
- * Does an order's original total equal the sheet's revenue definition ("gross sales less
- * discounts, before returns")? Only when it carries no shipping and no tax. true / false /
- * null (the payload can't tell).
- */
-export function revenueDefinitionMatch(rawText) {
-  const raw = safeJson(rawText, null);
-  if (!raw) return null;
-  const num = (v) => (v == null || v === "" || !Number.isFinite(Number(v)) ? null : Number(v));
-  if (raw.total_price != null) {
-    const tax = num(raw.total_tax);
-    const shipSet = raw.total_shipping_price_set && raw.total_shipping_price_set.shop_money && raw.total_shipping_price_set.shop_money.amount;
-    const ship = shipSet != null ? num(shipSet) : Array.isArray(raw.shipping_lines) ? raw.shipping_lines.reduce((s, l) => s + (num(l && l.price) || 0), 0) : null;
-    if (tax == null || ship == null) return null;
-    return Math.abs(tax) < 0.005 && Math.abs(ship) < 0.005;
-  }
-  const sub = num(raw.currentSubtotalPriceSet && raw.currentSubtotalPriceSet.shopMoney && raw.currentSubtotalPriceSet.shopMoney.amount);
-  const tot = num(raw.currentTotalPriceSet && raw.currentTotalPriceSet.shopMoney && raw.currentTotalPriceSet.shopMoney.amount);
-  if (sub == null || tot == null || tot === 0) return null; // fully refunded: can't tell
-  return Math.abs(sub - tot) < 0.005;
-}
-
-/**
- * The sheet's revenue for a day ("gross sales less discounts, before returns": no shipping, no
- * tax), from the same orders the brain's revenue counts (test and voided orders excluded).
- * Why: express orders carry a shipping charge, and refusing the whole day (live 2026-10-15:
- * H&C 10/14 left blank) helps nobody when Shopify states the number itself.
- * Per order, Shopify's own ORIGINAL `subtotal_price` (webhook payload: line items after
- * discounts, no shipping, no tax, no tips) is used. Refused (never guessed) when:
- *   - prices include tax (`taxes_included`): the subtotal would then carry tax;
- *   - a line is a gift card (Shopify's gross sales leaves gift cards out);
- *   - the payload has no original subtotal (GraphQL pulls): then only an order with nothing
- *     changed since (current total = original total) and no shipping or tax counts, at its total.
- * And the plain order totals must add up to the brain's own revenue (same orders, same day).
- */
-/**
- * A pulled (GraphQL) order carries no line items; its stored lines' titles and handles are passed
- * in as `_line_titles`. order_lines has no gift-card flag, so this is by name ("gift" in the title
- * or handle; Shopify's own gift card product is "Gift Card" / gift-card). The stores sell
- * clothing only; a webhook payload, when present, is checked by Shopify's own gift_card flag.
- */
-const giftCardTitles = (raw) => (raw._line_titles || []).some((t) => /gift/i.test(String(t)));
-
-export function sheetRevenueOfOrder(rawText, lineTitles = null) {
-  const raw0 = safeJson(rawText, null);
-  if (!raw0) return { skip: "an order has no stored payload" };
-  const raw = lineTitles ? { ...raw0, _line_titles: lineTitles } : raw0;
-  const num = (v) => (v == null || v === "" || !Number.isFinite(Number(v)) ? null : Number(v));
-  if (raw.total_price != null) {
-    const gross = num(raw.total_price), sub = num(raw.subtotal_price);
-    if (gross == null || sub == null) return { skip: "an order's payload has no original subtotal" };
-    if (raw.taxes_included === true) return { skip: "an order's prices include tax, so its subtotal isn't gross sales less discounts" };
-    if (!Array.isArray(raw.line_items)) return { skip: "an order's payload has no line items (gift cards can't be ruled out)" };
-    if (raw.line_items.some((l) => l && l.gift_card === true)) return { skip: "an order includes a gift card" };
-    return { gross, value: sub };
-  }
-  const amt = (k) => num(raw[k] && raw[k].shopMoney && raw[k].shopMoney.amount);
-  const orig = amt("totalPriceSet"), origSub = amt("subtotalPriceSet");
-  // Pulled since 2026-10-15 (reconcile.js ORDER_FIELDS): the original subtotal, as in the webhook.
-  if (orig != null && origSub != null && raw.taxesIncluded === false) {
-    if (giftCardTitles(raw)) return { skip: "an order includes a gift card" };
-    return { gross: orig, value: origSub };
-  }
-  if (orig != null && origSub != null && raw.taxesIncluded === true) return { skip: "an order's prices include tax, so its subtotal isn't gross sales less discounts" };
-  // Pulled before those fields existed: whether its prices include tax is unknown. Refused.
-  return { skip: "an order's payload can't show its original subtotal (pulled before 2026-10-15)" };
-}
-
-export async function sheetRevenue(db, storeId, day, pnlRevenue) {
-  const { results } = await db.prepare(`SELECT order_id, raw, financial_status FROM orders WHERE store = ? AND local_day = ?`).bind(storeId, day).all();
-  let gross = 0, value = 0, linesBy = null;
-  for (const o of results || []) {
-    const raw = safeJson(o.raw, null);
-    if (raw && raw.test === true) continue;
-    if (String(o.financial_status || "").toLowerCase() === "voided") continue;
-    let titles = null;
-    if (raw && raw.total_price == null) {
-      // Shape first (no query for an order that is refused anyway), then the day's lines in one query.
-      const pre = sheetRevenueOfOrder(o.raw, []);
-      if (pre.skip) return { skip: pre.skip };
-      if (!linesBy) {
-        const { results: ls } = await db.prepare(`SELECT l.order_id, l.title, l.product_handle FROM order_lines l JOIN orders o ON o.store = l.store AND o.order_id = l.order_id WHERE l.store = ? AND o.local_day = ?`).bind(storeId, day).all();
-        linesBy = new Map();
-        for (const l of ls || []) { if (!linesBy.has(l.order_id)) linesBy.set(l.order_id, []); linesBy.get(l.order_id).push(l.title, l.product_handle); }
-      }
-      titles = linesBy.get(o.order_id);
-      // No lines stored yet: a gift card can't be ruled out.
-      if (!titles || !titles.length) return { skip: "an order's lines aren't stored yet (gift cards can't be ruled out)" };
-    }
-    const r = sheetRevenueOfOrder(o.raw, titles);
-    if (r.skip) return { skip: r.skip };
-    gross += r.gross; value += r.value;
-  }
-  // Same orders as the brain's revenue, or nothing is written.
-  if (pnlRevenue == null || Math.abs(gross - Number(pnlRevenue)) > 0.01) return { skip: "the day's orders don't add up to the brain's revenue" };
-  return { value: Math.round(value * 100) / 100 };
-}
-
-/** The brain's revenue on the sheet's definition when it can be worked out, else its own revenue. */
-async function comparableRevenue(db, storeId, day, pnlRevenue) {
-  if (pnlRevenue == null) return null;
-  const r = await sheetRevenue(db, storeId, day, pnlRevenue).catch(() => ({ skip: "error" }));
-  return r.skip ? Number(pnlRevenue) : r.value;
-}
 
 /* ---------------- day basis: is the sheet's "day" the brain's "day"? ---------------- */
 
@@ -543,12 +444,15 @@ const judgeTz = (tz, cfg) => (tz === cfg ? { ok: true, tz, why: null } : { ok: f
 
 /**
  * Pure: do the sheet's hand-filled days use the brain's day basis? The last DAY_BASIS_DAYS
- * closed days where both have revenue and orders: proven when at least DAY_BASIS_MIN_MATCH of
- * them match (orders exactly, revenue within $1). Days the brain itself wrote are not evidence.
+ * closed days where both have orders: proven when at least DAY_BASIS_MIN_MATCH of them have
+ * exactly the same order count. Days the brain itself wrote are not evidence.
  */
 export function judgeDayBasis(pairs) {
   const last = [...pairs].sort((a, b) => (a.day < b.day ? 1 : -1)).slice(0, DAY_BASIS_DAYS);
-  const bad = last.filter((p) => Number(p.sheet_orders) !== Number(p.brain_orders) || Math.abs(Number(p.sheet_revenue) - Number(p.brain_revenue)) > 1);
+  // Orders only: the sheet's hand-filled revenue was products-only (before Reilly's 2026-10-15
+  // decision, pnl.sheet_revenue), the brain's includes shipping and tax, so revenue can't prove
+  // the day basis. The exact order count of 8 of the last 10 days does.
+  const bad = last.filter((p) => Number(p.sheet_orders) !== Number(p.brain_orders));
   const matched = last.length - bad.length;
   const ok = matched >= DAY_BASIS_MIN_MATCH;
   const mism = bad.map((p) => `${p.day} (orders ${p.sheet_orders} vs ${p.brain_orders}, revenue $${Number(p.sheet_revenue).toFixed(2)} vs $${Number(p.brain_revenue).toFixed(2)})`);
@@ -577,10 +481,7 @@ export async function dayBasis(db, storeId, { nowMs = Date.now() } = {}) {
       ORDER BY s.day DESC LIMIT ?`
   ).bind(storeId, DAY_BASIS_DAYS).all();
   const pairs = [];
-  for (const p of results || []) {
-    const off = Math.abs(Number(p.sheet_revenue) - Number(p.brain_revenue)) > 1;
-    pairs.push(off ? { ...p, brain_revenue: await comparableRevenue(db, storeId, p.day, p.brain_revenue) } : p);
-  }
+  for (const p of results || []) pairs.push(p);
   const out = { ...judgeDayBasis(pairs), at: nowIso(nowMs) };
   await db.prepare(`UPDATE sheet_workbooks SET day_basis = ?, day_basis_at = ? WHERE store = ?`).bind(JSON.stringify(out), out.at, storeId).run();
   return out;
@@ -607,8 +508,10 @@ export async function brainValue(db, storeId, day, field, { pnl, setup, tz, toda
   switch (field) {
     case "revenue": {
       if (!tzOk) return { skip: tzWhy };
+      // Everything the customer paid: products + shipping + tax, each order's original total (the
+      // brain's own revenue). Reilly 2026-10-15 (pnl.sheet_revenue): "Everything the customer paid".
       if (pnl.revenue == null) return { skip: "revenue unknown" };
-      return sheetRevenue(db, storeId, day, pnl.revenue);
+      return { value: r2(pnl.revenue) };
     }
     case "orders":
       if (!tzOk) return { skip: tzWhy };
@@ -645,9 +548,21 @@ export async function brainValue(db, storeId, day, field, { pnl, setup, tz, toda
       if (!tzOk) return { skip: tzWhy };
       if (Number(pnl.orders) === 0) return { value: 0 };
       const basis = safeJson(pnl.cogs_basis, {}) || {};
-      if (pnl.cogs_source !== "actual" || Number(basis.orders_actual) !== Number(pnl.orders)) return { skip: "not every order has its actual KFB charge" };
-      const k = await db.prepare(`SELECT SUM(cost_eur) AS eur, COUNT(*) AS n FROM cogs_matches WHERE store = ? AND local_day = ? AND status = 'matched'`).bind(storeId, day).first();
-      return k && Number(k.n) === Number(pnl.orders) ? { value: r2(k.eur) } : { skip: "KFB matches don't cover every order" };
+      if (pnl.cogs_source === "actual" && Number(basis.orders_actual) === Number(pnl.orders)) {
+        const k = await db.prepare(`SELECT SUM(cost_eur) AS eur, COUNT(*) AS n FROM cogs_matches WHERE store = ? AND local_day = ? AND status = 'matched'`).bind(storeId, day).first();
+        if (k && Number(k.n) === Number(pnl.orders)) return { value: r2(k.eur) };
+      }
+      // Not every KFB charge is in yet (they often land days later). Reilly 2026-10-15
+      // (pnl.sheet_cog_estimate): "COGs for yesteerday should always be an estimate, that is filled
+      // in with accurate numbers at a later time". So the brain's COGS (actual where known, its
+      // rate estimate for the rest) goes in, in EUR at the sheet's own rate, and the correction
+      // pass replaces it with the actual KFB total once every charge is in (COG_CORRECT_DAYS).
+      const fx = Number(setup && setup.fx_rate);
+      if (pnl.cogs == null) return { skip: "COGS unknown" };
+      if (!Number.isFinite(fx) || fx <= 0) return { skip: "no EUR to USD rate in SETUP" };
+      // Only while the correction pass can still replace it: an older blank stays blank.
+      if (!recentOk && today && day < minusDays(today, COG_ESTIMATE_MAX_AGE_DAYS)) return { skip: "too old for a COG estimate (it could never be corrected)" };
+      return { value: r2(Number(pnl.cogs) / fx), estimate: true };
     }
     default:
       return { skip: "not an input the brain writes" };
@@ -831,9 +746,12 @@ export async function planStore(db, wb, read, { nowMs = Date.now(), maxDays = PL
 export async function planCorrections(db, wb, read, { nowMs = Date.now(), dayOk = false, dayWhy = null } = {}) {
   const today = localDay(nowMs, wb.tz);
   const since = minusDays(today, CORRECT_DAYS);
+  // COG cells are looked at for longer: an estimate waits for its actual KFB total.
+  const cogSince = minusDays(today, COG_CORRECT_DAYS);
   const { results } = await db.prepare(
-    `SELECT tab, cell, day, field, value, id FROM sheet_writes WHERE store = ? AND status = 'verified' AND day >= ? AND day < ? ORDER BY id DESC`
-  ).bind(wb.store, since, today).all();
+    `SELECT tab, cell, day, field, value, id FROM sheet_writes WHERE store = ? AND status = 'verified' AND day < ?
+        AND (day >= ? OR (field = 'cog_eur' AND day >= ?)) ORDER BY id DESC`
+  ).bind(wb.store, today, since, cogSince).all();
   const latest = new Map();
   for (const w of results || []) if (!latest.has(`${w.tab}|${w.cell}`)) latest.set(`${w.tab}|${w.cell}`, w);
   const plan = [];
@@ -846,6 +764,12 @@ export async function planCorrections(db, wb, read, { nowMs = Date.now(), dayOk 
     const pnl = await db.prepare(`SELECT * FROM pnl_days WHERE store = ? AND day = ? AND complete = 1`).bind(wb.store, w.day).first();
     if (!pnl) continue;
     const v = await brainValue(db, wb.store, w.day, w.field, { pnl, setup: read.setup, tz: wb.tz, today, dayOk, dayWhy, recentOk: true });
+    if (w.field === "cog_eur" && v.estimate && w.day <= minusDays(today, COG_ESTIMATE_WARN_DAYS)) {
+      // Rule 5: an estimate that never turns into the actual KFB cost is said out loud.
+      await logOnce(db, { actor: ACTOR, kind: "pnl.sheet_cog_still_estimate", store: wb.store, target: "sys.sheets",
+        summary: `${wb.name} ${w.day}: COG is still the brain's estimate (€${w.value}); not every KFB charge for that day has come in. Check KFB; the brain stops correcting it after ${COG_CORRECT_DAYS} days`,
+      }, { key: `${wb.store}:${w.day}`, windowMin: 7 * 24 * 60, nowMs }).catch(() => {});
+    }
     if (v.skip || v.value == null || close(v.value, w.value)) continue;
     plan.push({ tab: w.tab, day: w.day, row_no: d.row_no, field: w.field, cell: w.cell, value: v.value, expect: Number(w.value) });
   }
@@ -1028,9 +952,9 @@ export async function runSheets(env, { fetchImpl = fetch, nowMs = Date.now(), ca
  * nothing to write (the reasons are given). Anything else = retry.
  */
 /**
- * Skips that can clear up later the same morning: the KFB import (Reilly does it after the
- * 07:00 run). Only yesterday's row waits, and only until noon, so an order that never gets a
- * KFB charge holds up one morning, not every morning. Yesterday isn't "done" while one of these holds a cell
+ * Skips that can clear up later the same morning (a KFB-related one). Since 2026-10-15 a missing
+ * KFB charge gets the brain's COG estimate instead (pnl.sheet_cog_estimate), so this rarely
+ * fires; it stays as a guard. Only yesterday waits, and only until noon. Yesterday isn't "done" while one of these holds a cell
  * back, so the run retries until noon (live 2026-10-15: the COG cells stayed blank because the
  * run marked the day done before the KFB import landed).
  */

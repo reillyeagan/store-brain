@@ -7,7 +7,7 @@ import {
   writableBlank, tabForMonth, colLetter, SHEETS_API,
 } from "../src/lib/sheets.js";
 import {
-  runSheets, trustRow, sheetsWriteOn, revenueDefinitionMatch, sheetsState, fillAdsFromSheet, crossCheck,
+  runSheets, trustRow, sheetsWriteOn, sheetsState, fillAdsFromSheet, crossCheck,
 } from "../src/agents/pnl/sheets.js";
 import { runAdsHistory, historyEnd, CHUNK_DAYS } from "../src/lib/adsHistory.js";
 import { runHistoryExtension, extensionTarget } from "../src/lib/historyExtend.js";
@@ -297,16 +297,6 @@ test("sheets: trust rules — $0 COG on a day with orders is unknown, not zero; 
   assert.equal(trustRow({ cog_eur: 50, orders: 1 }, { estimated: setup.estimated }, "2026-10-01", today).cog_ok, 0, "no FX rate, no COG");
 });
 
-test("sheets: revenue definition — only orders with no shipping and no tax match 'gross sales less discounts'", () => {
-  assert.equal(revenueDefinitionMatch(JSON.stringify({ total_price: "50", total_tax: "0.00", total_shipping_price_set: { shop_money: { amount: "0.00" } } })), true);
-  assert.equal(revenueDefinitionMatch(JSON.stringify({ total_price: "55", total_tax: "5.00", total_shipping_price_set: { shop_money: { amount: "0.00" } } })), false);
-  assert.equal(revenueDefinitionMatch(JSON.stringify({ total_price: "50" })), null, "can't tell → not written");
-  assert.equal(revenueDefinitionMatch(JSON.stringify({ currentSubtotalPriceSet: { shopMoney: { amount: "40" } }, currentTotalPriceSet: { shopMoney: { amount: "40" } } })), true);
-  assert.equal(revenueDefinitionMatch(JSON.stringify({ currentSubtotalPriceSet: { shopMoney: { amount: "40" } }, currentTotalPriceSet: { shopMoney: { amount: "45" } } })), false);
-});
-
-/* ---------------- read → fill → cross-check ---------------- */
-
 test("sheets: not wired → nothing changes and the state says so", async () => {
   const env = baseEnv();
   const r = await runSheets(env, { nowMs: NOW, fetchImpl: async () => { throw new Error("no network"); } });
@@ -456,9 +446,11 @@ test("sheets: cross-check — revenue, orders, services and fees vs closed brain
   assert.equal((await crossCheck(DB, { nowMs: NOW })).length, 0);
   await DB.prepare(`UPDATE sheet_pnl_days SET seen_at = ? WHERE store = 'hc' AND tab = 'OCT'`).bind(iso(NOW)).run();
   const found = await crossCheck(DB, { nowMs: NOW });
-  assert.deepEqual(found.map((f) => f.field).sort(), ["orders", "revenue"], "a $0.31 fee difference is rounding, services agree");
+  // Revenue before 2026-10-14 isn't compared: the sheet's was products only, the brain's is
+  // everything the customer paid (Reilly 2026-10-15).
+  assert.deepEqual(found.map((f) => f.field).sort(), ["orders"], "a $0.31 fee difference is rounding, services agree");
   assert.equal((await crossCheck(DB, { nowMs: NOW + 3600000 })).length, 0, "already logged");
-  assert.equal((await evs(DB, "pnl.sheet_mismatch")).length, 2);
+  assert.equal((await evs(DB, "pnl.sheet_mismatch")).length, 1);
   assert.equal((await DB.prepare(`SELECT revenue FROM pnl_days WHERE store = 'hc' AND day = '2026-10-03'`).first()).revenue, 726.44, "nothing overwritten");
   assert.equal(await fillAdsFromSheet(DB, { nowMs: NOW }).then((x) => x.length), 0);
 });
@@ -505,13 +497,15 @@ test("sheets writer: fills only BLANK input cells of a CLOSED day — never a fo
   const before = JSON.parse(JSON.stringify(books[HC].tabs.OCT));
   const g = fakeGoogle(books);
   const r = await runSheets(env, { nowMs: NOW, fetchImpl: g.fetchImpl });
-  assert.equal(r.written.hc, 6);
+  assert.equal(r.written.hc, 7);
   assert.equal(r.mode, "live (Reilly 2026-10-14, decision pnl.sheets_write)");
   const cells = Object.fromEntries(g.log.updates.map((u) => [u.range, u.value]));
   // Oct 13 is row 14.
-  assert.deepEqual(cells, { "'OCT'!B12": 100, "'OCT'!D12": 420.05, "'OCT'!E12": 42.01, "'OCT'!G12": 3.5, "'OCT'!O12": 2, "'OCT'!Q12": 727 });
+  assert.deepEqual(cells, { "'OCT'!B12": 100, "'OCT'!D12": 420.05, "'OCT'!E12": 42.01, "'OCT'!G12": 3.5, "'OCT'!O12": 2, "'OCT'!Q12": 727, "'OCT'!R12": 25.21 });
   assert.ok(!("'OCT'!P12" in cells), "Clicks was typed by Reilly: not touched");
-  assert.ok(!("'OCT'!R12" in cells), "COG (EUR) only from actual KFB charges for every order");
+  // Not every KFB charge is in: the brain's COGS estimate goes in, in EUR at the sheet's rate
+  // (Reilly 2026-10-15), and is replaced by the actual total later.
+  assert.equal(cells["'OCT'!R12"], 25.21, "COG (EUR) estimate = brain COGS $30 / 1.19");
   assert.ok(Object.keys(cells).every((c) => /12$/.test(c)), "nothing outside the day's row");
   assert.ok(!Object.keys(cells).some((c) => /'OCT'!(C|H|I|J|K|L|M)\d+/.test(c)), "no formula column");
   assert.ok(!Object.keys(cells).some((c) => /13$/.test(c)), "Oct 12 (row 13) is Reilly's: untouched");
@@ -519,21 +513,21 @@ test("sheets writer: fills only BLANK input cells of a CLOSED day — never a fo
   // Every other cell of the workbook is exactly as it was.
   const after = books[HC].tabs.OCT;
   for (let ri = 0; ri < before.length; ri++) for (let ci = 0; ci < 18; ci++) {
-    if (ri === 11 && [1, 3, 4, 6, 14, 16].includes(ci)) continue;
+    if (ri === 11 && [1, 3, 4, 6, 14, 16, 17].includes(ci)) continue;
     assert.deepEqual(after[ri] && after[ri][ci] ? after[ri][ci] : null, before[ri] && before[ri][ci] ? before[ri][ci] : null, `cell r${ri + 1}c${ci} unchanged`);
   }
   const ev = await evs(DB, "pnl.sheet_written");
   assert.equal(ev.length, 1);
-  assert.match(ev[0].summary, /filled 6 blank cells \(2026-10-11\), each confirmed by a re-read/);
-  assert.equal((await DB.prepare(`SELECT COUNT(*) AS n FROM sheet_writes WHERE verified = 1`).first()).n, 6);
-  // Reilly's Oct 12 revenue differs from the brain's: a mismatch, never an overwrite.
+  assert.match(ev[0].summary, /filled 7 blank cells \(2026-10-11\), each confirmed by a re-read/);
+  assert.equal((await DB.prepare(`SELECT COUNT(*) AS n FROM sheet_writes WHERE verified = 1`).first()).n, 7);
+  // Reilly's Oct 12 revenue (products only, before the 10-15 decision) is not compared or overwritten.
   const mm = await evs(DB, "pnl.sheet_mismatch");
-  assert.ok(mm.some((e) => /2026-10-12 revenue: sheet \$236\.80 vs brain/.test(e.summary)));
+  assert.ok(!mm.some((e) => /2026-10-12 revenue/.test(e.summary)));
   // Once an hour per workbook.
   const again = await runSheets(env, { nowMs: NOW + 10 * 60000, fetchImpl: g.fetchImpl });
   assert.equal(again.written.hc, "not due");
   const st = await sheetsState(env, { nowMs: NOW });
-  assert.equal(st.cells_written_today, 6);
+  assert.equal(st.cells_written_today, 7);
   assert.ok(st.mismatches_total >= 1);
 });
 
@@ -566,7 +560,7 @@ test("sheets writer: re-read verification — a value that didn't land is report
   const g = fakeGoogle(books, { tamper: (v) => v + 1 });
   await runSheets(env, { nowMs: NOW, fetchImpl: g.fetchImpl });
   assert.equal((await DB.prepare(`SELECT COUNT(*) AS n FROM sheet_writes WHERE verified = 1`).first()).n, 0);
-  assert.equal((await DB.prepare(`SELECT COUNT(*) AS n FROM sheet_writes WHERE verified = 0`).first()).n, 6);
+  assert.equal((await DB.prepare(`SELECT COUNT(*) AS n FROM sheet_writes WHERE verified = 0`).first()).n, 7);
   const bad = await evs(DB, "pnl.sheet_write_unverified");
   assert.equal(bad.length, 1);
   assert.match(bad[0].summary, /did not read back as written/);
@@ -599,7 +593,7 @@ test("sheets writer: Shopify's timezone is the authority — a stale SETUP label
   const g = fakeGoogle(books);
   await runSheets(env, { nowMs: NOW, fetchImpl: g.fetchImpl });
   const cells = g.log.updates.map((u) => u.range).sort();
-  assert.deepEqual(cells, ["'OCT'!B12", "'OCT'!D12", "'OCT'!E12", "'OCT'!G12", "'OCT'!O12", "'OCT'!Q12"]);
+  assert.deepEqual(cells, ["'OCT'!B12", "'OCT'!D12", "'OCT'!E12", "'OCT'!G12", "'OCT'!O12", "'OCT'!Q12", "'OCT'!R12"]);
   assert.equal(g.log.shop, 1, "Shopify asked once (cached for the day)");
   const st = await sheetsState(env, { nowMs: NOW });
   const hc = st.workbooks.find((w) => w.store === "hc");
@@ -607,7 +601,7 @@ test("sheets writer: Shopify's timezone is the authority — a stale SETUP label
   assert.equal(hc.timezone_note, "SETUP says CDT but Shopify says Eastern (America/New_York); please fix the label in SETUP (the brain never edits SETUP)");
   assert.equal(hc.day_basis.ok, true);
   assert.equal(hc.day_basis.checked, 9);
-  assert.equal(hc.day_basis.matched, 8);
+  assert.equal(hc.day_basis.matched, 9, "orders only: the one day that differs only in revenue still matches");
   assert.ok(!g.log.updates.some((u) => /SETUP/.test(u.range)), "SETUP is never edited");
   assert.match(books[HC].tabs.SETUP.find((r) => r[0] && r[0].f === "Revenue")[1].f, /\(CDT\)/, "the label is left for Reilly");
 });
@@ -620,7 +614,7 @@ test("sheets writer: day basis NOT proven (fewer than 8 of the last 10 hand-fill
   const st = await sheetsState(env, { nowMs: NOW });
   const hc = st.workbooks.find((w) => w.store === "hc");
   assert.equal(hc.day_basis.ok, false);
-  assert.match(hc.day_basis.why, /5 of 9 match/);
+  assert.match(hc.day_basis.why, /6 of 9 match/);
   assert.ok(hc.day_basis.mismatching_days.some((d) => /^2026-10-06 \(orders 3 vs 2/.test(d)));
   assert.ok(Object.keys(hc.last_write.skipped).some((k) => /don't match the brain's/.test(k)));
 });
@@ -640,7 +634,9 @@ test("sheets: the day-basis proof is pure; a pass is cached for a day, a failure
   const pair = (day, so, bo, sr, br) => ({ day, sheet_orders: so, brain_orders: bo, sheet_revenue: sr, brain_revenue: br });
   const ten = Array.from({ length: 10 }, (_, i) => pair(`2026-10-${String(i + 1).padStart(2, "0")}`, 2, 2, 100, 100.5));
   assert.equal(judgeDayBasis(ten).ok, true);
-  ten[0] = pair("2026-10-01", 3, 2, 100, 100); ten[1] = pair("2026-10-02", 2, 2, 100, 102); ten[2] = pair("2026-10-03", 2, 2, 90, 100);
+  ten[0] = pair("2026-10-01", 3, 2, 100, 100); ten[1] = pair("2026-10-02", 1, 2, 100, 102); ten[2] = pair("2026-10-03", 4, 2, 90, 100);
+  // Revenue alone never fails the proof (the sheet's hand-filled revenue was products only).
+  assert.equal(judgeDayBasis(Array.from({ length: 10 }, (_, i) => pair(`2026-10-${String(i + 1).padStart(2, "0")}`, 2, 2, 100, 140))).ok, true);
   const r = judgeDayBasis(ten);
   assert.deepEqual([r.ok, r.matched, r.checked], [false, 7, 10]);
   assert.equal(r.mismatching_days.length, 3);
@@ -970,17 +966,17 @@ test("sheets writer: intended cells are recorded as pending BEFORE the write; a 
   const g1 = fakeGoogle(a.books, { failUpdate: true });
   const r1 = await runSheets(a.env, { nowMs: NOW, fetchImpl: g1.fetchImpl });
   assert.equal(r1.written.hc.phase, "write_unknown");
-  assert.equal((await a.DB.prepare(`SELECT COUNT(*) AS n FROM sheet_writes WHERE status = 'pending'`).first()).n, 6, "the record survives the failure");
+  assert.equal((await a.DB.prepare(`SELECT COUNT(*) AS n FROM sheet_writes WHERE status = 'pending'`).first()).n, 7, "the record survives the failure");
   const e1 = (await evs(a.DB, "error.sheet_write"))[0];
   assert.match(e1.summary, /may or may not have landed/);
   assert.doesNotMatch(e1.summary, /nothing/i, "never claims nothing changed once the write was sent");
-  assert.equal((await sheetsState(a.env, { nowMs: NOW })).pending_writes, 6);
+  assert.equal((await sheetsState(a.env, { nowMs: NOW })).pending_writes, 7);
 
   const b = await writerFixture();
   const g2 = fakeGoogle(b.books, { failVerify: true });
   await runSheets(b.env, { nowMs: NOW, fetchImpl: g2.fetchImpl });
-  assert.equal(g2.log.updates.length, 6, "the write itself went through");
-  assert.equal((await b.DB.prepare(`SELECT COUNT(*) AS n FROM sheet_writes WHERE status = 'unverified'`).first()).n, 6);
+  assert.equal(g2.log.updates.length, 7, "the write itself went through");
+  assert.equal((await b.DB.prepare(`SELECT COUNT(*) AS n FROM sheet_writes WHERE status = 'unverified'`).first()).n, 7);
   assert.match((await evs(b.DB, "pnl.sheet_write_unverified"))[0].summary, /written but the confirming re-read failed/);
 
   // A failure before anything is sent (no backup bucket) does say nothing changed, and records nothing.
@@ -1289,45 +1285,39 @@ test("verdict: a cell dropped because its row moved is NOT 'filled by hand' — 
   assert.equal(await m.env.DB.prepare(`SELECT last_result FROM job_runs WHERE job = 'pnl.sheets.done'`).first(), null);
 });
 
-test("sheets revenue (live 2026-10-15): Shopify's own subtotal (no shipping, tax or tips) is written; tax-inclusive prices, gift cards and unknown payloads block the day", async () => {
-  const { sheetRevenue, yesterdayVerdict } = await import("../src/agents/pnl/sheets.js");
-  const DB = makeD1();
-  let n = 0;
-  const add = (raw, fin = "paid") => { n++; return DB.prepare(`INSERT INTO orders (store, order_id, name, created_at, local_day, currency, total, financial_status, raw, updated_at) VALUES ('hc', ?, ?, 't', '2026-10-14', 'USD', 0, ?, ?, 't')`).bind(String(n), `#${n}`, fin, JSON.stringify(raw)).run(); };
-  const line = [{ gift_card: false }];
-  await add({ total_price: "59.90", subtotal_price: "59.90", total_tax: "0.00", line_items: line });
-  await add({ total_price: "89.85", subtotal_price: "69.90", total_tax: "0.00", total_tip_received: "5.00", line_items: line }); // express + tip
-  await add({ total_price: "999", test: true });
-  await add({ total_price: "40", subtotal_price: "40", line_items: line }, "voided");
-  assert.deepEqual(await sheetRevenue(DB, "hc", "2026-10-14", 149.75), { value: 129.8 });
-  assert.match((await sheetRevenue(DB, "hc", "2026-10-14", 150)).skip, /don't add up/, "same orders as the brain or nothing");
-  // Tax-inclusive prices: refused.
-  const DB2 = makeD1();
-  await DB2.prepare(`INSERT INTO orders (store, order_id, name, created_at, local_day, currency, total, financial_status, raw, updated_at) VALUES ('hc', '1', '#1', 't', '2026-10-14', 'USD', 0, 'paid', ?, 't')`).bind(JSON.stringify({ total_price: "50", subtotal_price: "50", taxes_included: true, line_items: line })).run();
-  assert.match((await sheetRevenue(DB2, "hc", "2026-10-14", 50)).skip, /include tax/);
-  // Gift card line: refused.
-  await add({ total_price: "25", subtotal_price: "25", line_items: [{ gift_card: true }] });
-  assert.match((await sheetRevenue(DB, "hc", "2026-10-14", 174.75)).skip, /gift card/);
-  // GraphQL payload with its shipping refunded since (current subtotal = current total, but original is higher): refused.
-  const DB3 = makeD1();
-  const gql = (o, c, cs) => JSON.stringify({ totalPriceSet: { shopMoney: { amount: o } }, currentTotalPriceSet: { shopMoney: { amount: c } }, currentSubtotalPriceSet: { shopMoney: { amount: cs } } });
-  await DB3.prepare(`INSERT INTO orders (store, order_id, name, created_at, local_day, currency, total, financial_status, raw, updated_at) VALUES ('hc', '1', '#1', 't', '2026-10-14', 'USD', 0, 'paid', ?, 't')`).bind(gql("74.85", "59.90", "59.90")).run();
-  assert.ok((await sheetRevenue(DB3, "hc", "2026-10-14", 74.85)).skip);
-  // Pulled before subtotal/tax fields existed: whether prices include tax is unknown, refused.
-  await DB3.prepare(`UPDATE orders SET raw = ?`).bind(gql("59.90", "59.90", "59.90")).run();
-  assert.match((await sheetRevenue(DB3, "hc", "2026-10-14", 59.9)).skip, /pulled before/);
-  // A pulled order with the original subtotal (since 2026-10-15): express shipping comes off.
-  const pulled = (title) => JSON.stringify({ totalPriceSet: { shopMoney: { amount: "74.85" } }, subtotalPriceSet: { shopMoney: { amount: "59.90" } }, totalTaxSet: { shopMoney: { amount: "0.00" } }, taxesIncluded: false });
-  await DB3.prepare(`UPDATE orders SET raw = ?`).bind(pulled()).run();
-  assert.match((await sheetRevenue(DB3, "hc", "2026-10-14", 74.85)).skip, /lines aren't stored/, "gift cards can't be ruled out yet");
-  await DB3.prepare(`INSERT INTO order_lines (store, order_id, line_id, title, product_handle, quantity, price, updated_at) VALUES ('hc', '1', 'l1', 'Wool Coat', 'wool-coat', 1, 59.9, 't')`).run();
-  assert.deepEqual(await sheetRevenue(DB3, "hc", "2026-10-14", 74.85), { value: 59.9 });
-  await DB3.prepare(`UPDATE order_lines SET title = 'Gift Card'`).run();
-  assert.match((await sheetRevenue(DB3, "hc", "2026-10-14", 74.85)).skip, /gift card/);
-  // A COG cell waiting on the KFB import keeps yesterday open (retried until noon); nothing else does.
-  const y = { day: "2026-10-14", in_sheet: true, closed: true, skipped: { "not every order has its actual KFB charge": 1 } };
-  const plan = [{ day: "2026-10-14", field: "adspend" }];
-  const r = { written: [{ day: "2026-10-14", verified: true }] };
-  assert.equal(yesterdayVerdict({ store: "hc" }, y, plan, r).ok, false);
-  assert.equal(yesterdayVerdict({ store: "hc" }, { ...y, skipped: { "the sheet's days don't match the brain's: 3 of 10 match": 1 } }, plan, r).ok, true);
+
+test("COG (Reilly 2026-10-15): an estimate goes in while KFB charges are missing, and is replaced by the actual KFB total when it lands, even weeks later; a cell Reilly changed is never touched", async () => {
+  const { env, DB, books } = await writerFixture();
+  const g = fakeGoogle(books);
+  await runSheets(env, { nowMs: NOW, fetchImpl: g.fetchImpl });
+  const at = (cell) => books[HC].tabs.OCT[Number(cell.slice(1)) - 1][cell.charCodeAt(0) - 65].raw;
+  assert.equal(at("R12"), 25.21, "estimate: brain COGS $30 at the sheet's 1.19");
+  // The brain never reads its own estimate back as the sheet's KFB figure (rule 9).
+  const { sheetDay } = await import("../src/lib/pnl.js");
+  await runSheets(env, { nowMs: NOW + 2 * 3600000, fetchImpl: g.fetchImpl });
+  const sd = await sheetDay(DB, "hc", "2026-10-11", { nowMs: NOW + 2 * 3600000, revenue: 100, orders: 2 });
+  assert.equal(sd.use.cog, false);
+  assert.match(sd.why.cog, /brain wrote this cell itself/);
+  // Ten days later every KFB charge for Oct 11 is in.
+  await DB.prepare(`UPDATE pnl_days SET cogs = 33.5, cogs_actual = 33.5, cogs_est = 0, cogs_source = 'actual', cogs_basis = ? WHERE store = 'hc' AND day = '2026-10-11'`).bind(JSON.stringify({ orders_actual: 2 })).run();
+  for (const [id, eur] of [["o1", 12.5], ["o2", 15]]) {
+    await DB.prepare(`INSERT INTO cogs_matches (store, order_id, local_day, cost_eur, status, line_count, matched_at) VALUES ('hc', ?, '2026-10-11', ?, 'matched', 1, 't')`).bind(id, eur).run();
+  }
+  await runSheets(env, { nowMs: NOW + 10 * 86400000, fetchImpl: g.fetchImpl });
+  assert.equal(at("R12"), 27.5, "the actual KFB total replaced the estimate");
+  // Reilly's own edit wins over any later change.
+  books[HC].tabs.OCT[11][17] = cell("€26.00", 26);
+  await DB.prepare(`UPDATE cogs_matches SET cost_eur = 20 WHERE order_id = 'o1'`).run();
+  await runSheets(env, { nowMs: NOW + 12 * 86400000, fetchImpl: g.fetchImpl });
+  assert.equal(at("R12"), 26);
+});
+
+test("COG estimate still standing after 38 days is reported to Reilly (rule 5)", async () => {
+  const { env, DB, books } = await writerFixture();
+  const g = fakeGoogle(books);
+  await runSheets(env, { nowMs: NOW, fetchImpl: g.fetchImpl });
+  await runSheets(env, { nowMs: NOW + 40 * 86400000, fetchImpl: g.fetchImpl });
+  const ev = await evs(DB, "pnl.sheet_cog_still_estimate");
+  assert.equal(ev.length, 1);
+  assert.match(ev[0].summary, /2026-10-11: COG is still the brain's estimate/);
 });

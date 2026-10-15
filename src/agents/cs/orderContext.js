@@ -11,7 +11,7 @@
  *      A where-is-my-order ticket whose ledger data is over 2 hours old gets a fresh read-only
  *      Shopify read, or is marked "status not current" so the reply can't state it as fact.
  *   2. Attaches what the reply writer may quote: payment/fulfillment status, items and sizes,
- *      express, Shopify's own fulfillment tracking numbers (no 17TRACK: parcel tracking is OFF),
+ *      express, Shopify's own fulfillment tracking numbers (17TRACK carrier status only if parcel tracking is on; it is OFF since 2026-10-13),
  *      refunds as recorded events.
  *   3. Feeds Supplier: sizing complaints → size_complaints (Size Checker complaint log);
  *      size / colour / address changes, exchanges, cancellations → cs_kfb_asks (Relay adds
@@ -86,15 +86,33 @@ function expressFrom(title, code, storedFlag = null) {
   return /express/i.test(String(title || "")) || /express/i.test(String(code || ""));
 }
 
+export const CARRIER_MAX_AGE_MS = 24 * 3600000;
+
 /** Everything the reply writer may quote about an order, from the ledger. */
 export async function ledgerContext(db, order) {
   const { results: lines } = await db.prepare(`SELECT product_id, title, variant_title, size, color, quantity FROM order_lines WHERE store = ? AND order_id = ?`).bind(order.store, order.order_id).all();
   const { results: ships } = await db.prepare(
-    `SELECT tracking_number, tracking_url, carrier_hint, shipped_at, shopify_status, shopify_delivered_at FROM shipments WHERE store = ? AND order_id = ?`
+    `SELECT tracking_number, tracking_url, carrier_hint, shipped_at, shopify_status, shopify_delivered_at, state, last_status, last_event_at, last_event_text, last_event_location, polled_at FROM shipments WHERE store = ? AND order_id = ?`
   ).bind(order.store, order.order_id).all();
   const { results: refunds } = await db.prepare(`SELECT amount, status, processed_at FROM refunds WHERE store = ? AND order_id = ?`).bind(order.store, order.order_id).all();
   const st = rawStatus(order.raw);
-  const shipments = (ships || []).map((s) => ({ tracking_number: s.tracking_number, tracking_url: s.tracking_url, carrier: s.carrier_hint, shipped_at: s.shipped_at, shopify_status: s.shopify_status, delivered_at: s.shopify_delivered_at }));
+  // The CARRIER's own status (17TRACK) when the brain has read it. Shopify's status lags behind
+  // the carrier (live 2026-10-15: a draft said "not delivered yet" for a parcel the carrier had
+  // delivered four days earlier), so only the carrier's word says delivered or not.
+  // Only a carrier reading from the last day counts (parcel tracking has been off since
+  // 2026-10-13, so older stored states are stale and say nothing about today).
+  const nowMs = Date.now();
+  const fresh = (s) => s.polled_at && nowMs - Date.parse(s.polled_at) < CARRIER_MAX_AGE_MS;
+  const shipments = (ships || []).map((s) => {
+    const known = fresh(s) && s.state && s.state !== "unknown";
+    return {
+      tracking_number: s.tracking_number, tracking_url: s.tracking_url, carrier: s.carrier_hint, shipped_at: s.shipped_at,
+      shopify_status: s.shopify_status, delivered_at: s.shopify_delivered_at,
+      carrier_state: known ? s.state : null,
+      carrier_delivered: known ? s.state === "delivered" : null,
+      carrier_last_event: known && s.last_event_text ? { at: s.last_event_at, text: s.last_event_text, location: s.last_event_location } : null,
+    };
+  });
   return {
     source: "ledger", as_of: order.updated_at,
     store: order.store, order_id: order.order_id, name: order.name, created_at: order.created_at,

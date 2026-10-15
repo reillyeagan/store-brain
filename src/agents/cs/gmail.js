@@ -25,10 +25,14 @@ async function gget(token, path, { fetchImpl }) {
  * (contact forms); the code filter (filters.js) still decides.
  * @param {string[]|null} domains null = a store's own inbox (no narrowing)
  */
-export function inboxQuery(afterMs, domains = null, beforeMs = null) {
+export function inboxQuery(afterMs, domains = null, beforeMs = null, storeNames = null) {
   const base = `-from:me -in:sent -in:drafts -in:chats -category:promotions -category:social -category:forums after:${Math.floor(afterMs / 1000)}${beforeMs != null ? ` before:${Math.ceil(beforeMs / 1000)}` : ""}`;
   if (!domains) return base;
-  const who = [...domains.flatMap((d) => [`to:${d}`, `deliveredto:${d}`]), "from:shopify.com"];
+  // Plus mail anywhere in it that mentions a store domain or name: customers of the stores whose
+  // contact address is Reilly's own (and replies to Judge.me requests) write to him directly,
+  // with the store's mail quoted below (live 2026-10-15). The code filter decides.
+  const names = (storeNames || []).map((n) => `"${n}"`);
+  const who = [...domains.flatMap((d) => [`to:${d}`, `deliveredto:${d}`]), ...[...new Set(names)], "from:shopify.com"];
   return `${base} {${who.join(" ")}}`;
 }
 

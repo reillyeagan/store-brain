@@ -116,6 +116,15 @@ export const SEED_DECISIONS = Object.freeze([
   // Wired: cs/starterDrafts.js — flagged emails also get a starting reply in Gmail (decision stays his).
   { at: "2026-10-15T12:25:00Z", topic: "cs.starter_drafts", scope: "all", source: "chat 2026-10-15 — looking at Waiting on you (Escalation Desk cards)",
     words: "i thought the brain was supposed to draft replies for me, not just tell me" },
+  // Wired: pnl/sheets.js brainValue "revenue" = each order's original total (products + shipping + tax).
+  { at: "2026-10-15T14:00:00Z", topic: "pnl.sheet_revenue", scope: "all", source: "chat 2026-10-15 — Q: what counts as Revenue in the P&L sheets? Reilly picked \"Everything the customer paid\" (products + shipping + tax)",
+    words: "that P&L sheet needs to be exactly accurate, with shipping accounted for, as well as tax. can we fix it? — Everything the customer paid" },
+  // Wired: pnl/sheets.js brainValue "cog_eur" estimate + COG_CORRECT_DAYS corrections.
+  { at: "2026-10-15T14:00:00Z", topic: "pnl.sheet_cog_estimate", scope: "all", source: "chat 2026-10-15",
+    words: "COGs are not always updated the day after, so like for yesterday it is very possible we will not have full COGs today, because of this, COGs for yesteerday should always be an estimate, that is filled in with accurate numbers at a later time" },
+  // Wired: cs/replyWriter.js signOff + both prompts.
+  { at: "2026-10-15T14:03:00Z", topic: "cs.sign_off", scope: "all", source: "chat 2026-10-15 — on a Gmail draft signed \"Holt & Crane Customer Care\"",
+    words: "it should say just \"Holt & Crane\" at the end, not cusotmer care" },
 ]);
 
 /** Latest (unsuperseded) decision on a topic, or null. */

@@ -25,7 +25,7 @@ import { nowIso } from "../../lib/time.js";
 import { CAPS, DELIVERY_FACTS, storeName } from "./config.js";
 import { checkDraft } from "./routing.js";
 import { emailAsksAboutSize } from "./sizeUpGate.js";
-import { draftsLive, pushGmailDraft, corePolicy, userPrompt } from "./replyWriter.js";
+import { draftsLive, pushGmailDraft, corePolicy, userPrompt, signOff } from "./replyWriter.js";
 import { escalationReason } from "./escalation.js";
 import { otherLiveDraft } from "./gmailDrafts.js";
 import { getThread } from "./gmail.js";
@@ -45,8 +45,10 @@ The reply must:
 - use only the order facts given; if no order was found, ask for the order number;
 - if an item arrived wrong, damaged or faulty, ask for a photo of it;
 - say the team is looking into it and will follow up shortly (no date, no time frame);
-- decide nothing and promise nothing.
-Voice: warm, short, plain English, no corporate filler. 3-6 sentences. Greet the customer by first name if known. Sign off exactly: "${store} Customer Care".
+- decide nothing and promise nothing;
+- say a parcel is delivered or not delivered ONLY from carrier_says_delivered (when unknown, say neither);
+- write as the store ("we"); never mention Reilly or any person by name.
+Voice: warm, short, plain English, no corporate filler. 3-6 sentences. Greet the customer by first name if known. Sign off with just the store name on its own line, exactly: "${store}" (Reilly 2026-10-15: not "Customer Care").
 Hard rules:
 - Never invent order numbers, tracking numbers, dates, measurements or policies.
 - Never write any date, weekday or month name, and never the words refund, money, credit, discount, code, free, replace, reship, resend, return label. The only numbers you may write are the order number, tracking numbers and links given, and delivery-time ranges in business days.
@@ -132,7 +134,7 @@ export async function writeStarterDrafts(env, { nowMs = Date.now(), fetchImpl = 
         await skip(t, "No starting reply: the writer says this email needs no reply", at);
         continue;
       }
-      body = typeof j.body === "string" ? j.body.trim() : "";
+      body = signOff(typeof j.body === "string" ? j.body.trim() : "");
       const problems = checkDraft(body, { ctx: t.order_mismatch ? null : ctx, orderRef: t.order_mismatch ? null : t.order_ref, sizeAsked });
       if (problems.length) {
         out.failed++;

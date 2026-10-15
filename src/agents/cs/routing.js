@@ -9,6 +9,33 @@ import { sizeUpMention } from "./sizeUpGate.js";
 /**
  * @returns {{action:"escalate"|"draft", reason:string}}
  */
+/**
+ * The customer says the parcel shows delivered (or was delivered somewhere wrong) but they don't
+ * have it. A "delivered" with a negation right before it ("hasn't been delivered", "not
+ * delivered yet") is an ordinary where-is-my-order.
+ */
+const DELIVERED_CLAIM = /\b(delivered|delivery (was )?(confirmed|complete))\b/gi;
+const NEGATED = /(\bnot\b|\bnever\b|n['’]?t\b|\byet to be\b|\bstill\b)[^.?!]{0,20}$/i;
+const FUTURE = /\b(would|will|should|supposed to|going to|expected to|estimated)\b[^.?!]{0,20}$/i;
+const QUESTION_START = /^\s*(has|have|is|was|did|does|when|will|can|could|would|should|why|how)\b/i;
+// The customer doesn't have it: a "delivered" claim alone ("it was delivered, thank you!") isn't enough.
+const MISSING_WORDS = /\b(not|never|nothing|missing|where|cannot|lost|stolen|nowhere|no sign)\b|n['’]?t\b/i;
+const NOT_THERE = /\bchecked (all|every|the|around)\b.{0,30}\b(locations?|places?|spots?|door|mailbox|porch)|\bnothing (was )?there\b|\bnot (anywhere|at my door|in my mailbox)\b|\bdelivered to (the )?wrong\b|\bwrong (address|house|door)\b|\bno (package|parcel)\b(?!\s+tracking)/i;
+export function isMissingParcel(text) {
+  const t = String(text || "");
+  if (NOT_THERE.test(t)) return true;
+  if (!MISSING_WORDS.test(t)) return false;
+  for (const m of t.matchAll(DELIVERED_CLAIM)) {
+    const before = t.slice(Math.max(0, m.index - 40), m.index);
+    const sentenceStart = (t.slice(0, m.index).split(/[.!?\n]/).pop() || "");
+    if (QUESTION_START.test(sentenceStart)) continue; // "has it been delivered?" asks, it doesn't claim
+    if (NEGATED.test(before) || FUTURE.test(before)) continue;
+    if (/\b(says?|said|shows?|showing|shown|marked|listed|status|tracking|usps|ups|fedex|carrier|been|was)\b/i.test(before)) return true;
+  }
+  return false;
+}
+export const MISSING_PARCEL = { test: isMissingParcel };
+
 export function routeTicket(t, triage, ctx) {
   const cat = t.category || "other";
   // The order number written belongs to someone else's email: never answer from it.
@@ -18,6 +45,11 @@ export function routeTicket(t, triage, ctx) {
   if (triage && triage.wants_refund) return { action: "escalate", reason: "asks for a refund" };
   // The item arrived and doesn't fit: an exchange or return follows, which is a replacement or
   // refund decision (Reilly's). Before shipping, a size swap is just a change KFB can make.
+  // The carrier says delivered but the customer is asking where it is: a missing parcel (claim,
+  // reship or refund), Reilly's call. Live 2026-10-15: "i checked all locations and there was nothing there".
+  if (cat === "where_is_order" && ctx && (ctx.shipments || []).some((s) => s.carrier_delivered === true)) return { action: "escalate", reason: "the carrier says delivered but the customer hasn't got it (missing parcel)" };
+  // Parcel tracking is off, so the customer's own words are the signal.
+  if (cat === "where_is_order" && MISSING_PARCEL.test(String(t.body || ""))) return { action: "escalate", reason: "the customer says it shows delivered or isn't there (missing parcel)" };
   if (cat === "size_complaint") return { action: "escalate", reason: "item doesn't fit (exchange / return is Reilly's call)" };
   if (cat === "exchange" && !(ctx && ctx.shipped === false)) return { action: "escalate", reason: "exchange after shipping (replacement is Reilly's call)" };
   if (!DRAFT_CATEGORIES.includes(cat)) return { action: "escalate", reason: "not covered by the playbook" };
@@ -73,6 +105,8 @@ export function checkDraft(body, { ctx = null, orderRef = null, sizeAsked = fals
   const dur = noRange.match(/\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|a few|a couple( of)?|couple of|several|24|48|72)\s*(hours?|hrs?|days?|weeks?|business days?|working days?)\b/i);
   if (dur) problems.push(`gives a time frame ("${dur[0]}") — only "N-M business days" delivery ranges`);
   if (/\[[^\]]{2,40}\]|\{\{|\}\}|<(name|order|tracking)[^>]*>/i.test(s)) problems.push("contains a placeholder");
+  // Customers hear from the store, never about Reilly (live 2026-10-15: "Reilly will review").
+  if (/\breilly\b/i.test(s)) problems.push("mentions Reilly by name");
 
   // Links and addresses: only this order's tracking links; no other link, domain or email.
   const shipments = (ctx && ctx.shipments) || [];
