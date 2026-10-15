@@ -364,8 +364,14 @@ export async function crossCheck(db, { nowMs = Date.now() } = {}) {
       }
       if (!r.p_complete) continue; // only days the brain has closed
       const notes = safeJson(r.p_notes, {}) || {};
-      if (r.revenue != null && r.p_revenue != null && Math.abs(Number(r.revenue) - Number(r.p_revenue)) > Math.max(1, 0.01 * Number(r.p_revenue))) {
-        await push({ field: "revenue", sheet: r.revenue, brain: r.p_revenue, source: "brain (Shopify orders)" });
+      // On the sheet's own definition (no shipping, no tax) when the orders show it, so an express
+      // order isn't reported as a mismatch (and the brain's own writes never are).
+      const tol = (x) => Math.max(1, 0.01 * x);
+      const plainOff = r.revenue != null && r.p_revenue != null && Math.abs(Number(r.revenue) - Number(r.p_revenue)) > tol(Number(r.p_revenue));
+      // Only a disagreeing day costs the extra look (bounded D1 work per run).
+      const pRev = plainOff ? await comparableRevenue(db, id, r.day, r.p_revenue) : r.p_revenue != null ? Number(r.p_revenue) : null;
+      if (r.revenue != null && pRev != null && Math.abs(Number(r.revenue) - pRev) > tol(pRev)) {
+        await push({ field: "revenue", sheet: r.revenue, brain: r2(pRev), source: "brain (Shopify orders)" });
       }
       if (r.orders != null && r.p_orders != null && Number(r.orders) !== Number(r.p_orders)) await push({ field: "orders", sheet: r.orders, brain: r.p_orders, source: "brain (Shopify orders)" });
       if (r.services != null && r.p_guy != null && Math.abs(Number(r.services) - Number(r.p_guy)) > MISMATCH_USD) await push({ field: "services", sheet: r.services, brain: r.p_guy, source: "brain (10% of ad spend)" });
@@ -405,16 +411,87 @@ export function revenueDefinitionMatch(rawText) {
   return Math.abs(sub - tot) < 0.005;
 }
 
-async function revenueMatchesDefinition(db, storeId, day) {
-  const { results } = await db.prepare(`SELECT raw, financial_status FROM orders WHERE store = ? AND local_day = ?`).bind(storeId, day).all();
+/**
+ * The sheet's revenue for a day ("gross sales less discounts, before returns": no shipping, no
+ * tax), from the same orders the brain's revenue counts (test and voided orders excluded).
+ * Why: express orders carry a shipping charge, and refusing the whole day (live 2026-10-15:
+ * H&C 10/14 left blank) helps nobody when Shopify states the number itself.
+ * Per order, Shopify's own ORIGINAL `subtotal_price` (webhook payload: line items after
+ * discounts, no shipping, no tax, no tips) is used. Refused (never guessed) when:
+ *   - prices include tax (`taxes_included`): the subtotal would then carry tax;
+ *   - a line is a gift card (Shopify's gross sales leaves gift cards out);
+ *   - the payload has no original subtotal (GraphQL pulls): then only an order with nothing
+ *     changed since (current total = original total) and no shipping or tax counts, at its total.
+ * And the plain order totals must add up to the brain's own revenue (same orders, same day).
+ */
+/**
+ * A pulled (GraphQL) order carries no line items; its stored lines' titles and handles are passed
+ * in as `_line_titles`. order_lines has no gift-card flag, so this is by name ("gift" in the title
+ * or handle; Shopify's own gift card product is "Gift Card" / gift-card). The stores sell
+ * clothing only; a webhook payload, when present, is checked by Shopify's own gift_card flag.
+ */
+const giftCardTitles = (raw) => (raw._line_titles || []).some((t) => /gift/i.test(String(t)));
+
+export function sheetRevenueOfOrder(rawText, lineTitles = null) {
+  const raw0 = safeJson(rawText, null);
+  if (!raw0) return { skip: "an order has no stored payload" };
+  const raw = lineTitles ? { ...raw0, _line_titles: lineTitles } : raw0;
+  const num = (v) => (v == null || v === "" || !Number.isFinite(Number(v)) ? null : Number(v));
+  if (raw.total_price != null) {
+    const gross = num(raw.total_price), sub = num(raw.subtotal_price);
+    if (gross == null || sub == null) return { skip: "an order's payload has no original subtotal" };
+    if (raw.taxes_included === true) return { skip: "an order's prices include tax, so its subtotal isn't gross sales less discounts" };
+    if (!Array.isArray(raw.line_items)) return { skip: "an order's payload has no line items (gift cards can't be ruled out)" };
+    if (raw.line_items.some((l) => l && l.gift_card === true)) return { skip: "an order includes a gift card" };
+    return { gross, value: sub };
+  }
+  const amt = (k) => num(raw[k] && raw[k].shopMoney && raw[k].shopMoney.amount);
+  const orig = amt("totalPriceSet"), origSub = amt("subtotalPriceSet");
+  // Pulled since 2026-10-15 (reconcile.js ORDER_FIELDS): the original subtotal, as in the webhook.
+  if (orig != null && origSub != null && raw.taxesIncluded === false) {
+    if (giftCardTitles(raw)) return { skip: "an order includes a gift card" };
+    return { gross: orig, value: origSub };
+  }
+  if (orig != null && origSub != null && raw.taxesIncluded === true) return { skip: "an order's prices include tax, so its subtotal isn't gross sales less discounts" };
+  // Pulled before those fields existed: whether its prices include tax is unknown. Refused.
+  return { skip: "an order's payload can't show its original subtotal (pulled before 2026-10-15)" };
+}
+
+export async function sheetRevenue(db, storeId, day, pnlRevenue) {
+  const { results } = await db.prepare(`SELECT order_id, raw, financial_status FROM orders WHERE store = ? AND local_day = ?`).bind(storeId, day).all();
+  let gross = 0, value = 0, linesBy = null;
   for (const o of results || []) {
     const raw = safeJson(o.raw, null);
     if (raw && raw.test === true) continue;
     if (String(o.financial_status || "").toLowerCase() === "voided") continue;
-    const m = revenueDefinitionMatch(o.raw);
-    if (m !== true) return m === false ? "an order carries shipping or tax, so the brain's total isn't gross sales less discounts" : "an order's payload can't show shipping and tax";
+    let titles = null;
+    if (raw && raw.total_price == null) {
+      // Shape first (no query for an order that is refused anyway), then the day's lines in one query.
+      const pre = sheetRevenueOfOrder(o.raw, []);
+      if (pre.skip) return { skip: pre.skip };
+      if (!linesBy) {
+        const { results: ls } = await db.prepare(`SELECT l.order_id, l.title, l.product_handle FROM order_lines l JOIN orders o ON o.store = l.store AND o.order_id = l.order_id WHERE l.store = ? AND o.local_day = ?`).bind(storeId, day).all();
+        linesBy = new Map();
+        for (const l of ls || []) { if (!linesBy.has(l.order_id)) linesBy.set(l.order_id, []); linesBy.get(l.order_id).push(l.title, l.product_handle); }
+      }
+      titles = linesBy.get(o.order_id);
+      // No lines stored yet: a gift card can't be ruled out.
+      if (!titles || !titles.length) return { skip: "an order's lines aren't stored yet (gift cards can't be ruled out)" };
+    }
+    const r = sheetRevenueOfOrder(o.raw, titles);
+    if (r.skip) return { skip: r.skip };
+    gross += r.gross; value += r.value;
   }
-  return null;
+  // Same orders as the brain's revenue, or nothing is written.
+  if (pnlRevenue == null || Math.abs(gross - Number(pnlRevenue)) > 0.01) return { skip: "the day's orders don't add up to the brain's revenue" };
+  return { value: Math.round(value * 100) / 100 };
+}
+
+/** The brain's revenue on the sheet's definition when it can be worked out, else its own revenue. */
+async function comparableRevenue(db, storeId, day, pnlRevenue) {
+  if (pnlRevenue == null) return null;
+  const r = await sheetRevenue(db, storeId, day, pnlRevenue).catch(() => ({ skip: "error" }));
+  return r.skip ? Number(pnlRevenue) : r.value;
 }
 
 /* ---------------- day basis: is the sheet's "day" the brain's "day"? ---------------- */
@@ -487,7 +564,11 @@ export function judgeDayBasis(pairs) {
 /** The day-basis proof for one store workbook, re-evaluated once a day (cached in sheet_workbooks). */
 export async function dayBasis(db, storeId, { nowMs = Date.now() } = {}) {
   const w = await db.prepare(`SELECT day_basis, day_basis_at FROM sheet_workbooks WHERE store = ?`).bind(storeId).first().catch(() => null);
-  if (w && w.day_basis && w.day_basis_at && nowMs - Date.parse(w.day_basis_at) < DAY_BASIS_EVERY_MIN * 60000) return safeJson(w.day_basis, { ok: false, why: "unreadable" });
+  // Only a PASSING proof is reused for a day. A failing one is worked out again every run: live
+  // 2026-10-15 a "0 days to compare" from the first read (before the sheet's rows were stored)
+  // was kept for 24 h and blocked Auberlane's and Marlowe's morning fill. The query is D1 only.
+  const cached = w && w.day_basis && w.day_basis_at && nowMs - Date.parse(w.day_basis_at) < DAY_BASIS_EVERY_MIN * 60000 ? safeJson(w.day_basis, null) : null;
+  if (cached && cached.ok === true) return cached;
   const { results } = await db.prepare(
     `SELECT s.day, s.revenue AS sheet_revenue, s.orders AS sheet_orders, p.revenue AS brain_revenue, p.orders AS brain_orders
        FROM sheet_pnl_days s JOIN pnl_days p ON p.store = s.store AND p.day = s.day
@@ -495,7 +576,12 @@ export async function dayBasis(db, storeId, { nowMs = Date.now() } = {}) {
         AND NOT EXISTS (SELECT 1 FROM sheet_writes x WHERE x.store = s.store AND x.day = s.day AND x.field IN ('revenue', 'orders'))
       ORDER BY s.day DESC LIMIT ?`
   ).bind(storeId, DAY_BASIS_DAYS).all();
-  const out = { ...judgeDayBasis(results || []), at: nowIso(nowMs) };
+  const pairs = [];
+  for (const p of results || []) {
+    const off = Math.abs(Number(p.sheet_revenue) - Number(p.brain_revenue)) > 1;
+    pairs.push(off ? { ...p, brain_revenue: await comparableRevenue(db, storeId, p.day, p.brain_revenue) } : p);
+  }
+  const out = { ...judgeDayBasis(pairs), at: nowIso(nowMs) };
   await db.prepare(`UPDATE sheet_workbooks SET day_basis = ?, day_basis_at = ? WHERE store = ?`).bind(JSON.stringify(out), out.at, storeId).run();
   return out;
 }
@@ -522,8 +608,7 @@ export async function brainValue(db, storeId, day, field, { pnl, setup, tz, toda
     case "revenue": {
       if (!tzOk) return { skip: tzWhy };
       if (pnl.revenue == null) return { skip: "revenue unknown" };
-      const bad = await revenueMatchesDefinition(db, storeId, day);
-      return bad ? { skip: bad } : { value: r2(pnl.revenue) };
+      return sheetRevenue(db, storeId, day, pnl.revenue);
     }
     case "orders":
       if (!tzOk) return { skip: tzWhy };
@@ -942,7 +1027,23 @@ export async function runSheets(env, { fetchImpl = fetch, nowMs = Date.now(), ca
  * written AND verified (a cell Reilly filled in between counts as filled), or there was provably
  * nothing to write (the reasons are given). Anything else = retry.
  */
+/**
+ * Skips that can clear up later the same morning: the KFB import (Reilly does it after the
+ * 07:00 run). Only yesterday's row waits, and only until noon, so an order that never gets a
+ * KFB charge holds up one morning, not every morning. Yesterday isn't "done" while one of these holds a cell
+ * back, so the run retries until noon (live 2026-10-15: the COG cells stayed blank because the
+ * run marked the day done before the KFB import landed).
+ */
+export const WAIT_SKIPS = /KFB/i;
+
 export function yesterdayVerdict(wb, y, plan, r, storesWroteYesterday = []) {
+  const v = yesterdayVerdictBase(wb, y, plan, r, storesWroteYesterday);
+  if (!v.ok || !y) return v;
+  const waiting = Object.keys(y.skipped || {}).filter((k) => WAIT_SKIPS.test(k));
+  return waiting.length ? { ok: false, why: `${y.day}: waiting on ${waiting.join("; ")} (retried until noon)` } : v;
+}
+
+function yesterdayVerdictBase(wb, y, plan, r, storesWroteYesterday = []) {
   if (!y) return { ok: false, why: "no plan for yesterday" };
   if (y.retry) return { ok: false, why: y.retry };
   if (!y.in_sheet) return { ok: false, why: `no row for ${y.day} in the sheet (month tab missing?)` };

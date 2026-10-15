@@ -28,8 +28,10 @@ import { nowIso } from "./time.js";
  *  - `totalPriceSet`: the ORIGINAL order total ("before returns"), which is the P&L
  *    revenue basis; refunds are booked separately on their processed day (rule 7).
  *  - `currentTotalPriceSet`: the current total (after refunds/edits), kept as `orders.total`.
- * Requested cost per order: the Order 1 + 4 MoneyBags x 2 (bag + shopMoney) + shippingLine 1
- * = 10 points; 25 orders ≈ 252 points, 50 orders ≈ 502 (Shopify's limit is 1,000).
+ *  - `subtotalPriceSet`, `totalTaxSet`, `taxesIncluded`: the ORIGINAL subtotal (line items after
+ *    discounts, no shipping, no tax), for the P&L sheets' revenue definition (pnl/sheets.js).
+ * Requested cost per order: the Order 1 + 6 MoneyBags x 2 (bag + shopMoney) + shippingLine 1
+ * = 14 points; 25 orders ≈ 352 points, 50 orders ≈ 702 (Shopify's limit is 1,000).
  */
 export const ORDER_FIELDS = `
       id name createdAt updatedAt test currencyCode displayFinancialStatus
@@ -37,6 +39,9 @@ export const ORDER_FIELDS = `
       currentTotalDiscountsSet { shopMoney { amount } }
       currentTotalPriceSet { shopMoney { amount } }
       totalPriceSet { shopMoney { amount } }
+      subtotalPriceSet { shopMoney { amount } }
+      totalTaxSet { shopMoney { amount } }
+      taxesIncluded
       shippingLine { title code }`;
 
 const RECENT_ORDERS = `{

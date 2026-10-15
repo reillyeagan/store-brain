@@ -185,7 +185,7 @@ async function order(DB, store, { id, created_at, total, raw = null }) {
   await upsertOrder(DB, STORES[store], {
     order_id: `gid://shopify/Order/${store}-${id}`, name: `#${id}`, created_at, currency: "USD",
     subtotal: total, discounts: 0, total, financial_status: "paid", payload_updated_at: created_at,
-  }, JSON.stringify(raw || { total_price: String(total), total_tax: "0.00", total_shipping_price_set: { shop_money: { amount: "0.00" } } }), STORES[store].timezone, created_at);
+  }, JSON.stringify(raw || { total_price: String(total), subtotal_price: String(total), total_tax: "0.00", total_shipping_price_set: { shop_money: { amount: "0.00" } }, line_items: [{ gift_card: false }] }), STORES[store].timezone, created_at);
 }
 
 async function closedDay(DB, store, day, f) {
@@ -635,7 +635,7 @@ test("sheets writer: Shopify's timezone differs from stores.js → alarm, and no
   assert.match(ev[0].summary, /Shopify says the store runs on America\/Chicago but the brain counts days in America\/New_York/);
 });
 
-test("sheets: the day-basis proof is pure, cached for a day, then re-evaluated", async () => {
+test("sheets: the day-basis proof is pure; a pass is cached for a day, a failure is re-worked every run", async () => {
   const { judgeDayBasis, dayBasis } = await import("../src/agents/pnl/sheets.js");
   const pair = (day, so, bo, sr, br) => ({ day, sheet_orders: so, brain_orders: bo, sheet_revenue: sr, brain_revenue: br });
   const ten = Array.from({ length: 10 }, (_, i) => pair(`2026-10-${String(i + 1).padStart(2, "0")}`, 2, 2, 100, 100.5));
@@ -657,8 +657,12 @@ test("sheets: the day-basis proof is pure, cached for a day, then re-evaluated",
     await closedDay(DB, "hc", `2026-10-0${d}`, { revenue: 10, orders: 1, ads: 1, guy_fee: 0.1, fees: 0.3 });
     await DB.prepare(`INSERT INTO sheet_pnl_days (store, day, sheet_id, tab, row_no, revenue, orders, read_at) VALUES ('hc', ?, 'x', 'OCT', 2, 10, 1, 't')`).bind(`2026-10-0${d}`).run();
   }
-  assert.equal((await dayBasis(DB, "hc", { nowMs: NOW + 3600000 })).ok, false, "cached until tomorrow");
-  assert.equal((await dayBasis(DB, "hc", { nowMs: NOW + 25 * 3600000 })).ok, true, "re-evaluated daily");
+  // A FAILING proof is never kept (live 2026-10-15: a stale "0 days" blocked two stores' fill).
+  assert.equal((await dayBasis(DB, "hc", { nowMs: NOW + 3600000 })).ok, true, "a failure is re-worked next run");
+  // A passing proof is kept for a day, then re-evaluated.
+  await DB.prepare(`UPDATE sheet_pnl_days SET orders = 5 WHERE store = 'hc'`).run();
+  assert.equal((await dayBasis(DB, "hc", { nowMs: NOW + 2 * 3600000 })).ok, true, "a pass is cached for a day");
+  assert.equal((await dayBasis(DB, "hc", { nowMs: NOW + 26 * 3600000 })).ok, false, "re-evaluated daily");
 });
 
 test("sheets writer: a missing month tab is never created — one event a day asks Reilly", async () => {
@@ -1283,4 +1287,47 @@ test("verdict: a cell dropped because its row moved is NOT 'filled by hand' — 
   const last = (await m.env.DB.prepare(`SELECT last_result FROM job_runs WHERE job = 'pnl.sheets.morning'`).first()).last_result;
   assert.match(last, /^not filled: .*row moved/);
   assert.equal(await m.env.DB.prepare(`SELECT last_result FROM job_runs WHERE job = 'pnl.sheets.done'`).first(), null);
+});
+
+test("sheets revenue (live 2026-10-15): Shopify's own subtotal (no shipping, tax or tips) is written; tax-inclusive prices, gift cards and unknown payloads block the day", async () => {
+  const { sheetRevenue, yesterdayVerdict } = await import("../src/agents/pnl/sheets.js");
+  const DB = makeD1();
+  let n = 0;
+  const add = (raw, fin = "paid") => { n++; return DB.prepare(`INSERT INTO orders (store, order_id, name, created_at, local_day, currency, total, financial_status, raw, updated_at) VALUES ('hc', ?, ?, 't', '2026-10-14', 'USD', 0, ?, ?, 't')`).bind(String(n), `#${n}`, fin, JSON.stringify(raw)).run(); };
+  const line = [{ gift_card: false }];
+  await add({ total_price: "59.90", subtotal_price: "59.90", total_tax: "0.00", line_items: line });
+  await add({ total_price: "89.85", subtotal_price: "69.90", total_tax: "0.00", total_tip_received: "5.00", line_items: line }); // express + tip
+  await add({ total_price: "999", test: true });
+  await add({ total_price: "40", subtotal_price: "40", line_items: line }, "voided");
+  assert.deepEqual(await sheetRevenue(DB, "hc", "2026-10-14", 149.75), { value: 129.8 });
+  assert.match((await sheetRevenue(DB, "hc", "2026-10-14", 150)).skip, /don't add up/, "same orders as the brain or nothing");
+  // Tax-inclusive prices: refused.
+  const DB2 = makeD1();
+  await DB2.prepare(`INSERT INTO orders (store, order_id, name, created_at, local_day, currency, total, financial_status, raw, updated_at) VALUES ('hc', '1', '#1', 't', '2026-10-14', 'USD', 0, 'paid', ?, 't')`).bind(JSON.stringify({ total_price: "50", subtotal_price: "50", taxes_included: true, line_items: line })).run();
+  assert.match((await sheetRevenue(DB2, "hc", "2026-10-14", 50)).skip, /include tax/);
+  // Gift card line: refused.
+  await add({ total_price: "25", subtotal_price: "25", line_items: [{ gift_card: true }] });
+  assert.match((await sheetRevenue(DB, "hc", "2026-10-14", 174.75)).skip, /gift card/);
+  // GraphQL payload with its shipping refunded since (current subtotal = current total, but original is higher): refused.
+  const DB3 = makeD1();
+  const gql = (o, c, cs) => JSON.stringify({ totalPriceSet: { shopMoney: { amount: o } }, currentTotalPriceSet: { shopMoney: { amount: c } }, currentSubtotalPriceSet: { shopMoney: { amount: cs } } });
+  await DB3.prepare(`INSERT INTO orders (store, order_id, name, created_at, local_day, currency, total, financial_status, raw, updated_at) VALUES ('hc', '1', '#1', 't', '2026-10-14', 'USD', 0, 'paid', ?, 't')`).bind(gql("74.85", "59.90", "59.90")).run();
+  assert.ok((await sheetRevenue(DB3, "hc", "2026-10-14", 74.85)).skip);
+  // Pulled before subtotal/tax fields existed: whether prices include tax is unknown, refused.
+  await DB3.prepare(`UPDATE orders SET raw = ?`).bind(gql("59.90", "59.90", "59.90")).run();
+  assert.match((await sheetRevenue(DB3, "hc", "2026-10-14", 59.9)).skip, /pulled before/);
+  // A pulled order with the original subtotal (since 2026-10-15): express shipping comes off.
+  const pulled = (title) => JSON.stringify({ totalPriceSet: { shopMoney: { amount: "74.85" } }, subtotalPriceSet: { shopMoney: { amount: "59.90" } }, totalTaxSet: { shopMoney: { amount: "0.00" } }, taxesIncluded: false });
+  await DB3.prepare(`UPDATE orders SET raw = ?`).bind(pulled()).run();
+  assert.match((await sheetRevenue(DB3, "hc", "2026-10-14", 74.85)).skip, /lines aren't stored/, "gift cards can't be ruled out yet");
+  await DB3.prepare(`INSERT INTO order_lines (store, order_id, line_id, title, product_handle, quantity, price, updated_at) VALUES ('hc', '1', 'l1', 'Wool Coat', 'wool-coat', 1, 59.9, 't')`).run();
+  assert.deepEqual(await sheetRevenue(DB3, "hc", "2026-10-14", 74.85), { value: 59.9 });
+  await DB3.prepare(`UPDATE order_lines SET title = 'Gift Card'`).run();
+  assert.match((await sheetRevenue(DB3, "hc", "2026-10-14", 74.85)).skip, /gift card/);
+  // A COG cell waiting on the KFB import keeps yesterday open (retried until noon); nothing else does.
+  const y = { day: "2026-10-14", in_sheet: true, closed: true, skipped: { "not every order has its actual KFB charge": 1 } };
+  const plan = [{ day: "2026-10-14", field: "adspend" }];
+  const r = { written: [{ day: "2026-10-14", verified: true }] };
+  assert.equal(yesterdayVerdict({ store: "hc" }, y, plan, r).ok, false);
+  assert.equal(yesterdayVerdict({ store: "hc" }, { ...y, skipped: { "the sheet's days don't match the brain's: 3 of 10 match": 1 } }, plan, r).ok, true);
 });
