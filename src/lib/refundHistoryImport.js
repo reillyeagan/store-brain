@@ -23,6 +23,7 @@
 import { REFUND_HISTORY } from "../data/refundHistory.js";
 import { STORES } from "../config/stores.js";
 import { logEvent } from "./eventlog.js";
+import { logOnce } from "../agents/cs/util.js";
 import { localDay, nowIso } from "./time.js";
 
 const ACTOR = "pnl.refunds";
@@ -57,21 +58,26 @@ export async function applyRefundHistory(env, { nowMs = Date.now(), history = RE
         if (!have) diffs.push(`${orderName} $${amount} on ${day} not in the ledger`);
         else if (Math.abs(Number(have.amount) - amount) > 0.005) diffs.push(`${orderName}: ledger $${have.amount}, Shopify $${amount}`);
         else matched++;
-      } else if (have) matched++;
+      } else if (have) {
+        if (Math.abs(Number(have.amount) - amount) > 0.005) diffs.push(`${orderName}: ledger $${have.amount}, Shopify $${amount}`);
+        else matched++;
+      }
       else if (day >= h.from) toAdd.push([refundId, orderId, orderName, processedAt, day, amount, status]);
     }
     // The other direction proves the list is complete: every money refund the ledger has from
     // coverage up to the day the list was read must be on it. One missing = the list is short.
     const { results: ledger } = await db.prepare(
-      `SELECT refund_id, local_day, amount FROM refunds WHERE store = ? AND local_day >= ? AND local_day < ? AND amount <> 0`
+      // A PENDING refund can leave its order showing "paid", so the list's query can't promise
+      // to include it: those are left out of this check (an old pending refund settles within days).
+      `SELECT refund_id, local_day, amount FROM refunds WHERE store = ? AND local_day >= ? AND local_day < ? AND amount <> 0 AND upper(status) NOT LIKE '%PENDING%'`
     ).bind(h.store, cov.covered_from, localDay(history.read_at, tz)).all();
     for (const r of ledger || []) if (!listed.has(r.refund_id)) diffs.push(`ledger refund $${r.amount} on ${r.local_day} missing from the list`);
     if (diffs.length) {
       // Nothing is loaded from a list that doesn't match the brain's own reads (rule 5).
-      await logEvent(db, { actor: ACTOR, kind: "refunds.history_mismatch", store: h.store, target: "sys.shopify", at,
-        summary: `${store.name}: refund history NOT loaded, it doesn't match the brain's own reads (${diffs.length}: ${diffs.slice(0, 3).join("; ")}). Those days stay open`, data: { diffs } });
-      await db.prepare(`INSERT INTO job_runs (job, last_run_at, last_result) VALUES (?, ?, ?) ON CONFLICT(job) DO UPDATE SET last_run_at = excluded.last_run_at, last_result = excluded.last_result`)
-        .bind(job(h.store), at, JSON.stringify({ refused: true, diffs })).run();
+      await logOnce(db, { actor: ACTOR, kind: "refunds.history_mismatch", store: h.store, target: "sys.shopify",
+        summary: `${store.name}: refund history NOT loaded, it doesn't match the brain's own reads (${diffs.length}: ${diffs.slice(0, 3).join("; ")}). Those days stay open`, data: { diffs } }, { key: h.store, windowMin: 24 * 60, nowMs });
+      // Not marked done: it tries again every run (a refund still settling can clear itself);
+      // the warning is logged at most once a day.
       out.push({ store: h.store, refused: "mismatch", diffs });
       continue;
     }
@@ -85,6 +91,11 @@ export async function applyRefundHistory(env, { nowMs = Date.now(), history = RE
       ? await db.prepare(`UPDATE feed_coverage SET start_day = ?, covered_from = ?, updated_at = ? WHERE store = ? AND feed = 'refunds' AND covered_from = ?`)
         .bind(h.from, h.from, at, h.store, cov.covered_from).run()
       : null;
+    if (h.from < cov.covered_from && !(moved && moved.meta && moved.meta.changes)) {
+      // Something else moved the coverage meanwhile: not done, look again next run.
+      out.push({ store: h.store, retry: "coverage changed during the load", added });
+      continue;
+    }
     const result = { added, matched, from: h.from, was: cov.covered_from, moved: !!(moved && moved.meta && moved.meta.changes) };
     await db.prepare(`INSERT INTO job_runs (job, last_run_at, last_result) VALUES (?, ?, ?) ON CONFLICT(job) DO UPDATE SET last_run_at = excluded.last_run_at, last_result = excluded.last_result`)
       .bind(job(h.store), at, JSON.stringify(result)).run();

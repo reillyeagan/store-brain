@@ -34,7 +34,16 @@ test("refund history: refused (nothing loaded, coverage kept) when the list miss
     assert.equal(r.refused, "mismatch");
     assert.equal((await env.DB.prepare(`SELECT COUNT(*) AS n FROM refunds`).first()).n, 1);
     assert.equal((await env.DB.prepare(`SELECT covered_from FROM feed_coverage WHERE store='aub'`).first()).covered_from, "2026-08-19");
+    const [again] = await applyRefundHistory(env, { nowMs: at + 900000, history: H([R(1, "2026-07-28T16:11:56Z", 43.95), R(9, "2026-10-10T22:25:54Z", 64.95)]) });
+    assert.equal(again.refused, "mismatch", "tried again, not skipped forever");
   }
+});
+
+test("refund history: a PENDING refund the list doesn't show doesn't block it", async () => {
+  const env = await ledger({ have: [["gid://shopify/Refund/9", "2026-10-10", 64.95]] });
+  await env.DB.prepare(`INSERT INTO refunds (store, refund_id, order_id, processed_at, local_day, amount, status, raw, updated_at) VALUES ('aub','gid://shopify/Refund/55','o','2026-10-12T12:00:00Z','2026-10-12',30,'PENDING','{}','x')`).run();
+  const [r] = await applyRefundHistory(env, { nowMs: at, history: H([R(1, "2026-07-28T16:11:56Z", 43.95), R(9, "2026-10-10T22:25:54Z", 64.95)]) });
+  assert.equal(r.added, 1);
 });
 
 test("refund history: a list read from another shop is refused", async () => {
