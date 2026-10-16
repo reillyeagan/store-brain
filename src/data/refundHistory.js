@@ -5,7 +5,7 @@
  */
 export const REFUND_HISTORY = {
  "source": "Shopify Admin API via Shopify's own connector (signed in by Reilly), read by Claude",
- "read_at": "2026-10-16T17:42:00Z",
+ "read_at": "2026-10-16T17:49:00Z",
  "query": "orders with financial_status refunded or partially_refunded, updated since 2026-06-29; every refund and refund transaction on each",
  "stores": [
   {
@@ -226,6 +226,21 @@ export const REFUND_HISTORY = {
      "#1038",
      "2026-10-10T22:25:54Z",
      64.95,
+     "SUCCESS"
+    ]
+   ]
+  },
+  {
+   "store": "mar",
+   "shop_domain": "806080-g8.myshopify.com",
+   "from": "2026-07-01",
+   "refunds": [
+    [
+     "gid://shopify/Refund/1112161583156",
+     "gid://shopify/Order/6439993966644",
+     "#1001",
+     "2026-10-11T00:08:34Z",
+     144.95,
      "SUCCESS"
     ]
    ]
