@@ -26,6 +26,10 @@ import { findGoodsPromises, recordGoodsPromise } from "./promises.js";
 const ACTOR = "cs.obligations";
 const TZ = "America/New_York";
 const RECHECK_HOURS = 2; // a thread is re-read at most every 2 hours (cost-bounded; replies are not urgent)
+// A conversation on Reilly's to-do list is re-read much sooner, so it drops off soon after he
+// answers (Reilly 2026-10-16: "the brain should know when i reply to emails").
+const RECHECK_FLAGGED_MIN = 20;
+const ESCALATION_ACTOR = "cs.escalation";
 const WATCH_DAYS = 10;
 
 const DAYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
@@ -84,13 +88,16 @@ export async function checkThreads(env, { nowMs = Date.now(), fetchImpl = fetch,
   const db = env.DB;
   const since = nowIso(nowMs - WATCH_DAYS * 86400000);
   const recheck = nowIso(nowMs - RECHECK_HOURS * 3600000);
+  const recheckFlagged = nowIso(nowMs - RECHECK_FLAGGED_MIN * 60000);
+  // Unanswered emails still on Reilly's list come first and have no age limit: a 4-day-old
+  // refund request he answered must still drop off.
   const { results } = await db.prepare(
     `SELECT * FROM cs_tickets t WHERE t.thread_id IS NOT NULL AND t.status IN ('open','drafted','needs_reilly','replied')
-       AND (t.thread_checked_at IS NULL OR t.thread_checked_at < ?)
-       AND ((t.replied_at IS NULL AND t.received_at >= ?)
+       AND (t.thread_checked_at IS NULL OR t.thread_checked_at < CASE WHEN t.status = 'needs_reilly' AND t.replied_at IS NULL THEN ? ELSE ? END)
+       AND ((t.replied_at IS NULL AND (t.received_at >= ? OR t.status = 'needs_reilly'))
             OR EXISTS (SELECT 1 FROM obligations o WHERE o.status = 'open' AND o.kind = 'reply' AND o.note LIKE 'cs ticket ' || t.id || ':%'))
-     ORDER BY t.thread_checked_at IS NOT NULL, t.thread_checked_at, t.id LIMIT ?`
-  ).bind(recheck, since, CAPS.threadChecksPerTick).all();
+     ORDER BY (t.status = 'needs_reilly' AND t.replied_at IS NULL) DESC, t.thread_checked_at IS NOT NULL, t.thread_checked_at, t.id LIMIT ?`
+  ).bind(recheckFlagged, recheck, since, CAPS.threadChecksPerTick).all();
   let checked = 0, replied = 0, promises = 0, closed = 0, goods = 0;
   const tokens = new Map();
   for (const t of results || []) {
@@ -157,7 +164,38 @@ export async function checkThreads(env, { nowMs = Date.now(), fetchImpl = fetch,
     }
     await db.prepare(`UPDATE cs_tickets SET thread_checked_at = ? WHERE id = ?`).bind(at, t.id).run();
   }
-  return { checked, replied, promises, goods, closed };
+  const answered = await closeAnsweredFlags(db, nowMs);
+  return { checked, replied, promises, goods, closed, answered };
+}
+
+/**
+ * Take an email flag off Reilly's list once he has replied in Gmail to every email on it
+ * (Reilly 2026-10-16: "I have replied to their email but havent heard anything back, so that
+ * should be gone until i hear back from them"). Proof is his SENT message in the thread
+ * (replied_at, set above from Gmail itself, rule 3), never a draft.
+ * When the customer writes again, that email is a new ticket with no reply yet, so it comes
+ * back onto the list through the normal flow (a new flag, or a drafted reply).
+ * The flag is closed as 'expired' with not_reilly: closing it is bookkeeping, not a decision.
+ */
+export async function closeAnsweredFlags(db, nowMs = Date.now()) {
+  const { results: flags } = await db.prepare(
+    `SELECT a.id, a.store, a.title FROM approvals a
+      WHERE a.status = 'pending' AND a.requested_by = ?
+        AND EXISTS (SELECT 1 FROM cs_tickets c WHERE c.approval_id = a.id)
+        AND NOT EXISTS (SELECT 1 FROM cs_tickets c WHERE c.approval_id = a.id AND (c.replied_at IS NULL OR c.replied_at < COALESCE(c.received_at, c.opened_at)))
+      ORDER BY a.id LIMIT 50`
+  ).bind(ESCALATION_ACTOR).all();
+  let n = 0;
+  for (const a of flags || []) {
+    const at = nowIso(nowMs);
+    const r = await db.prepare(`UPDATE approvals SET status = 'expired', decided_at = ?, result = ? WHERE id = ? AND status = 'pending'`)
+      .bind(at, JSON.stringify({ closed_by: ACTOR, not_reilly: true, outcome: "replied_in_gmail", reason: "Reilly replied in Gmail; back on the list if the customer writes again" }), a.id).run();
+    if (!r.meta || r.meta.changes !== 1) continue;
+    await db.prepare(`UPDATE cs_tickets SET status = 'replied', updated_at = ? WHERE approval_id = ? AND status = 'needs_reilly'`).bind(at, a.id).run();
+    n++;
+    await logEvent(db, { actor: ACTOR, kind: "cs.flag_answered", store: a.store, target: "core.approvals", at, summary: `Off your list: ${clip(a.title, 120)} (you replied in Gmail; it comes back if they write again)`, data: { approvalId: a.id } });
+  }
+  return n;
 }
 
 /** Flag each CS promise that is past due, once. */

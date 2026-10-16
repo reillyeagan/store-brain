@@ -1391,3 +1391,39 @@ test("cs (live 2026-10-16): a starter that fails the check is rewritten once and
   assert.equal(same.store, "aub");
   assert.equal(storeFromQuoted("Invoice attached\nOn Mon, Reilly <reillyworking26@gmail.com> wrote:\n> Please quote these for Holt & Crane\n> Thanks\n> Reilly", "reillyworking26@gmail.com"), null, "a store named in the text, not as the sign-off");
 });
+
+test("cs: once Reilly replies in Gmail the flag drops off his list (even days later); the customer writing again brings it back", async () => {
+  const env = await setup();
+  await connect(env, "google", "reillyworking26@gmail.com", "rt-main");
+  await addOrder(env.DB, {});
+  const cust = mail({ id: "f1", threadId: "TF", from: "Jane <jane@buyer.com>", subject: "order", body: "Where is #1001?" });
+  const box = { messages: [cust], threads: { TF: [cust] } };
+  const w = world({
+    boxes: { "at-main": box },
+    triage: () => ({ category: "where_is_order", summary: "Where is 1001" }),
+    reply: () => ({ body: "Hi Jane, sorry for the wait, we'll refund your order in full today. Auberlane Customer Care" }),
+  });
+  await runCs(env, { nowMs: NOW, fetchImpl: w.fetchImpl });
+  await runCs(env, { nowMs: NOW + 15 * MIN, fetchImpl: w.fetchImpl });
+  assert.equal((await listPending(env.DB)).filter((a) => a.requested_by === "cs.escalation").length, 1);
+  // Four days later Reilly answers in Gmail; the next runs see his SENT message and close the flag.
+  const LATER = NOW + 4 * 24 * 60 * MIN;
+  const sent = mail({ id: "f2", threadId: "TF", from: "Reilly <reillyworking26@gmail.com>", labels: ["SENT"], body: "Hi Jane, looking into it now.", at: LATER });
+  box.threads.TF = [cust, sent];
+  await runCs(env, { nowMs: LATER + 5 * MIN, fetchImpl: w.fetchImpl });
+  await runCs(env, { nowMs: LATER + 30 * MIN, fetchImpl: w.fetchImpl });
+  assert.equal((await listPending(env.DB)).filter((a) => a.requested_by === "cs.escalation").length, 0, "off the list");
+  const ap = await env.DB.prepare(`SELECT status, result FROM approvals WHERE requested_by = 'cs.escalation'`).first();
+  assert.equal(ap.status, "expired");
+  assert.equal(JSON.parse(ap.result).outcome, "replied_in_gmail");
+  assert.equal((await tickets(env.DB))[0].status, "replied");
+  assert.equal((await evs(env.DB, "cs.flag_answered")).length, 1);
+  // The customer writes again: a new email with no reply, back on the list.
+  const again = mail({ id: "f3", threadId: "TF", from: "Jane <jane@buyer.com>", subject: "Re: order", body: "Still nothing. I want my money back for #1001.", at: LATER + 60 * MIN });
+  box.messages.push(again); box.threads.TF = [cust, sent, again];
+  await runCs(env, { nowMs: LATER + 75 * MIN, fetchImpl: w.fetchImpl });
+  await runCs(env, { nowMs: LATER + 90 * MIN, fetchImpl: w.fetchImpl });
+  const open = (await tickets(env.DB)).find((t) => t.gmail_id === "f3");
+  assert.ok(open && open.replied_at == null, "the new email is waiting on Reilly");
+  assert.ok(["needs_reilly", "drafted", "open"].includes(open.status), open.status);
+});

@@ -61,7 +61,7 @@ export const CAPS = Object.freeze({
   draftsPerTick: 3,          // AI reply drafts per run
   retentionPerTick: 2,       // AI retention suggestions per run
   escalationsPerTick: 5,     // approvals created per run
-  threadChecksPerTick: 3,    // Gmail threads re-read per run for Reilly's sent replies
+  threadChecksPerTick: 5,    // Gmail threads re-read per run for Reilly's sent replies
 });
 
 /** First read of an inbox only looks this far back (bounded, so a first run can't flood). */

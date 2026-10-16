@@ -128,6 +128,23 @@ function startOfLocalDayIso(tz) {
   return new Date(base).toISOString();
 }
 
+async function doneTodayItems(db, todayStart) {
+  const { results } = await db.prepare(
+    `SELECT id, title, store, requested_by, status, decided_at, result FROM approvals
+      WHERE status <> 'pending' AND decided_at >= ? ORDER BY decided_at DESC LIMIT 30`
+  ).bind(todayStart).all();
+  const rows = results || [];
+  const cards = await csCards(db, rows).catch(() => ({}));
+  return rows.map((a) => {
+    let r = {}; try { r = a.result ? JSON.parse(a.result) : {}; } catch { r = {}; }
+    const auto = !!(r && r.not_reilly);
+    return {
+      id: a.id, title: a.title, store: a.store, requested_by: a.requested_by, decided_at: a.decided_at, card: cards[a.id] || null,
+      how: r && r.outcome === "replied_in_gmail" ? "you replied in Gmail" : auto ? "closed by the brain" : a.status === "rejected" ? "you dismissed it" : "you ticked it off",
+    };
+  });
+}
+
 async function handleState(env) {
   await ensureFeeds(env.DB);
   const tz = env.TIMEZONE || "America/New_York";
@@ -146,6 +163,9 @@ async function handleState(env) {
   // Short cards for flagged customer emails (the dashboard's "What needs you").
   const cards = await csCards(env.DB, approvals).catch(() => ({}));
   for (const a of approvals) if (cards[a.id]) a.card = cards[a.id];
+  // Today's finished to-do items, so the list can show them crossed off: closed by Reilly's
+  // own button, or by the brain seeing it done (e.g. he replied in Gmail).
+  const doneToday = await doneTodayItems(env.DB, todayStart).catch(() => []);
   const [pnl, brief, kfbImport, alerts] = await Promise.all([pnlState(env.DB), latestBrief(env.DB), kfbImportStatus(env.DB), phoneAlertsState(env)]);
   return json({
     version: VERSION,
@@ -165,6 +185,7 @@ async function handleState(env) {
       id, store, label, max_age_min, last_ok_at, last_error, state: current,
     })),
     approvals,
+    doneToday,
     aiCostToday,
     todayStart,
     supplier: { mode: supplierMode(env), kfbMessages, expressToday },
