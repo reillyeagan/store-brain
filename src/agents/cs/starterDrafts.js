@@ -33,9 +33,9 @@ import { getGoogleAccessToken } from "../../lib/google.js";
 import { safeJson, clip } from "./util.js";
 
 const ACTOR = "cs.reply_writer";
-const PER_RUN = 2;
+const PER_RUN = 2; // tickets per run (up to 2 AI calls each: the starter and one rewrite)
 /** Starters blocked before the one-rewrite retry existed (2026-10-16) get one more go. */
-export const RETRY_BLOCKED_BEFORE = "2026-10-16T17:00:00.000Z"; // AI starters per run (the run's call allowance is shared with the rest of CS)
+export const RETRY_BLOCKED_BEFORE = "2026-10-16T17:00:00.000Z";
 
 export const OLD_CARD_TAIL = "Reply in Gmail; nothing has been sent.";
 export const NEW_CARD_TAIL = "A starting reply is in your Gmail drafts: add your decision, then send. Nothing has been sent.";

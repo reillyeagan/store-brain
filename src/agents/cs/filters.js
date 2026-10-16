@@ -64,16 +64,20 @@ export function storeFromQuoted(fullBody, inboxAccount = null) {
     }
   }
   // A reply to REILLY's own answer from this inbox ("On Mon, Reilly <reillyworking26@gmail.com>
-  // wrote:", live 2026-10-16): the store is the one his quoted answer is signed as (full store
-  // names only, in the quoted text below that line).
+  // wrote:", live 2026-10-16): the store is the one his quoted answer is SIGNED as: a full store
+  // name ("Holt & Crane", "Auberlane", "Marlowe Standard"; never "Marlowe" or "MS" alone) in the
+  // last lines of his quoted answer, i.e. its sign-off, not anywhere in the text (review: a
+  // supplier's reply quoting a mail that merely mentions a store must not become a ticket).
   if (!found.size && inboxAccount) {
     const acct = String(inboxAccount).toLowerCase();
     const i = lines.findIndex((l) => /\bwrote:\s*$/i.test(l) && l.toLowerCase().includes(acct));
     if (i >= 0) {
-      const below = lines.slice(i + 1).join("\n");
+      let end = lines.findIndex((l, k) => k > i && /\bwrote:\s*$/i.test(l));
+      if (end < 0) end = lines.length;
+      const sig = lines.slice(i + 1, end).map((l) => l.replace(/^[\s>]+/, "").trim()).filter(Boolean).slice(-3);
       for (const [id, names] of Object.entries(STORE_ALIASES)) {
-        const full = names.filter((x) => x.length > 4); // "Holt & Crane", "Auberlane", "Marlowe Standard"…, never "MS"/"HC"
-        if (full.some((nm) => new RegExp(`(^|[^A-Za-z])${esc(nm)}([^A-Za-z]|$)`, "i").test(below))) found.add(id);
+        const full = names.filter((x) => x.length > 4 && x.toLowerCase() !== "marlowe");
+        if (sig.some((l) => full.some((nm) => new RegExp(`^(the\\s+)?${esc(nm)}(\\s+(team|customer\\s+care))?[.!]?$`, "i").test(l)))) found.add(id);
       }
     }
   }
@@ -147,7 +151,13 @@ export function screenMail({ headers, labelIds = [], body = "", fullBody = null,
   if (!store && !contactForm && !/^\s*(fwd?|fw)\s*:/i.test(subject)) { store = storeFromQuoted(fullBody != null ? fullBody : body, inboxAccount); quoted = !!store; }
   // A conversation the brain already has a ticket in (the customer replying to Reilly's own
   // answer, live 2026-10-16): the same store, read here, wherever it was addressed.
-  if (!store && !contactForm && threadStore) { store = threadStore; quoted = true; }
+  // Only the same customer (review: someone else CC'd or forwarded into the thread is not), and
+  // never a forward.
+  if (!store && !contactForm && threadStore && !/^\s*(fwd?|fw)\s*:/i.test(subject)) {
+    const ts = typeof threadStore === "string" ? { store: threadStore, customer: null } : threadStore;
+    const sender = (parseAddress(h["reply-to"]).email || from.email || "").toLowerCase();
+    if (ts.store && (!ts.customer || ts.customer.toLowerCase() === sender)) { store = ts.store; quoted = true; }
+  }
   if (!store) return no("not addressed to a store");
   if (!quoted && !inbox.stores.includes(store)) return no(`read in ${STORES[store].name}'s own inbox`);
   return { keep: true, store, via, replyTo, fromName };

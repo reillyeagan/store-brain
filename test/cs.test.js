@@ -1383,4 +1383,11 @@ test("cs (live 2026-10-16): a starter that fails the check is rewritten once and
   const H = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k.toLowerCase(), v]));
   const s = screenMail({ headers: H({ From: "Christine <c@x.com>", To: "reillyworking26@gmail.com", Subject: "Re: Return please" }), body: "Here is a picture", fullBody: "Here is a picture", threadStore: "aub" }, { slot: "google", stores: ["aub", "mar"], own: false }, "reillyworking26@gmail.com");
   assert.deepEqual([s.keep, s.store], [true, "aub"]);
+  // Review 2026-10-16: only the same customer; a supplier quoting Reilly's mail isn't a ticket.
+  const inbox = { slot: "google", stores: ["aub", "mar"], own: false };
+  const other = screenMail({ headers: H({ From: "Guy <guy@x.com>", To: "reillyworking26@gmail.com", Subject: "Re: Return please" }), body: "noted", fullBody: "noted", threadStore: { store: "aub", customer: "c@x.com" } }, inbox, "reillyworking26@gmail.com");
+  assert.equal(other.keep, false);
+  const same = screenMail({ headers: H({ From: "Christine <c@x.com>", To: "reillyworking26@gmail.com", Subject: "Re: Return please" }), body: "pic", fullBody: "pic", threadStore: { store: "aub", customer: "c@x.com" } }, inbox, "reillyworking26@gmail.com");
+  assert.equal(same.store, "aub");
+  assert.equal(storeFromQuoted("Invoice attached\nOn Mon, Reilly <reillyworking26@gmail.com> wrote:\n> Please quote these for Holt & Crane\n> Thanks\n> Reilly", "reillyworking26@gmail.com"), null, "a store named in the text, not as the sign-off");
 });
