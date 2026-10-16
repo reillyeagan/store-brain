@@ -212,6 +212,9 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
 .meta{font:10.5px var(--mono);color:var(--faint);display:flex;gap:8px;flex-wrap:wrap}
 .fd{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;background:var(--faint)}
 .fd.fresh{background:var(--good)}.fd.stale,.fd.failing{background:var(--bad)}
+  .pane{height:calc(100vh - 120px);min-height:420px;display:flex;flex-direction:column;overflow:hidden}
+  .pane-scroll{flex:1;min-height:0;overflow-y:auto;margin-top:12px;padding-right:4px}
+  @media (max-width:1000px){ .pane{height:auto;max-height:80vh} }
   .todo{background:var(--panel2);border:1px solid var(--border);border-radius:10px;padding:10px 12px}
   .todo-row{display:flex;gap:10px;align-items:flex-start}
   .todo .num{color:var(--faint);font-size:12px;min-width:16px;padding-top:2px;text-align:right}
@@ -654,10 +657,11 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
   }
   function briefPage(){
     var list=todoList(), done=(state.doneToday||[]).filter(function(d){ return store==="all"||!d.store||d.store===store; });
-    var todo='<div class="box"><div class="lab" style="display:flex;justify-content:space-between"><span>To do · '+list.length+'</span>'+(done.length?'<span style="text-transform:none;letter-spacing:0">'+done.length+' done today</span>':'')+'</div><div class="col" style="margin-top:12px;gap:8px">'+
-      (list.length?list.map(todoRow).join(""):'<div class="empty">Nothing to do right now.</div>')+done.map(doneRow).join("")+'</div>'+expressBox()+'</div>';
-    var live='<div class="box"><div class="lab" style="display:flex;justify-content:space-between"><span>What has happened · live</span><span style="color:var(--good);text-transform:none;letter-spacing:0"><span class="dot live" style="background:var(--good);margin-right:5px"></span>updating</span></div>'+feedHtml(60,true)+'</div>';
-    return '<div class="two"><div class="col">'+todo+'</div><div class="col">'+live+'</div></div>';
+    /* Two panes of the same fixed height, each scrolling on its own, so the bottoms line up. */
+    var todo='<div class="box pane"><div class="lab" style="display:flex;justify-content:space-between"><span>To do · '+list.length+'</span>'+(done.length?'<span style="text-transform:none;letter-spacing:0">'+done.length+' done today</span>':'')+'</div><div class="pane-scroll"><div class="col" style="gap:8px">'+
+      (list.length?list.map(todoRow).join(""):'<div class="empty">Nothing to do right now.</div>')+done.map(doneRow).join("")+'</div>'+expressBox()+'</div></div>';
+    var live='<div class="box pane"><div class="lab" style="display:flex;justify-content:space-between"><span>What has happened · live</span><span style="color:var(--good);text-transform:none;letter-spacing:0"><span class="dot live" style="background:var(--good);margin-right:5px"></span>updating</span></div><div class="pane-scroll">'+feedHtml(60,true)+'</div></div>';
+    return '<div class="two">'+todo+live+'</div>';
   }
   function needCard(x){
     if(x.kind==="approval"){ var a=x.a, c=a.card;
