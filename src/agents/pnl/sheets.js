@@ -776,6 +776,9 @@ export async function planCorrections(db, wb, read, { nowMs = Date.now(), dayOk 
   return plan;
 }
 
+/** No media buyer for this store on this day (after Reilly's recorded end date, stores.js guyEnd). */
+export const noMediaBuyer = (store, day) => !!(STORES[store] && STORES[store].guyEnd && day > STORES[store].guyEnd);
+
 /** Ecom P&L: blank inputs get the sum of the three store sheets; filled ones are checked against it. */
 export async function planEcom(db, read, { nowMs = Date.now() } = {}) {
   const at = nowIso(nowMs);
@@ -808,7 +811,9 @@ export async function planEcom(db, read, { nowMs = Date.now() } = {}) {
         continue;
       }
       for (const f of INPUT_FIELDS) {
-        const parts = results.map((r) => r[f]);
+        // A store with no media buyer that day leaves its Services cell blank on purpose (Auberlane
+        // after 2026-10-13, per its SETUP): that is $0 in the Ecom sum, not "unknown".
+        const parts = results.map((r) => (f === "services" && r[f] == null && noMediaBuyer(r.store, d.day) ? 0 : r[f]));
         if (parts.some((x) => x == null)) { if (isY && writableBlank(d, f)) y.skipped[`${f}: a store cell is blank`] = 1; continue; }
         const sum = ["orders", "clicks", "sessions"].includes(f) ? parts.reduce((s, x) => s + Number(x), 0) : r2(parts.reduce((s, x) => s + Number(x), 0));
         if (writableBlank(d, f) && !isY && plan.length >= PLAN_CELLS_PER_RUN + y.planned) { skipped["more cells next run (per-run limit)"] = (skipped["more cells next run (per-run limit)"] || 0) + 1; continue; }

@@ -114,35 +114,33 @@ test("spend alarm: a stale orders feed never produces a 0-orders alarm", async (
 
 /* ---------------- 3. Guy's fee end date ---------------- */
 
-test("guy fee: every store has an end date field, all null (only Reilly's words set one); the fee stops after an end date", async () => {
+test("guy fee: Auberlane's media buyer ended 2026-10-13 (Reilly 2026-10-16); the others run on; the fee stops after the end date", async () => {
   const { STORES } = await import("../src/config/stores.js");
   const { guyFeeFor } = await import("../src/lib/pnl.js");
-  for (const id of ["hc", "aub", "mar"]) assert.equal(STORES[id].guyEnd, null, id);
-  assert.equal(guyFeeFor("aub", "2026-10-14", 100), 10); // still charged: no end date yet
-  // With an end date (set only for this test, then put back): charged through that day, 0 after.
-  STORES.aub.guyEnd = "2026-10-13";
-  try {
-    assert.equal(guyFeeFor("aub", "2026-10-13", 100), 10);
-    assert.equal(guyFeeFor("aub", "2026-10-14", 100), 0);
-    assert.equal(guyFeeFor("aub", "2026-10-14", null), null); // ads unknown stays unknown
-    assert.equal(guyFeeFor("hc", "2026-10-14", 100), 10);     // other stores unaffected
-  } finally {
-    STORES.aub.guyEnd = null;
-  }
+  assert.equal(STORES.aub.guyEnd, "2026-10-13");
+  for (const id of ["hc", "mar"]) assert.equal(STORES[id].guyEnd, null, id);
+  assert.equal(guyFeeFor("aub", "2026-10-13", 100), 10);
+  assert.equal(guyFeeFor("aub", "2026-10-14", 100), 0);
+  assert.equal(guyFeeFor("aub", "2026-10-14", null), null); // ads unknown stays unknown
+  assert.equal(guyFeeFor("hc", "2026-10-14", 100), 10);     // other stores unaffected
 });
 
-test("guy fee: Auberlane's end-date question is asked once, verbatim, and never assumed", async () => {
-  const DB = makeD1();
+test("guy fee: once an end date is set, Auberlane's question is not asked; without one it is asked once, verbatim", async () => {
+  const { STORES } = await import("../src/config/stores.js");
   const { askGuyEndDates } = await import("../src/agents/pnl/guyFee.js");
-  assert.equal(await askGuyEndDates(DB, { nowMs: Date.parse("2026-10-14T12:00:00Z") }), 1);
-  assert.equal(await askGuyEndDates(DB, { nowMs: Date.parse("2026-10-15T12:00:00Z") }), 0);
-  const a = (await DB.prepare(`SELECT * FROM approvals`).all()).results;
-  assert.equal(a.length, 1);
-  assert.equal(a[0].title, "Auberlane's media buyer: did Guy stop after Oct 13? (your sheet says so). Reply to set the end date.");
-  assert.equal(a[0].store, "aub");
-  // Even after Reilly answers, it is not asked again (and nothing is parsed from his note).
-  await DB.prepare(`UPDATE approvals SET status = 'approved', choice = 'reply', note = 'yes last day was the 13th'`).run();
-  assert.equal(await askGuyEndDates(DB, { nowMs: Date.parse("2026-10-16T12:00:00Z") }), 0);
+  const DB = makeD1();
+  assert.equal(await askGuyEndDates(DB, { nowMs: Date.parse("2026-10-16T12:00:00Z") }), 0, "answered in config");
+  STORES.aub.guyEnd = null;
+  try {
+    const DB2 = makeD1();
+    assert.equal(await askGuyEndDates(DB2, { nowMs: Date.parse("2026-10-14T12:00:00Z") }), 1);
+    assert.equal(await askGuyEndDates(DB2, { nowMs: Date.parse("2026-10-15T12:00:00Z") }), 0);
+    const a = (await DB2.prepare(`SELECT * FROM approvals`).all()).results;
+    assert.equal(a.length, 1);
+    assert.equal(a[0].title, "Auberlane's media buyer: did Guy stop after Oct 13? (your sheet says so). Reply to set the end date.");
+  } finally {
+    STORES.aub.guyEnd = "2026-10-13";
+  }
 });
 
 test("guy fee: the monthly check compares the ledger fee with 10% x spend and the sheet's SERVICES; no sheet = not wired, never $0", async () => {

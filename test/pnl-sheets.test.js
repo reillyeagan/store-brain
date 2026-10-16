@@ -1331,3 +1331,10 @@ test("schedule: SHEETS_RERUN_AFTER makes that day's earlier morning runs not cou
   await DB.prepare(`UPDATE job_runs SET last_run_at = ?`).bind(iso(etMs("2026-10-15", 13))).run();
   assert.equal((await sheetsDue(DB, etMs("2026-10-15", 14), "2026-10-15T14:00:00Z")).why, "done for today");
 });
+
+test("Ecom services: a store with no media buyer that day counts as $0, not unknown (Auberlane after 2026-10-13)", async () => {
+  const { noMediaBuyer } = await import("../src/agents/pnl/sheets.js");
+  assert.equal(noMediaBuyer("aub", "2026-10-14"), true);
+  assert.equal(noMediaBuyer("aub", "2026-10-13"), false);
+  assert.equal(noMediaBuyer("hc", "2026-10-14"), false);
+});

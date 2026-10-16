@@ -125,6 +125,9 @@ export const SEED_DECISIONS = Object.freeze([
   // Wired: cs/replyWriter.js signOff + both prompts.
   { at: "2026-10-15T14:03:00Z", topic: "cs.sign_off", scope: "all", source: "chat 2026-10-15 — on a Gmail draft signed \"Holt & Crane Customer Care\"",
     words: "it should say just \"Holt & Crane\" at the end, not cusotmer care" },
+  // Wired: stores.js aub.guyEnd = 2026-10-13 (the cut-off his Auberlane sheet books).
+  { at: "2026-10-16T16:22:00Z", topic: "guy.end.aub", scope: "aub", source: "chat 2026-10-16 — end date taken from his Auberlane sheet (SETUP!B11: booked through 10-13)",
+    words: "also keep in mind i no longer have a mediabuyer on auberlane" },
 ]);
 
 /** Latest (unsuperseded) decision on a topic, or null. */

@@ -156,7 +156,10 @@ export const STORES = Object.freeze({
     // Guy (media buyer) fee: see GUY_FEE below.
     guyFeeRate: GUY_FEE.rate,
     guyStart: GUY_FEE.start,
-    guyEnd: null, // still active until Reilly says otherwise (see GUY_END_QUESTIONS)
+    // Reilly 2026-10-16 (decision guy.end.aub): "i no longer have a mediabuyer on auberlane".
+    // Last day charged = 2026-10-13, the cut-off his Auberlane sheet already books (SETUP!B11:
+    // booked through 10-13, zero from 10-14; ad spend 0.00 on 10-14).
+    guyEnd: "2026-10-13",
   },
   mar: {
     id: "mar",
