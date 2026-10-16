@@ -435,3 +435,29 @@ test("payouts: older fees are read back page by page to HISTORY_FROM, the cursor
   const st = JSON.parse((await DB.prepare(`SELECT last_result FROM job_runs WHERE job = 'payouts.txn_history.hc'`).first()).last_result);
   assert.equal(st.done, true);
 });
+
+test("payouts: a failing history page is logged once a day; 3 failures drop the cursor; 'more pages' with no cursor ends it", async () => {
+  _resetTokenCacheForTests();
+  const DB = makeD1(); const env = { DB, ...SHOP_SECRETS };
+  const { feeHistoryOldest } = await import("../src/lib/payouts.js");
+  const handler = paymentsHandler({ payouts: [], txnsByPayout: {} });
+  let mode = "first";
+  const s = fakeShopify((store, op, vars) => {
+    if (op === "BalanceTxns" && !vars.query && store === "hc" && vars.after) throw new Error("invalid cursor");
+    if (op === "BalanceTxns" && !vars.query && store === "hc") return { shopifyPaymentsAccount: { balanceTransactions: {
+      pageInfo: { hasNextPage: true, endCursor: mode === "nocursor" ? null : "c1" }, nodes: [{ ...txn(500, null, 10), transactionDate: "2026-10-01T12:00:00Z" }] } } };
+    return handler(store, op, vars);
+  });
+  const st = async () => JSON.parse((await DB.prepare(`SELECT last_result FROM job_runs WHERE job = 'payouts.txn_history.hc'`).first()).last_result);
+  await pullPayouts(env, { fetchImpl: s.fetchImpl }); // page 1 ok, page 2 throws
+  assert.equal((await st()).fails, 1);
+  await pullPayouts(env, { fetchImpl: s.fetchImpl });
+  await pullPayouts(env, { fetchImpl: s.fetchImpl });
+  const after3 = await st();
+  assert.equal(after3.fails, 0); assert.equal(after3.after, null, "cursor dropped after 3 failures");
+  assert.equal((await evs(DB, "payouts.history_failed")).filter((e) => e.store === "hc").length, 1, "logged once a day");
+  assert.equal((await feeHistoryOldest(DB, "hc")).done, false);
+  mode = "nocursor";
+  await pullPayouts(env, { fetchImpl: s.fetchImpl });
+  assert.equal((await st()).done, true, "no cursor means no way forward: stop, don't loop");
+});

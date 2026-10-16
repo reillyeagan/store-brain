@@ -489,7 +489,7 @@ test("cs obligations: Reilly's sent reply with a dated promise is recorded, flag
   await runCs(env, { nowMs: NOW, fetchImpl: w.fetchImpl });
   assert.equal((await env.DB.prepare(`SELECT kind FROM cs_kfb_asks`).first()).kind, "colour");
   // Reilly sends a reply with a promise.
-  const sent = mail({ id: "o2", threadId: "TO", from: "Reilly <reillyworking26@gmail.com>", labels: ["SENT"], body: "Hi Jane, we'll update you by Friday once the warehouse confirms.", at: NOW + 20 * MIN });
+  const sent = mail({ id: "o2", threadId: "TO", from: "Reilly <reillyworking26@gmail.com>", to: "Jane <jane@buyer.com>", labels: ["SENT"], body: "Hi Jane, we'll update you by Friday once the warehouse confirms.", at: NOW + 20 * MIN });
   box.threads.TO = [cust, sent];
   await runCs(env, { nowMs: NOW + 3 * 60 * MIN, fetchImpl: w.fetchImpl });
   const t = (await tickets(env.DB))[0];
@@ -1408,7 +1408,7 @@ test("cs: once Reilly replies in Gmail the flag drops off his list (even days la
   assert.equal((await listPending(env.DB)).filter((a) => a.requested_by === "cs.escalation").length, 1);
   // Four days later Reilly answers in Gmail; the next runs see his SENT message and close the flag.
   const LATER = NOW + 4 * 24 * 60 * MIN;
-  const sent = mail({ id: "f2", threadId: "TF", from: "Reilly <reillyworking26@gmail.com>", labels: ["SENT"], body: "Hi Jane, looking into it now.", at: LATER });
+  const sent = mail({ id: "f2", threadId: "TF", from: "Reilly <reillyworking26@gmail.com>", to: "Jane <jane@buyer.com>", labels: ["SENT"], body: "Hi Jane, looking into it now.", at: LATER });
   box.threads.TF = [cust, sent];
   await runCs(env, { nowMs: LATER + 5 * MIN, fetchImpl: w.fetchImpl });
   await runCs(env, { nowMs: LATER + 30 * MIN, fetchImpl: w.fetchImpl });
@@ -1425,5 +1425,37 @@ test("cs: once Reilly replies in Gmail the flag drops off his list (even days la
   await runCs(env, { nowMs: LATER + 90 * MIN, fetchImpl: w.fetchImpl });
   const open = (await tickets(env.DB)).find((t) => t.gmail_id === "f3");
   assert.ok(open && open.replied_at == null, "the new email is waiting on Reilly");
-  assert.ok(["needs_reilly", "drafted", "open"].includes(open.status), open.status);
+  assert.equal(open.status, "needs_reilly", "a refund ask goes back on his list, not to an AI draft");
+});
+
+test("cs: a flag stays on the list if Reilly only forwarded the email, or the customer wrote again before the flag was closed", async () => {
+  const env = await setup();
+  await connect(env, "google", "reillyworking26@gmail.com", "rt-main");
+  await addOrder(env.DB, {});
+  const cust = mail({ id: "h1", threadId: "TH", from: "Jane <jane@buyer.com>", subject: "order", body: "Where is #1001?" });
+  const box = { messages: [cust], threads: { TH: [cust] } };
+  const w = world({
+    boxes: { "at-main": box },
+    triage: () => ({ category: "where_is_order", summary: "Where is 1001" }),
+    reply: () => ({ body: "Hi Jane, sorry for the wait, we'll refund your order in full today. Auberlane Customer Care" }),
+  });
+  await runCs(env, { nowMs: NOW, fetchImpl: w.fetchImpl });
+  await runCs(env, { nowMs: NOW + 15 * MIN, fetchImpl: w.fetchImpl });
+  const pending = async () => (await listPending(env.DB)).filter((a) => a.requested_by === "cs.escalation").length;
+  assert.equal(await pending(), 1);
+  // A forward to the supplier is not a reply to the customer.
+  const fwd = mail({ id: "h2", threadId: "TH", from: "Reilly <reillyworking26@gmail.com>", to: "kfb@supplier.example", labels: ["SENT"], body: "Fwd: see below", at: NOW + 30 * MIN });
+  box.threads.TH = [cust, fwd];
+  await runCs(env, { nowMs: NOW + 45 * MIN, fetchImpl: w.fetchImpl });
+  assert.equal(await pending(), 1, "forward does not tick it off");
+  // He replies, but the customer has already written again (not joined to the flag yet).
+  const rep = mail({ id: "h3", threadId: "TH", from: "Reilly <reillyworking26@gmail.com>", to: "jane@buyer.com", labels: ["SENT"], body: "Looking into it.", at: NOW + 50 * MIN });
+  const again = mail({ id: "h4", threadId: "TH", from: "Jane <jane@buyer.com>", subject: "Re: order", body: "Any news?", at: NOW + 55 * MIN });
+  box.threads.TH = [cust, fwd, rep, again];
+  await env.DB.prepare(`INSERT INTO cs_tickets (slot, gmail_id, thread_id, store, from_email, subject, status, opened_at, received_at, updated_at) VALUES ('google','h4','TH','aub','jane@buyer.com','Re: order','new',?,?,?)`)
+    .bind(new Date(NOW + 56 * MIN).toISOString(), new Date(NOW + 55 * MIN).toISOString(), new Date(NOW + 56 * MIN).toISOString()).run();
+  const { closeAnsweredFlags } = await import("../src/agents/cs/obligations.js");
+  await env.DB.prepare(`UPDATE cs_tickets SET replied_at = ? WHERE gmail_id = 'h1'`).bind(new Date(NOW + 50 * MIN).toISOString()).run();
+  assert.equal(await closeAnsweredFlags(env.DB, NOW + 60 * MIN), 0, "a newer unanswered email keeps it open");
+  assert.equal(await pending(), 1);
 });

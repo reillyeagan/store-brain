@@ -51,6 +51,7 @@ import { logEvent } from "./eventlog.js";
 import { localDay, nowIso, endOfLocalDayMs } from "./time.js";
 import { minusDays } from "./adsSpend.js";
 import { orderCoverage, coveredDays } from "./orderBackfill.js";
+import { feeHistoryOldest } from "./payouts.js";
 
 /**
  * Break-even ROAS constants. Source: docs/specs/media.md, "true break-even ROAS
@@ -415,7 +416,10 @@ export async function computeStoreDay(db, storeId, day, { nowMs = Date.now(), fe
   // Fees are only known from the day after the oldest balance transaction stored: older
   // days were never read, and a missing fee would flatter profit (rule 5).
   const oldest = await db.prepare(`SELECT MIN(date) AS d FROM balance_txns WHERE store = ? AND test = 0`).bind(storeId).first().catch(() => null);
-  const feesFrom = oldest && oldest.d ? minusDays(localDay(oldest.d, tz), -1) : null;
+  // While the fee-history read is unfinished, only the stretch it has read without gaps counts.
+  const hist = await feeHistoryOldest(db, storeId).catch(() => null);
+  const from = hist && !hist.done ? hist.oldest : oldest && oldest.d;
+  const feesFrom = from ? minusDays(localDay(from, tz), -1) : null;
   if (fresh.payouts.usable && !(feesFrom && feesFrom <= day)) why.fees = feesFrom ? `fees only read from ${feesFrom}` : "no balance transactions read yet";
   else if (fresh.payouts.usable) {
     const { results: txns } = await db.prepare(

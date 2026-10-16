@@ -68,7 +68,7 @@ export const CAPS = Object.freeze({
 export const FIRST_READ_DAYS = 3;
 
 /** Cadences (minutes) for claimJob. CS comes round in the department rotation about every 20 minutes. */
-export const CADENCE = Object.freeze({ read: 15, work: 15, obligations: 60 });
+export const CADENCE = Object.freeze({ read: 15, work: 15, obligations: 20 }); // obligations every 20 min so a flag drops off soon after Reilly replies
 
 /**
  * Days a money/goods promise in Reilly's sent mail may stay open before it goes to Waiting on

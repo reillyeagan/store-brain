@@ -20,6 +20,7 @@
  * and its payouts feed stays "not wired". It is never shown as failing.
  */
 import { LIVE_STORE_IDS, STORES, HISTORY_FROM } from "../config/stores.js";
+import { logOnce } from "../agents/cs/util.js";
 import { shopifyGraphQL } from "./storeGuard.js";
 import { markFeedOk, markFeedFailed } from "./freshness.js";
 import { logEvent } from "./eventlog.js";
@@ -177,7 +178,7 @@ export async function pullStorePayouts(env, storeId, opts = {}) {
   // couple of pages per run (live 2026-10-16: fees were only known from 2026-09-26, so every
   // earlier day's profit was blank). Pages go back from the newest without gaps, so the
   // ledger's "fees known from" date (the oldest transaction) stays honest.
-  const history = await backfillTxns(env, storeId, opts, at).catch((err) => ({ error: String(err && err.message).slice(0, 120) }));
+  const history = await backfillTxns(env, storeId, opts, at).catch((err) => backfillFailed(env.DB, storeId, err, at));
 
   // Check PAID payouts not yet matched (newest first, a few per run).
   const toCheck = [];
@@ -234,7 +235,13 @@ export async function backfillTxns(env, storeId, opts, at) {
   if (st.done) return { done: true, oldest: st.oldest || null };
   let after = st.after || null, pages = 0, read = 0, oldest = st.oldest || null, done = false;
   while (pages < BACKFILL_PAGES_PER_RUN) {
-    const data = await shopifyGraphQL(env, storeId, BALANCE_TXNS, { first: TXNS_PER_PAGE, after, query: null }, opts);
+    let data;
+    try { data = await shopifyGraphQL(env, storeId, BALANCE_TXNS, { first: TXNS_PER_PAGE, after, query: null }, opts); }
+    catch (err) {
+      // Keep the pages already read this run before reporting the failure.
+      if (pages) await db.prepare(`UPDATE job_runs SET last_result = ? WHERE job = ?`).bind(JSON.stringify({ ...st, after, oldest, done: false }), job).run().catch(() => {});
+      throw err;
+    }
     const conn = data && data.shopifyPaymentsAccount && data.shopifyPaymentsAccount.balanceTransactions;
     if (!conn) break;
     pages++;
@@ -245,13 +252,46 @@ export async function backfillTxns(env, storeId, opts, at) {
       if (t.date && (!oldest || t.date < oldest)) oldest = t.date;
     }
     if (!conn.pageInfo || !conn.pageInfo.hasNextPage || (oldest && oldest.slice(0, 10) < HISTORY_FROM)) { done = true; break; }
+    // "More pages" with no cursor would restart from the newest page every run, forever.
+    if (!conn.pageInfo.endCursor) { done = true; break; }
     after = conn.pageInfo.endCursor;
   }
-  const state = JSON.stringify({ after, done, oldest });
+  const state = JSON.stringify({ after, done, oldest, fails: 0 });
   await db.prepare(
     `INSERT INTO job_runs (job, last_run_at, last_result) VALUES (?, ?, ?) ON CONFLICT(job) DO UPDATE SET last_run_at = excluded.last_run_at, last_result = excluded.last_result`
   ).bind(job, at, state).run();
   return { done, pages, read, oldest };
+}
+
+/**
+ * A failed history page is logged (once a day per store) and retried next run. After 3 failures
+ * in a row the saved cursor is dropped, so a cursor Shopify no longer accepts can't stall it
+ * forever: it starts again from the newest page (re-reading is harmless, rows upsert by id).
+ */
+async function backfillFailed(db, storeId, err, at) {
+  const job = backfillJob(storeId);
+  const msg = String(err && err.message).slice(0, 120);
+  const row = await db.prepare(`SELECT last_result FROM job_runs WHERE job = ?`).bind(job).first().catch(() => null);
+  let st = {};
+  try { st = row && row.last_result ? JSON.parse(row.last_result) : {}; } catch { st = {}; }
+  st.fails = (st.fails || 0) + 1;
+  if (st.fails >= 3) { st.after = null; st.oldest = null; st.fails = 0; }
+  await db.prepare(
+    `INSERT INTO job_runs (job, last_run_at, last_result) VALUES (?, ?, ?) ON CONFLICT(job) DO UPDATE SET last_run_at = excluded.last_run_at, last_result = excluded.last_result`
+  ).bind(job, at, JSON.stringify(st)).run().catch(() => {});
+  await logOnce(db, { actor: "pnl.money_map", kind: "payouts.history_failed", store: storeId, target: "sys.shopify", summary: `${STORES[storeId].name}: reading older Shopify fees failed (${msg}); retrying next run. Days before the fees already read stay incomplete` }, { key: storeId, windowMin: 24 * 60, nowMs: Date.parse(at) }).catch(() => {});
+  return { error: msg };
+}
+
+/** How far back fees are known for sure: while the history read is unfinished, only back to the
+ *  oldest transaction it reached (older rows from single payouts leave gaps); once it is done,
+ *  everything stored. Null when the history read hasn't started (caller falls back). */
+export async function feeHistoryOldest(db, storeId) {
+  const row = await db.prepare(`SELECT last_result FROM job_runs WHERE job = ?`).bind(backfillJob(storeId)).first().catch(() => null);
+  let st = null;
+  try { st = row && row.last_result ? JSON.parse(row.last_result) : null; } catch { st = null; }
+  if (!st) return null;
+  return { done: !!st.done, oldest: st.oldest || null };
 }
 
 /** The 6-hourly job across every live store. One store's failure never stops the others. */

@@ -19,7 +19,7 @@ import { getGoogleAccessToken } from "../../lib/google.js";
 import { logEvent } from "../../lib/eventlog.js";
 import { nowIso, localDay, endOfLocalDayMs } from "../../lib/time.js";
 import { CAPS, storeName } from "./config.js";
-import { getThread, bodyText, stripQuoted } from "./gmail.js";
+import { getThread, bodyText, stripQuoted, headerMap } from "./gmail.js";
 import { clip, logOnce } from "./util.js";
 import { findGoodsPromises, recordGoodsPromise } from "./promises.js";
 
@@ -30,6 +30,17 @@ const RECHECK_HOURS = 2; // a thread is re-read at most every 2 hours (cost-boun
 // answers (Reilly 2026-10-16: "the brain should know when i reply to emails").
 const RECHECK_FLAGGED_MIN = 20;
 const ESCALATION_ACTOR = "cs.escalation";
+// "Still on Reilly's list": unanswered, and its flag is still pending (a flag he already ticked
+// off must not keep taking the front of the queue).
+const ON_LIST = `(t.status = 'needs_reilly' AND t.replied_at IS NULL AND EXISTS (SELECT 1 FROM approvals a WHERE a.id = t.approval_id AND a.status = 'pending'))`;
+
+/** A SENT message counts as a reply only if it went to the customer (not a forward to a supplier). */
+export function sentToCustomer(m, customerEmail) {
+  const email = String(customerEmail || "").toLowerCase().trim();
+  if (!email) return false;
+  const h = headerMap(m);
+  return `${h.to || ""}, ${h.cc || ""}`.toLowerCase().includes(email);
+}
 const WATCH_DAYS = 10;
 
 const DAYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
@@ -93,10 +104,10 @@ export async function checkThreads(env, { nowMs = Date.now(), fetchImpl = fetch,
   // refund request he answered must still drop off.
   const { results } = await db.prepare(
     `SELECT * FROM cs_tickets t WHERE t.thread_id IS NOT NULL AND t.status IN ('open','drafted','needs_reilly','replied')
-       AND (t.thread_checked_at IS NULL OR t.thread_checked_at < CASE WHEN t.status = 'needs_reilly' AND t.replied_at IS NULL THEN ? ELSE ? END)
-       AND ((t.replied_at IS NULL AND (t.received_at >= ? OR t.status = 'needs_reilly'))
+       AND (t.thread_checked_at IS NULL OR t.thread_checked_at < CASE WHEN ${ON_LIST} THEN ? ELSE ? END)
+       AND ((t.replied_at IS NULL AND (t.received_at >= ? OR ${ON_LIST}))
             OR EXISTS (SELECT 1 FROM obligations o WHERE o.status = 'open' AND o.kind = 'reply' AND o.note LIKE 'cs ticket ' || t.id || ':%'))
-     ORDER BY (t.status = 'needs_reilly' AND t.replied_at IS NULL) DESC, t.thread_checked_at IS NOT NULL, t.thread_checked_at, t.id LIMIT ?`
+     ORDER BY (${ON_LIST}) DESC, t.thread_checked_at IS NOT NULL, t.thread_checked_at, t.id LIMIT ?`
   ).bind(recheckFlagged, recheck, since, CAPS.threadChecksPerTick).all();
   let checked = 0, replied = 0, promises = 0, closed = 0, goods = 0;
   const tokens = new Map();
@@ -124,8 +135,9 @@ export async function checkThreads(env, { nowMs = Date.now(), fetchImpl = fetch,
     const sent = (thread.messages || [])
       .filter((m) => (m.labelIds || []).includes("SENT") && Number(m.internalDate) > customerMs)
       .sort((a, b) => Number(a.internalDate) - Number(b.internalDate));
-    if (sent.length && !t.replied_at) {
-      const firstMs = Number(sent[0].internalDate);
+    const toCustomer = sent.filter((m) => sentToCustomer(m, t.from_email));
+    if (toCustomer.length && !t.replied_at) {
+      const firstMs = Number(toCustomer[0].internalDate);
       replied++;
       await db.prepare(`UPDATE cs_tickets SET replied_at = ?, status = CASE WHEN status IN ('open','drafted') THEN 'replied' ELSE status END, updated_at = ? WHERE id = ?`)
         .bind(new Date(firstMs).toISOString(), at, t.id).run();
@@ -183,6 +195,11 @@ export async function closeAnsweredFlags(db, nowMs = Date.now()) {
       WHERE a.status = 'pending' AND a.requested_by = ?
         AND EXISTS (SELECT 1 FROM cs_tickets c WHERE c.approval_id = a.id)
         AND NOT EXISTS (SELECT 1 FROM cs_tickets c WHERE c.approval_id = a.id AND (c.replied_at IS NULL OR c.replied_at < COALESCE(c.received_at, c.opened_at)))
+        -- and nothing newer from the customer in the same conversation is still unanswered
+        -- (an email the escalation step hasn't joined to this flag yet still counts).
+        AND NOT EXISTS (SELECT 1 FROM cs_tickets c JOIN cs_tickets o ON o.slot = c.slot AND o.thread_id = c.thread_id AND o.id <> c.id
+                         WHERE c.approval_id = a.id AND o.replied_at IS NULL AND o.status NOT IN ('no_action','ignored','superseded')
+                           AND COALESCE(o.received_at, o.opened_at) > COALESCE(c.received_at, c.opened_at))
       ORDER BY a.id LIMIT 50`
   ).bind(ESCALATION_ACTOR).all();
   let n = 0;
