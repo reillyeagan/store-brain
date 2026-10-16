@@ -51,7 +51,7 @@ export function extensionTarget(nowMs, tz, allOrders, historyFrom = HISTORY_FROM
 }
 
 /** Re-check a missing read_all_orders scope this often. */
-export const SCOPE_RECHECK_MIN = 24 * 60;
+export const SCOPE_RECHECK_MIN = 60; // hourly, so a newly granted scope is picked up the same hour
 
 /** Does the store's app have read_all_orders right now (asked live)? */
 async function hasAllOrders(env, id, opts) {
