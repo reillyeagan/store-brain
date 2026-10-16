@@ -78,6 +78,7 @@ import { checkStores, registerWebhooks } from "./lib/setup.js";
 import { reconcileOrders } from "./lib/reconcile.js";
 import { runOrderBackfill } from "./lib/orderBackfill.js";
 import { runHistoryExtension } from "./lib/historyExtend.js";
+import { applyRefundHistory } from "./lib/refundHistoryImport.js";
 import { runMoneyJobs } from "./lib/moneyJobs.js";
 import { moneyState } from "./lib/moneyState.js";
 import { payoutsState } from "./lib/payoutsState.js";
@@ -425,6 +426,12 @@ export default {
             actor: "pnl.pullers", kind: "error.history_extension", target: "sys.shopify",
             summary: `Older order history read failed to start; it will try again in 15 minutes (${String(err && err.message).slice(0, 200)})`,
           }).catch(() => {});
+        }
+        // One-off refund history read from Shopify by Claude (2026-10-16); does nothing once applied.
+        try {
+          await applyRefundHistory(env);
+        } catch (err) {
+          await logEvent(env.DB, { actor: "pnl.refunds", kind: "error.refund_history", target: "sys.shopify", summary: `Loading the refund history failed; it will try again in 15 minutes (${String(err && err.message).slice(0, 200)})` }).catch(() => {});
         }
         // Money feeds: throttled (15 min / hourly) and isolated from each other inside.
         try {
