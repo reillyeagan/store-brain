@@ -104,7 +104,7 @@ a{color:inherit}
 .av{width:26px;height:26px;border-radius:50%;border:1px solid;display:grid;place-items:center;font:600 9.5px var(--font);letter-spacing:.02em}
 .av.on{box-shadow:0 0 0 3px rgba(111,227,180,.18),0 0 12px rgba(111,227,180,.35)}
 .spk{display:block;width:100%;height:42px;margin-top:auto;padding-top:12px}
-.bars{display:block;width:100%;height:70px;margin-top:auto;padding-top:14px}
+.bars{display:block;width:100%;height:auto;margin-top:auto;padding-top:10px}
 .glow{position:absolute;right:-60px;bottom:-80px;width:220px;height:220px;border-radius:50%;opacity:.16;pointer-events:none;-webkit-mask:radial-gradient(closest-side,#000,transparent);mask:radial-gradient(closest-side,#000,transparent)}
 .stores{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:var(--gap)}
 @media (max-width:900px){.stores{grid-template-columns:minmax(0,1fr)}}
@@ -395,22 +395,23 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
   /* A bar per day (oldest → yesterday), same size everywhere, so up and down days read at
      a glance. colorFn(v,row) picks each bar's colour; unknown days are a grey stub, never 0. */
   function dayBars(rows,key,opt){
-    opt=opt||{}; var W=280,H=70,T=4,B=14, ih=H-T-B;
+    /* Drawn at the card's real shape (no stretching): text and bars keep their proportions. */
+    opt=opt||{}; var W=480,H=72,T=6,B=16, ih=H-T-B;
     if(!rows||!rows.length) return '<svg class="bars" viewBox="0 0 '+W+' '+H+'"></svg>';
     var vals=rows.map(function(r){return r[key]}), known=vals.filter(function(v){return v!=null&&isFinite(v)});
     var hi=Math.max.apply(null,known.concat([0,opt.ref||0])), lo=Math.min.apply(null,known.concat([0]));
     if(hi===lo) hi=lo+1;
-    var n=rows.length, slot=W/n, bw=Math.max(6,slot*.62), y=function(v){return T+(hi-v)/(hi-lo)*ih}, z=y(0), out='';
+    var n=rows.length, slot=W/n, bw=Math.max(6,Math.min(22,slot*.5)), y=function(v){return T+(hi-v)/(hi-lo)*ih}, z=y(0), out='';
     if(opt.ref!=null) out+='<line x1="0" x2="'+W+'" y1="'+y(opt.ref).toFixed(1)+'" y2="'+y(opt.ref).toFixed(1)+'" stroke="#a3a3ae" stroke-opacity=".55" stroke-dasharray="3 3"/>';
     rows.forEach(function(r,i){
       var cx=slot*i+slot/2, v=vals[i], last=i===n-1, wd=new Date(r.day+"T12:00:00Z").toLocaleDateString(undefined,{weekday:"narrow",timeZone:"UTC"});
-      out+='<text x="'+cx.toFixed(1)+'" y="'+(H-2)+'" text-anchor="middle" style="font:'+(last?"600":"400")+' 9px Inter;fill:'+(last?"#e8e8ea":"#5c5c66")+'">'+esc(wd)+'</text>';
+      out+='<text x="'+cx.toFixed(1)+'" y="'+(H-2)+'" text-anchor="middle" style="font:'+(last?"600":"400")+' 10px Inter;fill:'+(last?"#e8e8ea":"#5c5c66")+'">'+esc(wd)+'</text>';
       if(v==null||!isFinite(v)){ out+='<rect x="'+(cx-bw/2).toFixed(1)+'" y="'+(z-1.5).toFixed(1)+'" width="'+bw.toFixed(1)+'" height="3" rx="1" fill="#33333c"><title>'+esc(fmtDay(r.day,true))+': unknown</title></rect>'; return; }
       var top=Math.min(y(v),z), h=Math.max(2,Math.abs(y(v)-z)), c=opt.color(v,r);
       out+='<rect x="'+(cx-bw/2).toFixed(1)+'" y="'+top.toFixed(1)+'" width="'+bw.toFixed(1)+'" height="'+h.toFixed(1)+'" rx="2" fill="'+c+'" opacity="'+(last?1:.62)+'"><title>'+esc(fmtDay(r.day,true))+': '+esc(opt.fmt(v))+'</title></rect>';
     });
     if(lo<0) out+='<line x1="0" x2="'+W+'" y1="'+z.toFixed(1)+'" y2="'+z.toFixed(1)+'" stroke="#3a3a44"/>';
-    return '<svg class="bars" viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none" aria-hidden="true">'+out+'</svg>';
+    return '<svg class="bars" viewBox="0 0 '+W+' '+H+'" aria-hidden="true">'+out+'</svg>';
   }
   var PROFIT_C=function(v){return v<0?"#ff8fab":"#6fe3b4"};
   function spark(rows,key,opt){
