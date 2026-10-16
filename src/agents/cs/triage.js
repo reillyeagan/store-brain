@@ -205,7 +205,8 @@ async function storeMessage(db, inbox, account, msg, at) {
   const headers = headerMap(msg);
   const fullBody = bodyText(msg);
   const body = stripQuoted(fullBody);
-  const screen = screenMail({ headers, labelIds: msg.labelIds || [], body, fullBody }, inbox, account);
+  const known = msg.threadId ? await db.prepare(`SELECT store FROM cs_tickets WHERE slot = ? AND thread_id = ? AND store IS NOT NULL ORDER BY id DESC LIMIT 1`).bind(inbox.slot, msg.threadId).first().catch(() => null) : null;
+  const screen = screenMail({ headers, labelIds: msg.labelIds || [], body, fullBody, threadStore: known ? known.store : null }, inbox, account);
   const internal = Number(msg.internalDate) || null;
   const seen = (outcome) => db.prepare(`INSERT OR IGNORE INTO cs_mail_seen (slot, gmail_id, seen_at, outcome, internal_ms) VALUES (?, ?, ?, ?, ?)`).bind(inbox.slot, msg.id, at, outcome, internal).run();
   if (!screen.keep) { await seen(`ignored:${screen.reason}`); return "ignored"; }

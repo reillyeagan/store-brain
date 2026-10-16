@@ -33,7 +33,9 @@ import { getGoogleAccessToken } from "../../lib/google.js";
 import { safeJson, clip } from "./util.js";
 
 const ACTOR = "cs.reply_writer";
-const PER_RUN = 2; // AI starters per run (the run's call allowance is shared with the rest of CS)
+const PER_RUN = 2;
+/** Starters blocked before the one-rewrite retry existed (2026-10-16) get one more go. */
+export const RETRY_BLOCKED_BEFORE = "2026-10-16T17:00:00.000Z"; // AI starters per run (the run's call allowance is shared with the rest of CS)
 
 export const OLD_CARD_TAIL = "Reply in Gmail; nothing has been sent.";
 export const NEW_CARD_TAIL = "A starting reply is in your Gmail drafts: add your decision, then send. Nothing has been sent.";
@@ -81,7 +83,8 @@ export async function writeStarterDrafts(env, { nowMs = Date.now(), fetchImpl = 
     `SELECT c.* FROM cs_tickets c JOIN approvals a ON a.id = c.approval_id
       WHERE c.status = 'needs_reilly' AND a.status = 'pending' AND c.replied_at IS NULL
         AND c.gmail_draft_id IS NULL AND c.gmail_push IS NULL
-        AND (c.draft_status IS NULL OR c.draft_status IN ('blocked','escalated','starter'))
+        AND (c.draft_status IS NULL OR c.draft_status IN ('blocked','escalated','starter')
+             ${nowMs >= Date.parse(RETRY_BLOCKED_BEFORE) ? `OR (c.draft_status = 'starter_skipped' AND c.draft_note LIKE '%Starting reply not used:%' AND c.updated_at < '${RETRY_BLOCKED_BEFORE}')` : ""})
       ORDER BY c.id DESC LIMIT 10`
   ).all();
   let asked = 0;
@@ -90,7 +93,7 @@ export async function writeStarterDrafts(env, { nowMs = Date.now(), fetchImpl = 
     .bind(clip(`${t.draft_note ? `${t.draft_note} · ` : ""}${note}`, 300), at, t.id).run();
   for (const t of results || []) {
     // Up to 2 thread reads + 1 AI call + 4 Gmail calls for the draft (guard, create, read back).
-    if (budget.left < 7) break;
+    if (budget.left < 8) break;
     const at = nowIso(nowMs);
     let body = t.draft_status === "starter" ? t.draft_body : null;
     if (!body && asked >= PER_RUN) continue;
@@ -135,7 +138,26 @@ export async function writeStarterDrafts(env, { nowMs = Date.now(), fetchImpl = 
         continue;
       }
       body = signOff(typeof j.body === "string" ? j.body.trim() : "");
-      const problems = checkDraft(body, { ctx: t.order_mismatch ? null : ctx, orderRef: t.order_mismatch ? null : t.order_ref, sizeAsked });
+      const checkOpts = { ctx: t.order_mismatch ? null : ctx, orderRef: t.order_mismatch ? null : t.order_ref, sizeAsked };
+      let problems = checkDraft(body, checkOpts);
+      // One rewrite with the check's own words (live 2026-10-16: refund and return requests kept
+      // failing because the writer echoed "refund" / "send it back"). The same code check then
+      // decides again; a second failure is final.
+      if (problems.length && budget.take(1)) {
+        try {
+          const r2 = await askJson(env, {
+            system: starterSystem(store, await corePolicy(db, t.order_store || t.store), why),
+            user: `${userPrompt(t, ctx, null)}\n\nYour previous reply was rejected by the safety check: ${problems.join("; ")}.\nWrite it again without those words or anything like them. Refer to what they asked for as "your request" (never name a refund, return, replacement or exchange), and say the team is looking into it.`,
+            maxTokens: 500, actor: ACTOR, label: "CS starter draft (rewrite)", store: t.store || undefined,
+          }, { fetchImpl, nowMs });
+          const j2 = (r2 && r2.json) || {};
+          if (typeof j2.body === "string" && j2.body.trim()) {
+            const body2 = signOff(j2.body.trim());
+            const p2 = checkDraft(body2, checkOpts);
+            if (!p2.length) { body = body2; problems = []; } else problems = p2;
+          }
+        } catch { /* keep the first problems */ }
+      }
       if (problems.length) {
         out.failed++;
         await skip(t, `Starting reply not used: ${problems.join("; ")}`, at);

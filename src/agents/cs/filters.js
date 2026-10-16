@@ -43,7 +43,7 @@ export function storeForShopifySender(name) {
  * or nothing. Why: Marlowe's and Auberlane's customer mail, and replies to Judge.me requests,
  * arrive at Reilly's own address (live 2026-10-15: a return request was never read).
  */
-export function storeFromQuoted(fullBody) {
+export function storeFromQuoted(fullBody, inboxAccount = null) {
   const t = String(fullBody || "");
   const found = new Set();
   for (const m of t.matchAll(/requests\+([a-z0-9.-]+)@judge\.me/gi)) { const s = storeForDomain(m[1]); if (s) found.add(s); }
@@ -63,6 +63,20 @@ export function storeFromQuoted(fullBody) {
       if (headerLines.some((l) => header.test(l)) || wroteLines.some((l) => wrote.test(l))) found.add(id);
     }
   }
+  // A reply to REILLY's own answer from this inbox ("On Mon, Reilly <reillyworking26@gmail.com>
+  // wrote:", live 2026-10-16): the store is the one his quoted answer is signed as (full store
+  // names only, in the quoted text below that line).
+  if (!found.size && inboxAccount) {
+    const acct = String(inboxAccount).toLowerCase();
+    const i = lines.findIndex((l) => /\bwrote:\s*$/i.test(l) && l.toLowerCase().includes(acct));
+    if (i >= 0) {
+      const below = lines.slice(i + 1).join("\n");
+      for (const [id, names] of Object.entries(STORE_ALIASES)) {
+        const full = names.filter((x) => x.length > 4); // "Holt & Crane", "Auberlane", "Marlowe Standard"…, never "MS"/"HC"
+        if (full.some((nm) => new RegExp(`(^|[^A-Za-z])${esc(nm)}([^A-Za-z]|$)`, "i").test(below))) found.add(id);
+      }
+    }
+  }
   return found.size === 1 ? [...found][0] : null;
 }
 
@@ -72,7 +86,7 @@ export function storeFromQuoted(fullBody) {
  * @param {string|null} inboxAccount the Gmail account behind the slot
  * @returns {{keep:false, reason:string} | {keep:true, store:string|null, via:string, replyTo:string, fromName:string}}
  */
-export function screenMail({ headers, labelIds = [], body = "", fullBody = null }, inbox, inboxAccount = null) {
+export function screenMail({ headers, labelIds = [], body = "", fullBody = null, threadStore = null }, inbox, inboxAccount = null) {
   const h = headers || {};
   const no = (reason) => ({ keep: false, reason });
   if (labelIds.some((l) => SKIP_LABELS.includes(l))) return no("not inbox mail (sent/draft/spam/marketing tab)");
@@ -130,7 +144,10 @@ export function screenMail({ headers, labelIds = [], body = "", fullBody = null 
   let quoted = false;
   // Not for a forward ("Fwd:"): that is someone passing a store's mail on (a supplier, Guy), not a
   // customer replying to it.
-  if (!store && !contactForm && !/^\s*(fwd?|fw)\s*:/i.test(subject)) { store = storeFromQuoted(fullBody != null ? fullBody : body); quoted = !!store; }
+  if (!store && !contactForm && !/^\s*(fwd?|fw)\s*:/i.test(subject)) { store = storeFromQuoted(fullBody != null ? fullBody : body, inboxAccount); quoted = !!store; }
+  // A conversation the brain already has a ticket in (the customer replying to Reilly's own
+  // answer, live 2026-10-16): the same store, read here, wherever it was addressed.
+  if (!store && !contactForm && threadStore) { store = threadStore; quoted = true; }
   if (!store) return no("not addressed to a store");
   if (!quoted && !inbox.stores.includes(store)) return no(`read in ${STORES[store].name}'s own inbox`);
   return { keep: true, store, via, replyTo, fromName };

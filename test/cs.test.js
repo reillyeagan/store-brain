@@ -1365,3 +1365,22 @@ test("cs cards (Reilly 2026-10-15, less text): a flagged email becomes a short c
   const cards = await csCards(env.DB, await listPending(env.DB));
   assert.deepEqual({ ...cards[aid], at: undefined, idea: undefined }, { store: "hc", kind: "Return / refund", summary: "Wants a refund for a wrong colour.", customer: "Jane", email: "j@x.com", order: "#1032 · paid · shipped", draft: true, idea: undefined, emails: 1, at: undefined });
 });
+
+test("cs (live 2026-10-16): a starter that fails the check is rewritten once and used if the rewrite passes; replies to Reilly's own answers and to known conversations are read", async () => {
+  const env = await setup({ CS_DRAFTS_LIVE: "1" });
+  await connect(env, "google", "reillyworking26@gmail.com", "rt-main");
+  let n = 0;
+  const w = world({ reply: (u) => { n++; return /rejected by the safety check/.test(u)
+    ? { body: "Hi Jane, thanks for your message about your request. The team is looking into it and will follow up shortly. Holt & Crane" }
+    : { body: "Hi Jane, we'll refund you right away. Holt & Crane" }; } });
+  await flagged(env, { id: 1, body: "I want my money back." });
+  const out = await writeStarterDrafts(env, { nowMs: NOW, fetchImpl: w.fetchImpl, budget: new Budget(28) });
+  assert.equal(n, 2, "one rewrite");
+  assert.equal(out.gmail, 1);
+  const { storeFromQuoted } = await import("../src/agents/cs/filters.js");
+  assert.equal(storeFromQuoted("Has the larger size gone out?\nOn Mon, Oct 5, 2026 at 6:23 PM Reilly <reillyworking26@gmail.com> wrote:\n> Thanks, Reilly\n> Holt & Crane", "reillyworking26@gmail.com"), "hc");
+  assert.equal(storeFromQuoted("lunch?\nOn Mon, Reilly <reillyworking26@gmail.com> wrote:\n> see you", "reillyworking26@gmail.com"), null);
+  const H = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k.toLowerCase(), v]));
+  const s = screenMail({ headers: H({ From: "Christine <c@x.com>", To: "reillyworking26@gmail.com", Subject: "Re: Return please" }), body: "Here is a picture", fullBody: "Here is a picture", threadStore: "aub" }, { slot: "google", stores: ["aub", "mar"], own: false }, "reillyworking26@gmail.com");
+  assert.deepEqual([s.keep, s.store], [true, "aub"]);
+});
