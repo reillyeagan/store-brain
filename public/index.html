@@ -339,6 +339,13 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
   function isAlarm(e){ return /alarm|error|failed|mismatch/i.test(e.kind||""); }
   function recentEvents(){ var now=Date.now(); return (state.events||[]).filter(function(e){return now-Date.parse(e.at)<WORKING_MS&&inStore(e)}); }
   function workingAgents(){ var set={}; recentEvents().forEach(function(e){ if(agentOf(e.actor)) set[e.actor]=1; }); return Object.keys(set); }
+  /* The brain wakes every 5 minutes, works for a few seconds, and an agent only acts when there
+     is something to do. So "working this second" is usually 0; what matters is that the brain is
+     awake on schedule and how many agents did something in the last hour. */
+  function lastTick(){ var j=((state.money||{}).jobs||[]).find(function(x){return x.job==="brain.tick"}); return j&&j.last_run_at?Date.parse(j.last_run_at):null; }
+  function agentHeadline(w){ var t=lastTick(); if(w.length) return w.length+" working now"; if(t&&Date.now()-t<12*60000) return "On duty"; return t?"No check since "+hm(new Date(t).toISOString()):"On duty"; }
+  function agentSub(){ var now=Date.now(), set={}; (state.events||[]).forEach(function(e){ if(now-Date.parse(e.at)<3600000&&inStore(e)&&agentOf(e.actor)) set[e.actor]=1; });
+    var n=Object.keys(set).length, t=lastTick(); return n+" acted in the last hour"+(t?" · last check "+ago(new Date(t).toISOString()):""); }
   function builtCount(){ return (state.agents||[]).filter(isOn).length; }
 
   /* Don't redraw under a text selection (e.g. copying part of a KFB message). */
@@ -462,7 +469,7 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
       kpi("Yesterday revenue",money(y.revenue),y.orders!=null?y.orders+" orders · bars = last 14 days":"",null,dayBars(days,"revenue",{color:function(){return "#b9d3ff"},fmt:function(v){return money(v)}}),"#b9d3ff")+
       kpi("Yesterday profit",prof==null?"—":money(prof,true),prof==null?(y.revenue!=null?"not final yet":""):(!y.complete?"not final yet":(y.cogs_estimated_share>0?"COGS estimated":"final")),prof==null?"":prof<0?"bad-t":"ok-t",dayBars(days,"profit",{color:PROFIT_C,fmt:function(v){return money(v,true)}}),prof!=null&&prof<0?"#ff8fab":"#6fe3b4")+
       kpi("Yesterday ROAS",x2(y.roas),be!=null?"green = above break-even "+x2(be)+" (dashed)":"",y.roas!=null&&be!=null?(y.roas>=be?"ok-t":"bad-t"):"",dayBars(days,"roas",{ref:be,color:function(v,r){var b=r.breakeven_roas!=null?r.breakeven_roas:be; return b==null?"#7cc4ff":v>=b?"#6fe3b4":"#ff8fab"},fmt:function(v){return x2(v)}}),"#7cc4ff")+
-      kpi("Agents running",w.length+" working now",builtCount()+" of "+state.agents.length+" built",null,agentBar(),"#b69cff")+'</div>';
+      kpi("Agents",agentHeadline(w),agentSub(),null,agentBar(),"#b69cff")+'</div>';
     var map='<div class="mapbox"><svg id="map" data-k="'+esc(mapKey())+'" viewBox="0 0 1200 860" role="img" aria-label="Every agent and the systems they use; working agents pulse, moving dots are real hand-offs">'+mapSvg()+'</svg>'+'</div>';
     var n=todoList();
     var wait='<div class="lab" style="display:flex;justify-content:space-between;margin-bottom:12px"><span>Waiting on you · '+n.length+'</span><a href="#/brief" style="text-transform:none;letter-spacing:0;color:var(--muted)">open To do →</a></div><div class="col" style="gap:10px;max-height:70vh;overflow-y:auto;padding-right:4px">'+

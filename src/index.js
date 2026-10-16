@@ -156,7 +156,7 @@ async function handleState(env) {
     costSince(env.DB, todayStart),
     listKfbMessages(env.DB, 10),
     expressOrdersToday(env.DB),
-    env.DB.prepare(`SELECT job, last_run_at, last_result FROM job_runs WHERE job IN ('ads.spend','payouts','refunds')`).all(),
+    env.DB.prepare(`SELECT job, last_run_at, last_result FROM job_runs WHERE job IN ('ads.spend','payouts','refunds','brain.tick')`).all(),
     shippingState(env),
   ]);
   const money = await moneyState(env.DB, feeds);
@@ -370,6 +370,9 @@ export default {
   async scheduled(event, env, ctx) {
     ctx.waitUntil(
       (async () => {
+        // Heartbeat for the dashboard: when the brain last woke up (any schedule).
+        await env.DB.prepare(`INSERT INTO job_runs (job, last_run_at, last_result) VALUES ('brain.tick', ?, ?) ON CONFLICT(job) DO UPDATE SET last_run_at = excluded.last_run_at, last_result = excluded.last_result`)
+          .bind(new Date(Number(event.scheduledTime) || Date.now()).toISOString(), String(event.cron).slice(0, 60)).run().catch(() => {});
         if (event.cron === DEPT_CRON) {
           await runDepartmentSlot(env, { nowMs: Number(event.scheduledTime) || Date.now() }); // never throws
           return;
