@@ -403,3 +403,35 @@ test("money jobs: a job failing every tick logs its alarm at most once an hour, 
   await runMoneyJobs({ DB }, { jobs, nowMs: t0 + 61 * 60000 });
   assert.equal((await evs(DB, "error.money_job")).length, 2, "a new alarm after an hour");
 });
+
+test("payouts: older fees are read back page by page to HISTORY_FROM, the cursor survives between runs, then it stops", async () => {
+  _resetTokenCacheForTests();
+  const DB = makeD1(); const env = { DB, ...SHOP_SECRETS };
+  const { HISTORY_FROM } = await import("../src/config/stores.js");
+  const { BACKFILL_PAGES_PER_RUN } = await import("../src/lib/payouts.js");
+  const dated = (id, date) => ({ ...txn(id, null, 10, "CHARGE", 0.5), transactionDate: `${date}T12:00:00Z` });
+  const before = new Date(Date.parse(HISTORY_FROM) - 86400000).toISOString().slice(0, 10);
+  // Five pages, newest first; the last one crosses HISTORY_FROM.
+  const pages = [["2026-10-10"], ["2026-09-20"], ["2026-09-01"], ["2026-08-10"], [before]];
+  const page = (i) => ({ shopifyPaymentsAccount: { balanceTransactions: {
+    pageInfo: { hasNextPage: i < pages.length - 1, endCursor: `c${i + 1}` }, nodes: pages[i].map((d, k) => dated(100 + i * 10 + k, d)) } } });
+  const afters = [];
+  const handler = paymentsHandler({ payouts: [], txnsByPayout: {} });
+  const s = fakeShopify((store, op, vars) => {
+    if (op === "BalanceTxns" && !vars.query && store === "hc") { afters.push(vars.after || null); return page(vars.after ? Number(vars.after.slice(1)) : 0); }
+    return handler(store, op, vars);
+  });
+  await pullPayouts(env, { fetchImpl: s.fetchImpl });
+  const oldest = async () => (await DB.prepare(`SELECT MIN(date) AS d FROM balance_txns WHERE store = 'hc'`).first()).d.slice(0, 10);
+  assert.equal(afters.length, 1 + BACKFILL_PAGES_PER_RUN, "recent page + backfill pages");
+  assert.equal(await oldest(), "2026-09-20");
+  await pullPayouts(env, { fetchImpl: s.fetchImpl });
+  assert.ok(afters.includes("c2") && afters.includes("c3"), "second run continues from the saved cursor");
+  await pullPayouts(env, { fetchImpl: s.fetchImpl });
+  assert.equal(await oldest(), before, "reached the page past HISTORY_FROM");
+  const n = afters.length;
+  await pullPayouts(env, { fetchImpl: s.fetchImpl });
+  assert.equal(afters.length, n + 1, "once done, only the recent page is read");
+  const st = JSON.parse((await DB.prepare(`SELECT last_result FROM job_runs WHERE job = 'payouts.txn_history.hc'`).first()).last_result);
+  assert.equal(st.done, true);
+});

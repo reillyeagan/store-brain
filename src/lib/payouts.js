@@ -19,7 +19,7 @@
  * A store without Shopify Payments (account is null, or access denied) is logged ONCE
  * and its payouts feed stays "not wired". It is never shown as failing.
  */
-import { LIVE_STORE_IDS, STORES } from "../config/stores.js";
+import { LIVE_STORE_IDS, STORES, HISTORY_FROM } from "../config/stores.js";
 import { shopifyGraphQL } from "./storeGuard.js";
 import { markFeedOk, markFeedFailed } from "./freshness.js";
 import { logEvent } from "./eventlog.js";
@@ -173,6 +173,12 @@ export async function pullStorePayouts(env, storeId, opts = {}) {
     recent.shopifyPaymentsAccount.balanceTransactions.nodes) || [];
   for (const n of recentNodes) await upsertTxn(env.DB, storeId, txnFromNode(n), at);
 
+  // History: page back through every older transaction until the store's history start, a
+  // couple of pages per run (live 2026-10-16: fees were only known from 2026-09-26, so every
+  // earlier day's profit was blank). Pages go back from the newest without gaps, so the
+  // ledger's "fees known from" date (the oldest transaction) stays honest.
+  const history = await backfillTxns(env, storeId, opts, at).catch((err) => ({ error: String(err && err.message).slice(0, 120) }));
+
   // Check PAID payouts not yet matched (newest first, a few per run).
   const toCheck = [];
   for (const p of payouts) {
@@ -207,8 +213,45 @@ export async function pullStorePayouts(env, storeId, opts = {}) {
   return {
     store: storeId, ok: true, at,
     balance: bal.length ? { amount: num(bal[0].amount), currency: bal[0].currencyCode } : null,
-    payouts: payouts.length, newPayouts, txns: recentNodes.length, checks,
+    payouts: payouts.length, newPayouts, txns: recentNodes.length, checks, history,
   };
+}
+
+export const BACKFILL_PAGES_PER_RUN = 2;
+const backfillJob = (storeId) => `payouts.txn_history.${storeId}`;
+
+/**
+ * Older balance transactions, newest to oldest, BACKFILL_PAGES_PER_RUN pages a run. The cursor
+ * lives in job_runs (last_result = JSON {after, done, oldest}). Done when Shopify has no more
+ * pages or the page reaches HISTORY_FROM.
+ */
+export async function backfillTxns(env, storeId, opts, at) {
+  const db = env.DB;
+  const job = backfillJob(storeId);
+  const row = await db.prepare(`SELECT last_result FROM job_runs WHERE job = ?`).bind(job).first().catch(() => null);
+  let st = {};
+  try { st = row && row.last_result ? JSON.parse(row.last_result) : {}; } catch { st = {}; }
+  if (st.done) return { done: true, oldest: st.oldest || null };
+  let after = st.after || null, pages = 0, read = 0, oldest = st.oldest || null, done = false;
+  while (pages < BACKFILL_PAGES_PER_RUN) {
+    const data = await shopifyGraphQL(env, storeId, BALANCE_TXNS, { first: TXNS_PER_PAGE, after, query: null }, opts);
+    const conn = data && data.shopifyPaymentsAccount && data.shopifyPaymentsAccount.balanceTransactions;
+    if (!conn) break;
+    pages++;
+    for (const n of conn.nodes || []) {
+      const t = txnFromNode(n);
+      await upsertTxn(db, storeId, t, at);
+      read++;
+      if (t.date && (!oldest || t.date < oldest)) oldest = t.date;
+    }
+    if (!conn.pageInfo || !conn.pageInfo.hasNextPage || (oldest && oldest.slice(0, 10) < HISTORY_FROM)) { done = true; break; }
+    after = conn.pageInfo.endCursor;
+  }
+  const state = JSON.stringify({ after, done, oldest });
+  await db.prepare(
+    `INSERT INTO job_runs (job, last_run_at, last_result) VALUES (?, ?, ?) ON CONFLICT(job) DO UPDATE SET last_run_at = excluded.last_run_at, last_result = excluded.last_result`
+  ).bind(job, at, state).run();
+  return { done, pages, read, oldest };
 }
 
 /** The 6-hourly job across every live store. One store's failure never stops the others. */
