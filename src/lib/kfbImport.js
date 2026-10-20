@@ -238,7 +238,64 @@ export function normalizeQuoteRow(raw) {
   };
   const v = validateQuoteRow(row);
   if (v.reason) return { code, store: sc.store, reason: v.reason };
-  return { code, store: sc.store, row, clean: v, timeFromCreation: CREATE_TIME_KEYS.has(timeKey) };
+  return { code, store: sc.store, row, clean: v, timeFromCreation: CREATE_TIME_KEYS.has(timeKey), factory: factoryOf(raw) };
+}
+
+/** The 1688 offer behind a factory link, or null (only detail.1688.com/offer/<n>.html counts). */
+export function offerFrom(url) {
+  const m = String(url || "").match(/^https?:\/\/(?:detail\.1688\.com|m\.1688\.com)\/offer\/(\d{6,20})\.html/i);
+  return m ? { offer_id: m[1], offer_url: `https://detail.1688.com/offer/${m[1]}.html` } : null;
+}
+
+/**
+ * What KFB says it buys for this quote: the factory listing and the factory's name for each
+ * store variant (product[].order_items, Reilly 2026-10-20: "every quoted product in KFB has a
+ * supplier link"). Pure. Only 1688 offer links are kept.
+ */
+export function factoryOf(raw) {
+  const entries = (Array.isArray(raw && raw.product) ? raw.product : []).filter(isObj);
+  const variants = [];
+  let offer = null;
+  for (const e of entries) {
+    const oi = isObj(e.order_items) ? e.order_items : null;
+    const o = oi ? offerFrom(oi.goods_url) : null;
+    if (o && !offer) offer = o;
+    const vid = e.un_variant_id != null && /^\d{1,20}$/.test(String(e.un_variant_id)) ? String(e.un_variant_id) : null;
+    if (vid) variants.push({ variant_id: vid, product_id: /^\d{1,20}$/.test(String(e.un_good_id || "")) ? `gid://shopify/Product/${e.un_good_id}` : null,
+      shop_spec: e.un_good_spec ? String(e.un_good_spec).slice(0, 120) : null,
+      factory_spec: oi && oi.goods_spec ? String(oi.goods_spec).slice(0, 120) : null,
+      factory_sku: oi && oi.goods_sku ? String(oi.goods_sku).slice(0, 80) : null, offer_id: o ? o.offer_id : null });
+  }
+  const productId = (variants.find((v) => v.product_id) || {}).product_id || null;
+  return offer || variants.length ? { ...(offer || {}), product_id: productId, variants } : null;
+}
+
+/** Store the factory links and factory variant names from this import's quotes. */
+async function writeSupplierLinks(db, quotes, at) {
+  const out = { links: 0, variants: 0 };
+  const stmts = [];
+  for (const q of quotes) {
+    const f = q.factory, v = q.clean;
+    if (!f || !v || !v.handle) continue;
+    if (f.offer_id) {
+      out.links++;
+      stmts.push(db.prepare(
+        `INSERT INTO supplier_links (store, product_handle, product_id, offer_id, offer_url, first_seen_at, last_seen_at) VALUES (?,?,?,?,?,?,?)
+         ON CONFLICT(store, product_handle, offer_id) DO UPDATE SET last_seen_at = excluded.last_seen_at, product_id = COALESCE(excluded.product_id, supplier_links.product_id)`
+      ).bind(v.store, v.handle, f.product_id, f.offer_id, f.offer_url, at, at));
+    }
+    for (const x of f.variants) {
+      out.variants++;
+      stmts.push(db.prepare(
+        `INSERT INTO factory_variants (store, variant_id, product_handle, shop_spec, factory_spec, factory_sku, offer_id, seen_at) VALUES (?,?,?,?,?,?,?,?)
+         ON CONFLICT(store, variant_id) DO UPDATE SET product_handle = excluded.product_handle, shop_spec = excluded.shop_spec,
+           factory_spec = COALESCE(excluded.factory_spec, factory_variants.factory_spec), factory_sku = COALESCE(excluded.factory_sku, factory_variants.factory_sku),
+           offer_id = COALESCE(excluded.offer_id, factory_variants.offer_id), seen_at = excluded.seen_at`
+      ).bind(v.store, x.variant_id, v.handle, x.shop_spec, x.factory_spec, x.factory_sku, x.offer_id, at));
+    }
+  }
+  if (stmts.length) await runBatched(db, stmts);
+  return out;
 }
 
 /** One order row → a kfb_orders row. */
@@ -559,6 +616,7 @@ export async function importKfb(env, payload, { nowMs = Date.now() } = {}) {
   const billsTruncated = !!(sectionInfo.bills && sectionInfo.bills.truncated);
   const counts = {
     quotes: await writeQuotes(db, n.quotes, at, fetchedAt),
+    supplier_links: await writeSupplierLinks(db, n.quotes, at),
     orders: await writeOrders(db, n.orders, at),
     bills: await writeBills(db, n.bills, at, { truncated: billsTruncated }),
   };

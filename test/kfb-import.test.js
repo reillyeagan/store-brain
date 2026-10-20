@@ -698,3 +698,29 @@ test("review 12: KFB times respect a written zone and accept YYYY/MM/DD", () => 
   assert.equal(kfbTime("2026/1/3"), "2026-01-02T16:00:00.000Z");
   assert.equal(kfbTime("2026-10-13T09:15:00"), "2026-10-13T01:15:00.000Z", "a T stamp without a zone is still China time");
 });
+
+test("factory links: each quote's 1688 supplier link and the factory's size names are kept (Reilly 2026-10-20)", async () => {
+  const { factoryOf, offerFrom } = await import("../src/lib/kfbImport.js");
+  assert.deepEqual(offerFrom("https://detail.1688.com/offer/982289210807.html?spm=x"), { offer_id: "982289210807", offer_url: "https://detail.1688.com/offer/982289210807.html" });
+  assert.equal(offerFrom("https://evil.example/offer/982289210807.html"), null, "only 1688 offer links");
+  const e = env();
+  const p = cleanPayload();
+  p.sections.quotes.rows[0].product = [
+    { un_good_id: "9778258051307", un_variant_id: "49168195322091", un_good_spec: "Green / 2XL", manual_pricing: { "United States": { nameOne: "15.47" } },
+      order_items: { goods_url: "https://detail.1688.com/offer/982289210807.html", goods_spec: "开衫-绿色-2XL", goods_sku: "CW3772-3-2XL" } },
+  ];
+  assert.equal(factoryOf(p.sections.quotes.rows[0]).offer_id, "982289210807");
+  const r = await importKfb(e, p, { nowMs: NOW });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  const link = await e.DB.prepare(`SELECT * FROM supplier_links`).first();
+  assert.equal(link.store, "hc"); assert.equal(link.product_handle, "belted-trench");
+  assert.equal(link.offer_url, "https://detail.1688.com/offer/982289210807.html");
+  assert.equal(link.product_id, "gid://shopify/Product/9778258051307");
+  const fv = await e.DB.prepare(`SELECT * FROM factory_variants`).first();
+  assert.equal(fv.factory_spec, "开衫-绿色-2XL"); assert.equal(fv.shop_spec, "Green / 2XL");
+});
+
+test("bookmarklet: keeps the supplier link fields (order_items.goods_url / goods_spec)", () => {
+  const src = readFileSync(new URL("../public/kfb-bookmarklet.js", import.meta.url), "utf8");
+  for (const k of ["order_items", "goods_url", "goods_spec", "un_variant_id"]) assert.ok(new RegExp(`\\b${k}\\b`).test(src.slice(src.indexOf("var KEEP"), src.indexOf("forEach(function (k) { KEEP[k] = 1; })"))), k);
+});

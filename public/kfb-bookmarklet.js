@@ -49,7 +49,10 @@ window.SB_KFB_BOOKMARKLET = function () {
    "bill_amount bill_price bill_total total_amount total_money total_price total amount money subtotal " +
    "goods_total goods_amount total_goods_price product_total goods_money purchase_amount goods_price purchase_price product_price unit_price cost " +
    "service_fee service_price service_charge handling_fee commission fee freight freight_price shipping_fee shipping_price shipping " +
-   "logistics_fee logistics_price postage express_fee quantity num goods_num qty number").split(" ").forEach(function (k) { KEEP[k] = 1; });
+   "logistics_fee logistics_price postage express_fee quantity num goods_num qty number " +
+   /* The factory link and the factory's size name (Reilly 2026-10-20: size charts come from the
+      "supplier link" on each quote): product[].order_items.goods_url / goods_spec. */
+   "order_items goods_spec un_good_spec un_good_id un_variant_id").split(" ").forEach(function (k) { KEEP[k] = 1; });
 
   if (KFB.indexOf(location.origin) < 0) {
     alert("Store Brain: this only works on KungFuBuy while you are logged in. This page is " + location.origin + ". If KungFuBuy has moved to this address, tell Claude.");

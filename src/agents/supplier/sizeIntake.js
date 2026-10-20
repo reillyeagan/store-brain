@@ -277,6 +277,24 @@ export async function addChartFromImage(env, body, { fetchImpl = fetch, nowMs = 
   return saveChart(env, { store: b.store, product, rows: v.rows, notes: v.notes, kind: "image", unit, flat: j.flat === true, source: IMAGE_SOURCE, replace: b.replace === true }, nowMs);
 }
 
+/**
+ * A chart the brain read itself from a product's factory (1688) listing (chartFetch.js). Same
+ * checks as a paste; always NOT YET CHECKED (verified=0), so it makes no KFB ask until Reilly
+ * confirms it. Never replaces a chart Reilly confirmed.
+ */
+export async function addChartFromListing(env, { store, product_handle, product_id, unit, flat, rows, source }, { nowMs = Date.now() } = {}) {
+  const bad = checkStore(store);
+  if (bad) return bad;
+  const u = String(unit || "").toLowerCase();
+  if (u !== "cm" && u !== "in") return fail(422, `the listing's chart does not say the unit: ${UNCLEAR_UNIT}`);
+  const v = validateChart({ unit: u, flat: flat === true ? true : undefined, rows });
+  if (!v.ok) return fail(422, `the chart read from the listing didn't pass the checks: ${v.error}`);
+  const product = await resolveProduct(env.DB, store, { product_handle, product_id });
+  if (!product.ok) return product;
+  if (await confirmedChartExists(env.DB, store, product)) return fail(409, CONFIRMED_EXISTS);
+  return saveChart(env, { store, product, rows: v.rows, notes: v.notes, kind: "listing", unit: u, flat: flat === true, source: String(source).slice(0, 240), replace: false }, nowMs);
+}
+
 /** POST /api/size-charts/:id/confirm: Reilly checked the chart. Marks exactly that chart's rows verified. */
 export async function confirmChart(env, id, { nowMs = Date.now() } = {}) {
   const db = env.DB;

@@ -54,6 +54,7 @@ export async function askClaude(env, req, { fetchImpl = fetch, nowMs = Date.now(
   const at = nowIso(nowMs);
   const prompt = { system: req.system, user: req.user };
   if (req.image) prompt.image = req.image; // optional {media_type, data}: one base64 image (size-chart intake)
+  if (Array.isArray(req.images) && req.images.length) prompt.images = req.images; // several (1688 description images)
   const r = await callClaude({ ...env, BRIEF_MODEL: env.AGENT_MODEL || env.BRIEF_MODEL }, prompt, {
     fetchImpl,
     maxTokens: req.maxTokens,

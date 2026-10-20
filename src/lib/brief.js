@@ -438,8 +438,12 @@ export async function callClaude(env, prompt, { fetchImpl = fetch, onUsage = nul
     model, max_tokens: Math.min(Number(maxTokens) || BRIEF_MAX_TOKENS, 4000), system: prompt.system,
     // An optional image (size-chart intake) goes in front of the text as one base64 image block;
     // without one the request is exactly what it always was.
-    messages: [{ role: "user", content: prompt.image
-      ? [{ type: "image", source: { type: "base64", media_type: prompt.image.media_type, data: prompt.image.data } }, { type: "text", text: prompt.user }]
+    // `images` (several, numbered in order) is for reading a factory listing's description.
+    messages: [{ role: "user", content: (prompt.image || (Array.isArray(prompt.images) && prompt.images.length))
+      ? [...(prompt.images || [prompt.image]).flatMap((im, i) => [
+          ...(prompt.images ? [{ type: "text", text: `Image ${i}:` }] : []),
+          { type: "image", source: { type: "base64", media_type: im.media_type, data: im.data } },
+        ]), { type: "text", text: prompt.user }]
       : prompt.user }],
   };
   // No up-front thinking (plain writing task, keeps tokens down) and low effort.

@@ -128,6 +128,11 @@ export const SEED_DECISIONS = Object.freeze([
   // Wired: stores.js aub.guyEnd = 2026-10-13 (the cut-off his Auberlane sheet books).
   { at: "2026-10-16T16:22:00Z", topic: "guy.end.aub", scope: "aub", source: "chat 2026-10-16 — end date taken from his Auberlane sheet (SETUP!B11: booked through 10-13)",
     words: "also keep in mind i no longer have a mediabuyer on auberlane" },
+  // Wired: kfbImport.js keeps each quote's factory link; supplier/chartFetch.js reads the chart.
+  { at: "2026-10-20T14:39:00Z", topic: "sup.size_chart_source", scope: "all", source: "chat 2026-10-20",
+    words: "every quoted product in KFB has a \"supplier link\" button on it, that you can view via the browser. in most cases, if you open that supplier link, you should be able to see the size chart." },
+  { at: "2026-10-20T14:45:00Z", topic: "sup.chart_fetch", scope: "all", source: "chat 2026-10-20 — answer to: which way should the brain get the size charts? (1688 shows a slider check to automated browsing)",
+    words: "Brain fetches 1688 itself" },
 ]);
 
 /** Latest (unsuperseded) decision on a topic, or null. */

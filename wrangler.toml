@@ -58,6 +58,9 @@ BRIEF_MODEL = "claude-sonnet-5-5"
 # that day. 2026-10-15: the 07:37 run predated the revenue / COG / day-basis fixes. Harmless
 # after that day; remove whenever.
 SHEETS_RERUN_AFTER = "2026-10-15T14:00:00Z"
+# The brain reads missing factory size charts from 1688 itself (Reilly 2026-10-20: "Brain fetches 1688 itself").
+# Charts it reads are saved NOT YET CHECKED: nothing reaches KFB until Reilly confirms a chart.
+CHART_FETCH_LIVE = "1"
 # Shopify app Client IDs are identifiers, not passwords, so they live here where a
 # deploy can never wipe them. The matching Client SECRETS stay Cloudflare secrets.
 SB_HC_CLIENT_ID = "91f62305f583acc7ac4dcaf6641590c1"

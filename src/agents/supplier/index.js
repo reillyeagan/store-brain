@@ -29,6 +29,7 @@ import { runSimilarQc, SIMILAR_RULE } from "./similarQc.js";
 import { runQuoteDesk, FX } from "./quotes.js";
 import { runSizeChecker, REFERENCE_SOURCE } from "./sizeChecker.js";
 import { chartsNeeded, recentCharts } from "./sizeIntake.js";
+import { runChartFetch } from "./chartFetch.js";
 import { runPreflight } from "./preflight.js";
 import { runClaims, creditAging } from "./claims.js";
 import { runDigest, digestData, digestBody, latestSupplierDigest } from "./digest.js";
@@ -45,6 +46,8 @@ export const SUPPLIER_JOBS = Object.freeze([
   { job: "sup.similar_qc", everyMin: 15, actor: "sup.similar_qc", run: runSimilarQc },
   { job: "sup.quote_desk", everyMin: 60, actor: "sup.quote_desk", run: runQuoteDesk },
   { job: "sup.size_charts", everyMin: 15, actor: "sup.size_charts", run: runSizeChecker },
+  // Reads missing factory charts from the 1688 listings KFB buys from (Reilly 2026-10-20).
+  { job: "sup.chart_fetch", everyMin: 15, actor: "sup.size_charts", run: runChartFetch },
   { job: "sup.preflight", everyMin: 60, actor: "sup.preflight", run: runPreflight },
   { job: "sup.claims", everyMin: 360, actor: "sup.claims", run: runClaims },
   { job: "sup.digest", everyMin: 15, actor: "sup.digest", run: runDigest },
