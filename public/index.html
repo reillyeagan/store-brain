@@ -1237,9 +1237,9 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
   function sizeChartsHtml(st){
     var sc=((st||{}).agents||{})["sup.size_charts"]||{}, need=sc.chartsNeeded||[], charts=sc.charts||[];
     var h='<div class="box" id="sizeBox" style="background:var(--panel2);margin-bottom:12px"><div class="lab">Size charts</div>'+
-      '<div class="note">The size check needs the factory chart for each product (from KFB or 1688). Everything added here is saved as not yet checked until you press Confirm. Nothing is sent to KFB or a customer.</div>';
+      '<div class="note">The brain reads each product\'s chart from the factory listing KFB buys from. Every chart stays not yet checked until you press Confirm; only a confirmed chart can put a size change in the KFB message.</div>';
     h+='<div class="lab" style="margin-top:12px">Charts needed · last 30 days, most order lines first</div>';
-    h+=need.length?need.map(function(n){ return '<div class="rowx"><span><b style="font-weight:500">'+esc(n.title||n.product_handle||n.product_id)+'</b></span><span class="meta"><span>'+esc(n.storeName||n.store)+'</span><span>'+esc(n.product_handle||"no handle")+'</span><span>'+esc(n.lines)+' line'+(n.lines===1?"":"s")+'</span><span>sizes '+esc(n.sizes)+'</span></span>'+
+    h+=need.length?need.map(function(n){ return '<div class="rowx"><span><b style="font-weight:500">'+esc(n.title||n.product_handle||n.product_id)+'</b></span><span class="meta"><span>'+esc(n.storeName||n.store)+'</span><span>'+esc(n.product_handle||"no handle")+'</span><span>'+esc(n.lines)+' line'+(n.lines===1?"":"s")+'</span><span>sizes '+esc(n.sizes)+'</span>'+(n.factory_url?'<span><a href="'+esc(n.factory_url)+'" target="_blank" rel="noopener" style="color:var(--blue)">factory listing</a></span>':'<span>no factory link from KFB yet</span>')+(n.fetch?'<span>brain: '+esc((n.fetch.status==="blocked"?"1688 asked for a check":n.fetch.status==="not_found"?"no chart found":n.fetch.status)+(n.fetch.next_try_at?", tries again later":n.fetch.status==="read"?"":", gave up: add it here"))+'</span>':'')+'</span>'+
       (n.product_handle?'<div class="btns"><button class="btn" data-scuse="'+esc(n.product_handle)+'" data-scstore="'+esc(n.store)+'">Add chart</button></div>':'')+'</div>'; }).join(""):'<div class="note">No sized orders without a chart in the last 30 days.</div>';
     h+='<div class="lab" style="margin-top:14px">Add a chart</div><div class="scform">'+
       '<select class="fld" id="scStore"><option value="hc">Holt &amp; Crane</option><option value="aub">Auberlane</option><option value="mar">Marlowe Standard</option></select>'+
@@ -1256,7 +1256,7 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
     h+=charts.length?charts.map(function(c){
       var cst=c.verified?'<span class="ok-t">confirmed by you</span>':!c.current?'<span style="color:var(--faint)">replaced</span>':'<span class="warn-t">not yet checked</span>';
       return '<div class="rowx"><span><b style="font-weight:500">#'+esc(c.id)+' '+esc(c.title||c.product_handle||c.product_id)+'</b></span><div class="msg">'+esc(scSummary(c.rows))+'</div>'+
-        '<span class="meta"><span>'+esc(c.storeName||c.store)+'</span><span>'+esc(c.product_handle||c.product_id)+'</span><span>'+(c.kind==="image"?"read from an image":"pasted")+'</span><span>'+cst+'</span><span>'+esc(ago(c.created_at))+'</span>'+((c.notes||[]).length?'<span>'+esc(c.notes.join("; "))+'</span>':'')+'</span>'+
+        '<span class="meta"><span>'+esc(c.storeName||c.store)+'</span><span>'+esc(c.product_handle||c.product_id)+'</span><span>'+(c.kind==="image"?"read from an image":c.kind==="listing"?"read by the brain from the 1688 listing":"pasted")+'</span><span>'+cst+'</span><span>'+esc(ago(c.created_at))+'</span>'+((c.notes||[]).length?'<span>'+esc(c.notes.join("; "))+'</span>':'')+'</span>'+
         (!c.verified&&c.current?'<div class="btns"><button class="btn g" data-scconfirm="'+esc(c.id)+'">Confirm</button></div>':'')+'</div>';
     }).join(""):'<div class="note">No charts added yet.</div>';
     return h+'</div>';

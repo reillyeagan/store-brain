@@ -111,6 +111,14 @@ export async function supplierState(env, { nowMs = Date.now() } = {}) {
        FROM size_recommendations ORDER BY checked_at DESC LIMIT 50`
   ).all();
   const needed = await chartsNeeded(db, { nowMs });
+  // Where each missing chart stands: the factory link from KFB, and the brain's last try at it.
+  for (const n of needed) {
+    if (!n.product_handle) continue;
+    const link = await db.prepare(`SELECT offer_url FROM supplier_links WHERE store = ? AND product_handle = ? ORDER BY last_seen_at DESC LIMIT 1`).bind(n.store, n.product_handle).first().catch(() => null);
+    const f = await db.prepare(`SELECT status, note, attempts, next_try_at FROM chart_fetches WHERE store = ? AND product_handle = ?`).bind(n.store, n.product_handle).first().catch(() => null);
+    n.factory_url = link ? link.offer_url : null;
+    n.fetch = f || null;
+  }
   const charts = await recentCharts(db);
   const chartCount = await db.prepare(`SELECT COUNT(DISTINCT store || '|' || product_id) AS n FROM size_charts`).first();
   const { results: flags } = await db.prepare(`SELECT * FROM supply_flags ORDER BY id DESC LIMIT 50`).all();

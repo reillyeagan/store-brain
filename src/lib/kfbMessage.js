@@ -5,8 +5,9 @@
  * KFB group, Reilly gets a phone notification with a link to a signed page showing the
  * message and a Copy button, and he pastes and sends it himself (rule 12).
  *
- * It asks for two things (each a "kind" of line):
+ * It asks for these things (each a "kind" of line):
  *   express  add express shipping to the orders whose customers paid for it
+ *   size     send a different size for an order line (Size-Chart Checker, confirmed chart only)
  *   pickup   check a parcel KFB marked shipped 3+ days ago that no carrier has scanned yet
  *            (status from 17TRACK, see tracking.js; only a fresh status counts)
  *
@@ -131,13 +132,51 @@ export async function stripPickupLines(db, at = nowIso()) {
 
 /** The whole message: one section per kind, express first (it's time-critical). */
 export const isPickupKind = (kind) => kind === "pickup" || String(kind || "").startsWith("pickup:");
+/** Size changes are per order LINE: kind `size:<line id>`. */
+export const isSizeKind = (kind) => String(kind || "").startsWith("size:");
+
+/**
+ * Size changes from the Size-Chart Checker (Reilly 2026-10-11: "if the customer orders a M and
+ * the chinese M looks more like a S, we might want to send out a chinese L"). Only asks from a
+ * chart Reilly confirmed (or customer complaints) exist as pending asks. One line per item.
+ */
+export function composeSizeBody(items) {
+  if (!items.length) return null;
+  const sorted = [...items].sort((a, b) => storeOrder(a.store) - storeOrder(b.store) ||
+    String(a.order_name).localeCompare(String(b.order_name), "en", { numeric: true }));
+  return "Please send a different size for these (the factory size runs small):\n" + sorted.map((i) => {
+    let d = {}; try { d = JSON.parse(i.detail || "{}"); } catch { d = {}; }
+    return `• ${STORES[i.store] ? STORES[i.store].name : i.store} ${i.order_name}${d.title ? ` ${String(d.title).slice(0, 60)}` : ""}: ordered ${d.ordered}, please send ${d.send}`;
+  }).join("\n");
+}
 
 export function composeKfbBody(items) {
   const parts = [
     composeExpressBody(items.filter((i) => i.kind === "express")),
+    composeSizeBody(items.filter((i) => isSizeKind(i.kind))),
     composePickupBody(items.filter((i) => isPickupKind(i.kind))),
   ].filter(Boolean);
   return parts.length ? parts.join("\n\n") : null;
+}
+
+/**
+ * Size asks ready to go: pending, live store, order from the last few days (KFB works through
+ * the previous day's orders, so an older one has probably shipped), not refunded or voided.
+ */
+async function sizeCandidates(db, today) {
+  if (!LIVE_STORE_IDS.length) return [];
+  const marks = LIVE_STORE_IDS.map(() => "?").join(", ");
+  const { results } = await db.prepare(
+    `SELECT a.id, a.store, a.order_id, a.line_id, a.order_name, a.title, a.ordered_size, a.send_size
+       FROM kfb_size_asks a JOIN orders o ON o.store = a.store AND o.order_id = a.order_id
+      WHERE a.status = 'pending' AND a.store IN (${marks}) AND o.local_day >= ?
+        AND COALESCE(o.financial_status, '') NOT IN (${SKIP_STATUSES.map(() => "?").join(", ")})
+      ORDER BY a.id`
+  ).bind(...LIVE_STORE_IDS, dayMinus(today, LOOKBACK_DAYS), ...SKIP_STATUSES).all();
+  return (results || []).map((a) => ({
+    store: a.store, order_id: a.order_id, order_name: a.order_name || a.order_id, kind: `size:${a.line_id}`,
+    detail: JSON.stringify({ ordered: a.ordered_size, send: a.send_size, title: a.title || null }), ask_id: a.id,
+  }));
 }
 
 /**
@@ -178,6 +217,8 @@ function describeItems(items) {
   const pk = items.filter((i) => isPickupKind(i.kind));
   const names = (xs) => xs.map((i) => `${STORES[i.store].name} ${i.order_name}`).join(", ");
   if (ex.length) parts.push(`express shipping for ${ex.length} order${ex.length === 1 ? "" : "s"}: ${names(ex)}`);
+  const sz = items.filter((i) => isSizeKind(i.kind));
+  if (sz.length) parts.push(`size change for ${sz.length} item${sz.length === 1 ? "" : "s"}: ${names(sz)}`);
   if (pk.length) parts.push(`carrier pickup check for ${pk.length} parcel${pk.length === 1 ? "" : "s"}: ${pk.map((i) => `${STORES[i.store].name} ${i.order_name} (${i.tracking})`).join(", ")}`);
   return parts.join("; ");
 }
@@ -244,8 +285,15 @@ export async function runKfbComposer(env, { nowMs = Date.now(), fetchImpl = fetc
         summary: `KFB message: couldn't read stuck parcels, so no pickup lines today (${String(err && err.message).slice(0, 150)})`, at,
       }).catch(() => {});
     }
+    // Size changes: a fault there must not cost the express asks either.
+    let sizes = [];
+    try { sizes = await sizeCandidates(db, day); }
+    catch (err) {
+      await logEvent(db, { actor: ACTOR, kind: "error.kfb_size_lines", target: "sys.kfb", at,
+        summary: `KFB message: couldn't read the size changes, so none today (${String(err && err.message).slice(0, 150)})` }).catch(() => {});
+    }
     const warnings = await staleOrderFeeds(db, nowMs);
-    if (!rows.length && !pickups.length) {
+    if (!rows.length && !pickups.length && !sizes.length) {
       await logEvent(db, {
         actor: ACTOR, kind: "kfb.nothing_to_ask", target: "sys.kfb",
         summary: `KFB check ${day}: no new express orders or stuck parcels, so no message today` +
@@ -258,7 +306,7 @@ export async function runKfbComposer(env, { nowMs = Date.now(), fetchImpl = fetc
     const items = rows.map((r) => ({
       store: r.store, order_id: r.order_id, order_name: r.name || r.order_id, kind: "express",
       detail: r.shipping_title || r.shipping_code || null,
-    })).concat(pickups);
+    })).concat(sizes, pickups);
     const body = composeKfbBody(items);
     const mode = supplierMode(env);
     const ins = await db.prepare(
@@ -271,6 +319,8 @@ export async function runKfbComposer(env, { nowMs = Date.now(), fetchImpl = fetc
          VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(store, order_id, kind) DO NOTHING`
       ).bind(messageId, it.store, it.order_id, it.order_name, it.kind, it.detail).run();
     }
+    // The size asks are now in a message: the checker treats them as asked (never asked twice).
+    for (const it of sizes) await db.prepare(`UPDATE kfb_size_asks SET status = 'included' WHERE id = ? AND status = 'pending'`).bind(it.ask_id).run();
     await db.prepare(`UPDATE kfb_runs SET message_id = ?, item_count = ? WHERE local_day = ?`)
       .bind(messageId, items.length, day).run();
 
@@ -303,6 +353,7 @@ export async function runKfbComposer(env, { nowMs = Date.now(), fetchImpl = fetc
     if (notified) throw err;
     // Undo the half-done day so the next 15-minute run tries again.
     if (messageId != null) {
+      await db.prepare(`UPDATE kfb_size_asks SET status = 'pending' WHERE status = 'included' AND line_id IN (SELECT substr(kind, 6) FROM kfb_message_items WHERE message_id = ? AND kind LIKE 'size:%')`).bind(messageId).run().catch(() => {});
       await db.prepare(`DELETE FROM kfb_message_items WHERE message_id = ?`).bind(messageId).run().catch(() => {});
       await db.prepare(`DELETE FROM kfb_messages WHERE id = ?`).bind(messageId).run().catch(() => {});
     }

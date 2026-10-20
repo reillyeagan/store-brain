@@ -389,3 +389,17 @@ test("review fix: a same-moment payload refreshes legacy rows stored as '…00Z'
   assert.equal(row.shipping_title, "Express Shipping");
   assert.equal(res.isNew, false);
 });
+
+test("composer: a pending size ask goes in the KFB message once, then counts as asked", async () => {
+  const DB = makeD1();
+  const env = { DB, ...SECRETS };
+  await send(env, HC, restOrder(1240));
+  const o = await DB.prepare(`SELECT order_id, name FROM orders WHERE name = '#1240'`).first();
+  await DB.prepare(`INSERT INTO kfb_size_asks (store, order_id, line_id, order_name, title, ordered_size, send_size, why, created_at) VALUES ('hc', ?, 'gid://shopify/LineItem/77', '#1240', 'Shawl Cardigan', 'M', 'L', 'chest 104 < 108', ?)`)
+    .bind(o.order_id, new Date().toISOString()).run();
+  const r = await runKfbComposer(env, { nowMs: ET("18:45") });
+  assert.equal(r.body, "Please send a different size for these (the factory size runs small):\n• Holt & Crane #1240 Shawl Cardigan: ordered M, please send L");
+  assert.equal((await DB.prepare(`SELECT status FROM kfb_size_asks`).first()).status, "included");
+  const next = await runKfbComposer(env, { nowMs: ET("18:50", "2026-10-12") });
+  assert.equal(next.messageId, null, "never asked twice");
+});
