@@ -83,3 +83,23 @@ test("chart fetch helpers", () => {
   assert.equal(looksBlocked("https://x/_____tmd_____/punish", ""), true);
   assert.equal(looksBlocked(OFFER, LISTING), false);
 });
+
+test("chart fetch: hosts outside the allowlist and redirects off-host are never read", async () => {
+  const { allowedHost, imagesFrom: imgs } = await import("../src/agents/supplier/chartFetch.js");
+  assert.equal(allowedHost("https://evil-alicdn.com/x.jpg", "image"), false);
+  assert.equal(allowedHost("https://cbu01.alicdn.com/x.jpg", "image"), true);
+  assert.deepEqual(imgs(`<img src="https://evil-alicdn.com/a.jpg"><img src="https://img.alicdn.com/b.png">`), ["https://img.alicdn.com/b.png"]);
+  const DB = makeD1(); await seed(DB);
+  const w = world({ listingUrl: "https://login.1688.com/member/signin.htm" });
+  const r = await runChartFetch(env(DB), { nowMs: NOW, fetchImpl: w.fetchImpl });
+  assert.equal(r.fetched[0].status, "blocked");
+  assert.ok(!w.calls.some((c) => typeof c === "string" && c.includes("itemcdn")), "nothing past an off-host redirect");
+});
+
+test("chart fetch: no downloads when image reading can't happen (no key)", async () => {
+  const DB = makeD1(); await seed(DB);
+  const w = world();
+  const r = await runChartFetch({ DB, CHART_FETCH_LIVE: "1" }, { nowMs: NOW, fetchImpl: w.fetchImpl });
+  assert.equal(r.fetched[0].status, "skipped");
+  assert.equal(w.calls.length, 0);
+});

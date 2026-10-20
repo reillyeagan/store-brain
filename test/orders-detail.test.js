@@ -397,6 +397,11 @@ test("composer: a pending size ask goes in the KFB message once, then counts as 
   const o = await DB.prepare(`SELECT order_id, name FROM orders WHERE name = '#1240'`).first();
   await DB.prepare(`INSERT INTO kfb_size_asks (store, order_id, line_id, order_name, title, ordered_size, send_size, why, created_at) VALUES ('hc', ?, 'gid://shopify/LineItem/77', '#1240', 'Shawl Cardigan', 'M', 'L', 'chest 104 < 108', ?)`)
     .bind(o.order_id, new Date().toISOString()).run();
+  await DB.prepare(`INSERT INTO order_lines (store, order_id, line_id, title, size, quantity, price, updated_at) VALUES ('hc', ?, 'gid://shopify/LineItem/77', 'Shawl Cardigan', 'M', 1, 60, ?)`).bind(o.order_id, new Date().toISOString()).run();
+  // Shipped already: too late to change the size, so no line.
+  await DB.prepare(`UPDATE orders SET raw = json_set(COALESCE(raw, '{}'), '$.fulfillment_status', 'fulfilled') WHERE order_id = ?`).bind(o.order_id).run();
+  assert.equal((await runKfbComposer(env, { nowMs: ET("18:45", "2026-10-10") })).messageId, null);
+  await DB.prepare(`UPDATE orders SET raw = json_set(raw, '$.fulfillment_status', null) WHERE order_id = ?`).bind(o.order_id).run();
   const r = await runKfbComposer(env, { nowMs: ET("18:45") });
   assert.equal(r.body, "Please send a different size for these (the factory size runs small):\n• Holt & Crane #1240 Shawl Cardigan: ordered M, please send L");
   assert.equal((await DB.prepare(`SELECT status FROM kfb_size_asks`).first()).status, "included");

@@ -171,6 +171,9 @@ async function sizeCandidates(db, today) {
        FROM kfb_size_asks a JOIN orders o ON o.store = a.store AND o.order_id = a.order_id
       WHERE a.status = 'pending' AND a.store IN (${marks}) AND o.local_day >= ?
         AND COALESCE(o.financial_status, '') NOT IN (${SKIP_STATUSES.map(() => "?").join(", ")})
+        -- still a line of the order, and the order not shipped yet (too late to change the size)
+        AND EXISTS (SELECT 1 FROM order_lines l WHERE l.store = a.store AND l.line_id = a.line_id)
+        AND lower(COALESCE(json_extract(o.raw, '$.fulfillment_status'), json_extract(o.raw, '$.displayFulfillmentStatus'), '')) NOT IN ('fulfilled', 'partial', 'partially_fulfilled')
       ORDER BY a.id`
   ).bind(...LIVE_STORE_IDS, dayMinus(today, LOOKBACK_DAYS), ...SKIP_STATUSES).all();
   return (results || []).map((a) => ({
@@ -314,13 +317,16 @@ export async function runKfbComposer(env, { nowMs = Date.now(), fetchImpl = fetc
     ).bind(at, day, mode, body, JSON.stringify(items)).run();
     messageId = ins.meta.last_row_id;
     for (const it of items) {
-      await db.prepare(
+      const r = await db.prepare(
         `INSERT INTO kfb_message_items (message_id, store, order_id, order_name, kind, detail)
          VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(store, order_id, kind) DO NOTHING`
       ).bind(messageId, it.store, it.order_id, it.order_name, it.kind, it.detail).run();
+      // A size ask is "asked" once it is in a message (like express: never asked twice). Only
+      // when its line really went into THIS message, so the rollback below can undo it.
+      if (it.ask_id && r.meta && r.meta.changes === 1) {
+        await db.prepare(`UPDATE kfb_size_asks SET status = 'included' WHERE id = ? AND status = 'pending'`).bind(it.ask_id).run();
+      }
     }
-    // The size asks are now in a message: the checker treats them as asked (never asked twice).
-    for (const it of sizes) await db.prepare(`UPDATE kfb_size_asks SET status = 'included' WHERE id = ? AND status = 'pending'`).bind(it.ask_id).run();
     await db.prepare(`UPDATE kfb_runs SET message_id = ?, item_count = ? WHERE local_day = ?`)
       .bind(messageId, items.length, day).run();
 

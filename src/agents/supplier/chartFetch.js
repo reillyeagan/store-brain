@@ -22,13 +22,13 @@
  */
 import { logEvent } from "../../lib/eventlog.js";
 import { nowIso } from "../../lib/time.js";
-import { askJson, AiError } from "../../lib/ai.js";
+import { askJson, AiError, aiBudgetLeft } from "../../lib/ai.js";
 import { STORES } from "../../config/stores.js";
 import { chartsNeeded, addChartFromListing, IMAGE_TYPES } from "./sizeIntake.js";
 
 const ACTOR = "sup.size_charts";
 export const FETCH_PER_RUN = 2;
-export const MAX_IMAGES = 20;
+export const MAX_IMAGES = 18; // under 20 images, each may be up to 8000 px
 export const MAX_IMAGE_BYTES = 3_700_000;   // the Claude API's per-image limit is ~5 MB of base64
 export const MAX_TOTAL_BYTES = 14_000_000;
 export const MAX_TRIES = 4;
@@ -58,12 +58,21 @@ export function looksBlocked(url, html) {
     /_____tmd_____|nc_1_wrapper|punish-component|"action"\s*:\s*"captcha"|滑动验证|请拖动下方滑块/i.test(String(html || "").slice(0, 20000));
 }
 
+/** Hosts the brain may fetch from, by step. The final address after redirects is checked too. */
+export const isAlicdn = (host) => /^(?:[a-z0-9-]+\.)*alicdn\.com$/i.test(String(host || ""));
+export function allowedHost(url, step) {
+  let h; try { h = new URL(url).host.toLowerCase(); } catch { return false; }
+  if (step === "listing") return h === "detail.1688.com";
+  if (step === "desc") return h === "itemcdn.tmall.com";
+  return isAlicdn(h);
+}
+
 /** Image addresses in a description, in page order, alicdn only, each once. Pure. */
 export function imagesFrom(desc) {
   const seen = new Set(), out = [];
-  for (const m of String(desc || "").matchAll(/(?:https?:)?\/\/([a-z0-9.-]*alicdn\.com)\/[^"'\\\s)<>]+?\.(?:jpe?g|png|webp|gif)/gi)) {
+  for (const m of String(desc || "").matchAll(/(?:https?:)?\/\/([a-z0-9.-]+)\/[^"'\\\s)<>]+?\.(?:jpe?g|png|webp|gif)/gi)) {
     let u = m[0].replace(/^\/\//, "https://").replace(/^http:/, "https:");
-    if (seen.has(u)) continue;
+    if (!isAlicdn(m[1]) || seen.has(u)) continue;
     seen.add(u); out.push(u);
     if (out.length >= MAX_IMAGES) break;
   }
@@ -85,24 +94,50 @@ If no image is a readable garment measurement chart, return image_index null, ro
 const USER = `Return {"image_index":5,"unit":"cm"|"in","flat":true|false|null,"rows":[{"size":"M","chest":104,"shoulder":54,"length":67,"sleeve":55,"waist":null}],"unreadable":null}.
 "flat" is true only if the chart says chest/waist are measured laid flat (half the circumference), false if it says full circumference, null if it doesn't say.`;
 
-async function getText(fetchImpl, url, headers = HEADERS) {
+async function getText(fetchImpl, url, step, headers = HEADERS) {
   const r = await fetchImpl(url, { headers, redirect: "follow" });
+  const finalUrl = r.url || url;
+  // A redirect off the allowed host: the body is not read (a login or check page is "blocked").
+  if (!allowedHost(finalUrl, step)) return { status: r.status, url: finalUrl, text: "", offHost: true };
   const text = await r.text();
-  return { status: r.status, url: r.url || url, text };
+  return { status: r.status, url: finalUrl, text };
 }
+
+/** Width and height from a PNG or JPEG header, or null. Pure. */
+export function imageSize(buf) {
+  const b = new Uint8Array(buf);
+  if (b.length > 24 && b[0] === 0x89 && b[1] === 0x50) return { w: (b[16] << 24 | b[17] << 16 | b[18] << 8 | b[19]) >>> 0, h: (b[20] << 24 | b[21] << 16 | b[22] << 8 | b[23]) >>> 0 };
+  if (b.length > 4 && b[0] === 0xff && b[1] === 0xd8) {
+    let i = 2;
+    while (i + 9 < b.length) {
+      if (b[i] !== 0xff) { i++; continue; }
+      const m = b[i + 1], len = b[i + 2] << 8 | b[i + 3];
+      if (m >= 0xc0 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc) return { h: b[i + 5] << 8 | b[i + 6], w: b[i + 7] << 8 | b[i + 8] };
+      i += 2 + len;
+    }
+  }
+  return null;
+}
+/** The Claude API refuses an image over 8000 px on a side (2000 px when a request has many). */
+export const MAX_SIDE_PX = 7900;
 
 /** Read one product's chart from its listing. Returns {status, note, rows?, unit?, flat?, image?}. */
 export async function readListing(env, link, { fetchImpl = fetch, nowMs = Date.now(), store } = {}) {
+  // No downloads while image reading can't happen anyway (no key, or today's AI budget used).
+  if (!env.ANTHROPIC_API_KEY) return { status: "skipped", note: "image reading is not wired (no ANTHROPIC_API_KEY)" };
+  if ((await aiBudgetLeft(env, nowMs)) <= 0) return { status: "skipped", note: "image reading is paused (daily AI budget reached)" };
   let page;
-  try { page = await getText(fetchImpl, link.offer_url); }
+  if (!allowedHost(link.offer_url, "listing")) return { status: "not_found", note: "the factory link is not a 1688 listing" };
+  try { page = await getText(fetchImpl, link.offer_url, "listing"); }
   catch (err) { return { status: "failed", note: `listing not reached (${String(err && err.message).slice(0, 80)})` }; }
-  if (looksBlocked(page.url, page.text)) return { status: "blocked", note: "1688 asked for a slider check or a login instead of the listing" };
+  if (page.offHost || looksBlocked(page.url, page.text)) return { status: "blocked", note: "1688 asked for a slider check or a login instead of the listing" };
   if (page.status >= 400) return { status: page.status === 404 ? "not_found" : "failed", note: `listing answered HTTP ${page.status}` };
   const descUrl = descUrlFrom(page.text);
   if (!descUrl) return { status: looksBlocked("", page.text) ? "blocked" : "not_found", note: "no description address in the listing page" };
   let desc;
-  try { desc = await getText(fetchImpl, descUrl, { ...HEADERS, referer: link.offer_url }); }
+  try { desc = await getText(fetchImpl, descUrl, "desc", { ...HEADERS, referer: link.offer_url }); }
   catch (err) { return { status: "failed", note: `description not reached (${String(err && err.message).slice(0, 80)})` }; }
+  if (desc.offHost) return { status: "blocked", note: "the description address redirected off itemcdn.tmall.com" };
   const urls = imagesFrom(desc.text);
   if (!urls.length) return { status: "not_found", note: "the description has no images" };
   const images = [], used = [];
@@ -110,12 +145,14 @@ export async function readListing(env, link, { fetchImpl = fetch, nowMs = Date.n
   for (const u of urls) {
     try {
       const r = await fetchImpl(u, { headers: { "user-agent": UA, referer: link.offer_url } });
-      if (!r.ok) continue;
+      if (!r.ok || !allowedHost(r.url || u, "image")) continue;
       const type = String(r.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
       const mediaType = type === "image/jpg" ? "image/jpeg" : type;
       if (!IMAGE_TYPES.includes(mediaType)) continue;
       const buf = await r.arrayBuffer();
       if (!buf.byteLength || buf.byteLength > MAX_IMAGE_BYTES || total + buf.byteLength > MAX_TOTAL_BYTES) continue;
+      const dim = imageSize(buf);
+      if (dim && (dim.w > MAX_SIDE_PX || dim.h > MAX_SIDE_PX)) continue;
       total += buf.byteLength;
       images.push({ media_type: mediaType, data: base64(buf) });
       used.push(u);
@@ -139,18 +176,22 @@ export async function readListing(env, link, { fetchImpl = fetch, nowMs = Date.n
 export async function runChartFetch(env, { nowMs = Date.now(), fetchImpl = fetch } = {}) {
   if (String(env.CHART_FETCH_LIVE || "") !== "1") return { skipped: "CHART_FETCH_LIVE is not 1" };
   const db = env.DB;
-  const needed = await chartsNeeded(db, { nowMs, limit: 20 });
+  // The whole list (not the top 20): products with no link or no tries left must not hide the rest.
+  const needed = await chartsNeeded(db, { nowMs, limit: 200 });
   const out = [];
   for (const n of needed) {
     if (out.length >= FETCH_PER_RUN) break;
     if (!n.product_handle) continue;
-    const link = await db.prepare(`SELECT * FROM supplier_links WHERE store = ? AND product_handle = ? ORDER BY last_seen_at DESC LIMIT 1`).bind(n.store, n.product_handle).first();
+    // Stable choice: the newest link KFB first showed for this product (ties by offer number), so
+    // two offers on one product can't take turns resetting the tries.
+    const link = await db.prepare(`SELECT * FROM supplier_links WHERE store = ? AND product_handle = ? ORDER BY first_seen_at DESC, offer_id DESC LIMIT 1`).bind(n.store, n.product_handle).first();
     if (!link) continue;
     const prev = await db.prepare(`SELECT * FROM chart_fetches WHERE store = ? AND product_handle = ?`).bind(n.store, n.product_handle).first();
-    // A new factory link starts the tries again; otherwise wait for the next try (none = given up).
-    const sameOffer = prev && prev.offer_id === link.offer_id;
-    if (sameOffer && (!prev.next_try_at || Date.parse(prev.next_try_at) > nowMs)) continue;
-    const attempt = (sameOffer ? prev.attempts : 0) + 1;
+    // Only a link KFB showed AFTER the last try starts the tries again; otherwise wait for the
+    // next try (none = given up: it stays on the charts-needed list for Reilly).
+    const fresh = !prev || (prev.offer_id !== link.offer_id && link.first_seen_at > prev.last_try_at);
+    if (!fresh && (!prev.next_try_at || Date.parse(prev.next_try_at) > nowMs)) continue;
+    const attempt = (fresh ? 0 : prev.attempts) + 1;
     const at = nowIso(nowMs);
     const res = await readListing(env, link, { fetchImpl, nowMs, store: n.store });
     if (res.status === "skipped") { out.push({ store: n.store, handle: n.product_handle, ...res }); break; } // AI paused: try again next run
