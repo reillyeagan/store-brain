@@ -92,7 +92,8 @@ Return {"body":"the full reply text","needs_reilly":false,"reason":null}`;
  * wrote is dropped first. The checks run on the body BEFORE this (the signature names Reilly).
  */
 export function withSignature(body, { slot, store }) {
-  return `${bodyWithoutSignature(body, store)}\n\n${signatureFor(slot, store)}`;
+  const known = store && store !== "our store";
+  return `${bodyWithoutSignature(body, store)}\n\n${known ? signatureFor(slot, store) : slot === "google" ? "Reilly" : "Holt & Crane"}`;
 }
 export function bodyWithoutSignature(body, store) {
   const lines = signOff(body).split(/\r?\n/);

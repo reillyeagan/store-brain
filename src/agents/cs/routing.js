@@ -77,25 +77,41 @@ export function routeTicket(t, triage, ctx) {
  * Returns a list of problems (empty = passes).
  */
 /**
- * A draft Reilly asked for as his own next step (playbook.js, mail flagged to him): his standard
- * policy wording is allowed (refund to the original payment method, free replacement, keep the
- * product, return address, return shipping paid by the customer, "within the next week or so").
- * Still refused: amounts, percentages, codes, coupons, store credit, labels, dates, links.
+ * A draft that states Reilly's own next step (playbook.js, mail flagged to him). Only HIS exact
+ * policy sentences for THAT step are allowed, nothing looser: e.g. a replacement proposal can't
+ * carry a refund, and "partial refund" or "we'll pay the return shipping" never match.
+ * Still refused everywhere: amounts, percentages, codes, coupons, store credit, labels, dates, links.
  */
-function policyPhrases(s) {
-  return s
-    .replace(/601 S Kings Drive\s*,?\s*Suite F,?\s*PMB #?133\s*,?\s*Charlotte,?\s*NC,?\s*28204/gi, " the return address ")
-    .replace(/\breturn shipping is paid (?:for )?by the customer\b/gi, " ")
-    .replace(/\b(?:full |the )?refund(?:ed|s|ing)?\b/gi, " ")
-    .replace(/\bfree (?:replacement|of charge)\b/gi, " ")
-    .replace(/\b(?:feel free to |you can |please )?keep (?:it|them|the (?:item|product|jacket|coat|blazer|sweater|cardigan|order))\b/gi, " ")
-    .replace(/\breplacement\b/gi, " ")
-    .replace(/\b(?:ship|send|return) (?:it|them|the (?:item|product|\w+)) back\b/gi, " ")
-    .replace(/\b(?:ship|send) (?:out )?(?:the |a )?(?:new|larger|smaller|correct) (?:size|one)\b/gi, " ")
-    .replace(/\bwithin the next (?:few days|week or so)\b/gi, " ");
+const ADDRESS = /601 S Kings Drive\s*,?\s*Suite F,?\s*PMB #?133\s*,?\s*Charlotte,?\s*NC,?\s*28204/gi;
+const CUSTOMER_PAYS = /\b(?:please (?:be aware|note) that )?(?:the )?return shipping is paid (?:for )?by the customer\b/gi;
+const POLICY_PHRASES = {
+  refund_keep: [
+    /\b(?:we(?:'ve| have) )?(?:issued|processed) (?:a |the )?(?:full )?refund to your original payment method\b/gi,
+    /\bno need to (?:ship|send) the (?:product|item|\w+) back(?: to us)?\b/gi,
+    /\bfeel free to keep (?:it|the (?:product|item|\w+))\b/gi,
+    /\bwithin the next (?:few days|week or so)\b/gi,
+  ],
+  replacement: [
+    /\b(?:send you |send out |ship out )?a free replacement in (?:a |the )?(?:larger|smaller|different|correct|right) size\b/gi,
+    /\b(?:ship|send) (?:out )?the (?:new|larger|smaller|correct) size\b/gi,
+    ADDRESS, CUSTOMER_PAYS,
+  ],
+  return_address: [
+    ADDRESS, CUSTOMER_PAYS,
+    /\b(?:we will |we'll )?(?:process|issue) (?:the |a |your )?(?:full )?refund to your original payment method\b/gi,
+  ],
+  received_refund: [
+    /\b(?:we(?:'ve| have) )?issued a full refund to your original payment method\b/gi,
+    /\bwithin the next (?:few days|week or so)\b/gi,
+  ],
+};
+function policyPhrases(s, proposal) {
+  let out = s;
+  for (const re of POLICY_PHRASES[proposal] || []) out = out.replace(re, " ");
+  return out;
 }
 
-export function checkDraft(body, { ctx = null, orderRef = null, sizeAsked = false, policy = false } = {}) {
+export function checkDraft(body, { ctx = null, orderRef = null, sizeAsked = false, policy = null } = {}) {
   const raw = String(body || "");
   const problems = [];
   if (raw.trim().length < 20) problems.push("empty draft");
@@ -111,15 +127,16 @@ export function checkDraft(body, { ctx = null, orderRef = null, sizeAsked = fals
     .replace(/\b\d{1,3}\s?%\s+(cotton|wool|polyester|linen|silk|cashmere|viscose|nylon|acrylic|spandex|elastane|rayon|leather|merino|modal|lyocell)\b/gi, " fabric ")
     // Reilly's own step-1 wording (2026-10-20 playbook): asking for photos "then we can continue
     // with the return process" promises nothing.
-    .replace(/\b(return|refund|exchange)(\s*\/\s*(return|refund|exchange))?\s+(process|request|policy)\b/gi, " the process ");
-  const s = policy ? policyPhrases(s0) : s0;
+    .replace(/\b(?:continue|proceed) with the (?:return|return\s*\/\s*refund|refund\s*\/\s*return|refund) process\b/gi, " continue ")
+    .replace(/\bthe first step (?:of|in) the (?:return|return\s*\/\s*refund|refund) process\b/gi, " the first step ");
+  const s = policy ? policyPhrases(s0, policy) : s0;
 
   const money = s.match(/\b(refund\w*|money|reimburs\w*|credit\w*|discount\w*|coupon\w*|promo\w*|code|compensat\w*|free|keep (it|them|the item|the order)|dollars?|usd|cents?|bucks|charge\w*|fees?|waive\w*|on us|at no (extra )?cost|no cost|cover\w*|postage|(return|shipping|prepaid) label|label|pay(ing)? for)\b|%|[$€£]\s?\d/i);
   if (money) problems.push(`mentions money or compensation ("${money[0]}") — Reilly's call`);
-  const repl = s.match(/\b(replac\w*|re-?ship\w*|re-?send\w*|another one|new one|send (you )?another|second|sort (you|it|this) out|send (it|them|the \w+|everything) back|return (it|them|the \w+)|exchange (it|them|the \w+)|swap (it|them|the \w+))\b/i);
+  const repl = s.match(/\b(replac\w*|re-?ship\w*|re-?send\w*|another one|new one|send (you )?another|second|sort (you|it|this) out|send (it|them|the \w+|everything) back|return (it|them|the \w+)|exchang\w*|swap (it|them|the \w+))\b/i);
   if (repl) problems.push(`mentions a replacement or return ("${repl[0]}") — Reilly's call`);
   // Month abbreviations only count next to a day number, so a name like "Jan" isn't a date.
-  const date = s.match(/\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tues?|wed|thur?s?|fri|sat|january|february|march|april|june|july|august|september|october|november|december|tomorrow|tonight|next week|this week|guarantee\w*)\b|\b(jan|feb|mar|apr|jun|jul|aug|sept?|oct|nov|dec)\.?\s*\d{1,2}\b|\b\d{1,2}[/.]\d{1,2}([/.]\d{2,4})?\b|\b\d{1,2}(st|nd|rd|th)\b/i);
+  const date = s.match(/\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tues?|wed|thur?s?|fri|sat|january|february|march|april|june|july|august|september|october|november|december|today|tomorrow|tonight|next week|this week|guarantee\w*)\b|\b(jan|feb|mar|apr|jun|jul|aug|sept?|oct|nov|dec)\.?\s*\d{1,2}\b|\b\d{1,2}[/.]\d{1,2}([/.]\d{2,4})?\b|\b\d{1,2}(st|nd|rd|th)\b/i);
   // "May" is a common verb, so it only counts followed by a day number.
   const mayDate = /\bmay\s+\d{1,2}\b/i.test(s);
   if (date || mayDate) problems.push(`mentions a date ("${date ? date[0] : "May"}") — never give dates`);

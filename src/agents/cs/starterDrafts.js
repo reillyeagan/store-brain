@@ -55,7 +55,15 @@ export const PROPOSALS = Object.freeze({
   other: "an answer in his usual words",
 });
 /** Proposals that state Reilly's decision: his policy wording is allowed in them (routing.checkDraft policy). */
-export const DECIDING = new Set(["refund_keep", "replacement", "return_address", "received_refund", "order_change"]);
+export const DECIDING = new Set(["refund_keep", "replacement", "return_address", "received_refund"]);
+/** Step 2 needs the photos first (his rule: "the first step of the return process is ... photos"). */
+export const NEEDS_PHOTOS = new Set(["refund_keep", "replacement", "return_address"]);
+/** The check options for a proposal: policy wording only for HIS step, and only once photos are in. */
+export function proposalPolicy(proposes, photosSent) {
+  if (!DECIDING.has(proposes)) return null;
+  if (NEEDS_PHOTOS.has(proposes) && !photosSent) return null;
+  return proposes;
+}
 
 export function starterSystem(store, policy, why) {
   return `You write customer-service email replies for ${store}, a small online clothing store, AS REILLY WOULD WRITE THEM. Reilly owns the store; he reads every draft, edits it if needed and sends it himself. This email was flagged to him because: ${why}.
@@ -167,7 +175,7 @@ export async function writeStarterDrafts(env, { nowMs = Date.now(), fetchImpl = 
       }
       proposes = PROPOSALS[j.proposes] ? j.proposes : "other";
       body = bodyWithoutSignature(typeof j.body === "string" ? j.body.trim() : "", store);
-      const checkOpts = { ctx: t.order_mismatch ? null : ctx, orderRef: t.order_mismatch ? null : t.order_ref, sizeAsked, policy: DECIDING.has(proposes) };
+      const checkOpts = { ctx: t.order_mismatch ? null : ctx, orderRef: t.order_mismatch ? null : t.order_ref, sizeAsked, policy: proposalPolicy(proposes, so.photosSent) };
       let problems = checkDraft(body, checkOpts);
       // One rewrite with the check's own words (live 2026-10-16: refund and return requests kept
       // failing because the writer echoed "refund" / "send it back"). The same code check then
@@ -182,8 +190,9 @@ export async function writeStarterDrafts(env, { nowMs = Date.now(), fetchImpl = 
           const j2 = (r2 && r2.json) || {};
           if (typeof j2.body === "string" && j2.body.trim()) {
             const body2 = bodyWithoutSignature(j2.body.trim(), store);
-            const p2 = checkDraft(body2, { ...checkOpts, policy: DECIDING.has(PROPOSALS[j2.proposes] ? j2.proposes : proposes) });
-            if (!p2.length) { body = body2; problems = []; } else problems = p2;
+            const proposes2 = PROPOSALS[j2.proposes] ? j2.proposes : proposes;
+            const p2 = checkDraft(body2, { ...checkOpts, policy: proposalPolicy(proposes2, so.photosSent) });
+            if (!p2.length) { body = body2; problems = []; proposes = proposes2; } else problems = p2;
           }
         } catch { /* keep the first problems */ }
       }

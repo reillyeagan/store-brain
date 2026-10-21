@@ -1470,18 +1470,32 @@ test("cs playbook (2026-10-20): Reilly's own wording passes; amounts, codes and 
   const step1 = "Hi Gary,\n\nThanks for getting in touch. Please attach some images of the current condition of the product, then we can continue with the return process.\n\nThanks,";
   assert.deepEqual(checkDraft(step1, {}), [], "step 1 is fine even as a routine reply");
   const keep = "Hi Pamela,\n\nThank you for sending the pictures. We've issued the refund to your original payment method, you should receive a notification soon, and see the amount appear within the next few days. No need to ship the product back to us, feel free to keep the product.\n\nThanks,";
-  assert.deepEqual(checkDraft(keep, { policy: true }), []);
+  assert.deepEqual(checkDraft(keep, { policy: "refund_keep" }), []);
+  // Only HIS sentences for THAT step: a replacement can't carry a refund, looser money talk fails.
+  assert.ok(checkDraft(keep, { policy: "replacement" }).length);
+  for (const bad of ["We have issued a partial refund of half the order.", "We will refund your return shipping.", "We'll pay the return shipping and refund it to you.", "We will ship the new size today."]) {
+    assert.ok(checkDraft(`Hi Ann, ${bad} Thanks,`, { policy: "refund_keep" }).length, bad);
+  }
+  for (const bad of ["Your refund request has been approved and processed.", "We have accepted your exchange request."]) {
+    assert.ok(checkDraft(`Hi Ann, ${bad} Thanks,`, {}).length, bad);
+  }
+  const { proposalPolicy } = await import("../src/agents/cs/starterDrafts.js");
+  assert.equal(proposalPolicy("refund_keep", false), null, "no step 2 before the photos");
+  assert.equal(proposalPolicy("refund_keep", true), "refund_keep");
+  assert.equal(proposalPolicy("photos", true), null);
   assert.ok(checkDraft(keep, {}).length, "outside a proposal the refund words are still Reilly's call");
   const addr = "Hi Gary,\n\nThanks for sending those photos over. Please ship the item to our return address:\n\n601 S Kings Drive\nSuite F, PMB 133\nCharlotte, NC, 28204\n\nPlease be aware that return shipping is paid by the customer. Once we receive your return, we will process the refund to your original payment method.\n\nThanks,";
-  assert.deepEqual(checkDraft(addr, { policy: true }), []);
-  assert.ok(checkDraft(`${keep} Here is $20 off with code FREE15.`, { policy: true }).length);
-  assert.ok(checkDraft(`${keep} It will arrive Friday.`, { policy: true }).length);
+  assert.deepEqual(checkDraft(addr, { policy: "return_address" }), []);
+  assert.ok(checkDraft(`${keep} Here is $20 off with code FREE15.`, { policy: "refund_keep" }).length);
+  assert.ok(checkDraft(`${keep} It will arrive Friday.`, { policy: "refund_keep" }).length);
   assert.ok(DECIDING.has("refund_keep") && !DECIDING.has("photos"));
   assert.match(withSignature("Hi Ann,\n\nDone.\n\nThanks,\nHolt & Crane", { slot: "google:hc", store: "Holt & Crane" }), /Thanks,\n\nHolt & Crane$/);
   assert.match(withSignature("Hi Ann,\n\nDone.\n\nThanks,", { slot: "google", store: "Auberlane" }), /Thanks,\n\nReilly\nAuberlane$/);
-  const img = { labelIds: ["INBOX"], internalDate: "300", payload: { parts: [{ mimeType: "image/jpeg", filename: "a.jpg", body: { attachmentId: "x" } }] } };
+  const img = { labelIds: ["INBOX"], internalDate: "300", payload: { parts: [{ mimeType: "image/jpeg", filename: "IMG_5160.jpeg", body: { attachmentId: "x", size: 900000 } }] } };
   const sent = mail({ id: "s", labels: ["SENT"], body: "Please attach some images", at: 200 });
   assert.equal(threadSoFar({ messages: [sent, img] }, 300).photosSent, true);
   assert.equal(threadSoFar({ messages: [sent] }, 300).photosSent, false);
   assert.match(threadSoFar({ messages: [sent, img] }, 300).reillyLast, /attach some images/);
+  const logo = { labelIds: ["INBOX"], internalDate: "300", payload: { parts: [{ mimeType: "image/png", filename: "image001.png", headers: [{ name: "Content-ID", value: "<x>" }], body: { attachmentId: "y", size: 4000 } }] } };
+  assert.equal(threadSoFar({ messages: [sent, logo] }, 300).photosSent, false, "a signature logo is not a photo");
 });

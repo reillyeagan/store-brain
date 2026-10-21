@@ -151,10 +151,15 @@ export function bodyText(msg) {
 
 /** Does this message carry an image attachment (the photos Reilly asks for)? */
 export function hasImages(msg) {
+  if (!msg || (msg.labelIds || []).includes("DRAFT")) return false;
   let found = false;
   const walk = (p) => {
     if (!p || found) return;
-    if (String(p.mimeType || "").toLowerCase().startsWith("image/") && (p.filename || (p.body && p.body.attachmentId))) found = true;
+    const h = Object.fromEntries((p.headers || []).map((x) => [String(x.name || "").toLowerCase(), String(x.value || "")]));
+    // An inline picture (a logo in an email signature) is not a photo of the item.
+    const inline = /^\s*inline/i.test(h["content-disposition"] || "") || !!h["content-id"] || /^image0\d\d\./i.test(p.filename || "");
+    const small = p.body && Number(p.body.size) > 0 && Number(p.body.size) < 15000;
+    if (String(p.mimeType || "").toLowerCase().startsWith("image/") && (p.filename || (p.body && p.body.attachmentId)) && !inline && !small) found = true;
     for (const c of p.parts || []) walk(c);
   };
   walk(msg && msg.payload);
