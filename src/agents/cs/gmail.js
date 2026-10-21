@@ -149,6 +149,18 @@ export function bodyText(msg) {
   return (msg && msg.snippet) || "";
 }
 
+/** Does this message carry an image attachment (the photos Reilly asks for)? */
+export function hasImages(msg) {
+  let found = false;
+  const walk = (p) => {
+    if (!p || found) return;
+    if (String(p.mimeType || "").toLowerCase().startsWith("image/") && (p.filename || (p.body && p.body.attachmentId))) found = true;
+    for (const c of p.parts || []) walk(c);
+  };
+  walk(msg && msg.payload);
+  return found;
+}
+
 /** Drop the quoted history under a reply, so the AI reads only what the customer just wrote. */
 export function stripQuoted(text) {
   const lines = String(text || "").replace(/\r\n/g, "\n").split("\n");

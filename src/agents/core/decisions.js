@@ -133,6 +133,10 @@ export const SEED_DECISIONS = Object.freeze([
     words: "every quoted product in KFB has a \"supplier link\" button on it, that you can view via the browser. in most cases, if you open that supplier link, you should be able to see the size chart." },
   { at: "2026-10-20T14:45:00Z", topic: "sup.chart_fetch", scope: "all", source: "chat 2026-10-20 — answer to: which way should the brain get the size charts? (1688 shows a slider check to automated browsing)",
     words: "Brain fetches 1688 itself" },
+  // Wired: cs/playbook.js (his practice from ~80 of his own sent replies) feeds both CS writers;
+  // flagged emails now get the reply he would send next, signed the way he signs in that inbox.
+  { at: "2026-10-21T00:38:00Z", topic: "cs.playbook", scope: "all", source: "chat 2026-10-20",
+    words: "Ive been responding to all the emails myself for the past few days, I want you to go through my email (both emails) and look at how i handle certain situations and what i do, and update and train the brain better because its repsonses were not great" },
 ]);
 
 /** Latest (unsuperseded) decision on a topic, or null. */

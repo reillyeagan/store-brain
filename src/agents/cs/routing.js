@@ -76,7 +76,26 @@ export function routeTicket(t, triage, ctx) {
  *     (`sizeAsked`; Reilly 2026-10-13: "no unless they ask")
  * Returns a list of problems (empty = passes).
  */
-export function checkDraft(body, { ctx = null, orderRef = null, sizeAsked = false } = {}) {
+/**
+ * A draft Reilly asked for as his own next step (playbook.js, mail flagged to him): his standard
+ * policy wording is allowed (refund to the original payment method, free replacement, keep the
+ * product, return address, return shipping paid by the customer, "within the next week or so").
+ * Still refused: amounts, percentages, codes, coupons, store credit, labels, dates, links.
+ */
+function policyPhrases(s) {
+  return s
+    .replace(/601 S Kings Drive\s*,?\s*Suite F,?\s*PMB #?133\s*,?\s*Charlotte,?\s*NC,?\s*28204/gi, " the return address ")
+    .replace(/\breturn shipping is paid (?:for )?by the customer\b/gi, " ")
+    .replace(/\b(?:full |the )?refund(?:ed|s|ing)?\b/gi, " ")
+    .replace(/\bfree (?:replacement|of charge)\b/gi, " ")
+    .replace(/\b(?:feel free to |you can |please )?keep (?:it|them|the (?:item|product|jacket|coat|blazer|sweater|cardigan|order))\b/gi, " ")
+    .replace(/\breplacement\b/gi, " ")
+    .replace(/\b(?:ship|send|return) (?:it|them|the (?:item|product|\w+)) back\b/gi, " ")
+    .replace(/\b(?:ship|send) (?:out )?(?:the |a )?(?:new|larger|smaller|correct) (?:size|one)\b/gi, " ")
+    .replace(/\bwithin the next (?:few days|week or so)\b/gi, " ");
+}
+
+export function checkDraft(body, { ctx = null, orderRef = null, sizeAsked = false, policy = false } = {}) {
   const raw = String(body || "");
   const problems = [];
   if (raw.trim().length < 20) problems.push("empty draft");
@@ -88,8 +107,12 @@ export function checkDraft(body, { ctx = null, orderRef = null, sizeAsked = fals
   if (sizeUp) problems.push(`mentions sizing up ("${sizeUp}") but the customer didn't ask about size or fit`);
 
   // Harmless set phrases that would otherwise trip the word lists.
-  const s = raw.replace(/\bfeel free\b/gi, " ").replace(/\b(zip|postal|post)\s*code\b/gi, " ")
-    .replace(/\b\d{1,3}\s?%\s+(cotton|wool|polyester|linen|silk|cashmere|viscose|nylon|acrylic|spandex|elastane|rayon|leather|merino|modal|lyocell)\b/gi, " fabric ");
+  const s0 = raw.replace(/\bfeel free\b/gi, " ").replace(/\b(zip|postal|post)\s*code\b/gi, " ")
+    .replace(/\b\d{1,3}\s?%\s+(cotton|wool|polyester|linen|silk|cashmere|viscose|nylon|acrylic|spandex|elastane|rayon|leather|merino|modal|lyocell)\b/gi, " fabric ")
+    // Reilly's own step-1 wording (2026-10-20 playbook): asking for photos "then we can continue
+    // with the return process" promises nothing.
+    .replace(/\b(return|refund|exchange)(\s*\/\s*(return|refund|exchange))?\s+(process|request|policy)\b/gi, " the process ");
+  const s = policy ? policyPhrases(s0) : s0;
 
   const money = s.match(/\b(refund\w*|money|reimburs\w*|credit\w*|discount\w*|coupon\w*|promo\w*|code|compensat\w*|free|keep (it|them|the item|the order)|dollars?|usd|cents?|bucks|charge\w*|fees?|waive\w*|on us|at no (extra )?cost|no cost|cover\w*|postage|(return|shipping|prepaid) label|label|pay(ing)? for)\b|%|[$€£]\s?\d/i);
   if (money) problems.push(`mentions money or compensation ("${money[0]}") — Reilly's call`);

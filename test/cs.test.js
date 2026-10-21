@@ -1261,7 +1261,10 @@ test("cs starter drafts: a flagged email gets a checked starting reply in Gmail 
   assert.equal(w.drafts.size, 1);
   assert.ok(!w.calls.some((c) => /\/send\b|messages\/send/.test(c.url)), "nothing is ever sent");
   const card = await env.DB.prepare(`SELECT options FROM approvals WHERE id = ?`).bind(a1).first();
-  assert.ok(card.options.includes(NEW_CARD_TAIL));
+  assert.match(card.options, /A draft reply is in your Gmail drafts \(it proposes: an answer in his usual words\)\. Check it, then send/);
+  // Signed the way Reilly signs in this inbox (reillyworking26 → "Reilly" + store), never "Customer Care".
+  assert.match(ts[0].draft_body, /\n\nReilly\nHolt & Crane$/);
+  assert.ok(!/Customer Care/.test(ts[0].draft_body));
   // A third run does nothing new: one draft per conversation.
   const out3 = await writeStarterDrafts(env, { nowMs: NOW + 2 * MIN, fetchImpl: w.fetchImpl, budget: new Budget(28) });
   assert.equal(out3.gmail, 0);
@@ -1458,4 +1461,27 @@ test("cs: a flag stays on the list if Reilly only forwarded the email, or the cu
   await env.DB.prepare(`UPDATE cs_tickets SET replied_at = ? WHERE gmail_id = 'h1'`).bind(new Date(NOW + 50 * MIN).toISOString()).run();
   assert.equal(await closeAnsweredFlags(env.DB, NOW + 60 * MIN), 0, "a newer unanswered email keeps it open");
   assert.equal(await pending(), 1);
+});
+
+test("cs playbook (2026-10-20): Reilly's own wording passes; amounts, codes and dates still don't", async () => {
+  const { checkDraft } = await import("../src/agents/cs/routing.js");
+  const { withSignature } = await import("../src/agents/cs/replyWriter.js");
+  const { threadSoFar, DECIDING } = await import("../src/agents/cs/starterDrafts.js");
+  const step1 = "Hi Gary,\n\nThanks for getting in touch. Please attach some images of the current condition of the product, then we can continue with the return process.\n\nThanks,";
+  assert.deepEqual(checkDraft(step1, {}), [], "step 1 is fine even as a routine reply");
+  const keep = "Hi Pamela,\n\nThank you for sending the pictures. We've issued the refund to your original payment method, you should receive a notification soon, and see the amount appear within the next few days. No need to ship the product back to us, feel free to keep the product.\n\nThanks,";
+  assert.deepEqual(checkDraft(keep, { policy: true }), []);
+  assert.ok(checkDraft(keep, {}).length, "outside a proposal the refund words are still Reilly's call");
+  const addr = "Hi Gary,\n\nThanks for sending those photos over. Please ship the item to our return address:\n\n601 S Kings Drive\nSuite F, PMB 133\nCharlotte, NC, 28204\n\nPlease be aware that return shipping is paid by the customer. Once we receive your return, we will process the refund to your original payment method.\n\nThanks,";
+  assert.deepEqual(checkDraft(addr, { policy: true }), []);
+  assert.ok(checkDraft(`${keep} Here is $20 off with code FREE15.`, { policy: true }).length);
+  assert.ok(checkDraft(`${keep} It will arrive Friday.`, { policy: true }).length);
+  assert.ok(DECIDING.has("refund_keep") && !DECIDING.has("photos"));
+  assert.match(withSignature("Hi Ann,\n\nDone.\n\nThanks,\nHolt & Crane", { slot: "google:hc", store: "Holt & Crane" }), /Thanks,\n\nHolt & Crane$/);
+  assert.match(withSignature("Hi Ann,\n\nDone.\n\nThanks,", { slot: "google", store: "Auberlane" }), /Thanks,\n\nReilly\nAuberlane$/);
+  const img = { labelIds: ["INBOX"], internalDate: "300", payload: { parts: [{ mimeType: "image/jpeg", filename: "a.jpg", body: { attachmentId: "x" } }] } };
+  const sent = mail({ id: "s", labels: ["SENT"], body: "Please attach some images", at: 200 });
+  assert.equal(threadSoFar({ messages: [sent, img] }, 300).photosSent, true);
+  assert.equal(threadSoFar({ messages: [sent] }, 300).photosSent, false);
+  assert.match(threadSoFar({ messages: [sent, img] }, 300).reillyLast, /attach some images/);
 });

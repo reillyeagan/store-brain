@@ -4,9 +4,10 @@
  * Why (Reilly 2026-10-15, looking at Waiting on you): "i thought the brain was supposed to draft
  * replies for me, not just tell me". Flagged emails (refunds, returns, complaints, anything the
  * playbook doesn't cover) are still Reilly's DECISION, but he shouldn't have to write the reply
- * from nothing. So each one gets a starting reply in Gmail that decides nothing: it acknowledges
- * the email, uses only the order facts code attached, asks for whatever is missing (order number,
- * photos) and says the team is looking into it. Reilly adds the decision and sends it himself.
+ * from nothing. Since 2026-10-20 ("look at how i handle certain situations and what i do, and
+ * update and train the brain better") each draft is the reply HE would send next, from his own
+ * sent mail (playbook.js): photos first for any return, then his usual choice once photos are in.
+ * The card says what the draft proposes; Reilly checks it, edits if needed, and sends it himself.
  *
  * Same safety as every draft: Gmail DRAFT only (never sent), only with CS_DRAFTS_LIVE=1, the
  * inbox account is checked first, one draft per conversation, read back after creating, and the
@@ -25,10 +26,11 @@ import { nowIso } from "../../lib/time.js";
 import { CAPS, DELIVERY_FACTS, storeName } from "./config.js";
 import { checkDraft } from "./routing.js";
 import { emailAsksAboutSize } from "./sizeUpGate.js";
-import { draftsLive, pushGmailDraft, corePolicy, userPrompt, signOff } from "./replyWriter.js";
+import { draftsLive, pushGmailDraft, corePolicy, userPrompt, withSignature, bodyWithoutSignature } from "./replyWriter.js";
 import { escalationReason } from "./escalation.js";
 import { otherLiveDraft } from "./gmailDrafts.js";
-import { getThread } from "./gmail.js";
+import { getThread, bodyText, stripQuoted, hasImages } from "./gmail.js";
+import { PLAYBOOK, VOICE } from "./playbook.js";
 import { getGoogleAccessToken } from "../../lib/google.js";
 import { safeJson, clip } from "./util.js";
 
@@ -40,36 +42,59 @@ export const RETRY_BLOCKED_BEFORE = "2026-10-16T17:00:00.000Z";
 export const OLD_CARD_TAIL = "Reply in Gmail; nothing has been sent.";
 export const NEW_CARD_TAIL = "A starting reply is in your Gmail drafts: add your decision, then send. Nothing has been sent.";
 
+/** What a starter draft proposes: Reilly's next step in his own playbook. */
+export const PROPOSALS = Object.freeze({
+  photos: "asks for photos of the item first",
+  info: "asks for the missing details (order number, reason, which product)",
+  refund_keep: "full refund, customer keeps the item",
+  replacement: "free replacement in the right size",
+  return_address: "return address, refund once it arrives",
+  received_refund: "item received, refund issued",
+  order_change: "says the order change is done (make it in Shopify first)",
+  delivered_check: "asks them to check other places it may have been left",
+  other: "an answer in his usual words",
+});
+/** Proposals that state Reilly's decision: his policy wording is allowed in them (routing.checkDraft policy). */
+export const DECIDING = new Set(["refund_keep", "replacement", "return_address", "received_refund", "order_change"]);
+
 export function starterSystem(store, policy, why) {
-  return `You write customer-service email replies for ${store}, a small online clothing store. This email was flagged to the owner, Reilly, because: ${why}. He makes that decision himself. Write a STARTING reply he will edit and send.
-The reply must:
-- thank them and show you understood exactly what they asked or reported;
-- use only the order facts given; if no order was found, ask for the order number;
-- if an item arrived wrong, damaged or faulty, ask for a photo of it;
-- say the team is looking into it and will follow up shortly (no date, no time frame);
-- decide nothing and promise nothing;
-- say a parcel is delivered or not delivered ONLY from carrier_says_delivered (when unknown, say neither);
-- write as the store ("we"); never mention Reilly or any person by name.
-Voice: warm, short, plain English, no corporate filler. 3-6 sentences. Greet the customer by first name if known. Sign off with just the store name on its own line, exactly: "${store}" (Reilly 2026-10-15: not "Customer Care").
-Hard rules:
-- Never invent order numbers, tracking numbers, dates, measurements or policies.
-- Never write any date, weekday or month name, and never the words refund, money, credit, discount, code, free, replace, reship, resend, return label. The only numbers you may write are the order number, tracking numbers and links given, and delivery-time ranges in business days.
-- Delivery timing you may use: ${DELIVERY_FACTS.join(" ")}
-- If the reason says the order number belongs to a different email, do not say anything about that order: ask which email address they used to place it.
-- Never mention that a bigger or different factory size may be sent.
-- If the email asks nothing and needs no reply (only thanks or an acknowledgement), return {"no_reply":true}.
-${policy ? `Store policy (from the playbook):\n${policy}` : ""}
-Return {"body":"the full reply text","no_reply":false}`;
+  return `You write customer-service email replies for ${store}, a small online clothing store, AS REILLY WOULD WRITE THEM. Reilly owns the store; he reads every draft, edits it if needed and sends it himself. This email was flagged to him because: ${why}.
+${PLAYBOOK}
+${VOICE}
+Write the reply Reilly would send NOW, following his playbook:
+- Work out which step the conversation is at from "Reilly's last reply" and whether the customer has sent photos. A return/refund/exchange request with no photos yet → step 1 (ask for photos of the current condition). Photos already sent → step 2 (his usual choice for what they show).
+- Use only the order facts given; if no order was found and you need it, ask for the order number. If the order number belongs to a different email, ask which email they used to place it.
+- Say a parcel is delivered or not ONLY from carrier_says_delivered.
+- Never write an amount of money, a percentage, a discount or coupon code, store credit, a prepaid label, a date, weekday or month name. Refund timing only as "within the next few days" or "within the next week or so". The only numbers allowed: the order number, tracking numbers and links given, and the return address.
+- Never mention that a bigger or different factory size may be sent unless the customer asked about size or fit.
+- If the email asks nothing and needs no reply (only thanks), return {"no_reply":true}.
+End with one closing line ("Thanks," / "Let us know if you have any other questions,"). Do NOT sign: the signature is added after you.
+${policy ? `Store policy notes (from the Core):\n${policy}` : ""}
+Return {"body":"the reply","proposes":"${Object.keys(PROPOSALS).join("|")}","no_reply":false}`;
+}
+
+/** The conversation so far, for the writer: Reilly's last reply and whether photos came after it. */
+export function threadSoFar(thread, customerMs) {
+  const msgs = [...((thread && thread.messages) || [])].sort((a, b) => Number(a.internalDate) - Number(b.internalDate));
+  const sent = msgs.filter((m) => (m.labelIds || []).includes("SENT") && Number(m.internalDate) <= customerMs);
+  const last = sent[sent.length - 1] || null;
+  const since = msgs.filter((m) => !(m.labelIds || []).includes("SENT") && Number(m.internalDate) > (last ? Number(last.internalDate) : 0));
+  return {
+    reillyLast: last ? clip(stripQuoted(bodyText(last)), 700) : null,
+    photosSent: since.some(hasImages) || (!last && msgs.some((m) => !(m.labelIds || []).includes("SENT") && hasImages(m))),
+  };
 }
 
 /** Swap the card's last line once a starter is in Gmail, so the card says where it is. */
-async function markCard(db, approvalId) {
+async function markCard(db, approvalId, proposes) {
+  const said = proposes ? (PROPOSALS[proposes] || proposes) : null;
+  const tail = said ? `A draft reply is in your Gmail drafts (it ${said.startsWith("asks") || said.startsWith("says") ? said : `proposes: ${said}`}). Check it, then send. Nothing has been sent.` : NEW_CARD_TAIL;
   if (!approvalId) return;
   const a = await db.prepare(`SELECT options, status FROM approvals WHERE id = ?`).bind(approvalId).first();
   if (!a || a.status !== "pending") return;
   const opts = safeJson(a.options, []);
   let changed = false;
-  for (const o of opts) if (o && typeof o.detail === "string" && o.detail.includes(OLD_CARD_TAIL)) { o.detail = o.detail.replace(OLD_CARD_TAIL, NEW_CARD_TAIL); changed = true; }
+  for (const o of opts) if (o && typeof o.detail === "string" && o.detail.includes(OLD_CARD_TAIL)) { o.detail = o.detail.replace(OLD_CARD_TAIL, tail); changed = true; }
   if (changed) await db.prepare(`UPDATE approvals SET options = ? WHERE id = ? AND status = 'pending'`).bind(JSON.stringify(opts), approvalId).run();
 }
 
@@ -96,6 +121,7 @@ export async function writeStarterDrafts(env, { nowMs = Date.now(), fetchImpl = 
     if (budget.left < 8) break;
     const at = nowIso(nowMs);
     let body = t.draft_status === "starter" ? t.draft_body : null;
+    let so = { reillyLast: null, photosSent: false }, proposes = null;
     if (!body && asked >= PER_RUN) continue;
     // Another draft for this conversation still in Gmail (a joined follow-up, or a stale draft
     // Reilly was told to delete): no second one, and no AI call spent finding that out.
@@ -107,6 +133,7 @@ export async function writeStarterDrafts(env, { nowMs = Date.now(), fetchImpl = 
       const token = await getGoogleAccessToken(env, { fetchImpl, nowMs, slot: t.slot });
       const thread = t.thread_id ? await getThread(token, t.thread_id, { fetchImpl }) : { messages: [] };
       const customerMs = Date.parse(t.received_at || t.opened_at) || 0;
+      so = threadSoFar(thread, customerMs);
       if ((thread.messages || []).some((m) => (m.labelIds || []).includes("SENT") && Number(m.internalDate) > customerMs)) {
         await skip(t, "No starting reply: you already replied in this conversation", at);
         continue;
@@ -119,11 +146,12 @@ export async function writeStarterDrafts(env, { nowMs = Date.now(), fetchImpl = 
       asked++;
       const ctx = safeJson(t.context, null);
       const sizeAsked = emailAsksAboutSize(t);
+      const convo = `Reilly's last reply in this conversation: ${so.reillyLast ? `\n${so.reillyLast}` : "(none: this is the first email)"}\nPhotos sent by the customer${so.reillyLast ? " since then" : ""}: ${so.photosSent ? "yes" : "no"}`;
       const store = storeName(t.order_store || t.store) || "our store";
       const why = clip(escalationReason(t) || String(t.category || "not covered by the playbook").replace(/_/g, " "), 200);
       let r;
       try {
-        r = await askJson(env, { system: starterSystem(store, await corePolicy(db, t.order_store || t.store), why), user: userPrompt(t, ctx, null), maxTokens: 500, actor: ACTOR, label: "CS starter draft", store: t.store || undefined }, { fetchImpl, nowMs });
+        r = await askJson(env, { system: starterSystem(store, await corePolicy(db, t.order_store || t.store), why), user: `${userPrompt(t, ctx, null)}\n\n${convo}`, maxTokens: 600, actor: ACTOR, label: "CS starter draft", store: t.store || undefined }, { fetchImpl, nowMs });
       } catch (err) {
         // An unusable AI answer is not retried every run (it would hold up every older flag).
         out.failed++;
@@ -137,8 +165,9 @@ export async function writeStarterDrafts(env, { nowMs = Date.now(), fetchImpl = 
         await skip(t, "No starting reply: the writer says this email needs no reply", at);
         continue;
       }
-      body = signOff(typeof j.body === "string" ? j.body.trim() : "");
-      const checkOpts = { ctx: t.order_mismatch ? null : ctx, orderRef: t.order_mismatch ? null : t.order_ref, sizeAsked };
+      proposes = PROPOSALS[j.proposes] ? j.proposes : "other";
+      body = bodyWithoutSignature(typeof j.body === "string" ? j.body.trim() : "", store);
+      const checkOpts = { ctx: t.order_mismatch ? null : ctx, orderRef: t.order_mismatch ? null : t.order_ref, sizeAsked, policy: DECIDING.has(proposes) };
       let problems = checkDraft(body, checkOpts);
       // One rewrite with the check's own words (live 2026-10-16: refund and return requests kept
       // failing because the writer echoed "refund" / "send it back"). The same code check then
@@ -147,13 +176,13 @@ export async function writeStarterDrafts(env, { nowMs = Date.now(), fetchImpl = 
         try {
           const r2 = await askJson(env, {
             system: starterSystem(store, await corePolicy(db, t.order_store || t.store), why),
-            user: `${userPrompt(t, ctx, null)}\n\nYour previous reply was rejected by the safety check: ${problems.join("; ")}.\nWrite it again without those words or anything like them. Refer to what they asked for as "your request" (never name a refund, return, replacement or exchange), and say the team is looking into it.`,
-            maxTokens: 500, actor: ACTOR, label: "CS starter draft (rewrite)", store: t.store || undefined,
+            user: `${userPrompt(t, ctx, null)}\n\n${convo}\n\nYour previous draft was rejected by the safety check: ${problems.join("; ")}.\nWrite it again in Reilly's words without those things.`,
+            maxTokens: 600, actor: ACTOR, label: "CS starter draft (rewrite)", store: t.store || undefined,
           }, { fetchImpl, nowMs });
           const j2 = (r2 && r2.json) || {};
           if (typeof j2.body === "string" && j2.body.trim()) {
-            const body2 = signOff(j2.body.trim());
-            const p2 = checkDraft(body2, checkOpts);
+            const body2 = bodyWithoutSignature(j2.body.trim(), store);
+            const p2 = checkDraft(body2, { ...checkOpts, policy: DECIDING.has(PROPOSALS[j2.proposes] ? j2.proposes : proposes) });
             if (!p2.length) { body = body2; problems = []; } else problems = p2;
           }
         } catch { /* keep the first problems */ }
@@ -165,12 +194,13 @@ export async function writeStarterDrafts(env, { nowMs = Date.now(), fetchImpl = 
         continue;
       }
       out.written++;
-      await db.prepare(`UPDATE cs_tickets SET draft_body = ?, draft_status = 'starter', draft_at = ?, updated_at = ? WHERE id = ?`).bind(body, at, at, t.id).run();
+      body = withSignature(body, { slot: t.slot, store });
+      await db.prepare(`UPDATE cs_tickets SET draft_body = ?, draft_status = 'starter', draft_note = ?, draft_at = ?, updated_at = ? WHERE id = ?`).bind(body, clip(`Draft proposes: ${PROPOSALS[proposes]}`, 300), at, at, t.id).run();
     }
     const g = await pushGmailDraft(env, t, body, { nowMs, fetchImpl, budget });
     if (!g.ok) continue; // stays 'starter' (retried) unless pushGmailDraft refused it for good
     out.gmail++;
-    await markCard(db, t.approval_id);
+    await markCard(db, t.approval_id, proposes || (String(t.draft_note || "").match(/Draft proposes: (.+)$/) || [])[1] || null);
     await logEvent(db, { actor: ACTOR, kind: "cs.starter_to_gmail", store: t.store, target: "sys.gmail", at, summary: `Ticket ${t.id} (flagged to Reilly): starting reply saved as a Gmail draft for him to finish and send. Nothing sent.`, data: { ticket: t.id, approvalId: t.approval_id } });
   }
   return out;

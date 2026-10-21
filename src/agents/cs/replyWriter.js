@@ -24,6 +24,7 @@ import { threadWaitingOnReilly, staleGmailDraft } from "./escalation.js";
 import { otherLiveDraft } from "./gmailDrafts.js";
 import { createReplyDraft, getDraft, getThread } from "./gmail.js";
 import { safeJson, clip, logOnce } from "./util.js";
+import { VOICE, signatureFor } from "./playbook.js";
 import { modeFor } from "../../config/live.js";
 
 const ACTOR = "cs.reply_writer";
@@ -64,7 +65,8 @@ export async function sizeChartFor(db, ctx) {
 
 function system(store, policy) {
   return `You write customer-service email replies for ${store}, a small online clothing store. Reilly reviews and sends every reply himself.
-Voice: warm, short, plain English, no corporate filler. 3-8 sentences. Greet the customer by first name if known. Sign off with just the store name on its own line, exactly: "${store}" (Reilly 2026-10-15: not "Customer Care").
+${VOICE}
+End with one closing line ("Thanks," or "Let us know if you have any other questions,"). Do NOT sign: the signature is added after you.
 Hard rules:
 - Use ONLY the order facts given. Never invent order numbers, tracking numbers, dates, measurements or policies.
 - Never promise a refund, a reship, a replacement, or a delivery date.
@@ -75,12 +77,28 @@ Hard rules:
 - If a tracking number and link are given, include them. If no order was found, ask politely for the order number.
 - Say a parcel is delivered or not delivered ONLY from carrier_says_delivered; when it is unknown, give the tracking link and don't say either.
 - Write as the store ("we"). Never mention Reilly or any person by name.
-- For size questions use only the size chart given; if there is none, say you'll check the measurements and get back to them (no date).
+- For size questions: Reilly's standard advice is "our products tend to run a little small, so we would recommend sizing up one size from what you typically wear"; use the size chart given to name a size when there is one.
+- For a product question that doesn't say which product: ask for the link to the exact product (his wording: "Could you please send us the link to the exact product you are looking at so we can get the details right?").
 - Never mention that a bigger or different factory size may be sent, or that factory sizes run small, unless the customer's email asks about size or fit.
-- For address / colour / size changes before shipping: say you've passed the request on and will confirm once it's updated (no promise it will be possible).
+- Address / colour / size changes and cancellations are Reilly's (he makes them in Shopify): set needs_reilly true.
+- Return, refund, exchange, quality and lost-parcel emails are Reilly's: set needs_reilly true (a draft in his playbook's words is written for him separately).
 - If the email needs a decision only the owner can make (money back, a replacement, a complaint, a threat), set needs_reilly true and write no body.
 ${policy ? `Store policy (from the playbook):\n${policy}` : ""}
 Return {"body":"the full reply text","needs_reilly":false,"reason":null}`;
+}
+
+/**
+ * The draft as Reilly signs it in that inbox (playbook.signatureFor): whatever sign-off the model
+ * wrote is dropped first. The checks run on the body BEFORE this (the signature names Reilly).
+ */
+export function withSignature(body, { slot, store }) {
+  return `${bodyWithoutSignature(body, store)}\n\n${signatureFor(slot, store)}`;
+}
+export function bodyWithoutSignature(body, store) {
+  const lines = signOff(body).split(/\r?\n/);
+  const sig = new RegExp(`^(?:reilly|${String(store || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}|holt & crane|auberlane|marlowe standard)(?:\s+(?:support|team))?$`, "i");
+  while (lines.length > 1 && (sig.test(lines[lines.length - 1].trim()) || !lines[lines.length - 1].trim())) lines.pop();
+  return lines.join("\n").trim();
 }
 
 /** Signed with just the store name (Reilly 2026-10-15: "it should say just "Holt & Crane" at the end, not cusotmer care"). */
@@ -184,8 +202,9 @@ export async function writeReplies(env, { nowMs = Date.now(), fetchImpl = fetch,
       await logEvent(db, { actor: ACTOR, kind: "cs.draft_needs_reilly", store: t.store, target: "cs.escalation", at, summary: `Ticket ${t.id}: no reply drafted, needs Reilly (${clip(j.reason || "no reason given", 120)})`, data: { ticket: t.id } });
       continue;
     }
-    const body = signOff(typeof j.body === "string" ? j.body.trim() : "");
-    const problems = checkDraft(body, { ctx, orderRef: t.order_ref, sizeAsked });
+    const plain = bodyWithoutSignature(typeof j.body === "string" ? j.body.trim() : "", store);
+    const problems = checkDraft(plain, { ctx, orderRef: t.order_ref, sizeAsked });
+    const body = withSignature(plain, { slot: t.slot, store });
     if (problems.length) {
       blocked++;
       await db.prepare(`UPDATE cs_tickets SET draft_body = ?, draft_status = 'blocked', draft_note = ?, draft_at = ?, updated_at = ? WHERE id = ?`).bind(clip(body, 3000), clip(`Draft failed the check: ${problems.join("; ")}`, 300), at, at, t.id).run();
