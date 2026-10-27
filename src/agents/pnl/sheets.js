@@ -800,7 +800,12 @@ export async function planEcom(db, read, { nowMs = Date.now() } = {}) {
   const rows = [];
   for (const m of read.months) for (const d of m.days) if (d.day < today) rows.push({ m, d });
   rows.sort((p, q) => (p.d.day === yesterday ? -1 : q.d.day === yesterday ? 1 : p.d.day < q.d.day ? 1 : -1));
+  // The Ecom sheet sums the LIVE stores. Before the day the set of stores last changed (Auberlane
+  // and Marlowe closed 2026-10-27) its days summed other stores too, so they are left alone: never
+  // "filled" or flagged against a sum that no longer covers every store of that day.
+  const setFrom = Object.values(STORES).filter((x) => !x.live && x.closedOn).map((x) => x.closedOn).sort().pop() || null;
   for (const { m, d } of rows) {
+    if (setFrom && d.day < setFrom) { skipped["before the stores changed"] = (skipped["before the stores changed"] || 0) + 1; continue; }
     {
       const isY = d.day === yesterday;
       if (isY) y.in_sheet = true;

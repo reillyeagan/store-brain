@@ -8,8 +8,8 @@ This repo is the **Store Brain**: the 24/7 operations system for Reilly's Shopif
 | id | Store | Live | KFB shop code |
 |---|---|---|---|
 | hc | Holt & Crane | yes | jmzjx1-it |
-| aub | Auberlane | yes | 3as2ya-dw |
-| mar | Marlowe Standard | yes | 806080-g8 |
+| aub | Auberlane | closed 2026-10-27 | 3as2ya-dw |
+| mar | Marlowe Standard | closed 2026-10-27 | 806080-g8 |
 | cc | Colette & Claire | not yet | tbc |
 | tund | Tundrelle | not yet | mek6yu-91 |
 

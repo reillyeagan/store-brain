@@ -363,7 +363,9 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
     $("#status").innerHTML='Updated '+esc(hm(state.now))+' · '+(bad?'<a href="#/agents/page/feeds" class="bad" style="text-decoration:none" title="'+esc(badF.map(function(f){return f.label}).join(", "))+'">● '+esc(bad===1?badF[0].label+" is stale":bad+" feeds stale")+' →</a>':'<span class="ok">● all feeds fresh</span>');
     var ls=liveStores();
     if(store!=="all"&&!ls.some(function(s){return s.id===store})) store="all";
-    $("#stores").innerHTML='<button class="pill'+(store==="all"?" on":"")+'" data-s="all">All stores</button>'+
+    /* One live store (H&C only since 2026-10-27): no "All stores" switch, just its name. */
+    if(ls.length===1) store="all";
+    $("#stores").innerHTML=ls.length===1?'<span class="pill on">'+esc(storeName(ls[0].id))+'</span><span class="pill dash" title="New stores come with the Store Factory">+ Add store</span>':'<button class="pill'+(store==="all"?" on":"")+'" data-s="all">All stores</button>'+
       ls.map(function(s){return '<button class="pill'+(store===s.id?" on":"")+'" data-s="'+esc(s.id)+'">'+esc(storeName(s.id))+'</button>'}).join("")+
       '<span class="pill dash" title="New stores come with the Store Factory">+ Add store</span>';
     document.querySelectorAll("#stores [data-s]").forEach(function(b){ b.addEventListener("click",function(){ store=b.dataset.s; try{localStorage.setItem(STORE_PICK,store)}catch(e){} busyUntil=0; render(); }); });
@@ -1242,7 +1244,7 @@ textarea.fld{font:12px var(--mono);width:100%;min-height:110px;resize:vertical;b
     h+=need.length?need.map(function(n){ return '<div class="rowx"><span><b style="font-weight:500">'+esc(n.title||n.product_handle||n.product_id)+'</b></span><span class="meta"><span>'+esc(n.storeName||n.store)+'</span><span>'+esc(n.product_handle||"no handle")+'</span><span>'+esc(n.lines)+' line'+(n.lines===1?"":"s")+'</span><span>sizes '+esc(n.sizes)+'</span>'+(n.factory_url?'<span><a href="'+esc(n.factory_url)+'" target="_blank" rel="noopener" style="color:var(--blue)">factory listing</a></span>':'<span>no factory link from KFB yet</span>')+(n.fetch?'<span>brain: '+esc((n.fetch.status==="blocked"?"1688 asked for a check":n.fetch.status==="not_found"?"no chart found":n.fetch.status)+(n.fetch.next_try_at?", tries again later":n.fetch.status==="read"?"":", gave up: add it here"))+'</span>':'')+'</span>'+
       (n.product_handle?'<div class="btns"><button class="btn" data-scuse="'+esc(n.product_handle)+'" data-scstore="'+esc(n.store)+'">Add chart</button></div>':'')+'</div>'; }).join(""):'<div class="note">No sized orders without a chart in the last 30 days.</div>';
     h+='<div class="lab" style="margin-top:14px">Add a chart</div><div class="scform">'+
-      '<select class="fld" id="scStore"><option value="hc">Holt &amp; Crane</option><option value="aub">Auberlane</option><option value="mar">Marlowe Standard</option></select>'+
+      '<select class="fld" id="scStore">'+liveStores().map(function(x){return '<option value="'+esc(x.id)+'">'+esc(x.name)+'</option>'}).join("")+'</select>'+
       '<input class="fld" id="scHandle" placeholder="product handle or link" style="min-width:220px">'+
       '<select class="fld" id="scUnit"><option value="cm">cm</option><option value="in">inches</option></select>'+
       '<label><input type="checkbox" id="scFlat"> measured flat (half chest)</label>'+

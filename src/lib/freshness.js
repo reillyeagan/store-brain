@@ -81,7 +81,9 @@ export async function markFeedFailed(db, feedId, error, atIso = nowIso()) {
 /** All feeds with their current state. */
 export async function evaluateFeeds(db, nowMs = Date.now()) {
   const { results } = await db.prepare(`SELECT * FROM feeds ORDER BY id`).all();
-  return (results || []).map((r) => ({ ...r, current: feedState(r, nowMs) }));
+  // A closed store's feeds (Auberlane, Marlowe: 2026-10-27) are left out: nothing reads them any
+  // more, so they would only ever turn "stale" and raise alarms about a store that is gone.
+  return (results || []).filter((r) => !r.store || !STORES[r.store] || STORES[r.store].live).map((r) => ({ ...r, current: feedState(r, nowMs) }));
 }
 
 /**

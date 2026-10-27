@@ -137,6 +137,9 @@ export const SEED_DECISIONS = Object.freeze([
   // flagged emails now get the reply he would send next, signed the way he signs in that inbox.
   { at: "2026-10-21T00:38:00Z", topic: "cs.playbook", scope: "all", source: "chat 2026-10-20",
     words: "Ive been responding to all the emails myself for the past few days, I want you to go through my email (both emails) and look at how i handle certain situations and what i do, and update and train the brain better because its repsonses were not great" },
+  // Wired: stores.js aub/mar live:false + closedOn; lib/closedStores.js; freshness and Ecom sheet guards.
+  { at: "2026-10-27T15:00:00Z", topic: "stores.live", scope: "all", source: "chat 2026-10-27",
+    words: "Okay so new updates, marlowe and auberlane are no longer live. can we switch the store brain so that its only focused on H&C now?" },
 ]);
 
 /** Latest (unsuperseded) decision on a topic, or null. */

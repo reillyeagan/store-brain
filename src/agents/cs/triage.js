@@ -45,7 +45,9 @@ export async function readInboxes(env, { nowMs = Date.now(), fetchImpl = fetch, 
   const slots = await connectedSlots(db);
   const out = [];
   for (const inbox of inboxPlan(new Set(slots.keys()))) {
-    if (!inbox.stores.length) continue; // every live store has its own inbox: nothing to read in main
+    // Every live store has its own inbox: the main inbox is still read for customers replying to
+    // Reilly's own Gmail answers (2026-10-27: only H&C is live, and it has its own inbox).
+    if (!inbox.stores.length && inbox.slot !== "google") continue;
     try {
       out.push(await readOneInbox(env, inbox, slots.get(inbox.slot) || null, { nowMs, fetchImpl, budget }));
     } catch (err) {

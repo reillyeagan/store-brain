@@ -79,6 +79,7 @@ import { reconcileOrders } from "./lib/reconcile.js";
 import { runOrderBackfill } from "./lib/orderBackfill.js";
 import { runHistoryExtension } from "./lib/historyExtend.js";
 import { applyRefundHistory } from "./lib/refundHistoryImport.js";
+import { closeStoreWork } from "./lib/closedStores.js";
 import { runMoneyJobs } from "./lib/moneyJobs.js";
 import { moneyState } from "./lib/moneyState.js";
 import { payoutsState } from "./lib/payoutsState.js";
@@ -427,6 +428,8 @@ export default {
             summary: `Older order history read failed to start; it will try again in 15 minutes (${String(err && err.message).slice(0, 200)})`,
           }).catch(() => {});
         }
+        // A closed store's leftover approvals come off Reilly's list once (2026-10-27).
+        await closeStoreWork(env).catch(() => {});
         // One-off refund history read from Shopify by Claude (2026-10-16); does nothing once applied.
         try {
           await applyRefundHistory(env);

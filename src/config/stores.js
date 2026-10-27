@@ -122,6 +122,17 @@ export const AUDIENCE_DECISION = Object.freeze({
   words: "H&C is mens and womens. Auberlane is womens. Marlowe is mens.",
 });
 
+/**
+ * Tests only: the test suite was written with three live stores and keeps them as fixtures
+ * (npm test sets SB_TEST_LIVE_STORES=hc,aub,mar). Production never has `process.env` set, so
+ * the real `live` values below always apply there (test/stores-live.test.js checks it).
+ */
+const TEST_LIVE = (() => {
+  try { return String((globalThis.process && globalThis.process.env && globalThis.process.env.SB_TEST_LIVE_STORES) || "").split(",").filter(Boolean); }
+  catch { return []; }
+})();
+const liveFor = (id, real) => (TEST_LIVE.length ? TEST_LIVE.includes(id) : real);
+
 export const STORES = Object.freeze({
   hc: {
     id: "hc",
@@ -134,7 +145,7 @@ export const STORES = Object.freeze({
     // "it has its own gmail, we need to connect it. also, eventually all the stores will have their own gmails").
     mailbox: "info@holtandcrane.com",
     audience: "both", // see AUDIENCE_DECISION: sized per product, never assumed men's
-    live: true,
+    live: liveFor("hc", true),
     timezone: "America/New_York",
     secrets: { clientId: "SB_HC_CLIENT_ID", clientSecret: "SB_HC_CLIENT_SECRET" },
     // Guy (media buyer) fee: see GUY_FEE below.
@@ -150,7 +161,8 @@ export const STORES = Object.freeze({
     adsCustomerId: "148-187-2496",
     pnlSheetId: "1_Bpg8G1Ztt8QTs3Bus0MGXmQi7wKOTqvKaAtHdDmD_8", // "Auberlane P&L"
     audience: "women", // see AUDIENCE_DECISION
-    live: true,
+    live: liveFor("aub", false), // closed 2026-10-27 (Reilly: "marlowe and auberlane are no longer live"); history kept
+    closedOn: "2026-10-27",
     timezone: "America/New_York",
     secrets: { clientId: "SB_AUB_CLIENT_ID", clientSecret: "SB_AUB_CLIENT_SECRET" },
     // Guy (media buyer) fee: see GUY_FEE below.
@@ -169,7 +181,8 @@ export const STORES = Object.freeze({
     adsCustomerId: "774-220-2674",
     pnlSheetId: "1hQPdzPDkJbX9uC1jjrKc2vrA2PUq-cmC-ziBqeUiCkg", // "Marlowe Standard P&L"
     audience: "men", // see AUDIENCE_DECISION
-    live: true,
+    live: liveFor("mar", false), // closed 2026-10-27 (Reilly: "marlowe and auberlane are no longer live"); history kept
+    closedOn: "2026-10-27",
     timezone: "America/New_York",
     secrets: { clientId: "SB_MAR_CLIENT_ID", clientSecret: "SB_MAR_CLIENT_SECRET" },
     // Guy (media buyer) fee: see GUY_FEE below.
